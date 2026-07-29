@@ -377,6 +377,7 @@ class DebugLogger:
             self._modified_chunks_buffer,
         ])
         if not has_capture_data and not has_legacy_data:
+            self._clear_buffers()
             return
         
         try:

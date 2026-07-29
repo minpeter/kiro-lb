@@ -25,6 +25,19 @@ _SENSITIVE_KEYS = frozenset({
     "credential",
     "privatekey",
 })
+_SENSITIVE_KEY_SUFFIXES = (
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "privatekey",
+    "accesskey",
+    "accesskeyid",
+    "secretaccesskey",
+    "session",
+    "sessionid",
+    "sessionkey",
+)
 _STRUCTURAL_TEXT_KEYS = frozenset({
     "type",
     "role",
@@ -59,6 +72,22 @@ def redact_patterns(value: str) -> str:
     return sanitized
 
 
+def sensitive_key_kind(key: Optional[str]) -> Optional[str]:
+    """Classify normalized credential fields, including provider variants."""
+    normalized = re.sub(r"[^a-z0-9]", "", (key or "").lower())
+    if normalized.endswith("signature"):
+        return "signature"
+    if normalized in _SENSITIVE_KEYS or normalized.endswith(
+        _SENSITIVE_KEY_SUFFIXES
+    ):
+        return "credential"
+    return None
+
+
+def _redacted_text(value: str) -> dict[str, Any]:
+    return {"$redacted_text": True, "chars": len(value)}
+
+
 def sanitize_value(
     value: Any,
     capture_content: bool,
@@ -66,8 +95,9 @@ def sanitize_value(
 ) -> Any:
     """Recursively sanitize credentials and optionally redact textual content."""
     normalized_key = re.sub(r"[^a-z0-9]", "", (key or "").lower())
-    if normalized_key in _SENSITIVE_KEYS:
-        if normalized_key == "signature":
+    sensitive_kind = sensitive_key_kind(key)
+    if sensitive_kind is not None:
+        if sensitive_kind == "signature":
             return "[REDACTED_SIGNATURE]"
         return "[REDACTED]"
     if isinstance(value, dict):
@@ -84,10 +114,21 @@ def sanitize_value(
             and re.fullmatch(r"[A-Za-z0-9+/=_-]+", value)
         ):
             return "[REDACTED_BINARY]"
+        try:
+            encoded_json = json.loads(value)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(encoded_json, (dict, list)):
+                return json.dumps(
+                    sanitize_value(encoded_json, capture_content),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
         sanitized = redact_patterns(value)
         if capture_content or normalized_key in _STRUCTURAL_TEXT_KEYS:
             return sanitized
-        return {"$redacted_text": True, "chars": len(value)}
+        return _redacted_text(value)
     return value
 
 
@@ -104,13 +145,23 @@ def sanitize_bytes(data: bytes, capture_content: bool) -> bytes:
         parsed = json.loads(decoded)
     except json.JSONDecodeError:
         json_start = decoded.find("{")
-        if json_start > 0:
+        if (
+            json_start > 0
+            and not decoded.lstrip().startswith(("data:", "event:"))
+        ):
             try:
                 parsed = json.loads(decoded[json_start:])
             except json.JSONDecodeError:
                 pass
             else:
-                prefix = redact_patterns(decoded[:json_start])
+                raw_prefix = decoded[:json_start]
+                if capture_content:
+                    prefix = redact_patterns(raw_prefix)
+                else:
+                    prefix = json.dumps(
+                        _redacted_text(raw_prefix),
+                        separators=(",", ":"),
+                    )
                 sanitized = json.dumps(
                     sanitize_value(parsed, capture_content),
                     ensure_ascii=False,
@@ -134,10 +185,7 @@ def sanitize_bytes(data: bytes, capture_content: bool) -> bytes:
                             separators=(",", ":"),
                         )
                     except json.JSONDecodeError:
-                        payload = json.dumps({
-                            "$redacted_text": True,
-                            "chars": len(payload),
-                        })
+                        payload = json.dumps(_redacted_text(payload))
                     sanitized_lines.append(f"data: {payload}")
                 else:
                     sanitized_lines.append(redact_patterns(line))
@@ -145,10 +193,7 @@ def sanitize_bytes(data: bytes, capture_content: bool) -> bytes:
             return ("\n".join(sanitized_lines) + suffix).encode()
         if capture_content:
             return redact_patterns(decoded).encode()
-        return json.dumps({
-            "$redacted_text": True,
-            "chars": len(decoded),
-        }).encode()
+        return json.dumps(_redacted_text(decoded)).encode()
     return json.dumps(
         sanitize_value(parsed, capture_content),
         ensure_ascii=False,

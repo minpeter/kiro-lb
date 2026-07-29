@@ -151,6 +151,7 @@ class CaptureState:
         category: str = "failures",
     ) -> Path:
         """Atomically publish a private failure bundle and enforce retention."""
+        prune_stale_temporaries(self.debug_dir)
         captures_dir = self.debug_dir / category
         captures_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(captures_dir, 0o700)
@@ -159,71 +160,75 @@ class CaptureState:
             shutil.rmtree(temporary)
         temporary.mkdir(mode=0o700)
 
-        failure = redact_patterns(error_message)
-        validation = {"valid": True, "failure": None}
-        if self.translated_sse:
-            from kiro.sse_validation import (
-                StreamProtocolError,
-                validate_anthropic_records,
-                validate_openai_records,
-            )
+        try:
+            failure = redact_patterns(error_message)
+            validation = {"valid": True, "failure": None}
+            if self.translated_sse:
+                from kiro.sse_validation import (
+                    StreamProtocolError,
+                    validate_anthropic_records,
+                    validate_openai_records,
+                )
 
-            try:
-                if _translated_protocol(self.translated_sse) == "openai":
-                    validate_openai_records(self.translated_sse)
-                else:
-                    validate_anthropic_records(self.translated_sse)
-            except StreamProtocolError as exc:
-                validation = {"valid": False, "failure": str(exc)}
-        replay = {
-            "schema_version": 1,
-            "request_id": self.request_id,
-            "failure": failure,
-            "capture_content": self.capture_content,
-            "client_request": self.client_request,
-            "kiro_request": self.kiro_request,
-            "upstream_chunks": self.upstream_chunks,
-            "translated_sse": self.translated_sse,
-            "validation": validation,
-        }
-        artifacts: dict[str, bytes] = {
-            "client_request.json": _json_bytes(self.client_request),
-            "kiro_request.json": _json_bytes(self.kiro_request),
-            "upstream_chunks.jsonl": _jsonl_bytes(self.upstream_chunks),
-            "translated_sse.jsonl": _jsonl_bytes(self.translated_sse),
-            "app_logs.txt": self._sanitized_logs(),
-            "replay.json": _json_bytes(replay),
-        }
-        artifact_manifest: dict[str, dict[str, Any]] = {}
-        for name, payload in artifacts.items():
-            _write_private_file(temporary / name, payload)
-            source_key = name.removesuffix(".json").removesuffix(".jsonl")
-            metadata = self.artifact_meta.get(source_key, {})
-            artifact_manifest[name] = {
-                "sha256": hashlib.sha256(payload).hexdigest(),
-                "bytes": len(payload),
-                "truncated": bool(metadata.get("truncated", False)),
-                "original_bytes": metadata.get("original_bytes", len(payload)),
+                try:
+                    if _translated_protocol(self.translated_sse) == "openai":
+                        validate_openai_records(self.translated_sse)
+                    else:
+                        validate_anthropic_records(self.translated_sse)
+                except StreamProtocolError as exc:
+                    validation = {"valid": False, "failure": str(exc)}
+            replay = {
+                "schema_version": 1,
+                "request_id": self.request_id,
+                "failure": failure,
+                "capture_content": self.capture_content,
+                "client_request": self.client_request,
+                "kiro_request": self.kiro_request,
+                "upstream_chunks": self.upstream_chunks,
+                "translated_sse": self.translated_sse,
+                "validation": validation,
             }
-        manifest = {
-            "schema_version": 1,
-            "request_id": self.request_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "status_code": status_code,
-            "failure": failure,
-            "capture_content": self.capture_content,
-            "artifacts": artifact_manifest,
-        }
-        _write_private_file(temporary / "manifest.json", _json_bytes(manifest))
-        _fsync_directory(temporary)
+            artifacts: dict[str, bytes] = {
+                "client_request.json": _json_bytes(self.client_request),
+                "kiro_request.json": _json_bytes(self.kiro_request),
+                "upstream_chunks.jsonl": _jsonl_bytes(self.upstream_chunks),
+                "translated_sse.jsonl": _jsonl_bytes(self.translated_sse),
+                "app_logs.txt": self._sanitized_logs(),
+                "replay.json": _json_bytes(replay),
+            }
+            artifact_manifest: dict[str, dict[str, Any]] = {}
+            for name, payload in artifacts.items():
+                _write_private_file(temporary / name, payload)
+                source_key = name.removesuffix(".json").removesuffix(".jsonl")
+                metadata = self.artifact_meta.get(source_key, {})
+                artifact_manifest[name] = {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "bytes": len(payload),
+                    "truncated": bool(metadata.get("truncated", False)),
+                    "original_bytes": metadata.get("original_bytes", len(payload)),
+                }
+            manifest = {
+                "schema_version": 1,
+                "request_id": self.request_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status_code": status_code,
+                "failure": failure,
+                "capture_content": self.capture_content,
+                "artifacts": artifact_manifest,
+            }
+            _write_private_file(temporary / "manifest.json", _json_bytes(manifest))
+            _fsync_directory(temporary)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        final_path = captures_dir / f"{timestamp}-{self.request_id}"
-        os.replace(temporary, final_path)
-        os.chmod(final_path, 0o700)
-        _fsync_directory(captures_dir)
-        _prune_completed(captures_dir, self.retention)
-        return final_path
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+            final_path = captures_dir / f"{timestamp}-{self.request_id}"
+            os.replace(temporary, final_path)
+            os.chmod(final_path, 0o700)
+            _fsync_directory(captures_dir)
+            _prune_completed(captures_dir, self.retention)
+            return final_path
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
 
     def _sanitized_logs(self) -> bytes:
         if not self.app_logs:

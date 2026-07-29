@@ -522,6 +522,19 @@ class TestAwsEventStreamParserFeed:
         assert len(events1) == 0
         assert len(events2) == 1
         assert events2[0]["data"] == "Hello World"
+
+    def test_observes_diagnostic_frame_fragmented_across_transport_chunks(
+        self,
+        aws_event_parser,
+    ):
+        frame = {"content": "fragmented diagnostic payload"}
+        payload = json.dumps(frame).encode()
+
+        for chunk in (payload[:5], payload[5:17], payload[17:]):
+            aws_event_parser.feed(chunk)
+
+        assert aws_event_parser.drain_observed_frames() == [frame]
+        assert aws_event_parser.drain_observed_frames() == []
     
     def test_decodes_escape_sequences(self, aws_event_parser):
         """

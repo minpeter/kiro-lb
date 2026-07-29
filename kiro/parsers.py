@@ -262,6 +262,7 @@ class AwsEventStreamParser:
     def __init__(self):
         """Initializes the parser."""
         self.buffer = ""
+        self._observation_buffer = ""
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(
             errors="replace"
         )
@@ -283,23 +284,26 @@ class AwsEventStreamParser:
         """
         decoded = self._utf8_decoder.decode(chunk, final=False)
         self.buffer += decoded
-        cursor = 0
-        while cursor < len(decoded):
-            start = decoded.find("{", cursor)
+        self._observation_buffer += decoded
+        while self._observation_buffer:
+            start = self._observation_buffer.find("{")
             if start == -1:
+                self._observation_buffer = ""
                 break
-            end = find_matching_brace(decoded, start)
+            if start:
+                self._observation_buffer = self._observation_buffer[start:]
+            end = find_matching_brace(self._observation_buffer, 0)
             if end == -1:
                 break
+            candidate = self._observation_buffer[:end + 1]
+            self._observation_buffer = self._observation_buffer[end + 1:]
             try:
-                frame = json.loads(decoded[start:end + 1])
+                frame = json.loads(candidate)
             except json.JSONDecodeError:
-                cursor = start + 1
                 continue
             if isinstance(frame, dict):
                 self._observed_frames.append(frame)
-            cursor = end + 1
-        
+
         events = []
         
         while True:
@@ -352,14 +356,17 @@ class AwsEventStreamParser:
             else None
         )
         frame_tool_id = data.get("toolUseId")
-        if data.get("stop") and self.current_tool_call:
-            return self._process_tool_stop_event(data)
         if (
             "input" in data
             and self.current_tool_call
             and (not frame_tool_id or frame_tool_id == current_id)
         ):
-            return self._process_tool_input_event(data)
+            self._process_tool_input_event(data)
+            if data.get("stop"):
+                return self._process_tool_stop_event(data)
+            return None
+        if data.get("stop") and self.current_tool_call:
+            return self._process_tool_stop_event(data)
         if event_type == 'content':
             return self._process_content_event(data)
         elif event_type == 'tool_start':
@@ -651,6 +658,7 @@ class AwsEventStreamParser:
     def reset(self) -> None:
         """Resets parser state."""
         self.buffer = ""
+        self._observation_buffer = ""
         self._utf8_decoder.reset()
         self.current_tool_call = None
         self.tool_calls = []

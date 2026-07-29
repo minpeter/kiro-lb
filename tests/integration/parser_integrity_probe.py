@@ -178,7 +178,7 @@ async def _run() -> dict[str, bool]:
                 "body": chronology.text,
             }
             parallel_requests = [
-                (protocol, f"marker-{index:02d}")
+                (protocol, f"{protocol}-marker-{index:02d}")
                 for protocol in ("anthropic", "openai")
                 for index in range(16)
             ]
@@ -210,7 +210,7 @@ def _scenario_chunks(scenario: str) -> list[bytes]:
         return _malformed_chunks()
     if scenario == "chronology":
         return _chronology_chunks()
-    if scenario.startswith("marker-"):
+    if "-marker-" in scenario:
         return _marker_chunks(scenario)
     raise ValueError(scenario)
 
@@ -288,22 +288,35 @@ def _summarize(results: dict[str, object]) -> dict[str, bool]:
 
 def _parallel_isolated(value: object) -> bool:
     assert isinstance(value, list)
-    identifiers = []
-    all_markers = {f"marker-{index:02d}" for index in range(16)}
+    identifiers = {"anthropic": [], "openai": []}
+    all_markers = {
+        f"{protocol}-marker-{index:02d}"
+        for protocol in ("anthropic", "openai")
+        for index in range(16)
+    }
     for item in value:
         protocol, marker, status, body = item
-        if status != 200 or marker not in body:
+        if status != 200 or body.count(marker) != 1:
             return False
         if any(other in body for other in all_markers - {marker}):
             return False
         if protocol == "anthropic":
-            match = re.search(r'"id":\s*"(msg_[^"]+)"', body)
+            matches = set(re.findall(r'"id":\s*"(msg_[^"]+)"', body))
+            if "chatcmpl-" in body:
+                return False
         else:
-            match = re.search(r'"id":\s*"(chatcmpl-[^"]+)"', body)
-        if match is None:
+            matches = set(
+                re.findall(r'"id":\s*"(chatcmpl-[^"]+)"', body)
+            )
+            if re.search(r'"id":\s*"msg_', body):
+                return False
+        if len(matches) != 1:
             return False
-        identifiers.append(match.group(1))
-    return len(identifiers) == 32 and len(set(identifiers)) == 32
+        identifiers[protocol].append(matches.pop())
+    return all(
+        len(protocol_ids) == 16 and len(set(protocol_ids)) == 16
+        for protocol_ids in identifiers.values()
+    )
 
 
 def _validate_chronology(body: str) -> tuple[bool, bool, bool]:

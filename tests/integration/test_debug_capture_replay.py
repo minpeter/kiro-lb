@@ -1,11 +1,11 @@
+import asyncio
 import json
 import base64
 from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
 from unittest.mock import patch
 
+from httpx import ASGITransport, AsyncClient
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
@@ -107,9 +107,10 @@ def test_parallel_real_http_failures_produce_independent_bundles(
     tmp_path: Path,
 ) -> None:
     debug_dir = tmp_path / "debug"
-    barrier = Barrier(2)
-    request_ids: list[str | None] = []
-    capture_paths: list[Path | None] = []
+    both_streams_entered: asyncio.Event | None = None
+    entered_streams = 0
+    request_ids: dict[str, str | None] = {}
+    capture_paths: dict[str, Path | None] = {}
 
     with (
         patch("kiro.debug_logger.DEBUG_MODE", "errors"),
@@ -126,11 +127,16 @@ def test_parallel_real_http_failures_produce_independent_bundles(
         @app.post("/v1/messages")
         async def messages(marker: str) -> StreamingResponse:
             async def failed_stream() -> AsyncIterator[str]:
+                nonlocal entered_streams
                 capture = logger._current_capture()
-                request_ids.append(
+                request_ids[marker] = (
                     capture.request_id if capture is not None else None
                 )
-                barrier.wait(timeout=2)
+                entered_streams += 1
+                assert both_streams_entered is not None
+                if entered_streams == 2:
+                    both_streams_entered.set()
+                await asyncio.wait_for(both_streams_entered.wait(), timeout=2)
                 logger.log_kiro_request_body(
                     json.dumps({"marker": marker}).encode()
                 )
@@ -144,41 +150,51 @@ def test_parallel_real_http_failures_produce_independent_bundles(
                 )
                 logger.log_modified_chunk(chunk.encode())
                 yield chunk
-                capture_paths.append(logger.flush_on_error(
+                capture_paths[marker] = logger.flush_on_error(
                     500,
                     "Invalid assistant content event order",
-                ))
+                )
 
             return StreamingResponse(
                 failed_stream(),
                 media_type="text/event-stream",
             )
 
-        def send(marker: str) -> int:
-            with TestClient(app) as client:
-                response = client.post(
-                    f"/v1/messages?marker={marker}",
-                    json={
-                        "model": "claude-opus-5",
-                        "max_tokens": 128,
-                        "messages": [
-                            {"role": "user", "content": marker}
-                        ],
-                    },
+        async def send_both() -> tuple[int, int]:
+            nonlocal both_streams_entered
+            both_streams_entered = asyncio.Event()
+            transport = ASGITransport(app=app)
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                async def send(marker: str) -> int:
+                    response = await client.post(
+                        f"/v1/messages?marker={marker}",
+                        json={
+                            "model": "claude-opus-5",
+                            "max_tokens": 128,
+                            "messages": [
+                                {"role": "user", "content": marker}
+                            ],
+                        },
+                    )
+                    return response.status_code
+
+                return await asyncio.gather(
+                    send("request-alpha"),
+                    send("request-beta"),
                 )
-                return response.status_code
 
         with patch("kiro.debug_logger.debug_logger", logger):
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                statuses = list(executor.map(
-                    send,
-                    ("request-alpha", "request-beta"),
-                ))
+            statuses = asyncio.run(send_both())
 
     assert statuses == [200, 200]
-    assert None not in request_ids
-    assert len(set(request_ids)) == 2
-    assert None not in capture_paths
+    assert set(request_ids) == {"request-alpha", "request-beta"}
+    assert None not in request_ids.values()
+    assert len(set(request_ids.values())) == 2
+    assert set(capture_paths) == {"request-alpha", "request-beta"}
+    assert None not in capture_paths.values()
     captures = sorted(
         path
         for path in (debug_dir / "failures").iterdir()
@@ -239,6 +255,9 @@ def test_successful_stream_retains_sanitized_rolling_capture(tmp_path: Path) -> 
             )
             logger.log_modified_chunk(chunk.encode())
             yield chunk
+            done = "data: [DONE]\n\n"
+            logger.log_modified_chunk(done.encode())
+            yield done
             logger.discard_buffers()
 
         @app.post("/v1/chat/completions")
@@ -262,6 +281,7 @@ def test_successful_stream_retains_sanitized_rolling_capture(tmp_path: Path) -> 
             )
 
         assert response.status_code == 200
+        assert response.text.endswith("data: [DONE]\n\n")
         captures = list((debug_dir / "requests").iterdir())
         assert len(captures) == 1
         stored = b"\n".join(
@@ -274,6 +294,7 @@ def test_successful_stream_retains_sanitized_rolling_capture(tmp_path: Path) -> 
         assert b"upstream-secret" not in stored
         assert b"claude-opus-5" in stored
         replay = json.loads((captures[0] / "replay.json").read_text())
+        assert replay["validation"] == {"valid": True, "failure": None}
         decoded_upstream = [
             base64.b64decode(item["payload_base64"])
             for item in replay["upstream_chunks"]

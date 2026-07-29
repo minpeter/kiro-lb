@@ -12,6 +12,7 @@ import os
 import time
 import pytest
 from pathlib import Path
+from loguru import logger as logger_module
 from unittest.mock import patch, MagicMock
 
 
@@ -920,6 +921,31 @@ class TestDebugLoggerBounds:
 
 
 class TestDebugLoggerPersistence:
+    def test_empty_error_flush_clears_capture_and_removes_sink(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            capture = logger._current_capture()
+            sink_id = logger._loguru_sink_id
+
+            assert capture is not None
+            assert sink_id is not None
+            with patch(
+                "kiro.debug_logger.logger.remove",
+                wraps=logger_module.remove,
+            ) as remove_sink:
+                result = logger.flush_on_error(500, "empty failure")
+
+        assert result is None
+        assert logger._current_capture() is None
+        assert logger._loguru_sink_id is None
+        assert capture.loguru_sink_id is None
+        remove_sink.assert_called_once_with(sink_id)
+
     def test_success_capture_failure_does_not_break_request(self, tmp_path):
         debug_dir = tmp_path / "debug"
         with (
@@ -958,6 +984,41 @@ class TestDebugLoggerPersistence:
         assert logger.debug_dir == debug_dir
         assert not stale.exists()
         assert fresh.exists()
+
+    def test_publication_failure_removes_temp_dirs_and_prunes_stale(
+        self,
+        tmp_path,
+    ):
+        debug_dir = tmp_path / "debug"
+        failures = debug_dir / "failures"
+        stale = failures / ".tmp-stale"
+
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch(
+                "kiro.debug_logger.DEBUG_CAPTURE_CONTENT",
+                True,
+                create=True,
+            ),
+        ):
+            logger = _capture_logger(debug_dir)
+            stale.mkdir(parents=True)
+            old = time.time() - 25 * 60 * 60
+            os.utime(stale, (old, old))
+            request_id = logger.prepare_new_request()
+            logger.log_request_body(b'{"message":"failure"}')
+
+            with patch(
+                "kiro.debug_capture._write_private_file",
+                side_effect=OSError("capture write failed"),
+            ):
+                result = logger.flush_on_error(500, "write failure")
+
+        assert result is None
+        assert not stale.exists()
+        assert not (failures / f".tmp-{request_id}").exists()
+        assert not list(failures.glob(".tmp-*"))
 
     def test_failure_bundle_is_atomic_private_and_retained(self, tmp_path):
         debug_dir = tmp_path / "debug"

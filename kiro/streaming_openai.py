@@ -41,6 +41,7 @@ from kiro.utils import generate_completion_id
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
+    OPENAI_SINGLE_BLOCK_TOOL_COMPAT,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 from kiro.stop_reasons import is_truncated, to_openai_finish_reason
@@ -155,7 +156,10 @@ async def stream_kiro_to_openai_internal(
     full_content = ""
     full_thinking_content = ""  # Accumulated thinking content for non-streaming
     upstream_stop_reason = None
-    defer_content_until_tool_outcome = bool(request_tools)
+    defer_content_until_tool_outcome = (
+        OPENAI_SINGLE_BLOCK_TOOL_COMPAT and bool(request_tools)
+    )
+    deferred_content_emitted = False
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
@@ -273,6 +277,7 @@ async def stream_kiro_to_openai_internal(
                             
                             # Accumulate for token counting
                             full_content += summary
+                            deferred_content_emitted = True
                             
                             # Skip normal tool_use processing
                             continue
@@ -298,7 +303,11 @@ async def stream_kiro_to_openai_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
-        if request_tools and len(all_tool_calls) > 1:
+        if (
+            OPENAI_SINGLE_BLOCK_TOOL_COMPAT
+            and request_tools
+            and len(all_tool_calls) > 1
+        ):
             logger.info(
                 "Serializing native tool execution: forwarding the first of "
                 f"{len(all_tool_calls)} calls"
@@ -327,7 +336,12 @@ async def stream_kiro_to_openai_internal(
                 }],
             })
 
-        if defer_content_until_tool_outcome and full_content and not all_tool_calls:
+        if (
+            defer_content_until_tool_outcome
+            and full_content
+            and not all_tool_calls
+            and not deferred_content_emitted
+        ):
             delta = {"content": full_content}
             if first_chunk:
                 delta["role"] = "assistant"

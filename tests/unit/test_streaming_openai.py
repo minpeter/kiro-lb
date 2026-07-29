@@ -261,6 +261,9 @@ class TestStreamKiroToOpenai:
         with patch(
             "kiro.streaming_openai.parse_kiro_stream",
             mock_parse_kiro_stream,
+        ), patch(
+            "kiro.streaming_openai.OPENAI_SINGLE_BLOCK_TOOL_COMPAT",
+            True,
         ):
             async for chunk in stream_kiro_to_openai(
                 mock_http_client,
@@ -300,6 +303,9 @@ class TestStreamKiroToOpenai:
         with patch(
             "kiro.streaming_openai.parse_kiro_stream",
             mock_parse_kiro_stream,
+        ), patch(
+            "kiro.streaming_openai.OPENAI_SINGLE_BLOCK_TOOL_COMPAT",
+            True,
         ):
             async for chunk in stream_kiro_to_openai(
                 mock_http_client,
