@@ -5,6 +5,7 @@ Unit tests for AwsEventStreamParser and auxiliary parsing functions.
 Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
+import json
 import pytest
 
 from kiro.parsers import (
@@ -244,7 +245,7 @@ class TestDeduplicateToolCalls:
         print("Setup: List with duplicates...")
         tool_calls = [
             {"id": "1", "function": {"name": "func", "arguments": '{"a": 1}'}},
-            {"id": "2", "function": {"name": "func", "arguments": '{"a": 1}'}},
+            {"id": "1", "function": {"name": "func", "arguments": '{"a": 1}'}},
             {"id": "3", "function": {"name": "other", "arguments": '{"b": 2}'}},
         ]
         
@@ -757,7 +758,7 @@ class TestAwsEventStreamParserFinalizeToolCall:
     def test_finalize_with_invalid_json_arguments(self, aws_event_parser):
         """
         What it does: Tests finalization of tool call with invalid JSON.
-        Goal: Ensure invalid JSON is replaced with "{}".
+        Goal: Ensure invalid JSON remains identifiable as a parse failure.
         """
         print("Setup: Tool call with invalid JSON...")
         aws_event_parser.current_tool_call = {
@@ -774,7 +775,13 @@ class TestAwsEventStreamParserFinalizeToolCall:
         
         print(f"Result: {aws_event_parser.tool_calls}")
         assert len(aws_event_parser.tool_calls) == 1
-        assert aws_event_parser.tool_calls[0]["function"]["arguments"] == "{}"
+        assert (
+            aws_event_parser.tool_calls[0]["function"]["arguments"]
+            == "not valid json {"
+        )
+        assert aws_event_parser.tool_calls[0]["_parse_error"]["type"] == (
+            "invalid_tool_arguments"
+        )
     
     def test_finalize_with_none_current_tool_call(self, aws_event_parser):
         """
@@ -1348,3 +1355,59 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+class TestAwsEventStreamParserUtf8:
+    def test_preserves_codepoint_split_across_chunks(self):
+        parser = AwsEventStreamParser()
+        chunks = [
+            bytes.fromhex("7b22636f6e74656e74223a22e4"),
+            bytes.fromhex("bda0e5a5"),
+            bytes.fromhex("bdf09f"),
+            bytes.fromhex("8c8d227d"),
+        ]
+
+        events = []
+        for chunk in chunks:
+            events.extend(parser.feed(chunk))
+
+        assert events == [{"type": "content", "data": "你好🌍"}]
+
+
+class TestToolCallDeduplication:
+    def test_preserves_distinct_ids_with_identical_payloads(self):
+        calls = [
+            {
+                "id": "toolu_A",
+                "function": {
+                    "name": "lookup",
+                    "arguments": '{"q":"same"}',
+                },
+            },
+            {
+                "id": "toolu_B",
+                "function": {
+                    "name": "lookup",
+                    "arguments": '{"q":"same"}',
+                },
+            },
+        ]
+
+        result = deduplicate_tool_calls(calls)
+
+        assert [call["id"] for call in result] == ["toolu_A", "toolu_B"]
+
+
+class TestMalformedToolInput:
+    def test_truncated_json_does_not_become_empty_success(self):
+        parser = AwsEventStreamParser()
+        malformed = '{"path":"/tmp/x","content":"unterminated'
+
+        parser.feed(b'{"name":"write_file","toolUseId":"toolu_cut"}')
+        parser.feed(json.dumps({"input": malformed}).encode())
+        parser.feed(b'{"stop":true}')
+        calls = parser.get_tool_calls()
+
+        assert len(calls) == 1
+        assert calls[0]["_truncation_detected"] is True
+        assert calls[0]["function"]["arguments"] == malformed

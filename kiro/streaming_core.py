@@ -37,7 +37,12 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict
 import httpx
 from loguru import logger
 
-from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import (
+    AwsEventStreamParser,
+    MalformedToolInputError,
+    deduplicate_tool_calls,
+    parse_bracket_tool_calls,
+)
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -149,6 +154,10 @@ async def parse_kiro_stream(
             async for event in _process_chunk(parser, chunk):
                 yield event
         for tool_call in parser.get_tool_calls():
+            if tool_call.get("_parse_error"):
+                raise MalformedToolInputError(
+                    "Malformed upstream tool input"
+                )
             yield KiroEvent(type="tool_use", tool_use=tool_call)
     except FirstTokenTimeoutError:
         raise

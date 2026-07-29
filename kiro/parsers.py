@@ -27,6 +27,7 @@ Contains classes and functions for:
 - Content deduplication
 """
 
+import codecs
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -34,6 +35,10 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from kiro.utils import generate_tool_call_id
+
+
+class MalformedToolInputError(ValueError):
+    """Raised when upstream tool arguments cannot be parsed safely."""
 
 
 def find_matching_brace(text: str, start_pos: int) -> int:
@@ -188,11 +193,10 @@ def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, A
     result_with_id = list(by_id.values())
     result_without_id = [tc for tc in tool_calls if not tc.get("id")]
     
-    # Now deduplicate by name+arguments for all
     seen = set()
-    unique = []
+    unique = list(result_with_id)
     
-    for tc in result_with_id + result_without_id:
+    for tc in result_without_id:
         # Protection against None in function
         func = tc.get("function") or {}
         func_name = func.get("name") or ""
@@ -258,6 +262,9 @@ class AwsEventStreamParser:
     def __init__(self):
         """Initializes the parser."""
         self.buffer = ""
+        self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(
+            errors="replace"
+        )
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
         self.native_thinking_started = False
@@ -272,10 +279,7 @@ class AwsEventStreamParser:
         Returns:
             List of events in {"type": str, "data": Any} format
         """
-        try:
-            self.buffer += chunk.decode('utf-8', errors='ignore')
-        except Exception:
-            return []
+        self.buffer += self._utf8_decoder.decode(chunk, final=False)
         
         events = []
         
@@ -461,8 +465,10 @@ class AwsEventStreamParser:
                     else:
                         # Regular JSON parse error
                         logger.warning(f"Failed to parse tool '{tool_name}' arguments: {e}. Raw: {args[:200]}")
-                    
-                    self.current_tool_call['function']['arguments'] = "{}"
+                    self.current_tool_call["_parse_error"] = {
+                        "type": "invalid_tool_arguments",
+                        "message": str(e),
+                    }
             else:
                 # Empty string - use empty object
                 # This is normal behavior for duplicate tool calls from Kiro
@@ -583,6 +589,7 @@ class AwsEventStreamParser:
     def reset(self) -> None:
         """Resets parser state."""
         self.buffer = ""
+        self._utf8_decoder.reset()
         self.current_tool_call = None
         self.tool_calls = []
         self.native_thinking_started = False

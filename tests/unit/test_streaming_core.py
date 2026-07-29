@@ -15,6 +15,7 @@ Tests for:
 
 import pytest
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import asdict
 
@@ -28,6 +29,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry,
     _process_chunk,
 )
+from kiro.parsers import MalformedToolInputError
 
 
 # ==================================================================================================
@@ -1059,3 +1061,27 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+@pytest.mark.asyncio
+async def test_parse_stream_rejects_malformed_tool_input():
+    malformed = '{"path":"/tmp/x","content":"unterminated'
+    chunks = [
+        b'{"name":"write_file","toolUseId":"toolu_cut"}',
+        json.dumps({"input": malformed}).encode(),
+        b'{"stop":true}',
+    ]
+
+    async def byte_stream():
+        for chunk in chunks:
+            yield chunk
+
+    response = MagicMock()
+    response.aiter_bytes.return_value = byte_stream()
+
+    with pytest.raises(
+        MalformedToolInputError,
+        match="Malformed upstream tool input",
+    ):
+        async for _ in parse_kiro_stream(response):
+            pass
