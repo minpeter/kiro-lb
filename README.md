@@ -744,6 +744,11 @@ Debug logging is **disabled by default**. To enable, add to your `.env`:
 # - errors: save logs only for failed requests (4xx, 5xx) - recommended for troubleshooting
 # - all: save logs for every request (overwrites on each request)
 DEBUG_MODE=errors
+
+# Safe defaults for replayable failed-stream captures
+DEBUG_CAPTURE_CONTENT=false
+DEBUG_CAPTURE_MAX_BYTES=4194304
+DEBUG_CAPTURE_RETENTION=10
 ```
 
 ### Debug Modes
@@ -751,21 +756,35 @@ DEBUG_MODE=errors
 | Mode | Description | Use Case |
 |------|-------------|----------|
 | `off` | Disabled (default) | Production |
-| `errors` | Save logs only for failed requests (4xx, 5xx) | **Recommended for troubleshooting** |
+| `errors` | Save bounded, request-scoped bundles for HTTP and stream-protocol failures | **Recommended for troubleshooting** |
 | `all` | Save logs for every request | Development/debugging |
 
 ### Debug Files
 
-When enabled, requests are logged to the `debug_logs/` folder:
+Failure captures are published atomically under
+`debug_logs/failures/<timestamp>-<request-id>/`. With
+`DEBUG_CAPTURE_CONTENT=false`, message, reasoning, and tool text is replaced by
+structural placeholders. Credentials, tokens, cookies, profile identifiers, and
+thinking signatures are always redacted.
 
 | File | Description |
 |------|-------------|
-| `request_body.json` | Incoming request from client (OpenAI format) |
-| `kiro_request_body.json` | Request sent to Kiro API |
-| `response_stream_raw.txt` | Raw stream from Kiro |
-| `response_stream_modified.txt` | Transformed stream (OpenAI format) |
-| `app_logs.txt` | Application logs for the request |
-| `error_info.json` | Error details (only on errors) |
+| `manifest.json` | Capture metadata, byte counts, truncation state, and artifact hashes |
+| `client_request.json` | Sanitized incoming OpenAI/Anthropic request |
+| `kiro_request.json` | Sanitized request sent to Kiro |
+| `upstream_chunks.jsonl` | Ordered, bounded upstream chunk records |
+| `translated_sse.jsonl` | Ordered OpenAI/Anthropic SSE records |
+| `app_logs.txt` | Request-scoped sanitized application logs |
+| `replay.json` | Deterministic input for `python -m kiro.debug_replay` |
+
+Validate or replay a capture without contacting Kiro:
+
+```bash
+python -m kiro.debug_replay validate debug_logs/failures/<capture>/replay.json
+python -m kiro.debug_replay replay debug_logs/failures/<capture>/replay.json \
+  --protocol anthropic \
+  --output /tmp/replayed.sse
+```
 
 ---
 

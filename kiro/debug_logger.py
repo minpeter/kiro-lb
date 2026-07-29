@@ -35,11 +35,19 @@ them to app_logs.txt file for debugging convenience.
 import io
 import json
 import shutil
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 from loguru import logger
 
-from kiro.config import DEBUG_MODE, DEBUG_DIR
+from kiro.config import (
+    DEBUG_CAPTURE_CONTENT,
+    DEBUG_CAPTURE_MAX_BYTES,
+    DEBUG_CAPTURE_RETENTION,
+    DEBUG_DIR,
+    DEBUG_MODE,
+)
+from kiro.debug_capture import CaptureState
 
 
 class DebugLogger:
@@ -74,6 +82,10 @@ class DebugLogger:
         # Buffer for application logs (loguru)
         self._app_logs_buffer: io.StringIO = io.StringIO()
         self._loguru_sink_id: Optional[int] = None
+        self._capture_state: ContextVar[Optional[CaptureState]] = ContextVar(
+            f"debug_capture_state_{id(self)}",
+            default=None,
+        )
     
     def _is_enabled(self) -> bool:
         """Checks if logging is enabled."""
@@ -90,6 +102,11 @@ class DebugLogger:
         self._raw_chunks_buffer.clear()
         self._modified_chunks_buffer.clear()
         self._clear_app_logs_buffer()
+        if hasattr(self, "_capture_state"):
+            self._capture_state.set(None)
+
+    def _current_capture(self) -> Optional[CaptureState]:
+        return self._capture_state.get()
     
     def _clear_app_logs_buffer(self):
         """Clears the application logs buffer and removes sink."""
@@ -139,6 +156,15 @@ class DebugLogger:
         
         # Clear buffers in any case
         self._clear_buffers()
+        capture = CaptureState(
+            debug_dir=self.debug_dir,
+            capture_content=(
+                DEBUG_CAPTURE_CONTENT or self._is_immediate_write()
+            ),
+            max_bytes=DEBUG_CAPTURE_MAX_BYTES,
+            retention=DEBUG_CAPTURE_RETENTION,
+        )
+        self._capture_state.set(capture)
         
         # Set up application log capture
         self._setup_app_logs_capture()
@@ -152,6 +178,7 @@ class DebugLogger:
                 logger.debug(f"[DebugLogger] Directory {self.debug_dir} cleared for new request.")
             except Exception as e:
                 logger.error(f"[DebugLogger] Error preparing directory: {e}")
+        return capture.request_id
 
     def log_request_body(self, body: bytes):
         """
@@ -162,6 +189,10 @@ class DebugLogger:
         """
         if not self._is_enabled():
             return
+
+        capture = self._current_capture()
+        if capture is not None:
+            capture.set_json_artifact("client_request", body)
 
         if self._is_immediate_write():
             self._write_request_body_to_file(body)
@@ -179,6 +210,10 @@ class DebugLogger:
         if not self._is_enabled():
             return
 
+        capture = self._current_capture()
+        if capture is not None:
+            capture.set_json_artifact("kiro_request", body)
+
         if self._is_immediate_write():
             self._write_kiro_request_body_to_file(body)
         else:
@@ -195,6 +230,10 @@ class DebugLogger:
         if not self._is_enabled():
             return
 
+        capture = self._current_capture()
+        if capture is not None:
+            capture.add_chunk("upstream_chunks", chunk)
+
         if self._is_immediate_write():
             self._append_raw_chunk_to_file(chunk)
         else:
@@ -210,6 +249,10 @@ class DebugLogger:
         """
         if not self._is_enabled():
             return
+
+        capture = self._current_capture()
+        if capture is not None:
+            capture.add_chunk("translated_sse", chunk)
 
         if self._is_immediate_write():
             self._append_modified_chunk_to_file(chunk)
@@ -248,7 +291,11 @@ class DebugLogger:
         except Exception as e:
             logger.error(f"[DebugLogger] Error writing error_info: {e}")
 
-    def flush_on_error(self, status_code: int, error_message: str = ""):
+    def flush_on_error(
+        self,
+        status_code: int,
+        error_message: str = "",
+    ) -> Optional[Path]:
         """
         Flushes buffers to files on error.
         
@@ -261,28 +308,44 @@ class DebugLogger:
         """
         if not self._is_enabled():
             return
+
+        capture = self._current_capture()
+        capture_path: Optional[Path] = None
+        if capture is not None:
+            capture.app_logs = self._app_logs_buffer.getvalue()
         
         # In "all" mode data is already written, add error_info and app logs
         if self._is_immediate_write():
+            if capture is not None:
+                capture_path = capture.publish(status_code, error_message)
             self.log_error_info(status_code, error_message)
             self._write_app_logs_to_file()
             self._clear_app_logs_buffer()
-            return
+            self._capture_state.set(None)
+            return capture_path
         
         # Check if there's anything to flush
-        if not any([
+        has_capture_data = False
+        if capture is not None:
+            has_capture_data = any([
+                capture.client_request is not None,
+                capture.kiro_request is not None,
+                capture.upstream_chunks,
+                capture.translated_sse,
+            ])
+        has_legacy_data = any([
             self._request_body_buffer,
             self._kiro_request_body_buffer,
             self._raw_chunks_buffer,
-            self._modified_chunks_buffer
-        ]):
+            self._modified_chunks_buffer,
+        ])
+        if not has_capture_data and not has_legacy_data:
             return
         
         try:
-            # Create directory if not exists
-            if self.debug_dir.exists():
-                shutil.rmtree(self.debug_dir)
             self.debug_dir.mkdir(parents=True, exist_ok=True)
+            if capture is not None:
+                capture_path = capture.publish(status_code, error_message)
             
             # Flush buffers to files
             if self._request_body_buffer:
@@ -314,6 +377,7 @@ class DebugLogger:
         finally:
             # Clear buffers after flush
             self._clear_buffers()
+        return capture_path
     
     def discard_buffers(self):
         """

@@ -30,7 +30,7 @@ Uses streaming_core.py for parsing Kiro stream into unified KiroEvent objects.
 
 import json
 import time
-from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -44,6 +44,12 @@ from kiro.config import (
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 from kiro.stop_reasons import is_truncated, to_openai_finish_reason
+from kiro.sse_validation import (
+    StreamProtocolError,
+    begin_openai_stream,
+    end_openai_stream,
+    validate_live_openai_payload,
+)
 
 # Import from streaming_core - reuse shared parsing logic
 from kiro.streaming_core import (
@@ -67,6 +73,32 @@ except ImportError:
 
 # Re-export FirstTokenTimeoutError for backward compatibility
 __all__ = ['FirstTokenTimeoutError', 'stream_kiro_to_openai', 'stream_with_first_token_retry', 'collect_stream_response']
+
+
+def _openai_sse(payload: dict[str, Any]) -> str:
+    chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    if debug_logger:
+        debug_logger.log_modified_chunk(chunk.encode("utf-8"))
+    try:
+        validate_live_openai_payload(payload)
+    except StreamProtocolError as exc:
+        if debug_logger:
+            debug_logger.flush_on_error(500, str(exc))
+        raise
+    return chunk
+
+
+def _openai_done() -> str:
+    chunk = "data: [DONE]\n\n"
+    if debug_logger:
+        debug_logger.log_modified_chunk(chunk.encode("utf-8"))
+    try:
+        validate_live_openai_payload(None, done=True)
+    except StreamProtocolError as exc:
+        if debug_logger:
+            debug_logger.flush_on_error(500, str(exc))
+        raise
+    return chunk
 
 
 async def stream_kiro_to_openai_internal(
@@ -127,6 +159,7 @@ async def stream_kiro_to_openai_internal(
     streaming_error_occurred = False
     tool_calls_from_stream = []
     
+    begin_openai_stream()
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
         # This handles AWS SSE parsing, first token timeout, and thinking parser
@@ -149,12 +182,7 @@ async def stream_kiro_to_openai_internal(
                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
                 }
                 
-                chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
-                
-                if debug_logger:
-                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
-                
-                yield chunk_text
+                yield _openai_sse(openai_chunk)
 
             elif event.type == "thinking" and event.thinking_content:
                 # Native Kiro adaptive-thinking event. No prompt tags or
@@ -172,10 +200,7 @@ async def stream_kiro_to_openai_internal(
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                 }
-                chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
-                if debug_logger:
-                    debug_logger.log_modified_chunk(chunk_text.encode("utf-8"))
-                yield chunk_text
+                yield _openai_sse(openai_chunk)
             
             elif event.type == "tool_use" and event.tool_use:
                 tool = event.tool_use
@@ -239,12 +264,7 @@ async def stream_kiro_to_openai_internal(
                                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
                                 }
                                 
-                                chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
-                                
-                                if debug_logger:
-                                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
-                                
-                                yield chunk_text
+                                yield _openai_sse(openai_chunk)
                             
                             # Accumulate for token counting
                             full_content += summary
@@ -358,7 +378,7 @@ async def stream_kiro_to_openai_internal(
                     "finish_reason": None
                 }]
             }
-            yield f"data: {json.dumps(tool_calls_chunk, ensure_ascii=False)}\n\n"
+            yield _openai_sse(tool_calls_chunk)
         
         # Final chunk with usage
         final_chunk = {
@@ -385,8 +405,8 @@ async def stream_kiro_to_openai_internal(
             f"total_tokens={total_tokens} ({total_source})"
         )
 
-        yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
+        yield _openai_sse(final_chunk)
+        yield _openai_done()
 
     except FirstTokenTimeoutError:
         # Propagate timeout up for retry
@@ -407,6 +427,7 @@ async def stream_kiro_to_openai_internal(
         # Propagate error up for proper handling in routes_openai.py
         raise
     finally:
+        end_openai_stream()
         # Always close response
         try:
             await response.aclose()

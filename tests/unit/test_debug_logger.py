@@ -6,6 +6,7 @@ Unit-тесты для DebugLogger.
 """
 
 import json
+import asyncio
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -688,3 +689,215 @@ class TestDebugLoggerAppLogsCapture:
             print(f"Проверяем, что app_logs.txt НЕ создан...")
             app_logs_file = debug_dir / "app_logs.txt"
             assert not app_logs_file.exists()
+
+
+def _capture_logger(debug_dir: Path):
+    from kiro.debug_logger import DebugLogger
+
+    logger = DebugLogger.__new__(DebugLogger)
+    logger._initialized = False
+    logger.__init__()
+    logger.debug_dir = debug_dir
+    return logger
+
+
+class TestDebugLoggerRequestIsolation:
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_do_not_mix_buffers(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        entered = 0
+        entered_lock = asyncio.Lock()
+        both_entered = asyncio.Event()
+
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", True, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 10, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+
+            async def capture(marker: str):
+                nonlocal entered
+                logger.prepare_new_request()
+                logger.log_request_body(json.dumps({"marker": marker}).encode())
+                async with entered_lock:
+                    entered += 1
+                    if entered == 2:
+                        both_entered.set()
+                await asyncio.wait_for(both_entered.wait(), timeout=1)
+                return logger.flush_on_error(
+                    500,
+                    "Invalid assistant content event order",
+                )
+
+            first, second = await asyncio.gather(
+                capture("request-alpha"),
+                capture("request-beta"),
+            )
+
+        assert first is not None
+        assert second is not None
+        assert first != second
+        first_data = (first / "client_request.json").read_text()
+        second_data = (second / "client_request.json").read_text()
+        assert ("request-alpha" in first_data) != ("request-alpha" in second_data)
+        assert ("request-beta" in first_data) != ("request-beta" in second_data)
+
+
+class TestDebugLoggerRedaction:
+    def test_recursively_redacts_credentials_and_signatures(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", True, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 10, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            logger.log_request_body(
+                json.dumps(
+                    {
+                        "content": "preserved prompt",
+                        "authorization": "Bearer secret-token",
+                        "nested": {
+                            "refresh_token": "refresh-secret",
+                            "signature": "thinking-signature",
+                        },
+                    }
+                ).encode()
+            )
+            capture = logger.flush_on_error(500, "stream failure")
+
+        assert capture is not None
+        stored = b"\n".join(
+            path.read_bytes() for path in capture.iterdir() if path.is_file()
+        )
+        assert b"preserved prompt" in stored
+        assert b"secret-token" not in stored
+        assert b"refresh-secret" not in stored
+        assert b"thinking-signature" not in stored
+
+    def test_content_disabled_preserves_structure_not_text(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", False, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 10, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            logger.log_request_body(
+                json.dumps(
+                    {
+                        "model": "claude-opus-5",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "original private prompt",
+                            }
+                        ],
+                    }
+                ).encode()
+            )
+            capture = logger.flush_on_error(500, "stream failure")
+
+        assert capture is not None
+        request_data = json.loads((capture / "client_request.json").read_text())
+        assert request_data["model"] == "claude-opus-5"
+        assert request_data["messages"][0]["role"] == "user"
+        assert request_data["messages"][0]["content"] == {
+            "$redacted_text": True,
+            "chars": 23,
+        }
+
+
+class TestDebugLoggerBounds:
+    def test_total_capture_size_is_bounded(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", True, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 10, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            logger.log_raw_chunk(b"prefix-" + (b"x" * 100000) + b"-suffix")
+            capture = logger.flush_on_error(500, "stream failure")
+
+        assert capture is not None
+        total_size = sum(
+            path.stat().st_size for path in capture.iterdir() if path.is_file()
+        )
+        assert total_size <= 70000
+        manifest = json.loads((capture / "manifest.json").read_text())
+        assert manifest["artifacts"]["upstream_chunks.jsonl"]["truncated"] is True
+
+
+class TestDebugLoggerPersistence:
+    def test_failure_bundle_is_atomic_private_and_retained(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", False, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 2, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            captures = []
+            for index in range(3):
+                logger.prepare_new_request()
+                logger.log_request_body(json.dumps({"index": index}).encode())
+                captures.append(logger.flush_on_error(500, f"failure-{index}"))
+
+        completed = [
+            path
+            for path in (debug_dir / "failures").iterdir()
+            if path.is_dir() and not path.name.startswith(".tmp-")
+        ]
+        assert len(completed) == 2
+        assert not list((debug_dir / "failures").glob(".tmp-*"))
+        for capture in completed:
+            assert capture.stat().st_mode & 0o777 == 0o700
+            assert all(
+                path.stat().st_mode & 0o777 == 0o600
+                for path in capture.iterdir()
+                if path.is_file()
+            )
+        assert captures[-1] in completed
+
+
+class TestDebugLoggerReplay:
+    def test_replay_bundle_preserves_order_and_chunk_boundaries(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", False, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 10, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            logger.log_raw_chunk(b'{"text":"thinking"}')
+            logger.log_raw_chunk(b'{"signature":"secret-signature"}')
+            logger.log_modified_chunk(b"event: message_start\n")
+            logger.log_modified_chunk(b"event: content_block_start\n")
+            capture = logger.flush_on_error(
+                500,
+                "Invalid assistant content event order",
+            )
+
+        assert capture is not None
+        replay = json.loads((capture / "replay.json").read_text())
+        assert [item["seq"] for item in replay["upstream_chunks"]] == [0, 1]
+        assert [item["seq"] for item in replay["translated_sse"]] == [2, 3]
+        assert "secret-signature" not in json.dumps(replay)

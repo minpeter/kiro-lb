@@ -178,6 +178,21 @@ class TestToolDescriptionMaxLengthConfig:
             assert config_module.TOOL_DESCRIPTION_MAX_LENGTH == 0
 
 
+class TestDebugCaptureConfig:
+    def test_bounded_debug_integer_accepts_safe_values(self):
+        from kiro.config import _bounded_debug_int
+
+        with patch("kiro.config.os.getenv", return_value="262144"):
+            assert _bounded_debug_int("SETTING", 100, 65536, 67108864) == 262144
+
+    @pytest.mark.parametrize("value", ["invalid", "1", "999999999"])
+    def test_bounded_debug_integer_rejects_unsafe_values(self, value):
+        from kiro.config import _bounded_debug_int
+
+        with patch("kiro.config.os.getenv", return_value=value):
+            assert _bounded_debug_int("SETTING", 100, 65536, 67108864) == 100
+
+
 class TestTimeoutConfigurationWarning:
     """Tests for _warn_timeout_configuration() function."""
     

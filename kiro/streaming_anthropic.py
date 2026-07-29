@@ -51,6 +51,12 @@ from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES
 from kiro.stop_reasons import is_truncated, to_anthropic_stop_reason
+from kiro.sse_validation import (
+    StreamProtocolError,
+    begin_anthropic_stream,
+    end_anthropic_stream,
+    validate_live_anthropic_event,
+)
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -83,7 +89,19 @@ def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
     Returns:
         Formatted SSE string
     """
-    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    formatted = (
+        f"event: {event_type}\n"
+        f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    )
+    if debug_logger:
+        debug_logger.log_modified_chunk(formatted.encode("utf-8"))
+    try:
+        validate_live_anthropic_event(event_type, data)
+    except StreamProtocolError as exc:
+        if debug_logger:
+            debug_logger.flush_on_error(500, str(exc))
+        raise
+    return formatted
 
 
 
@@ -191,6 +209,7 @@ async def stream_kiro_to_anthropic(
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
     
+    begin_anthropic_stream()
     try:
         # Send message_start event
         yield format_sse_event("message_start", {
@@ -692,6 +711,7 @@ async def stream_kiro_to_anthropic(
         })
         raise
     finally:
+        end_anthropic_stream()
         try:
             await response.aclose()
         except Exception as close_error:

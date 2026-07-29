@@ -20,6 +20,10 @@ services:
       ACCOUNTS_STATE_FILE: /app/data/state.json
       DASHBOARD_DATA_DIR: /app/data
       HOME: /tmp
+      DEBUG_MODE: ${DEBUG_MODE:-off}
+      DEBUG_CAPTURE_CONTENT: ${DEBUG_CAPTURE_CONTENT:-false}
+      DEBUG_CAPTURE_MAX_BYTES: ${DEBUG_CAPTURE_MAX_BYTES:-4194304}
+      DEBUG_CAPTURE_RETENTION: ${DEBUG_CAPTURE_RETENTION:-10}
     volumes:
       # Credentials live in the writable data volume so the dashboard can
       # register accounts atomically. The directory stays private on the host.

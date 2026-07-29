@@ -380,6 +380,39 @@ else:
 DEBUG_DIR: str = os.getenv("DEBUG_DIR", "debug_logs")
 
 
+def _bounded_debug_int(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Read a bounded debug setting and fail closed to its safe default."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    if value < minimum or value > maximum:
+        return default
+    return value
+
+
+DEBUG_CAPTURE_CONTENT: bool = (
+    os.getenv("DEBUG_CAPTURE_CONTENT", "false").lower() == "true"
+)
+DEBUG_CAPTURE_MAX_BYTES: int = _bounded_debug_int(
+    "DEBUG_CAPTURE_MAX_BYTES",
+    4 * 1024 * 1024,
+    64 * 1024,
+    64 * 1024 * 1024,
+)
+DEBUG_CAPTURE_RETENTION: int = _bounded_debug_int(
+    "DEBUG_CAPTURE_RETENTION",
+    10,
+    1,
+    100,
+)
+
+
 def _warn_timeout_configuration():
     """
     Print warning if timeout configuration is suboptimal.
