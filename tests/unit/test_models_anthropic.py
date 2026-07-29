@@ -1757,3 +1757,14 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+class TestAnthropicMaxTokensBoundary:
+    @pytest.mark.parametrize("max_tokens", [0, -1])
+    def test_rejects_nonpositive_max_tokens(self, max_tokens):
+        with pytest.raises(ValidationError):
+            AnthropicMessagesRequest(
+                model="claude-opus-5",
+                messages=[AnthropicMessage(role="user", content="test")],
+                max_tokens=max_tokens,
+            )

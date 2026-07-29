@@ -221,6 +221,100 @@ class TestStreamKiroToOpenai:
         assert len(tool_chunks) >= 1
         assert "get_weather" in tool_chunks[0]
         print("✓ Tool calls chunk yielded")
+
+    @pytest.mark.asyncio
+    async def test_tool_request_omits_preamble_text_before_native_tool_call(
+        self,
+        mock_http_client,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="I will inspect")
+            yield KiroEvent(type="content", content="I will search the repository.")
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "grep",
+                        "arguments": '{"pattern":"native tool"}',
+                    },
+                },
+            )
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "call_bash",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": '{"command":"pwd"}',
+                    },
+                },
+            )
+            yield KiroEvent(type="stop_reason", stop_reason="TOOL_USE")
+
+        chunks = []
+        with patch(
+            "kiro.streaming_openai.parse_kiro_stream",
+            mock_parse_kiro_stream,
+        ):
+            async for chunk in stream_kiro_to_openai(
+                mock_http_client,
+                mock_response,
+                "claude-opus-5",
+                mock_model_cache,
+                mock_auth_manager,
+                request_tools=[{"type": "function"}],
+            ):
+                chunks.append(chunk)
+
+        stream = "".join(chunks)
+        assert '"reasoning_content"' not in stream
+        assert '"tool_calls"' in stream
+        assert "I will search the repository." not in stream
+        assert "call_search" in stream
+        assert "call_bash" not in stream
+        assert stream.index('"tool_calls"') < stream.index(
+            '"finish_reason": "tool_calls"'
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_capable_final_text_omits_reasoning_block(
+        self,
+        mock_http_client,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="internal")
+            yield KiroEvent(type="content", content="Final answer")
+            yield KiroEvent(type="stop_reason", stop_reason="END_TURN")
+            yield KiroEvent(type="usage", usage={"credits_used": 0})
+
+        chunks = []
+        with patch(
+            "kiro.streaming_openai.parse_kiro_stream",
+            mock_parse_kiro_stream,
+        ):
+            async for chunk in stream_kiro_to_openai(
+                mock_http_client,
+                mock_response,
+                "claude-opus-5",
+                mock_model_cache,
+                mock_auth_manager,
+                request_tools=[{"type": "function"}],
+            ):
+                chunks.append(chunk)
+
+        stream = "".join(chunks)
+        assert '"reasoning_content"' not in stream
+        assert "Final answer" in stream
+        assert '"finish_reason": "stop"' in stream
     
     @pytest.mark.asyncio
     async def test_tool_calls_have_index(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):

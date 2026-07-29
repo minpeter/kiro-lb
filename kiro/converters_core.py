@@ -568,7 +568,7 @@ def convert_tool_results_to_kiro_format(tool_results: List[Dict[str, Any]]) -> L
         
         kiro_results.append({
             "content": [{"text": content_text}],
-            "status": "success",
+            "status": "error" if tr.get("is_error") else "success",
             "toolUseId": tr.get("tool_use_id", "")
         })
     

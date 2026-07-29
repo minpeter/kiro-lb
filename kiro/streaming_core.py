@@ -31,7 +31,7 @@ to convert Kiro events to their respective SSE formats.
 """
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict, List, Optional, Tuple
 
 import httpx
@@ -149,18 +149,37 @@ async def parse_kiro_stream(
         if debug_logger:
             debug_logger.log_raw_chunk(first_chunk)
         async for event in _process_chunk(parser, first_chunk):
+            if debug_logger:
+                debug_logger.log_parsed_event(asdict(event))
             yield event
+        if debug_logger:
+            for frame in parser.drain_observed_frames():
+                debug_logger.log_parsed_event({
+                    "type": "raw_upstream_frame",
+                    "frame": frame,
+                })
         async for chunk in byte_iterator:
             if debug_logger:
                 debug_logger.log_raw_chunk(chunk)
             async for event in _process_chunk(parser, chunk):
+                if debug_logger:
+                    debug_logger.log_parsed_event(asdict(event))
                 yield event
-        for tool_call in parser.get_tool_calls():
+            if debug_logger:
+                for frame in parser.drain_observed_frames():
+                    debug_logger.log_parsed_event({
+                        "type": "raw_upstream_frame",
+                        "frame": frame,
+                    })
+        for tool_call in parser.get_unemitted_tool_calls():
             if tool_call.get("_parse_error"):
                 raise MalformedToolInputError(
                     "Malformed upstream tool input"
                 )
-            yield KiroEvent(type="tool_use", tool_use=tool_call)
+            event = KiroEvent(type="tool_use", tool_use=tool_call)
+            if debug_logger:
+                debug_logger.log_parsed_event(asdict(event))
+            yield event
     except FirstTokenTimeoutError:
         raise
     except GeneratorExit:
@@ -196,6 +215,12 @@ async def _process_chunk(
                 thinking_signature=event["data"],
                 is_last_thinking_chunk=True,
             )
+        elif event["type"] == "tool_use":
+            if event["data"].get("_parse_error"):
+                raise MalformedToolInputError(
+                    "Malformed upstream tool input"
+                )
+            yield KiroEvent(type="tool_use", tool_use=event["data"])
 
 
 # ==================================================================================================

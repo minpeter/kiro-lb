@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import socket
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, AsyncIterator, cast
@@ -176,6 +177,22 @@ async def _run() -> dict[str, bool]:
                 "status": chronology.status_code,
                 "body": chronology.text,
             }
+            parallel_requests = [
+                (protocol, f"marker-{index:02d}")
+                for protocol in ("anthropic", "openai")
+                for index in range(16)
+            ]
+
+            async def fetch_marker(protocol: str, marker: str):
+                response = await client.get(
+                    f"http://127.0.0.1:{port}/{protocol}/{marker}"
+                )
+                return protocol, marker, response.status_code, response.text
+
+            results["parallel"] = await asyncio.gather(*(
+                fetch_marker(protocol, marker)
+                for protocol, marker in parallel_requests
+            ))
     finally:
         server.should_exit = True
         await asyncio.wait_for(server_task, timeout=5)
@@ -193,6 +210,8 @@ def _scenario_chunks(scenario: str) -> list[bytes]:
         return _malformed_chunks()
     if scenario == "chronology":
         return _chronology_chunks()
+    if scenario.startswith("marker-"):
+        return _marker_chunks(scenario)
     raise ValueError(scenario)
 
 
@@ -200,6 +219,22 @@ def _is_clean_terminal(protocol: str, body: bytes) -> bool:
     if protocol == "anthropic":
         return b'"type": "message_stop"' in body
     return b"data: [DONE]" in body
+
+
+def _marker_chunks(marker: str) -> list[bytes]:
+    payload = json.dumps({"content": marker}).encode()
+    chunks = []
+    position = 0
+    width = 1
+    while position < len(payload):
+        chunks.append(payload[position:position + width])
+        position += width
+        width = 1 if width == 4 else width + 1
+    chunks.extend([
+        b'{"stopReason":"END_TURN"}',
+        b'{"contextUsagePercentage":1}',
+    ])
+    return chunks
 
 
 def _summarize(results: dict[str, object]) -> dict[str, bool]:
@@ -234,6 +269,7 @@ def _summarize(results: dict[str, object]) -> dict[str, bool]:
         "anthropic_chronology": chronology_valid,
         "anthropic_chronology_tools": chronology_tools,
         "anthropic_chronology_signatures": chronology_signatures,
+        "parallel_isolated": _parallel_isolated(results["parallel"]),
     }
     assert all([
         summary["anthropic_unicode"],
@@ -245,8 +281,29 @@ def _summarize(results: dict[str, object]) -> dict[str, bool]:
         summary["anthropic_chronology"],
         summary["anthropic_chronology_tools"],
         summary["anthropic_chronology_signatures"],
+        summary["parallel_isolated"],
     ])
     return summary
+
+
+def _parallel_isolated(value: object) -> bool:
+    assert isinstance(value, list)
+    identifiers = []
+    all_markers = {f"marker-{index:02d}" for index in range(16)}
+    for item in value:
+        protocol, marker, status, body = item
+        if status != 200 or marker not in body:
+            return False
+        if any(other in body for other in all_markers - {marker}):
+            return False
+        if protocol == "anthropic":
+            match = re.search(r'"id":\s*"(msg_[^"]+)"', body)
+        else:
+            match = re.search(r'"id":\s*"(chatcmpl-[^"]+)"', body)
+        if match is None:
+            return False
+        identifiers.append(match.group(1))
+    return len(identifiers) == 32 and len(set(identifiers)) == 32
 
 
 def _validate_chronology(body: str) -> tuple[bool, bool, bool]:

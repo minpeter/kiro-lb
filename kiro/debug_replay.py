@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any, Optional
 from kiro.sse_validation import (
     StreamProtocolError,
     validate_anthropic_records,
+    validate_openai_records,
 )
 
 
@@ -33,7 +35,7 @@ def validate_replay(replay: dict[str, Any], protocol: str) -> None:
         validate_anthropic_records(replay.get("translated_sse", []))
         return
     if protocol == "openai":
-        _validate_openai_records(replay.get("translated_sse", []))
+        validate_openai_records(replay.get("translated_sse", []))
         return
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -44,9 +46,15 @@ def replay_to_file(
     protocol: str,
 ) -> None:
     """Write the sanitized translated stream and then validate its lifecycle."""
-    with output.open("wb") as handle:
+    descriptor = os.open(
+        output,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    with os.fdopen(descriptor, "wb") as handle:
         for record in replay.get("translated_sse", []):
             handle.write(base64.b64decode(record.get("payload_base64", "")))
+    output.chmod(0o600)
     validate_replay(replay, protocol)
 
 
@@ -55,8 +63,7 @@ def export_fixture(replay_path: Path, output: Path) -> None:
     replay = load_replay(replay_path)
     if replay.get("capture_content"):
         raise ValueError("Cannot export capture with content enabled")
-    serialized = json.dumps(replay, ensure_ascii=False)
-    if any(pattern.search(serialized) for pattern in _SECRET_PATTERNS):
+    if _contains_credential(replay):
         raise ValueError("Capture contains a credential pattern")
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp")
@@ -66,6 +73,25 @@ def export_fixture(replay_path: Path, output: Path) -> None:
     )
     temporary.chmod(0o600)
     temporary.replace(output)
+
+
+def _contains_credential(replay: dict[str, Any]) -> bool:
+    values = [json.dumps(replay, ensure_ascii=False)]
+    for key in ("upstream_chunks", "translated_sse"):
+        for record in replay.get(key, []):
+            try:
+                decoded = base64.b64decode(
+                    record.get("payload_base64", ""),
+                    validate=True,
+                ).decode("utf-8", errors="replace")
+            except (ValueError, TypeError):
+                continue
+            values.append(decoded)
+    return any(
+        pattern.search(value)
+        for value in values
+        for pattern in _SECRET_PATTERNS
+    )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -113,23 +139,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     return 0
-
-
-def _validate_openai_records(records: list[dict[str, Any]]) -> None:
-    from kiro.sse_validation import OpenAIStreamValidator
-
-    validator = OpenAIStreamValidator()
-    for record in records:
-        payload = base64.b64decode(record.get("payload_base64", ""))
-        for line in payload.decode("utf-8").splitlines():
-            if not line.startswith("data:"):
-                continue
-            data = line.removeprefix("data:").strip()
-            if data == "[DONE]":
-                validator.accept(None, done=True)
-            else:
-                validator.accept(json.loads(data))
-    validator.finish()
 
 
 if __name__ == "__main__":

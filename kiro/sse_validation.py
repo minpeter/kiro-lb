@@ -27,6 +27,12 @@ class AnthropicSSEValidator:
         """Accept one event or raise the stable client-facing order error."""
         if self.message_stopped:
             self._fail()
+        if event_type in {"ping", "error"}:
+            if event_type == "error":
+                self.message_stopped = True
+            return
+        if self.message_delta_seen and event_type != "message_stop":
+            self._fail()
         if event_type == "message_start":
             if self.message_started:
                 self._fail()
@@ -72,8 +78,6 @@ class AnthropicSSEValidator:
                 self._fail()
             self.message_stopped = True
             return
-        if event_type in {"ping", "error"}:
-            return
 
     def finish(self) -> None:
         """Require a complete terminal lifecycle."""
@@ -104,6 +108,8 @@ class OpenAIStreamValidator:
             return
         if payload is None:
             return
+        if self.terminal_seen and payload.get("choices"):
+            raise StreamProtocolError("Invalid assistant content event order")
         choices = payload.get("choices") or []
         for choice in choices:
             delta = choice.get("delta") or {}
@@ -176,6 +182,22 @@ def validate_anthropic_records(records: list[dict[str, Any]]) -> None:
         payload = base64.b64decode(record.get("payload_base64", ""))
         for event_type, data in _parse_anthropic_chunk(payload):
             validator.accept(event_type, data)
+    validator.finish()
+
+
+def validate_openai_records(records: list[dict[str, Any]]) -> None:
+    """Validate sanitized replay records containing OpenAI SSE chunks."""
+    validator = OpenAIStreamValidator()
+    for record in records:
+        payload = base64.b64decode(record.get("payload_base64", ""))
+        for line in payload.decode("utf-8").splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if data == "[DONE]":
+                validator.accept(None, done=True)
+            else:
+                validator.accept(json.loads(data))
     validator.finish()
 
 

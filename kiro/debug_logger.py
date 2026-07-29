@@ -37,17 +37,22 @@ import json
 import shutil
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from loguru import logger
 
 from kiro.config import (
     DEBUG_CAPTURE_CONTENT,
     DEBUG_CAPTURE_MAX_BYTES,
     DEBUG_CAPTURE_RETENTION,
+    DEBUG_CAPTURE_SUCCESS,
     DEBUG_DIR,
     DEBUG_MODE,
 )
-from kiro.debug_capture import CaptureState
+from kiro.debug_capture import (
+    CaptureLogBuffer,
+    CaptureState,
+    prune_stale_temporaries,
+)
 
 
 class DebugLogger:
@@ -71,6 +76,7 @@ class DebugLogger:
         if self._initialized:
             return
         self.debug_dir = Path(DEBUG_DIR)
+        prune_stale_temporaries(self.debug_dir)
         self._initialized = True
         
         # Buffers for "errors" mode
@@ -110,17 +116,26 @@ class DebugLogger:
     
     def _clear_app_logs_buffer(self):
         """Clears the application logs buffer and removes sink."""
-        # Remove sink from loguru
-        if self._loguru_sink_id is not None:
+        capture = self._current_capture()
+        sink_id = (
+            capture.loguru_sink_id
+            if capture is not None
+            else self._loguru_sink_id
+        )
+        if sink_id is not None:
             try:
-                logger.remove(self._loguru_sink_id)
+                logger.remove(sink_id)
             except ValueError:
-                # Sink already removed
                 pass
+        if capture is not None:
+            capture.loguru_sink_id = None
+            capture.app_log_buffer = CaptureLogBuffer(capture)
+            if self._loguru_sink_id == sink_id:
+                self._loguru_sink_id = None
+                self._app_logs_buffer = io.StringIO()
+        else:
             self._loguru_sink_id = None
-        
-        # Clear buffer
-        self._app_logs_buffer = io.StringIO()
+            self._app_logs_buffer = io.StringIO()
     
     def _setup_app_logs_capture(self):
         """
@@ -130,18 +145,25 @@ class DebugLogger:
         Captures ALL logs without filtering, as sink is active only
         during processing of a specific request.
         """
-        # Remove previous sink if exists
-        self._clear_app_logs_buffer()
-        
-        # Add new sink to capture ALL logs
-        # Format: time | level | module:function:line | message
-        self._loguru_sink_id = logger.add(
-            self._app_logs_buffer,
+        capture = self._current_capture()
+        if capture is None:
+            self._clear_app_logs_buffer()
+            app_log_buffer = self._app_logs_buffer
+        else:
+            app_log_buffer = capture.app_log_buffer
+
+        expected_capture = capture
+        sink_id = logger.add(
+            app_log_buffer,
             format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
-            level="DEBUG",  # Capture all levels from DEBUG and above
-            colorize=False,  # No ANSI colors in file
-            # No filter - capture ALL logs during request processing
+            level="DEBUG",
+            colorize=False,
+            filter=lambda _: self._current_capture() is expected_capture,
         )
+        self._loguru_sink_id = sink_id
+        self._app_logs_buffer = app_log_buffer
+        if capture is not None:
+            capture.loguru_sink_id = sink_id
 
     def prepare_new_request(self):
         """
@@ -154,8 +176,13 @@ class DebugLogger:
         if not self._is_enabled():
             return
         
-        # Clear buffers in any case
-        self._clear_buffers()
+        if self._current_capture() is not None:
+            self._clear_buffers()
+        else:
+            self._request_body_buffer = None
+            self._kiro_request_body_buffer = None
+            self._raw_chunks_buffer.clear()
+            self._modified_chunks_buffer.clear()
         capture = CaptureState(
             debug_dir=self.debug_dir,
             capture_content=(
@@ -196,8 +223,7 @@ class DebugLogger:
 
         if self._is_immediate_write():
             self._write_request_body_to_file(body)
-        else:
-            # "errors" mode - buffer
+        elif capture is None:
             self._request_body_buffer = body
 
     def log_kiro_request_body(self, body: bytes):
@@ -216,8 +242,7 @@ class DebugLogger:
 
         if self._is_immediate_write():
             self._write_kiro_request_body_to_file(body)
-        else:
-            # "errors" mode - buffer
+        elif capture is None:
             self._kiro_request_body_buffer = body
 
     def log_raw_chunk(self, chunk: bytes):
@@ -236,9 +261,22 @@ class DebugLogger:
 
         if self._is_immediate_write():
             self._append_raw_chunk_to_file(chunk)
-        else:
-            # "errors" mode - buffer
+        elif capture is None:
             self._raw_chunks_buffer.extend(chunk)
+
+    def log_parsed_event(self, event: dict[str, Any]) -> None:
+        """Record the parser-level event needed to reconstruct upstream order."""
+        if not self._is_enabled():
+            return
+        capture = self._current_capture()
+        if capture is not None:
+            capture.add_chunk(
+                "upstream_chunks",
+                json.dumps(
+                    {"parsed_kiro_event": event},
+                    ensure_ascii=False,
+                ).encode(),
+            )
 
     def log_modified_chunk(self, chunk: bytes):
         """
@@ -256,8 +294,7 @@ class DebugLogger:
 
         if self._is_immediate_write():
             self._append_modified_chunk_to_file(chunk)
-        else:
-            # "errors" mode - buffer
+        elif capture is None:
             self._modified_chunks_buffer.extend(chunk)
     
     def log_error_info(self, status_code: int, error_message: str = ""):
@@ -312,14 +349,14 @@ class DebugLogger:
         capture = self._current_capture()
         capture_path: Optional[Path] = None
         if capture is not None:
-            capture.app_logs = self._app_logs_buffer.getvalue()
+            capture.app_logs = capture.app_log_buffer.getvalue()
         
         # In "all" mode data is already written, add error_info and app logs
         if self._is_immediate_write():
             if capture is not None:
                 capture_path = capture.publish(status_code, error_message)
             self.log_error_info(status_code, error_message)
-            self._write_app_logs_to_file()
+            self._write_app_logs_to_file(capture.app_logs if capture else None)
             self._clear_app_logs_buffer()
             self._capture_state.set(None)
             return capture_path
@@ -347,28 +384,25 @@ class DebugLogger:
             if capture is not None:
                 capture_path = capture.publish(status_code, error_message)
             
-            # Flush buffers to files
-            if self._request_body_buffer:
-                self._write_request_body_to_file(self._request_body_buffer)
-            
-            if self._kiro_request_body_buffer:
-                self._write_kiro_request_body_to_file(self._kiro_request_body_buffer)
-            
-            if self._raw_chunks_buffer:
-                file_path = self.debug_dir / "response_stream_raw.txt"
-                with open(file_path, "wb") as f:
-                    f.write(self._raw_chunks_buffer)
-            
-            if self._modified_chunks_buffer:
-                file_path = self.debug_dir / "response_stream_modified.txt"
-                with open(file_path, "wb") as f:
-                    f.write(self._modified_chunks_buffer)
-            
-            # Save error information
-            self.log_error_info(status_code, error_message)
-            
-            # Save application logs
-            self._write_app_logs_to_file()
+            if capture is None:
+                if self._request_body_buffer:
+                    self._write_request_body_to_file(
+                        self._request_body_buffer
+                    )
+                if self._kiro_request_body_buffer:
+                    self._write_kiro_request_body_to_file(
+                        self._kiro_request_body_buffer
+                    )
+                if self._raw_chunks_buffer:
+                    file_path = self.debug_dir / "response_stream_raw.txt"
+                    with open(file_path, "wb") as f:
+                        f.write(self._raw_chunks_buffer)
+                if self._modified_chunks_buffer:
+                    file_path = self.debug_dir / "response_stream_modified.txt"
+                    with open(file_path, "wb") as f:
+                        f.write(self._modified_chunks_buffer)
+                self.log_error_info(status_code, error_message)
+                self._write_app_logs_to_file()
             
             logger.info(f"[DebugLogger] Error logs flushed to {self.debug_dir} (status={status_code})")
             
@@ -386,6 +420,20 @@ class DebugLogger:
         Called when request completed successfully in "errors" mode.
         Also called in "all" mode to save logs of successful request.
         """
+        capture = self._current_capture()
+        if DEBUG_CAPTURE_SUCCESS and capture is not None:
+            capture.app_logs = capture.app_log_buffer.getvalue()
+            try:
+                capture.publish(
+                    200,
+                    "Completed stream capture",
+                    category="requests",
+                )
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    f"[DebugLogger] Success capture skipped: {exc}"
+                )
+
         if DEBUG_MODE == "errors":
             self._clear_buffers()
         elif DEBUG_MODE == "all":
@@ -441,11 +489,14 @@ class DebugLogger:
         except Exception:
             pass
     
-    def _write_app_logs_to_file(self):
+    def _write_app_logs_to_file(
+        self,
+        logs_content: Optional[str] = None,
+    ):
         """Writes captured application logs to file."""
         try:
-            # Get buffer contents
-            logs_content = self._app_logs_buffer.getvalue()
+            if logs_content is None:
+                logs_content = self._app_logs_buffer.getvalue()
             
             if not logs_content.strip():
                 return

@@ -25,7 +25,11 @@ from kiro.converters_anthropic import (
     convert_anthropic_tools,
     anthropic_to_kiro,
 )
-from kiro.converters_core import UnifiedMessage, UnifiedTool
+from kiro.converters_core import (
+    UnifiedMessage,
+    UnifiedTool,
+    convert_tool_results_to_kiro_format,
+)
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessage,
@@ -1438,3 +1442,20 @@ class TestConvertAnthropicTools:
 # ==================================================================================================
 # Tests for anthropic_to_kiro
 # ==================================================================================================
+
+
+class TestAnthropicToolResultStatus:
+    def test_preserves_is_error_in_kiro_status(self):
+        extracted = extract_tool_results_from_anthropic_content([
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_A",
+                "is_error": True,
+                "content": "database unavailable",
+            }
+        ])
+
+        converted = convert_tool_results_to_kiro_format(extracted)
+
+        assert extracted[0]["is_error"] is True
+        assert converted[0]["status"] == "error"

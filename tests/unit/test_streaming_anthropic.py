@@ -25,7 +25,11 @@ from kiro.streaming_anthropic import (
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
 )
-from kiro.streaming_core import KiroEvent, StreamResult
+from kiro.streaming_core import (
+    FirstTokenTimeoutError,
+    KiroEvent,
+    StreamResult,
+)
 from kiro.sse_validation import StreamProtocolError
 
 
@@ -1821,3 +1825,44 @@ class TestCollectAnthropicNativeOrder:
             for block in result["content"]
             if block["type"] == "thinking"
         ] == ["S1", "S2"]
+
+
+class TestAnthropicRetryLifecycle:
+    @pytest.mark.asyncio
+    async def test_timeout_before_upstream_event_emits_one_message_start(
+        self,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+    ):
+        attempts = 0
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise FirstTokenTimeoutError("timeout")
+            yield KiroEvent(type="content", content="ok")
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        make_request = AsyncMock(return_value=mock_response)
+        chunks = []
+        with patch(
+            "kiro.streaming_anthropic.parse_kiro_stream",
+            mock_parse_kiro_stream,
+        ):
+            async for chunk in stream_with_first_token_retry_anthropic(
+                make_request,
+                "claude-opus-5",
+                mock_model_cache,
+                mock_auth_manager,
+                initial_response=mock_response,
+                max_retries=2,
+            ):
+                chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        assert [event["type"] for event in events].count("message_start") == 1
+        assert attempts == 2
+        make_request.assert_awaited_once()
+        assert_valid_content_event_order(events)

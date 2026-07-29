@@ -155,6 +155,7 @@ async def stream_kiro_to_openai_internal(
     full_content = ""
     full_thinking_content = ""  # Accumulated thinking content for non-streaming
     upstream_stop_reason = None
+    defer_content_until_tool_outcome = bool(request_tools)
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
@@ -167,6 +168,8 @@ async def stream_kiro_to_openai_internal(
             if event.type == "content" and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
+                if defer_content_until_tool_outcome:
+                    continue
                 
                 # Format as OpenAI chunk
                 delta = {"content": event.content}
@@ -189,6 +192,8 @@ async def stream_kiro_to_openai_internal(
                 # text heuristics are involved; emit the upstream text in the
                 # OpenAI-compatible reasoning_content field.
                 full_thinking_content += event.thinking_content
+                if defer_content_until_tool_outcome:
+                    continue
                 delta = {"reasoning_content": event.thinking_content}
                 if first_chunk:
                     delta["role"] = "assistant"
@@ -293,6 +298,51 @@ async def stream_kiro_to_openai_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
+        if request_tools and len(all_tool_calls) > 1:
+            logger.info(
+                "Serializing native tool execution: forwarding the first of "
+                f"{len(all_tool_calls)} calls"
+            )
+            all_tool_calls = all_tool_calls[:1]
+
+        if (
+            defer_content_until_tool_outcome
+            and full_thinking_content
+            and not full_content
+            and not all_tool_calls
+        ):
+            delta = {"reasoning_content": full_thinking_content}
+            if first_chunk:
+                delta["role"] = "assistant"
+                first_chunk = False
+            yield _openai_sse({
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": None,
+                }],
+            })
+
+        if defer_content_until_tool_outcome and full_content and not all_tool_calls:
+            delta = {"content": full_content}
+            if first_chunk:
+                delta["role"] = "assistant"
+                first_chunk = False
+            yield _openai_sse({
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": None,
+                }],
+            })
         
         # Detect content truncation (missing completion signals)
         content_was_truncated = (

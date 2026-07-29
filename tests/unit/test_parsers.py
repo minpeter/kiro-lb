@@ -621,6 +621,23 @@ class TestAwsEventStreamParserToolCalls:
         
         print(f"Result: {tool_calls}")
         assert len(tool_calls) == 2
+
+    def test_fragmented_input_frames_with_repeated_name_append_arguments(
+        self,
+        aws_event_parser,
+    ):
+        events = []
+        for frame in (
+            b'{"name":"bash","toolUseId":"tool1"}',
+            b'{"input":"{\\"comman","name":"bash","toolUseId":"tool1"}',
+            b'{"input":"d\\": \\"pwd\\"}","name":"bash","toolUseId":"tool1"}',
+            b'{"name":"bash","stop":true,"toolUseId":"tool1"}',
+        ):
+            events.extend(aws_event_parser.feed(frame))
+
+        assert events[-1]["data"]["function"]["arguments"] == (
+            '{"command": "pwd"}'
+        )
     
     def test_get_tool_calls_finalizes_current(self, aws_event_parser):
         """

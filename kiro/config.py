@@ -399,6 +399,9 @@ def _bounded_debug_int(
 DEBUG_CAPTURE_CONTENT: bool = (
     os.getenv("DEBUG_CAPTURE_CONTENT", "false").lower() == "true"
 )
+DEBUG_CAPTURE_SUCCESS: bool = (
+    os.getenv("DEBUG_CAPTURE_SUCCESS", "false").lower() == "true"
+)
 DEBUG_CAPTURE_MAX_BYTES: int = _bounded_debug_int(
     "DEBUG_CAPTURE_MAX_BYTES",
     4 * 1024 * 1024,

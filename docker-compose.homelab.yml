@@ -19,17 +19,19 @@ services:
       ACCOUNTS_CONFIG_FILE: /app/data/credentials.json
       ACCOUNTS_STATE_FILE: /app/data/state.json
       DASHBOARD_DATA_DIR: /app/data
+      SQLITE_READONLY: ${SQLITE_READONLY:-true}
       HOME: /tmp
       DEBUG_MODE: ${DEBUG_MODE:-off}
       DEBUG_CAPTURE_CONTENT: ${DEBUG_CAPTURE_CONTENT:-false}
+      DEBUG_CAPTURE_SUCCESS: ${DEBUG_CAPTURE_SUCCESS:-false}
       DEBUG_CAPTURE_MAX_BYTES: ${DEBUG_CAPTURE_MAX_BYTES:-4194304}
       DEBUG_CAPTURE_RETENTION: ${DEBUG_CAPTURE_RETENTION:-10}
     volumes:
-      # Credentials live in the writable data volume so the dashboard can
-      # register accounts atomically. The directory stays private on the host.
+      # Dashboard-managed credentials stay writable; the host CLI store is
+      # discovery-only and must never be modified by the gateway container.
       - ./data:/app/data
       - ./debug_logs:/app/debug_logs
-      - /home/minpeter/.local/share/kiro-cli:/host/kiro-cli
+      - /home/minpeter/.local/share/kiro-cli:/host/kiro-cli:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]

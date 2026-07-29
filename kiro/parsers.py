@@ -267,6 +267,8 @@ class AwsEventStreamParser:
         )
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
+        self._emitted_tool_call_count = 0
+        self._observed_frames: List[Dict[str, Any]] = []
         self.native_thinking_started = False
     
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
@@ -279,7 +281,24 @@ class AwsEventStreamParser:
         Returns:
             List of events in {"type": str, "data": Any} format
         """
-        self.buffer += self._utf8_decoder.decode(chunk, final=False)
+        decoded = self._utf8_decoder.decode(chunk, final=False)
+        self.buffer += decoded
+        cursor = 0
+        while cursor < len(decoded):
+            start = decoded.find("{", cursor)
+            if start == -1:
+                break
+            end = find_matching_brace(decoded, start)
+            if end == -1:
+                break
+            try:
+                frame = json.loads(decoded[start:end + 1])
+            except json.JSONDecodeError:
+                cursor = start + 1
+                continue
+            if isinstance(frame, dict):
+                self._observed_frames.append(frame)
+            cursor = end + 1
         
         events = []
         
@@ -327,6 +346,20 @@ class AwsEventStreamParser:
         Returns:
             Processed event or None
         """
+        current_id = (
+            self.current_tool_call.get("id")
+            if self.current_tool_call
+            else None
+        )
+        frame_tool_id = data.get("toolUseId")
+        if data.get("stop") and self.current_tool_call:
+            return self._process_tool_stop_event(data)
+        if (
+            "input" in data
+            and self.current_tool_call
+            and (not frame_tool_id or frame_tool_id == current_id)
+        ):
+            return self._process_tool_input_event(data)
         if event_type == 'content':
             return self._process_content_event(data)
         elif event_type == 'tool_start':
@@ -375,8 +408,11 @@ class AwsEventStreamParser:
     def _process_tool_start_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes tool call start."""
         # Finalize previous tool call if exists
+        completed_tool_call = None
         if self.current_tool_call:
             self._finalize_tool_call()
+            completed_tool_call = self.tool_calls[-1]
+            self._emitted_tool_call_count += 1
         
         # input can be string or object
         input_data = data.get('input', '')
@@ -401,7 +437,14 @@ class AwsEventStreamParser:
         
         if data.get('stop'):
             self._finalize_tool_call()
+            self._emitted_tool_call_count += 1
+            return {
+                "type": "tool_use",
+                "data": self.tool_calls[-1],
+            }
         
+        if completed_tool_call is not None:
+            return {"type": "tool_use", "data": completed_tool_call}
         return None
     
     def _process_tool_input_event(self, data: dict) -> Optional[Dict[str, Any]]:
@@ -423,6 +466,11 @@ class AwsEventStreamParser:
         """Processes tool call end."""
         if self.current_tool_call and data.get('stop'):
             self._finalize_tool_call()
+            self._emitted_tool_call_count += 1
+            return {
+                "type": "tool_use",
+                "data": self.tool_calls[-1],
+            }
         return None
     
     def _finalize_tool_call(self) -> None:
@@ -585,6 +633,20 @@ class AwsEventStreamParser:
         if self.current_tool_call:
             self._finalize_tool_call()
         return deduplicate_tool_calls(self.tool_calls)
+
+    def get_unemitted_tool_calls(self) -> List[Dict[str, Any]]:
+        """Return tool calls not already emitted by completed native frames."""
+        if self.current_tool_call:
+            self._finalize_tool_call()
+        return deduplicate_tool_calls(
+            self.tool_calls[self._emitted_tool_call_count:]
+        )
+
+    def drain_observed_frames(self) -> List[Dict[str, Any]]:
+        """Return and clear decoded upstream frames for sanitized diagnostics."""
+        frames = self._observed_frames
+        self._observed_frames = []
+        return frames
     
     def reset(self) -> None:
         """Resets parser state."""
@@ -592,4 +654,6 @@ class AwsEventStreamParser:
         self._utf8_decoder.reset()
         self.current_tool_call = None
         self.tool_calls = []
+        self._emitted_tool_call_count = 0
+        self._observed_frames = []
         self.native_thinking_started = False

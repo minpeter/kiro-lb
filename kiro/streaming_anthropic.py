@@ -252,27 +252,30 @@ async def stream_kiro_to_anthropic(
             pending_content.clear()
         return chunks
     
+    message_started = False
+    message_start_data = {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": 0
+            }
+        }
+    }
+
     begin_anthropic_stream()
     try:
-        # Send message_start event
-        yield format_sse_event("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0
-                }
-            }
-        })
-        
         async for event in parse_kiro_stream(response, first_token_timeout):
+            if not message_started:
+                yield format_sse_event("message_start", message_start_data)
+                message_started = True
             if (
                 pending_content
                 and event.type not in {"content", "thinking_signature"}
@@ -592,6 +595,10 @@ async def stream_kiro_to_anthropic(
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
         
+        if not message_started:
+            yield format_sse_event("message_start", message_start_data)
+            message_started = True
+
         # Check for bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         if bracket_tool_calls:

@@ -7,6 +7,9 @@ Unit-тесты для DebugLogger.
 
 import json
 import asyncio
+import base64
+import os
+import time
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -174,7 +177,10 @@ class TestDebugLoggerModeErrors:
         print("Настройка: Режим errors...")
         debug_dir = tmp_path / "debug_logs"
         
-        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+        with (
+            patch('kiro.debug_logger.DEBUG_MODE', 'errors'),
+            patch('kiro.debug_logger.DEBUG_CAPTURE_CONTENT', True),
+        ):
             from kiro.debug_logger import DebugLogger
             logger = DebugLogger.__new__(DebugLogger)
             logger._initialized = False
@@ -199,7 +205,10 @@ class TestDebugLoggerModeErrors:
         print("Настройка: Режим errors, заполняем буферы...")
         debug_dir = tmp_path / "debug_logs"
         
-        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+        with (
+            patch('kiro.debug_logger.DEBUG_MODE', 'errors'),
+            patch('kiro.debug_logger.DEBUG_CAPTURE_CONTENT', True),
+        ):
             from kiro.debug_logger import DebugLogger
             logger = DebugLogger.__new__(DebugLogger)
             logger._initialized = False
@@ -548,7 +557,10 @@ class TestDebugLoggerAppLogsCapture:
         print("Настройка: Режим errors...")
         debug_dir = tmp_path / "debug_logs"
         
-        with patch('kiro.debug_logger.DEBUG_MODE', 'errors'):
+        with (
+            patch('kiro.debug_logger.DEBUG_MODE', 'errors'),
+            patch('kiro.debug_logger.DEBUG_CAPTURE_CONTENT', True),
+        ):
             from kiro.debug_logger import DebugLogger
             from loguru import logger as loguru_logger
             
@@ -569,8 +581,14 @@ class TestDebugLoggerAppLogsCapture:
             print("Действие: Вызов flush_on_error...")
             dbg_logger.flush_on_error(500, "Test Error")
             
-            print(f"Проверяем, что app_logs.txt создан...")
-            app_logs_file = debug_dir / "app_logs.txt"
+            print(f"Проверяем, что app_logs.txt создан в bundle...")
+            captures = [
+                path
+                for path in (debug_dir / "failures").iterdir()
+                if path.is_dir() and not path.name.startswith(".tmp-")
+            ]
+            assert len(captures) == 1
+            app_logs_file = captures[0] / "app_logs.txt"
             assert app_logs_file.exists()
             
             print(f"Проверяем содержимое...")
@@ -781,6 +799,45 @@ class TestDebugLoggerRedaction:
         assert b"refresh-secret" not in stored
         assert b"thinking-signature" not in stored
 
+    def test_redacts_camelcase_secrets_and_prefixed_json(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", True, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 10, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            logger.log_request_body(json.dumps({
+                "accessToken": "camel-access-secret",
+                "refreshToken": "camel-refresh-secret",
+                "clientSecret": "camel-client-secret",
+                "password": "password-secret",
+            }).encode())
+            logger.log_raw_chunk(
+                b'[MCP REQUEST] {"accessToken":"mcp-access-secret"}'
+            )
+            logger.log_parsed_event({
+                "thinking_signature": "opaque-thinking-signature"
+            })
+            capture = logger.flush_on_error(500, "stream failure")
+
+        assert capture is not None
+        stored = b"\n".join(
+            path.read_bytes() for path in capture.iterdir() if path.is_file()
+        )
+        for secret in (
+            b"camel-access-secret",
+            b"camel-refresh-secret",
+            b"camel-client-secret",
+            b"password-secret",
+            b"mcp-access-secret",
+            b"opaque-thinking-signature",
+        ):
+            assert secret not in stored
+
     def test_content_disabled_preserves_structure_not_text(self, tmp_path):
         debug_dir = tmp_path / "debug"
         with (
@@ -840,8 +897,68 @@ class TestDebugLoggerBounds:
         manifest = json.loads((capture / "manifest.json").read_text())
         assert manifest["artifacts"]["upstream_chunks.jsonl"]["truncated"] is True
 
+    def test_fragmented_stream_metadata_remains_bounded(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", True, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 10, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            for _ in range(10000):
+                logger.log_raw_chunk(b"{}")
+            capture = logger.flush_on_error(500, "stream failure")
+
+        assert capture is not None
+        total_size = sum(
+            path.stat().st_size for path in capture.iterdir() if path.is_file()
+        )
+        assert total_size <= 70000
+
 
 class TestDebugLoggerPersistence:
+    def test_success_capture_failure_does_not_break_request(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_SUCCESS", True, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            logger.log_request_body(b'{"message":"ok"}')
+
+            with patch(
+                "kiro.debug_capture.CaptureState.publish",
+                side_effect=OSError("read-only capture directory"),
+            ):
+                logger.discard_buffers()
+
+        assert logger._current_capture() is None
+
+    def test_startup_removes_only_stale_temporary_directories(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        failures = debug_dir / "failures"
+        stale = failures / ".tmp-stale"
+        fresh = failures / ".tmp-fresh"
+        stale.mkdir(parents=True)
+        fresh.mkdir()
+        old = time.time() - 25 * 60 * 60
+        os.utime(stale, (old, old))
+
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+        ):
+            logger = _capture_logger(debug_dir)
+
+        assert logger.debug_dir == debug_dir
+        assert not stale.exists()
+        assert fresh.exists()
+
     def test_failure_bundle_is_atomic_private_and_retained(self, tmp_path):
         debug_dir = tmp_path / "debug"
         with (
@@ -901,3 +1018,32 @@ class TestDebugLoggerReplay:
         assert [item["seq"] for item in replay["upstream_chunks"]] == [0, 1]
         assert [item["seq"] for item in replay["translated_sse"]] == [2, 3]
         assert "secret-signature" not in json.dumps(replay)
+
+    def test_valid_openai_capture_preserves_terminal_structure(self, tmp_path):
+        debug_dir = tmp_path / "debug"
+        with (
+            patch("kiro.debug_logger.DEBUG_MODE", "errors"),
+            patch("kiro.debug_logger.DEBUG_DIR", str(debug_dir)),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_CONTENT", False, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_MAX_BYTES", 65536, create=True),
+            patch("kiro.debug_logger.DEBUG_CAPTURE_RETENTION", 10, create=True),
+        ):
+            logger = _capture_logger(debug_dir)
+            logger.prepare_new_request()
+            logger.log_request_body(b'{"model":"claude-opus-5"}')
+            logger.log_modified_chunk(
+                b'data: {"choices":[{"delta":{},'
+                b'"finish_reason":"stop"}]}\n\n'
+            )
+            logger.log_modified_chunk(b"data: [DONE]\n\n")
+            capture = logger.flush_on_error(500, "historical failure")
+
+        assert capture is not None
+        replay = json.loads((capture / "replay.json").read_text())
+        decoded = b"".join(
+            base64.b64decode(record["payload_base64"])
+            for record in replay["translated_sse"]
+        )
+        assert replay["validation"] == {"valid": True, "failure": None}
+        assert b'"finish_reason":"stop"' in decoded
+        assert b"data: [DONE]" in decoded

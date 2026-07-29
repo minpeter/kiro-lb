@@ -387,11 +387,9 @@ class TestHealthEndpointIntegration:
         assert root_response.status_code == 200
         assert health_response.status_code == 200
         
-        # Both should show "ok" status
-        assert root_response.json()["status"] == "ok"
+        assert root_response.headers["content-type"].startswith("text/html")
+        assert "Kiro" in root_response.text
         assert health_response.json()["status"] == "healthy"
-        
-        # Versions should match
-        assert root_response.json()["version"] == health_response.json()["version"]
+        assert health_response.json()["version"]
         
         print("Health endpoints are consistent")

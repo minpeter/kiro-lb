@@ -6,8 +6,10 @@ ignored so a truncated turn looked like a clean finish.
 """
 
 import pytest
+import httpx
 
 from kiro.parsers import AwsEventStreamParser
+from kiro.streaming_core import parse_kiro_stream
 from kiro.stop_reasons import (
     is_truncated,
     normalize,
@@ -79,3 +81,28 @@ def test_truncation_is_detected_from_upstream_reason():
     assert is_truncated("MAX_TOKENS")
     assert not is_truncated("END_TURN")
     assert not is_truncated(None)
+
+
+@pytest.mark.asyncio
+async def test_native_tool_use_precedes_terminal_stop_reason():
+    response = httpx.Response(
+        200,
+        content=(
+            b'{"name":"read","toolUseId":"tool-1"}'
+            b'{"input":"{\\"path\\":\\"README.md\\"}"}'
+            b'{"stop":true}'
+            b'{"stopReason":"TOOL_USE"}'
+        ),
+    )
+
+    events = [event async for event in parse_kiro_stream(response)]
+
+    assert [event.type for event in events] == ["tool_use", "stop_reason"]
+    assert events[0].tool_use == {
+        "id": "tool-1",
+        "type": "function",
+        "function": {
+            "name": "read",
+            "arguments": '{"path": "README.md"}',
+        },
+    }

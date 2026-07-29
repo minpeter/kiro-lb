@@ -317,7 +317,7 @@ class AnthropicMessagesRequest(BaseModel):
 
     model: str
     messages: List[AnthropicMessage] = Field(min_length=1)
-    max_tokens: int
+    max_tokens: int = Field(gt=0)
 
     # Optional parameters - system can be string or list of content blocks
     system: Optional[SystemPrompt] = None
