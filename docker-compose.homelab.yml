@@ -1,0 +1,41 @@
+# kiro-lb homelab deployment. Keep this service bound to the private lab IP.
+services:
+  kiro-lb:
+    image: kiro-lb:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    container_name: kiro-lb
+    user: "1000:1000"
+    ports:
+      - "10.10.10.10:${KIRO_LB_PORT:-8001}:8000"
+    env_file:
+      - .env
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "8000"
+      ACCOUNT_SYSTEM: "true"
+      ACCOUNTS_CONFIG_FILE: /app/data/credentials.json
+      ACCOUNTS_STATE_FILE: /app/data/state.json
+      DASHBOARD_DATA_DIR: /app/data
+      HOME: /tmp
+    volumes:
+      # Credentials live in the writable data volume so the dashboard can
+      # register accounts atomically. The directory stays private on the host.
+      - ./data:/app/data
+      - ./debug_logs:/app/debug_logs
+      - /home/minpeter/.local/share/kiro-cli:/host/kiro-cli
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - kiro-lb-network
+
+networks:
+  kiro-lb-network:
+    name: kiro-lb-network

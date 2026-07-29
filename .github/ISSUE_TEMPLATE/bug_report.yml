@@ -1,0 +1,49 @@
+name: 🐛 Bug Report
+description: Something isn't working? Report it here
+title: "BUG: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before submitting
+        
+        Please enable debug logging to help me fix the issue faster:
+        1. Add `DEBUG_MODE=errors` to your `.env` file
+        2. Restart the gateway
+        3. Reproduce the error
+        4. Attach files from `debug_logs/` folder below
+        **Note: For the "Improperly formed request" error logs are required!**
+
+  - type: input
+    id: version
+    attributes:
+      label: Kiro Gateway Version
+      description: Which version are you using?
+      placeholder: "e.g. latest or v2.0.0-rc.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe what you were doing and what went wrong
+      placeholder: "Example: I was trying to use X in OpenCode and got a 400 error \"Improperly formed request\"..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug Logs
+      description: |
+        Attach files from `debug_logs/` folder, especially these:
+        - `app_logs.txt`
+        - `request_body.json`
+        - `kiro_request_body.json`
+        
+        Drag & drop files here or paste the content.
+      placeholder: "Drag & drop your log files here..."
+    validations:
+      required: true

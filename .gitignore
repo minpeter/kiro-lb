@@ -1,0 +1,37 @@
+# Environment
+.env
+.env.local
+credentials.json
+state.json
+
+# IDE
+.vscode/
+.idea/
+.shard/
+
+# Python
+.venv/
+frontend/node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Debug logs (generated when DEBUG_MODE is enabled)
+debug_logs*/
+debug*.json
+
+# Project-specific
+_notes/
+requests/
+data/
+.omo/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
