@@ -1281,3 +1281,52 @@ class TestKiroHttpClientRequestParameters:
         assert captured_kwargs["params"]["filter"] == "active"
         assert json.loads(captured_kwargs["content"])["data"] == "value"
         assert response.status_code == 200
+
+
+class TestStreamRetryCleanup:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [403, 429, 500])
+    async def test_closes_discarded_response_before_retry(
+        self,
+        status_code,
+        mock_auth_manager_for_http,
+    ):
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        events = []
+        first_response = Mock(status_code=status_code)
+        first_response.aclose = AsyncMock(
+            side_effect=lambda: events.append("close-first")
+        )
+        success_response = Mock(status_code=200)
+        success_response.aclose = AsyncMock()
+        mock_client = Mock()
+        mock_client.build_request.return_value = Mock()
+
+        async def send(*args, **kwargs):
+            events.append("send")
+            if events.count("send") == 1:
+                return first_response
+            return success_response
+
+        mock_client.send = AsyncMock(side_effect=send)
+
+        with (
+            patch.object(
+                http_client,
+                "_get_client",
+                return_value=mock_client,
+            ),
+            patch("kiro.http_client.get_kiro_headers", return_value={}),
+            patch("kiro.http_client.asyncio.sleep", new=AsyncMock()),
+        ):
+            response = await http_client.request_with_retry(
+                "POST",
+                "https://example.invalid",
+                stream=True,
+                retry_rate_limits=True,
+            )
+
+        assert response is success_response
+        first_response.aclose.assert_awaited_once()
+        success_response.aclose.assert_not_awaited()
+        assert events == ["send", "close-first", "send"]

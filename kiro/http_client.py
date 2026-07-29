@@ -248,6 +248,8 @@ class KiroHttpClient:
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
                     logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if stream:
+                        await response.aclose()
                     await self.auth_manager.force_refresh()
                     continue
                 
@@ -259,6 +261,10 @@ class KiroHttpClient:
                         logger.info("Received 429; returning immediately for account failover")
                         return response
                     last_response = response
+                    if attempt >= max_retries - 1:
+                        break
+                    if stream:
+                        await response.aclose()
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
@@ -267,6 +273,10 @@ class KiroHttpClient:
                 # 5xx - server error, wait and retry
                 if 500 <= response.status_code < 600:
                     last_response = response  # Сохраняем для возврата после exhaustion
+                    if attempt >= max_retries - 1:
+                        break
+                    if stream:
+                        await response.aclose()
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
