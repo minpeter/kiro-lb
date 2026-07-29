@@ -44,6 +44,20 @@ def _write_replay(
 
 
 class TestDebugReplay:
+    def test_historical_fixture_replays_invalid_order(self, capsys):
+        fixture = (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "invalid_assistant_content_event_order.json"
+        )
+
+        exit_code = main(["validate", str(fixture)])
+
+        assert exit_code == 3
+        assert capsys.readouterr().err.strip() == (
+            "Invalid assistant content event order"
+        )
+
     def test_replays_invalid_assistant_content_order(
         self,
         tmp_path,

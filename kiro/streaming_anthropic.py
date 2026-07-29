@@ -196,6 +196,7 @@ async def stream_kiro_to_anthropic(
     thinking_block_index: Optional[int] = None
     text_block_started = False
     text_block_index: Optional[int] = None
+    pending_content: List[str] = []
     tool_blocks: List[Dict[str, Any]] = []
     tool_input_buffers: Dict[int, str] = {}  # index -> accumulated JSON
     upstream_stop_reason: Optional[str] = None
@@ -208,6 +209,48 @@ async def stream_kiro_to_anthropic(
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
+
+    def flush_pending_content(close_thinking: bool) -> List[str]:
+        nonlocal current_block_index
+        nonlocal thinking_block_started
+        nonlocal text_block_index
+        nonlocal text_block_started
+
+        chunks: List[str] = []
+        if (
+            close_thinking
+            and thinking_block_started
+            and thinking_block_index is not None
+        ):
+            chunks.append(format_sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": thinking_block_index
+            }))
+            thinking_block_started = False
+            current_block_index += 1
+        if pending_content and not text_block_started:
+            text_block_index = current_block_index
+            chunks.append(format_sse_event("content_block_start", {
+                "type": "content_block_start",
+                "index": text_block_index,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            }))
+            text_block_started = True
+        if pending_content and text_block_index is not None:
+            for pending_text in pending_content:
+                chunks.append(format_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": text_block_index,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": pending_text
+                    }
+                }))
+            pending_content.clear()
+        return chunks
     
     begin_anthropic_stream()
     try:
@@ -230,6 +273,13 @@ async def stream_kiro_to_anthropic(
         })
         
         async for event in parse_kiro_stream(response, first_token_timeout):
+            if (
+                pending_content
+                and event.type not in {"content", "thinking_signature"}
+            ):
+                for pending_chunk in flush_pending_content(True):
+                    yield pending_chunk
+
             if event.type == "thinking":
                 # Native Kiro reasoning frames map onto Anthropic thinking blocks.
                 # Nothing here is synthesized from ordinary response text.
@@ -267,12 +317,9 @@ async def stream_kiro_to_anthropic(
                     continue
 
                 if text_block_started and text_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": text_block_index
-                    })
-                    text_block_started = False
-                    current_block_index += 1
+                    raise StreamProtocolError(
+                        "Invalid assistant content event order"
+                    )
 
                 if not thinking_block_started:
                     thinking_block_index = current_block_index
@@ -302,20 +349,18 @@ async def stream_kiro_to_anthropic(
                 thinking_block_started = False
                 current_block_index += 1
 
+                for pending_chunk in flush_pending_content(False):
+                    yield pending_chunk
+
             elif event.type == "content":
                 content = event.content or ""
                 if not content:
                     continue
                 full_content += content
-                
-                # Close thinking block if it was open and we're now getting regular content
-                if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": thinking_block_index
-                    })
-                    thinking_block_started = False
-                    current_block_index += 1
+
+                if thinking_block_started:
+                    pending_content.append(content)
+                    continue
                 
                 # Start text block if not started
                 if not text_block_started:
@@ -612,6 +657,10 @@ async def stream_kiro_to_anthropic(
                 })
                 current_block_index += 1
         
+        if pending_content:
+            for pending_chunk in flush_pending_content(True):
+                yield pending_chunk
+
         # Close thinking block if still open
         if thinking_block_started and thinking_block_index is not None:
             yield format_sse_event("content_block_stop", {
@@ -761,45 +810,60 @@ async def collect_anthropic_response(
     result = await collect_stream_to_result(response)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
-    # Build content blocks
+    native_blocks = list(result.content_blocks)
+    if not native_blocks:
+        if result.thinking_content:
+            native_blocks.append({
+                "type": "thinking",
+                "thinking": result.thinking_content,
+                "signature": result.thinking_signature,
+            })
+        if result.content:
+            native_blocks.append({
+                "type": "text",
+                "text": result.content,
+            })
+        native_blocks.extend(
+            {"type": "tool_use", "tool": tool_call}
+            for tool_call in result.tool_calls
+        )
+
     content_blocks = []
-    
+    for native_block in native_blocks:
+        if native_block["type"] == "thinking":
+            content_blocks.append({
+                "type": "thinking",
+                "thinking": native_block["thinking"],
+                "signature": native_block["signature"],
+            })
+            continue
+        if native_block["type"] == "text":
+            content_blocks.append({
+                "type": "text",
+                "text": native_block["text"],
+            })
+            continue
 
-    # Native Kiro reasoning frames become thinking blocks; nothing is derived
-    # from ordinary response text.
-    if result.thinking_content:
-        content_blocks.append({
-            "type": "thinking",
-            "thinking": result.thinking_content,
-            "signature": result.thinking_signature,
-        })
-
-    # Add upstream text content without synthetic thinking blocks.
-    text_content = result.content
-    
-    if text_content:
-        content_blocks.append({
-            "type": "text",
-            "text": text_content
-        })
-    
-    # Add tool use blocks
-    for tc in result.tool_calls:
-        tool_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
-        tool_name = tc.get("function", {}).get("name", "") or tc.get("name", "")
-        tool_input = tc.get("function", {}).get("arguments", {}) or tc.get("input", {})
-        
+        tool_call = native_block["tool"]
+        tool_id = tool_call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+        tool_name = (
+            tool_call.get("function", {}).get("name", "")
+            or tool_call.get("name", "")
+        )
+        tool_input = (
+            tool_call.get("function", {}).get("arguments", {})
+            or tool_call.get("input", {})
+        )
         if isinstance(tool_input, str):
             try:
                 tool_input = json.loads(tool_input)
             except json.JSONDecodeError:
-                tool_input = {}
-        
+                raise StreamProtocolError("Malformed upstream tool input")
         content_blocks.append({
             "type": "tool_use",
             "id": tool_id,
             "name": tool_name,
-            "input": tool_input
+            "input": tool_input,
         })
     
     # Calculate output tokens

@@ -14,6 +14,7 @@ Tests for:
 import pytest
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,6 +26,7 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.streaming_core import KiroEvent, StreamResult
+from kiro.sse_validation import StreamProtocolError
 
 
 # ==================================================================================================
@@ -993,7 +995,7 @@ class TestCollectAnthropicResponse:
     async def test_handles_invalid_json_arguments(self, mock_response, mock_model_cache, mock_auth_manager):
         """
         What it does: Handles invalid JSON in tool arguments.
-        Goal: Verify graceful handling of invalid JSON.
+        Goal: Verify malformed input cannot become a successful empty tool call.
         """
         print("Setup: Mock stream result with invalid JSON arguments...")
         
@@ -1016,17 +1018,16 @@ class TestCollectAnthropicResponse:
         print("Action: Collecting Anthropic response...")
         
         with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
-            result = await collect_anthropic_response(
-                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
-            )
-        
-        print(f"Result: {result}")
-        
-        # Should handle gracefully with empty dict
-        tool_block = result["content"][0]
-        assert tool_block["type"] == "tool_use"
-        assert tool_block["input"] == {}
-        print("✓ Invalid JSON arguments handled gracefully")
+            with pytest.raises(
+                StreamProtocolError,
+                match="Malformed upstream tool input",
+            ):
+                await collect_anthropic_response(
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                )
     
     @pytest.mark.asyncio
     async def test_handles_empty_content(self, mock_response, mock_model_cache, mock_auth_manager):
@@ -1571,3 +1572,252 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+class TestStreamingAnthropicNativeOrder:
+    @pytest.mark.asyncio
+    async def test_captured_raw_fixture_translates_cleanly(
+        self,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+    ):
+        fixture = json.loads(
+            (
+                Path(__file__).parents[1]
+                / "fixtures"
+                / "invalid_assistant_content_event_order.json"
+            ).read_text()
+        )
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            for raw_event in fixture["raw_events"]:
+                yield KiroEvent(**raw_event)
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        chunks = []
+        with patch(
+            "kiro.streaming_anthropic.parse_kiro_stream",
+            mock_parse_kiro_stream,
+        ):
+            with patch(
+                "kiro.streaming_anthropic.parse_bracket_tool_calls",
+                return_value=[],
+            ):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response,
+                    "claude-opus-5",
+                    mock_model_cache,
+                    mock_auth_manager,
+                ):
+                    chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        assert_valid_content_event_order(events)
+        signature = next(
+            event
+            for event in events
+            if event.get("delta", {}).get("type") == "signature_delta"
+        )
+        text = next(
+            event
+            for event in events
+            if event.get("delta", {}).get("type") == "text_delta"
+        )
+        assert signature["index"] == 0
+        assert signature["delta"]["signature"] == "S1"
+        assert text["index"] == 1
+
+    @pytest.mark.asyncio
+    async def test_delayed_signature_precedes_buffered_text(
+        self,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="T1")
+            yield KiroEvent(type="content", content="A1")
+            yield KiroEvent(
+                type="thinking_signature",
+                thinking_signature="S1",
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        chunks = []
+        with patch(
+            "kiro.streaming_anthropic.parse_kiro_stream",
+            mock_parse_kiro_stream,
+        ):
+            with patch(
+                "kiro.streaming_anthropic.parse_bracket_tool_calls",
+                return_value=[],
+            ):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response,
+                    "claude-opus-5",
+                    mock_model_cache,
+                    mock_auth_manager,
+                ):
+                    chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        signature_position = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("delta", {}).get("type") == "signature_delta"
+        )
+        text_position = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("delta", {}).get("type") == "text_delta"
+        )
+
+        assert events[signature_position]["index"] == 0
+        assert events[signature_position]["delta"]["signature"] == "S1"
+        assert events[signature_position + 1] == {
+            "type": "content_block_stop",
+            "index": 0,
+        }
+        assert signature_position < text_position
+        assert_valid_content_event_order(events)
+
+    @pytest.mark.asyncio
+    async def test_interleaved_blocks_keep_native_order_and_tool_ids(
+        self,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="T1")
+            yield KiroEvent(type="content", content="A1")
+            yield KiroEvent(
+                type="thinking_signature",
+                thinking_signature="S1",
+            )
+            for tool_id in ("toolu_A", "toolu_B"):
+                yield KiroEvent(
+                    type="tool_use",
+                    tool_use={
+                        "id": tool_id,
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"q":"same"}',
+                        },
+                    },
+                )
+            yield KiroEvent(type="thinking", thinking_content="T2")
+            yield KiroEvent(type="content", content="A2")
+            yield KiroEvent(
+                type="thinking_signature",
+                thinking_signature="S2",
+            )
+            yield KiroEvent(
+                type="stop_reason",
+                stop_reason="TOOL_USE",
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        chunks = []
+        with patch(
+            "kiro.streaming_anthropic.parse_kiro_stream",
+            mock_parse_kiro_stream,
+        ):
+            with patch(
+                "kiro.streaming_anthropic.parse_bracket_tool_calls",
+                return_value=[],
+            ):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response,
+                    "claude-opus-5",
+                    mock_model_cache,
+                    mock_auth_manager,
+                ):
+                    chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        starts = [
+            event["content_block"]
+            for event in events
+            if event.get("type") == "content_block_start"
+        ]
+        signatures = [
+            (event["index"], event["delta"]["signature"])
+            for event in events
+            if event.get("delta", {}).get("type") == "signature_delta"
+        ]
+
+        assert [block["type"] for block in starts] == [
+            "thinking",
+            "text",
+            "tool_use",
+            "tool_use",
+            "thinking",
+            "text",
+        ]
+        assert [
+            block.get("id")
+            for block in starts
+            if block["type"] == "tool_use"
+        ] == ["toolu_A", "toolu_B"]
+        assert signatures == [(0, "S1"), (4, "S2")]
+        assert_valid_content_event_order(events)
+
+
+class TestCollectAnthropicNativeOrder:
+    @pytest.mark.asyncio
+    async def test_preserves_interleaved_native_blocks(
+        self,
+        mock_response,
+        mock_model_cache,
+        mock_auth_manager,
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="T1")
+            yield KiroEvent(type="content", content="A1")
+            yield KiroEvent(
+                type="thinking_signature",
+                thinking_signature="S1",
+            )
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_A",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": '{"q":"same"}',
+                    },
+                },
+            )
+            yield KiroEvent(type="thinking", thinking_content="T2")
+            yield KiroEvent(type="content", content="A2")
+            yield KiroEvent(
+                type="thinking_signature",
+                thinking_signature="S2",
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        with patch(
+            "kiro.streaming_core.parse_kiro_stream",
+            mock_parse_kiro_stream,
+        ):
+            result = await collect_anthropic_response(
+                mock_response,
+                "claude-opus-5",
+                mock_model_cache,
+                mock_auth_manager,
+            )
+
+        assert [block["type"] for block in result["content"]] == [
+            "thinking",
+            "text",
+            "tool_use",
+            "thinking",
+            "text",
+        ]
+        assert [
+            block["signature"]
+            for block in result["content"]
+            if block["type"] == "thinking"
+        ] == ["S1", "S2"]

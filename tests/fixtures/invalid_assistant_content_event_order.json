@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "request_id": "fixture-invalid-assistant-order",
+  "failure": "Invalid assistant content event order",
+  "capture_content": false,
+  "raw_events": [
+    {
+      "type": "thinking",
+      "thinking_content": "T1"
+    },
+    {
+      "type": "content",
+      "content": "A1"
+    },
+    {
+      "type": "thinking_signature",
+      "thinking_signature": "S1"
+    }
+  ],
+  "upstream_chunks": [],
+  "translated_sse": [
+    {
+      "seq": 0,
+      "size": 78,
+      "stored_size": 78,
+      "truncated": false,
+      "omitted_bytes": 0,
+      "payload_base64": "ZXZlbnQ6IG1lc3NhZ2Vfc3RhcnQKZGF0YTogeyJ0eXBlIjoibWVzc2FnZV9zdGFydCIsIm1lc3NhZ2UiOnsiY29udGVudCI6W119fQoK"
+    },
+    {
+      "seq": 1,
+      "size": 140,
+      "stored_size": 140,
+      "truncated": false,
+      "omitted_bytes": 0,
+      "payload_base64": "ZXZlbnQ6IGNvbnRlbnRfYmxvY2tfc3RhcnQKZGF0YTogeyJ0eXBlIjoiY29udGVudF9ibG9ja19zdGFydCIsImluZGV4IjowLCJjb250ZW50X2Jsb2NrIjp7InR5cGUiOiJ0aGlua2luZyIsInRoaW5raW5nIjoiIiwic2lnbmF0dXJlIjoiIn19Cgo="
+    },
+    {
+      "seq": 2,
+      "size": 125,
+      "stored_size": 125,
+      "truncated": false,
+      "omitted_bytes": 0,
+      "payload_base64": "ZXZlbnQ6IGNvbnRlbnRfYmxvY2tfZGVsdGEKZGF0YTogeyJ0eXBlIjoiY29udGVudF9ibG9ja19kZWx0YSIsImluZGV4IjowLCJkZWx0YSI6eyJ0eXBlIjoidGhpbmtpbmdfZGVsdGEiLCJ0aGlua2luZyI6IlQxIn19Cgo="
+    },
+    {
+      "seq": 3,
+      "size": 73,
+      "stored_size": 73,
+      "truncated": false,
+      "omitted_bytes": 0,
+      "payload_base64": "ZXZlbnQ6IGNvbnRlbnRfYmxvY2tfc3RvcApkYXRhOiB7InR5cGUiOiJjb250ZW50X2Jsb2NrX3N0b3AiLCJpbmRleCI6MH0KCg=="
+    },
+    {
+      "seq": 4,
+      "size": 117,
+      "stored_size": 117,
+      "truncated": false,
+      "omitted_bytes": 0,
+      "payload_base64": "ZXZlbnQ6IGNvbnRlbnRfYmxvY2tfc3RhcnQKZGF0YTogeyJ0eXBlIjoiY29udGVudF9ibG9ja19zdGFydCIsImluZGV4IjoxLCJjb250ZW50X2Jsb2NrIjp7InR5cGUiOiJ0ZXh0IiwidGV4dCI6IiJ9fQoK"
+    },
+    {
+      "seq": 5,
+      "size": 117,
+      "stored_size": 117,
+      "truncated": false,
+      "omitted_bytes": 0,
+      "payload_base64": "ZXZlbnQ6IGNvbnRlbnRfYmxvY2tfZGVsdGEKZGF0YTogeyJ0eXBlIjoiY29udGVudF9ibG9ja19kZWx0YSIsImluZGV4IjoxLCJkZWx0YSI6eyJ0eXBlIjoidGV4dF9kZWx0YSIsInRleHQiOiJBMSJ9fQoK"
+    },
+    {
+      "seq": 6,
+      "size": 140,
+      "stored_size": 140,
+      "truncated": false,
+      "omitted_bytes": 0,
+      "payload_base64": "ZXZlbnQ6IGNvbnRlbnRfYmxvY2tfc3RhcnQKZGF0YTogeyJ0eXBlIjoiY29udGVudF9ibG9ja19zdGFydCIsImluZGV4IjoyLCJjb250ZW50X2Jsb2NrIjp7InR5cGUiOiJ0aGlua2luZyIsInRoaW5raW5nIjoiIiwic2lnbmF0dXJlIjoiIn19Cgo="
+    }
+  ],
+  "validation": {
+    "valid": false,
+    "failure": "Invalid assistant content event order"
+  }
+}

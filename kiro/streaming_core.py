@@ -102,6 +102,7 @@ class StreamResult:
         content: Full text content
         thinking_content: Full thinking/reasoning content
         thinking_signature: Opaque upstream signature for the thinking block
+        content_blocks: Ordered native thinking, text, and tool blocks
         tool_calls: List of tool calls
         usage: Usage information
         context_usage_percentage: Context usage percentage from Kiro API
@@ -110,6 +111,7 @@ class StreamResult:
     content: str = ""
     thinking_content: str = ""
     thinking_signature: str = ""
+    content_blocks: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
@@ -224,13 +226,42 @@ async def collect_stream_to_result(
         if event.type == "content" and event.content:
             result.content += event.content
             full_content_for_bracket_tools += event.content
+            if (
+                result.content_blocks
+                and result.content_blocks[-1]["type"] == "text"
+            ):
+                result.content_blocks[-1]["text"] += event.content
+            else:
+                result.content_blocks.append({
+                    "type": "text",
+                    "text": event.content,
+                })
         elif event.type == "thinking" and event.thinking_content:
             result.thinking_content += event.thinking_content
             full_content_for_bracket_tools += event.thinking_content
+            if (
+                result.content_blocks
+                and result.content_blocks[-1]["type"] == "thinking"
+            ):
+                result.content_blocks[-1]["thinking"] += event.thinking_content
+            else:
+                result.content_blocks.append({
+                    "type": "thinking",
+                    "thinking": event.thinking_content,
+                    "signature": "",
+                })
         elif event.type == "thinking_signature" and event.thinking_signature:
             result.thinking_signature = event.thinking_signature
+            for block in reversed(result.content_blocks):
+                if block["type"] == "thinking" and not block["signature"]:
+                    block["signature"] = event.thinking_signature
+                    break
         elif event.type == "tool_use" and event.tool_use:
             result.tool_calls.append(event.tool_use)
+            result.content_blocks.append({
+                "type": "tool_use",
+                "tool": event.tool_use,
+            })
         elif event.type == "usage" and event.usage:
             result.usage = event.usage
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
@@ -242,6 +273,17 @@ async def collect_stream_to_result(
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
+        timeline_tool_ids = {
+            block["tool"].get("id")
+            for block in result.content_blocks
+            if block["type"] == "tool_use"
+        }
+        for tool_call in bracket_tool_calls:
+            if tool_call.get("id") not in timeline_tool_ids:
+                result.content_blocks.append({
+                    "type": "tool_use",
+                    "tool": tool_call,
+                })
     
     return result
 
