@@ -1,4 +1,14 @@
-import type { Account, ApiKey, KeyUsage, Overview, RegistrationForm, RequestLogPage, RequestRate } from "./types";
+import type {
+  Account,
+  ApiKey,
+  DeviceLoginFlow,
+  DeviceLoginProvider,
+  KeyUsage,
+  Overview,
+  RegistrationForm,
+  RequestLogPage,
+  RequestRate,
+} from "./types";
 
 export const AUTH_REQUIRED = "Dashboard authentication required";
 
@@ -44,4 +54,17 @@ export const dashboardApi = {
       method: "POST",
       body: JSON.stringify(form),
     }),
+  startDeviceLogin: (provider: DeviceLoginProvider) =>
+    request<DeviceLoginFlow>("/api/dashboard/accounts/device-login", {
+      method: "POST",
+      body: JSON.stringify({ provider }),
+    }),
+  pollDeviceLogin: (flowId: string) => request<DeviceLoginFlow>(`/api/dashboard/accounts/device-login/${flowId}`),
+  registerDeviceLogin: (flowId: string) =>
+    request<{ accountId: string; initialized: boolean; provider: string }>(
+      `/api/dashboard/accounts/device-login/${flowId}/register`,
+      { method: "POST" },
+    ),
+  cancelDeviceLogin: (flowId: string) =>
+    request<{ ok: boolean }>(`/api/dashboard/accounts/device-login/${flowId}`, { method: "DELETE" }),
 };

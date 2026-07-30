@@ -103,6 +103,19 @@ export type KeyUsage = Record<string, KeyModelUsage[]>;
 
 export type CredentialSource = "sqlite" | "json" | "refresh_token";
 
+export type DeviceLoginProvider = "google" | "github";
+
+export type DeviceLoginFlow = {
+  flowId: string;
+  provider: string;
+  status: "pending" | "approved" | "failed" | "expired";
+  detail: string | null;
+  userCode: string;
+  verificationUri: string;
+  verificationUriComplete: string;
+  expiresInSeconds: number;
+};
+
 export type RegistrationForm = {
   type: CredentialSource;
   path: string;

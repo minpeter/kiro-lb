@@ -50,6 +50,13 @@ from kiro.config import (
     REQUEST_LOG_RETENTION_DAYS,
 )
 from kiro.accounts_admin import register_account
+from kiro.device_login import (
+    DeviceLoginError,
+    discard_flow,
+    poll_device_login,
+    resolve_provider,
+    start_device_login,
+)
 from kiro.usage_tracking import ROOT_KEY_ID, current_api_key_id, drain_pending_usage
 from kiro.usage import fetch_account_usage
 
@@ -550,6 +557,74 @@ async def dashboard_register_account(request: Request) -> dict[str, Any]:
 async def dashboard_refresh_usage(request: Request) -> dict[str, Any]:
     _require_auth(request)
     return {"accounts": await refresh_all_account_usage(request.app.state.account_manager)}
+
+
+@router.post("/api/dashboard/accounts/device-login")
+async def dashboard_start_device_login(request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    try:
+        provider = resolve_provider(payload.get("provider", "google"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        flow = await start_device_login(provider)
+    except DeviceLoginError as exc:
+        raise HTTPException(status_code=502, detail=f"Kiro rejected the login request: {exc}") from exc
+    return flow.view()
+
+
+@router.get("/api/dashboard/accounts/device-login/{flow_id}")
+async def dashboard_poll_device_login(flow_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    try:
+        flow = await poll_device_login(flow_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return flow.view()
+
+
+@router.post("/api/dashboard/accounts/device-login/{flow_id}/register")
+async def dashboard_register_device_login(flow_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    try:
+        flow = await poll_device_login(flow_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if flow.status != "approved" or not flow.token:
+        raise HTTPException(status_code=409, detail=f"Login is {flow.status}, not approved yet")
+
+    refresh_token = flow.token.get("refreshToken")
+    if not refresh_token:
+        raise HTTPException(status_code=502, detail="Kiro approved the login without a refresh token")
+
+    try:
+        result = await register_account(
+            request.app.state.account_manager,
+            {
+                "type": "refresh_token",
+                "refreshToken": refresh_token,
+                "profileArn": flow.token.get("profileArn") or "",
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        # The token is registered or rejected; either way it must not linger.
+        discard_flow(flow_id)
+
+    result["provider"] = flow.provider
+    return result
+
+
+@router.delete("/api/dashboard/accounts/device-login/{flow_id}")
+async def dashboard_cancel_device_login(flow_id: str, request: Request) -> dict[str, bool]:
+    _require_auth(request)
+    discard_flow(flow_id)
+    return {"ok": True}
 
 
 @router.get("/api/dashboard/accounts")

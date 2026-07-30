@@ -6,6 +6,7 @@ import { useDashboard } from "@/features/dashboard/use-dashboard";
 import { useTabHash } from "@/features/dashboard/use-tab-hash";
 import { AccountsPanel } from "@/features/dashboard/components/accounts-panel";
 import { ApiKeysPanel } from "@/features/dashboard/components/api-keys-panel";
+import { DeviceLoginCard } from "@/features/dashboard/components/device-login-card";
 import { LoginCard } from "@/features/dashboard/components/login-card";
 import { RegisterAccountCard } from "@/features/dashboard/components/register-account-card";
 import { RequestLogTable } from "@/features/dashboard/components/request-log-table";
@@ -83,6 +84,7 @@ export default function App() {
           <TabsContent value="accounts" className="space-y-6">
             <AccountsPanel accounts={dashboard.accounts} isLoading={isLoading} />
             <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
+            <DeviceLoginCard onRegistered={dashboard.reload} />
             <RegisterAccountCard onRegistered={dashboard.reload} />
           </TabsContent>
 
