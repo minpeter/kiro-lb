@@ -49,9 +49,13 @@ export type AccountRateSeries = {
   /** Lowest RPM that drew a 429 at or above cleanly served traffic, or null. */
   limitRpm: number | null;
   limitUnknownReason: string | null;
-  servedPeakRpm: number;
+  /** Highest RPM proven to succeed. */
+  safeRpm: number;
+  /** Remaining uncertainty: limitRpm - safeRpm. Smaller is a tighter estimate. */
+  limitPrecisionRpm: number | null;
   rateLimitSamples: number;
   informativeSamples: number;
+  estimateWindowSeconds: number;
 };
 
 export type RequestRate = {

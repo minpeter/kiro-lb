@@ -12,7 +12,11 @@ import pytest
 
 from kiro.account_errors import ErrorType
 from kiro.account_manager import Account, AccountManager, RoutingEvent, account_label
-from kiro.config import RATE_WINDOW_SECONDS, ROUTING_EVENT_HISTORY
+from kiro.config import (
+    RATE_ESTIMATE_WINDOW_SECONDS,
+    RATE_WINDOW_SECONDS,
+    ROUTING_EVENT_HISTORY,
+)
 
 
 @pytest.fixture
@@ -169,17 +173,18 @@ async def test_evenly_spread_traffic_reports_its_true_rate(manager):
 
 @pytest.mark.asyncio
 async def test_guide_sits_at_or_above_cleanly_served_traffic(manager):
-    now = time.time()
-    events = [(now - 300 + index * 0.05, "success") for index in range(30)]
-    events.append((now - 300 + 30 * 0.05, "rate_limited"))
-    for at, outcome in sorted(events):
-        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+    for _ in range(30):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+    await manager.report_failure(
+        "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+    )
 
-    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+    estimate = manager.estimate_rate_limit("/creds/account0.json")
 
-    assert series["limitRpm"] == 31
-    assert series["limitRpm"] >= max(series["peakRpm"])
-    assert series["limitUnknownReason"] is None
+    assert estimate["safeRpm"] == 30
+    assert estimate["limitRpm"] == 31
+    assert estimate["limitRpm"] >= estimate["safeRpm"]
+    assert estimate["limitUnknownReason"] is None
 
 
 @pytest.mark.asyncio
@@ -190,81 +195,137 @@ async def test_a_rejection_below_served_traffic_does_not_define_the_guide(manage
     to the bottom of the chart, so the traffic area always covered it and the
     line stopped being a warning.
     """
-    now = time.time()
-    events = [(now - 800, "rate_limited")]
-    events += [(now - 300 + index * 0.05, "success") for index in range(14)]
-    for at, outcome in sorted(events):
-        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+    await manager.report_failure(
+        "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+    )
+    manager._rate_observations[-1].at = time.time() - 600
+    for _ in range(14):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
 
-    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+    estimate = manager.estimate_rate_limit("/creds/account0.json")
 
-    assert series["limitRpm"] is None
-    assert series["rateLimitSamples"] == 1
-    assert series["informativeSamples"] == 0
-    assert series["limitUnknownReason"] == "rejections seen only below the rate this account serves cleanly"
+    # 15, not 14: the rejected attempt was also a request at that rate.
+    assert estimate["safeRpm"] == 15
+    assert estimate["limitRpm"] is None
+    assert estimate["rateLimitSamples"] == 1
+    assert estimate["informativeSamples"] == 0
+    assert estimate["limitUnknownReason"] == "rejections seen only below the rate this account serves cleanly"
 
 
 @pytest.mark.asyncio
 async def test_the_tightest_informative_rejection_wins(manager):
     now = time.time()
-    # Two bursts rejected above cleanly served traffic. The lower rejection is
-    # the tighter upper bound on the limit.
-    events = [(now - 600 + index * 0.05, "success") for index in range(20)]
-    events.append((now - 600 + 20 * 0.05, "rate_limited"))
-    events += [(now - 200 + index * 0.05, "success") for index in range(19)]
-    events.append((now - 200 + 19 * 0.05, "rate_limited"))
-    for at, outcome in sorted(events):
-        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+    manager.load_rate_observations([
+        ("/creds/account0.json", now - 500, 18, 0),
+        ("/creds/account0.json", now - 400, 40, 1),
+        # A lower rejection still above proven-safe traffic: the tighter bound.
+        ("/creds/account0.json", now - 300, 25, 1),
+    ])
 
-    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+    estimate = manager.estimate_rate_limit("/creds/account0.json")
 
-    assert series["rateLimitSamples"] == 2
-    assert series["informativeSamples"] == 2
-    assert series["limitRpm"] == 20
-
-
-@pytest.mark.asyncio
-async def test_a_rejection_contradicted_by_a_higher_clean_rate_is_excluded(manager):
-    now = time.time()
-    # 40/min served cleanly, then a rejection at 26/min: the upstream limit
-    # cannot be below a rate it already served, so this sample is discarded.
-    events = [(now - 600 + index * 0.05, "success") for index in range(40)]
-    events += [(now - 200 + index * 0.05, "success") for index in range(25)]
-    events.append((now - 200 + 25 * 0.05, "rate_limited"))
-    for at, outcome in sorted(events):
-        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
-
-    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
-
-    assert series["servedPeakRpm"] == 40
-    assert series["rateLimitSamples"] == 1
-    assert series["informativeSamples"] == 0
-    assert series["limitRpm"] is None
+    assert estimate["safeRpm"] == 18
+    assert estimate["rateLimitSamples"] == 2
+    assert estimate["informativeSamples"] == 2
+    assert estimate["limitRpm"] == 25
+    assert estimate["limitPrecisionRpm"] == 7
 
 
 @pytest.mark.asyncio
 async def test_guide_is_absent_until_a_rejection_is_observed(manager):
     await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
 
-    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+    estimate = manager.estimate_rate_limit("/creds/account0.json")
 
-    assert series["limitRpm"] is None
-    assert series["rateLimitSamples"] == 0
-    assert series["limitUnknownReason"] == "no rate rejection observed yet"
+    assert estimate["limitRpm"] is None
+    assert estimate["rateLimitSamples"] == 0
+    assert estimate["limitUnknownReason"] == "no rate rejection observed yet"
 
 
 @pytest.mark.asyncio
-async def test_served_peak_is_reported_as_the_known_safe_rate(manager):
-    now = time.time()
-    for index in range(25):
-        manager._routing_events.append(
-            RoutingEvent(at=now - 300 + index * 0.05, account_id="/creds/account0.json", outcome="success")
-        )
+async def test_precision_reports_the_remaining_uncertainty(manager):
+    for _ in range(10):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+    await manager.report_failure(
+        "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+    )
 
-    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+    estimate = manager.estimate_rate_limit("/creds/account0.json")
 
-    assert series["servedPeakRpm"] == 25
-    assert series["limitRpm"] is None
+    assert estimate["limitPrecisionRpm"] == estimate["limitRpm"] - estimate["safeRpm"]
+    assert estimate["limitPrecisionRpm"] == 1
+
+
+@pytest.mark.asyncio
+async def test_precision_is_absent_without_a_limit(manager):
+    await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+
+    assert manager.estimate_rate_limit("/creds/account0.json")["limitPrecisionRpm"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_stale_bound_ages_out_so_a_raised_limit_can_recover(manager):
+    """The bound never rises on its own, so old samples must expire.
+
+    Without ageing, an upstream limit that was raised would keep the dashboard
+    pinned to the old, lower value indefinitely.
+    """
+    for _ in range(5):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+    await manager.report_failure(
+        "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+    )
+    assert manager.estimate_rate_limit("/creds/account0.json")["limitRpm"] == 6
+
+    for observation in manager._rate_observations:
+        observation.at -= RATE_ESTIMATE_WINDOW_SECONDS + 1
+
+    estimate = manager.estimate_rate_limit("/creds/account0.json")
+
+    assert estimate["limitRpm"] is None
+    assert estimate["rateLimitSamples"] == 0
+
+
+@pytest.mark.asyncio
+async def test_estimates_do_not_leak_between_accounts(manager):
+    for _ in range(8):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+    await manager.report_failure(
+        "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+    )
+
+    assert manager.estimate_rate_limit("/creds/account0.json")["limitRpm"] == 9
+    assert manager.estimate_rate_limit("/creds/account1.json")["limitRpm"] is None
+
+
+@pytest.mark.asyncio
+async def test_observations_survive_a_restart(manager, tmp_path):
+    """The estimate must outlive the process or every deploy resets the guide."""
+    for _ in range(12):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+    await manager.report_failure(
+        "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+    )
+    before = manager.estimate_rate_limit("/creds/account0.json")
+
+    rows = manager.drain_unsaved_rate_observations()
+    assert rows
+    assert manager.drain_unsaved_rate_observations() == []
+
+    restarted = AccountManager(
+        credentials_file=str(tmp_path / "credentials.json"),
+        state_file=str(tmp_path / "state.json"),
+    )
+    restarted._accounts["/creds/account0.json"] = Account(id="/creds/account0.json")
+    assert restarted.estimate_rate_limit("/creds/account0.json")["limitRpm"] is None
+
+    restarted.load_rate_observations(rows)
+    after = restarted.estimate_rate_limit("/creds/account0.json")
+
+    assert after["limitRpm"] == before["limitRpm"]
+    assert after["safeRpm"] == before["safeRpm"]
+    assert after["limitPrecisionRpm"] == before["limitPrecisionRpm"]
+
 
 
 def test_rate_window_is_reported_so_callers_can_label_the_unit(manager):

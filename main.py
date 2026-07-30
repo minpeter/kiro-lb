@@ -96,6 +96,9 @@ from kiro.dashboard import (
     initialize_dashboard_store,
     record_request,
     prune_request_logs,
+    record_rate_observations,
+    load_rate_observations,
+    prune_rate_observations,
     refresh_all_account_usage,
 )
 
@@ -543,6 +546,31 @@ async def lifespan(app: FastAPI):
 
     prune_task = asyncio.create_task(prune_request_logs_periodically())
 
+    # Restore the inferred rate limits. Without this every deploy resets the
+    # estimate and the dashboard guide line disappears until a fresh 429.
+    from kiro.config import RATE_ESTIMATE_WINDOW_SECONDS
+
+    restored = await asyncio.to_thread(load_rate_observations, time.time() - RATE_ESTIMATE_WINDOW_SECONDS)
+    if restored:
+        app.state.account_manager.load_rate_observations(restored)
+        logger.info("Restored {} rate observation(s) for limit inference", len(restored))
+
+    async def flush_rate_observations() -> None:
+        pending = app.state.account_manager.drain_unsaved_rate_observations()
+        if pending:
+            await asyncio.to_thread(record_rate_observations, pending)
+
+    async def persist_rate_observations_periodically() -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await flush_rate_observations()
+                await asyncio.to_thread(prune_rate_observations)
+            except Exception as exc:
+                logger.warning("Rate observation persistence failed: {}", exc)
+
+    rate_task = asyncio.create_task(persist_rate_observations_periodically())
+
     logger.info("Account system initialized successfully")
 
     yield
@@ -551,8 +579,14 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application...")
     
     # Cancel background tasks.
-    for task in (save_task, usage_task, prune_task):
+    for task in (save_task, usage_task, prune_task, rate_task):
         task.cancel()
+
+    # Keep the rate estimate across restarts.
+    try:
+        await flush_rate_observations()
+    except Exception as exc:
+        logger.warning("Final rate observation flush failed: {}", exc)
     for task in (save_task, usage_task):
         try:
             await task

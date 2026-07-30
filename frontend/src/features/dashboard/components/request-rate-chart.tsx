@@ -66,6 +66,17 @@ function AccountRatePanel({ series, rate }: { series: AccountRateSeries; rate: R
           {limitY !== null && (
             <rect x={0} y={0} width={buckets} height={limitY} fill={LIMIT_STROKE} opacity={0.06} />
           )}
+          {/* Uncertainty band: the limit is somewhere between safe and rejected. */}
+          {limitY !== null && series.safeRpm > 0 && (
+            <rect
+              x={0}
+              y={limitY}
+              width={buckets}
+              height={Math.max(y(series.safeRpm) - limitY, 0)}
+              fill={LIMIT_STROKE}
+              opacity={0.08}
+            />
+          )}
           <path d={area} fill={traffic} opacity={0.28} />
           <path d={line} fill="none" stroke={traffic} strokeWidth={1} vectorEffect="non-scaling-stroke" />
           {limitY !== null && (
@@ -96,7 +107,7 @@ function AccountRatePanel({ series, rate }: { series: AccountRateSeries; rate: R
         {series.limitRpm === null ? (
           <>
             No guide yet: {series.limitUnknownReason}.
-            {series.servedPeakRpm > 0 && ` Served ${series.servedPeakRpm}/min without rejection.`}
+            {series.safeRpm > 0 && ` Served ${series.safeRpm}/min without rejection.`}
           </>
         ) : nearLimit ? (
           <span className="text-destructive">
@@ -104,9 +115,9 @@ function AccountRatePanel({ series, rate }: { series: AccountRateSeries; rate: R
           </span>
         ) : (
           <>
-            Headroom to ~{series.limitRpm}/min, inferred from {series.informativeSamples} rejection
-            {series.informativeSamples === 1 ? "" : "s"}
-            {series.informativeSamples === 1 && " (rough)"}.
+            Limit between {series.safeRpm} and {series.limitRpm}/min (±{series.limitPrecisionRpm}), from{" "}
+            {series.informativeSamples} rejection{series.informativeSamples === 1 ? "" : "s"} in the last{" "
+            }{Math.round(series.estimateWindowSeconds / 3600)}h.
           </>
         )}
       </p>

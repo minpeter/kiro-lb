@@ -91,3 +91,48 @@ def test_prune_keeps_everything_inside_retention(dashboard, monkeypatch):
 
 def test_prune_is_safe_on_an_empty_table(dashboard):
     assert dashboard.prune_request_logs() == 0
+
+
+def test_rate_observations_round_trip(dashboard):
+    now = time.time()
+    dashboard.record_rate_observations([
+        ("/creds/a.json", now - 10, 12, 0),
+        ("/creds/a.json", now - 5, 13, 1),
+    ])
+
+    rows = dashboard.load_rate_observations(now - 60)
+
+    assert rows == [("/creds/a.json", now - 10, 12, 0), ("/creds/a.json", now - 5, 13, 1)]
+
+
+def test_rate_observations_outside_the_window_are_not_loaded(dashboard):
+    now = time.time()
+    dashboard.record_rate_observations([
+        ("/creds/a.json", now - 100000, 40, 1),
+        ("/creds/a.json", now - 5, 13, 1),
+    ])
+
+    rows = dashboard.load_rate_observations(now - 3600)
+
+    assert [row[2] for row in rows] == [13]
+
+
+def test_recording_no_rate_observations_is_a_noop(dashboard):
+    dashboard.record_rate_observations([])
+
+    assert dashboard.load_rate_observations(0) == []
+
+
+def test_prune_rate_observations_respects_retention(dashboard, monkeypatch):
+    now = time.time()
+    dashboard.record_rate_observations([
+        ("/creds/a.json", now - 30 * 86400, 40, 1),
+        ("/creds/a.json", now - 2 * 86400, 20, 1),
+        ("/creds/a.json", now, 10, 0),
+    ])
+
+    monkeypatch.setattr(dashboard, "RATE_OBSERVATION_RETENTION_DAYS", 7)
+    removed = dashboard.prune_rate_observations()
+
+    assert removed == 1
+    assert len(dashboard.load_rate_observations(0)) == 2

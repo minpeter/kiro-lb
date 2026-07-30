@@ -60,6 +60,7 @@ from kiro.config import (
     ACCOUNT_QUOTA_QUARANTINE,
     ROUTING_EVENT_HISTORY,
     RATE_WINDOW_SECONDS,
+    RATE_ESTIMATE_WINDOW_SECONDS,
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
@@ -259,6 +260,28 @@ class RoutingEvent:
 
 
 @dataclass
+class RateObservation:
+    """
+    The request rate an account was running when the upstream ruled on it.
+
+    Persisted, unlike RoutingEvent: the inferred rate limit must survive a
+    restart or every deploy resets the estimate to nothing. Only the rate at each
+    verdict is stored, not every event, so the data path takes no extra write per
+    request.
+
+    Attributes:
+        at: Unix timestamp of the verdict
+        account_id: Internal account ID
+        rpm: Requests in the trailing RATE_WINDOW_SECONDS at that instant
+        rejected: True when the upstream answered with a rate rejection
+    """
+    at: float
+    account_id: str
+    rpm: int
+    rejected: bool
+
+
+@dataclass
 class ModelAccountList:
     """
     List of accounts for a specific model.
@@ -309,6 +332,9 @@ class AccountManager:
         # Bounded ring of recent routing outcomes for the dashboard rate chart.
         # Memory-only: this is observability, not state the router depends on.
         self._routing_events: Deque[RoutingEvent] = deque(maxlen=ROUTING_EVENT_HISTORY)
+        # Rate observations outlive the process; see RateObservation.
+        self._rate_observations: List[RateObservation] = []
+        self._unsaved_rate_observations: List[RateObservation] = []
     
     async def load_credentials(self) -> None:
         """
@@ -1025,7 +1051,94 @@ class AccountManager:
             # Failover happens through exclude_accounts in get_next_account()
     
     def _record_routing_event(self, account_id: str, outcome: str) -> None:
-        self._routing_events.append(RoutingEvent(at=time.time(), account_id=account_id, outcome=outcome))
+        at = time.time()
+        self._routing_events.append(RoutingEvent(at=at, account_id=account_id, outcome=outcome))
+
+        if outcome not in ("success", "rate_limited"):
+            return
+
+        # Rate at this instant, counted from the events already in the ring.
+        cutoff = at - RATE_WINDOW_SECONDS
+        rpm = sum(
+            1
+            for event in self._routing_events
+            if event.account_id == account_id and event.at > cutoff
+        )
+        observation = RateObservation(
+            at=at, account_id=account_id, rpm=rpm, rejected=outcome == "rate_limited"
+        )
+        self._rate_observations.append(observation)
+        self._unsaved_rate_observations.append(observation)
+
+    def drain_unsaved_rate_observations(self) -> List[Tuple[str, float, int, int]]:
+        """Hand over rate observations not yet written to the dashboard store."""
+        pending = self._unsaved_rate_observations
+        self._unsaved_rate_observations = []
+        return [(item.account_id, item.at, item.rpm, int(item.rejected)) for item in pending]
+
+    def load_rate_observations(self, rows: List[Tuple[str, float, int, int]]) -> None:
+        """Restore persisted rate observations after a restart."""
+        restored = [
+            RateObservation(account_id=account_id, at=at, rpm=rpm, rejected=bool(rejected))
+            for account_id, at, rpm, rejected in rows
+        ]
+        self._rate_observations = restored + self._rate_observations
+
+    def _prune_rate_observations(self, now: float) -> None:
+        cutoff = now - RATE_ESTIMATE_WINDOW_SECONDS
+        if self._rate_observations and self._rate_observations[0].at < cutoff:
+            self._rate_observations = [item for item in self._rate_observations if item.at >= cutoff]
+
+    def estimate_rate_limit(self, account_id: str, now: Optional[float] = None) -> Dict[str, object]:
+        """
+        Infer the upstream rate limit for one account from observed verdicts.
+
+        A rejection means the rate exceeded the limit and a success means it did
+        not, so the samples bracket the limit rather than scattering around it.
+        Averaging them would settle above the true limit and report headroom that
+        does not exist, so the bound is the lowest rejected rate instead.
+
+        A rejection only counts when it happened at or above the highest rate the
+        account served cleanly. Below that it contradicts itself and was caused by
+        something else, so it is counted but excluded.
+
+        Only samples inside RATE_ESTIMATE_WINDOW_SECONDS are used. The bound can
+        never rise on its own, so without ageing an upstream limit that was
+        raised would stay pinned to the old value indefinitely.
+
+        Returns:
+            Dict with the inferred limit, the safe rate below it, the width of
+            the remaining interval, sample counts, and why a limit is absent.
+        """
+        now = time.time() if now is None else now
+        cutoff = now - RATE_ESTIMATE_WINDOW_SECONDS
+        samples = [
+            item for item in self._rate_observations
+            if item.account_id == account_id and item.at >= cutoff
+        ]
+
+        served_peak = max((item.rpm for item in samples if not item.rejected), default=0)
+        rejections = [item.rpm for item in samples if item.rejected]
+        informative = [rpm for rpm in rejections if rpm >= served_peak]
+        limit_rpm = min(informative) if informative else None
+
+        if limit_rpm is not None:
+            reason = None
+        elif rejections:
+            reason = "rejections seen only below the rate this account serves cleanly"
+        else:
+            reason = "no rate rejection observed yet"
+
+        return {
+            "limitRpm": limit_rpm,
+            "limitUnknownReason": reason,
+            "safeRpm": served_peak,
+            # How much room is left between proven-safe and known-rejected.
+            "limitPrecisionRpm": None if limit_rpm is None else max(0, limit_rpm - served_peak),
+            "rateLimitSamples": len(rejections),
+            "informativeSamples": len(informative),
+            "estimateWindowSeconds": RATE_ESTIMATE_WINDOW_SECONDS,
+        }
 
     def _events_by_account(self) -> Dict[str, List[RoutingEvent]]:
         grouped: Dict[str, List[RoutingEvent]] = {account_id: [] for account_id in self._accounts}
@@ -1050,17 +1163,9 @@ class AccountManager:
         bucket therefore also reports the highest RPM observed inside it,
         measured as a sliding RATE_WINDOW_SECONDS count at each request instant.
 
-        Kiro publishes no rate limit, so the guide line is derived from behavior
-        and is only drawn where the evidence supports one. A rejection is only
-        informative if it happened at or above the highest rate the account has
-        served cleanly: a 429 at 1/min while 14/min succeeds is not a rate
-        ceiling, it is a rejection caused by something else (concurrency, a
-        shared upstream quota, a transient). Those samples are counted but
-        excluded from the estimate. Among the informative ones the lowest RPM is
-        the tightest upper bound on the real limit, so the guide sits there,
-        above normal traffic, and traffic approaching it is the warning. When no
-        informative sample exists the guide is absent rather than pinned to the
-        floor, and the reason travels with it.
+        Kiro publishes no rate limit, so the guide line is inferred from observed
+        verdicts by estimate_rate_limit(), which documents the reasoning and the
+        ageing window that lets a raised limit recover.
 
         Args:
             window_seconds: How far back to report
@@ -1069,9 +1174,10 @@ class AccountManager:
         Returns:
             Dict with the bucket width, bucket start timestamps, the RPM
             averaging window, and one entry per account holding its per-bucket
-            counts, per-bucket peak RPM, the guide line, and why it is absent.
+            counts, per-bucket peak RPM, and its rate-limit estimate.
         """
         now = time.time()
+        self._prune_rate_observations(now)
         latest_start = int(now // bucket_seconds) * bucket_seconds
         bucket_count = max(1, window_seconds // bucket_seconds)
         starts = [latest_start - offset * bucket_seconds for offset in range(bucket_count - 1, -1, -1)]
@@ -1084,8 +1190,6 @@ class AccountManager:
             rate_limited = [0] * bucket_count
             failure = [0] * bucket_count
             peak_rpm = [0] * bucket_count
-            served_peak_rpm = 0
-            rejection_rpms: List[int] = []
 
             # Sliding request count over RATE_WINDOW_SECONDS. The ring is append
             # ordered, so a single left pointer covers every instant in one pass.
@@ -1094,11 +1198,6 @@ class AccountManager:
                 while events[left].at <= event.at - RATE_WINDOW_SECONDS:
                     left += 1
                 rpm = position - left + 1
-
-                if event.outcome == "rate_limited":
-                    rejection_rpms.append(rpm)
-                elif event.outcome == "success":
-                    served_peak_rpm = max(served_peak_rpm, rpm)
 
                 bucket = index_of.get(int(event.at // bucket_seconds) * bucket_seconds)
                 if bucket is None:
@@ -1112,27 +1211,13 @@ class AccountManager:
                     failure[bucket] += 1
                 peak_rpm[bucket] = max(peak_rpm[bucket], rpm)
 
-            # Only rejections at or above cleanly served traffic bound the rate.
-            informative = [rpm for rpm in rejection_rpms if rpm >= served_peak_rpm]
-            limit_rpm = min(informative) if informative else None
-            if limit_rpm is not None:
-                unknown_reason = None
-            elif rejection_rpms:
-                unknown_reason = "rejections seen only below the rate this account serves cleanly"
-            else:
-                unknown_reason = "no rate rejection observed yet"
-
             accounts.append({
                 "account": account_label(account_id),
                 "success": success,
                 "rateLimited": rate_limited,
                 "failure": failure,
                 "peakRpm": peak_rpm,
-                "limitRpm": limit_rpm,
-                "limitUnknownReason": unknown_reason,
-                "servedPeakRpm": served_peak_rpm,
-                "rateLimitSamples": len(rejection_rpms),
-                "informativeSamples": len(informative),
+                **self.estimate_rate_limit(account_id, now),
             })
 
         return {

@@ -63,11 +63,15 @@ class TestLifespanLegacyFallback:
         
         # Mock AccountManager to prevent actual initialization
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -114,11 +118,15 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -197,11 +205,15 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -250,11 +262,15 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -303,11 +319,15 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -385,6 +405,12 @@ class TestLifespanAccountManagerInit:
             
             async def save_state_periodically(self):
                 await asyncio.sleep(1000)
+
+            def load_rate_observations(self, rows):
+                self.restored_rate_observations = rows
+
+            def drain_unsaved_rate_observations(self):
+                return []
         
         with patch("main.AccountManager", MockAccountManager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -427,6 +453,8 @@ class TestLifespanAccountManagerInit:
         load_calls = {"credentials": False, "state": False}
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         
@@ -441,6 +469,8 @@ class TestLifespanAccountManagerInit:
         mock_manager._initialize_account = AsyncMock(return_value=True)
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -481,11 +511,15 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -525,6 +559,8 @@ class TestLifespanAccountManagerInit:
         initialized_accounts = []
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {
             "account1": MagicMock(),
             "account2": MagicMock()
@@ -538,6 +574,8 @@ class TestLifespanAccountManagerInit:
         mock_manager._initialize_account = track_initialize
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -580,6 +618,8 @@ class TestLifespanAccountManagerInit:
         initialized_attempts = []
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {
             "account1": MagicMock(),
             "account2": MagicMock(),
@@ -597,6 +637,8 @@ class TestLifespanAccountManagerInit:
         mock_manager._initialize_account = track_initialize
         mock_manager._save_state = AsyncMock()
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -636,6 +678,8 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {}  # Empty accounts dict
         mock_manager._current_account_index = 0
         
@@ -676,6 +720,8 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {
             "account1": MagicMock(),
             "account2": MagicMock()
@@ -722,6 +768,8 @@ class TestLifespanAccountManagerInit:
         save_state_called = False
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -732,6 +780,8 @@ class TestLifespanAccountManagerInit:
         
         mock_manager._save_state = track_save_state
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:
@@ -773,10 +823,14 @@ class TestLifespanAccountManagerInit:
         periodic_task_started = False
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
         mock_manager._save_state = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         async def track_periodic_save():
             nonlocal periodic_task_started
@@ -823,6 +877,8 @@ class TestLifespanAccountManagerInit:
         task_cancelled = False
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -881,6 +937,8 @@ class TestLifespanAccountManagerInit:
         save_calls = []
         
         mock_manager = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         mock_manager._accounts = {"test": MagicMock()}
         mock_manager._current_account_index = 0
         mock_manager._initialize_account = AsyncMock(return_value=True)
@@ -890,6 +948,8 @@ class TestLifespanAccountManagerInit:
         
         mock_manager._save_state = track_save_state
         mock_manager.save_state_periodically = AsyncMock()
+        mock_manager.load_rate_observations = MagicMock()
+        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
         
         with patch("main.AccountManager", return_value=mock_manager):
             with patch("main.httpx.AsyncClient") as mock_client_class:

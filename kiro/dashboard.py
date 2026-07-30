@@ -35,14 +35,19 @@ import os
 import secrets
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
 from kiro.account_manager import account_label, account_routing_state
-from kiro.config import FALLBACK_MODELS, REQUEST_LOG_RETENTION_DAYS
+from kiro.config import (
+    FALLBACK_MODELS,
+    RATE_OBSERVATION_RETENTION_DAYS,
+    REQUEST_LOG_RETENTION_DAYS,
+)
 from kiro.accounts_admin import register_account
 from kiro.usage import fetch_account_usage
 
@@ -56,11 +61,21 @@ _SESSION_TTL_SECONDS = 12 * 60 * 60
 _sessions: dict[str, float] = {}
 
 
-def _db() -> sqlite3.Connection:
+@contextmanager
+def _db() -> Iterator[sqlite3.Connection]:
+    """Yield a dashboard-store connection, committing then closing it.
+
+    sqlite3's own context manager commits but leaves the connection open, which
+    leaks a handle per call. Every store access goes through here.
+    """
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def initialize_dashboard_store() -> None:
@@ -76,6 +91,21 @@ def initialize_dashboard_store() -> None:
             )"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at)")
+        # Rate observations back the inferred rate limit shown on the dashboard.
+        # Only the RPM at each upstream verdict is kept, which is what the
+        # estimate needs; the high-resolution chart ring stays in memory.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS rate_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                observed_at REAL NOT NULL,
+                rpm INTEGER NOT NULL,
+                rejected INTEGER NOT NULL
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rate_observations_account ON rate_observations(account_id, observed_at)"
+        )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS api_keys (
                 id TEXT PRIMARY KEY,
@@ -124,6 +154,44 @@ def prune_request_logs() -> int:
     try:
         with _db() as conn:
             return conn.execute("DELETE FROM request_logs WHERE created_at < ?", (cutoff,)).rowcount
+    except Exception:
+        return 0
+
+
+def record_rate_observations(rows: list[tuple[str, float, int, int]]) -> None:
+    """Persist (account_id, observed_at, rpm, rejected) rate samples."""
+    if not rows:
+        return
+    try:
+        with _db() as conn:
+            conn.executemany(
+                "INSERT INTO rate_observations(account_id, observed_at, rpm, rejected) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+    except Exception:
+        pass
+
+
+def load_rate_observations(since: float) -> list[tuple[str, float, int, int]]:
+    try:
+        with _db() as conn:
+            return [
+                (row["account_id"], row["observed_at"], row["rpm"], row["rejected"])
+                for row in conn.execute(
+                    "SELECT account_id, observed_at, rpm, rejected FROM rate_observations"
+                    " WHERE observed_at >= ? ORDER BY observed_at",
+                    (since,),
+                )
+            ]
+    except Exception:
+        return []
+
+
+def prune_rate_observations() -> int:
+    cutoff = time.time() - RATE_OBSERVATION_RETENTION_DAYS * 86400
+    try:
+        with _db() as conn:
+            return conn.execute("DELETE FROM rate_observations WHERE observed_at < ?", (cutoff,)).rowcount
     except Exception:
         return 0
 

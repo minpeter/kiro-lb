@@ -532,6 +532,17 @@ ROUTING_EVENT_HISTORY: int = int(os.getenv("ROUTING_EVENT_HISTORY", "8000"))
 # seconds at each request instant rather than averaging a whole bucket.
 RATE_WINDOW_SECONDS: int = int(os.getenv("RATE_WINDOW_SECONDS", "60"))
 
+# How far back rate observations count toward the inferred limit. A bound taken
+# from the lowest rejection never rises on its own, so an upstream limit that
+# was raised would stay pinned to the old value forever. Ageing samples out lets
+# the estimate recover. Default 24h keeps enough samples to stay tight while
+# adapting within a day.
+RATE_ESTIMATE_WINDOW_SECONDS: int = int(os.getenv("RATE_ESTIMATE_WINDOW_SECONDS", "86400"))
+
+# Retention for persisted rate observations, which outlive the estimate window
+# so an operator can still inspect history.
+RATE_OBSERVATION_RETENTION_DAYS: int = int(os.getenv("RATE_OBSERVATION_RETENTION_DAYS", "7"))
+
 # Retention for the dashboard request log. Without pruning the table grows
 # unbounded and the 24h overview aggregate degrades: measured 0.85ms at 10k
 # rows versus 19.8ms at 1M, which matters once the dashboard polls every second.
