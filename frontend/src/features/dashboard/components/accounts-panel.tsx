@@ -4,9 +4,34 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { EmptyState } from "@/components/empty-state";
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { formatTimestamp, formatUsage } from "../format";
-import type { Account } from "../types";
+import { formatDuration, formatTimestamp, formatUsage } from "../format";
+import type { Account, AccountRoutingState } from "../types";
 import { TableSkeleton } from "./skeletons";
+
+const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
+  available: "ready",
+  rate_limited: "rate limited",
+  quota_exhausted: "quota exhausted",
+  cooling_down: "cooling down",
+  uninitialized: "pending",
+};
+
+/** Only "ready" is a routing target; everything else is currently excluded. */
+function RoutingStateCell({ account }: { account: Account }) {
+  const state = account.routingState;
+  const label = ROUTING_STATE_LABEL[state] ?? state;
+  const variant = state === "available" ? "secondary" : state === "uninitialized" ? "outline" : "destructive";
+  return (
+    <div className="space-y-1">
+      <Badge variant={variant}>{label}</Badge>
+      {account.eligibleInSeconds > 0 && (
+        <p className="text-xs tabular-nums text-muted-foreground">
+          back in {formatDuration(account.eligibleInSeconds)}
+        </p>
+      )}
+    </div>
+  );
+}
 
 function UsageCell({ account }: { account: Account }) {
   const usage = account.usage;
@@ -54,9 +79,7 @@ export function AccountsPanel({ accounts, isLoading }: { accounts: Account[]; is
                 <TableRow key={account.id}>
                   <TableCell className="font-mono text-xs">{account.id}</TableCell>
                   <TableCell>
-                    <Badge variant={account.initialized ? "secondary" : "outline"}>
-                      {account.initialized ? "ready" : "pending"}
-                    </Badge>
+                    <RoutingStateCell account={account} />
                   </TableCell>
                   <TableCell>{account.usage?.subscriptionTitle ?? "—"}</TableCell>
                   <TableCell>

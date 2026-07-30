@@ -41,7 +41,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
-from kiro.account_manager import account_label
+from kiro.account_manager import account_label, account_routing_state
 from kiro.config import FALLBACK_MODELS
 from kiro.accounts_admin import register_account
 from kiro.usage import fetch_account_usage
@@ -249,9 +249,15 @@ async def refresh_all_account_usage(manager: Any) -> list[dict[str, Any]]:
 def _account_view(account: Any) -> dict[str, Any]:
     now = time.time()
     cooldown_seconds = max(0, int(account.last_failure_time - now)) if account.last_failure_time else 0
+    # The failure counter no longer covers every exclusion: rate limits and
+    # quota exhaustion deliberately bypass the Circuit Breaker, so the routing
+    # state is what tells an operator whether this account is serving traffic.
+    routing_state, eligible_in = account_routing_state(account, now)
     return {
         "id": account_label(account.id),
         "initialized": account.auth_manager is not None,
+        "routingState": routing_state,
+        "eligibleInSeconds": eligible_in,
         "failures": account.failures,
         "cooldownSeconds": cooldown_seconds,
         "modelsCachedAt": int(account.models_cached_at or 0),

@@ -27,7 +27,11 @@ from kiro.account_manager import (
     _format_duration
 )
 from kiro.account_errors import ErrorType
-from kiro.config import ACCOUNT_RATE_LIMIT_COOLDOWN, ACCOUNT_RECOVERY_TIMEOUT
+from kiro.config import (
+    ACCOUNT_QUOTA_QUARANTINE,
+    ACCOUNT_RATE_LIMIT_COOLDOWN,
+    ACCOUNT_RECOVERY_TIMEOUT,
+)
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
@@ -1034,29 +1038,185 @@ class TestAccountManagerRateLimitCooldown:
         print(f"rate_limited_until: {manager._accounts[account_id].rate_limited_until}")
         assert manager._accounts[account_id].rate_limited_until == 0.0
 
+
+class TestAccountManagerQuotaExclusion:
+    """
+    Tests for the 402 MONTHLY_REQUEST_COUNT path.
+
+    A quota-exhausted account cannot serve anything until its quota resets, so
+    it must leave the rotation entirely instead of absorbing probabilistic
+    retries that can only ever return another 402.
+    """
+
+    def _pool(self, tmp_path, account_count: int = 2) -> AccountManager:
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+        for index in range(account_count):
+            account_id = f"/creds/account{index}.json"
+            account = Account(id=account_id)
+            account.auth_manager = MagicMock()
+            account.models_cached_at = time.time()
+            manager._accounts[account_id] = account
+        return manager
+
     @pytest.mark.asyncio
-    async def test_quota_exhaustion_still_uses_circuit_breaker(self, tmp_path):
+    async def test_quota_exhaustion_quarantines_without_failure_count(self, tmp_path):
         """
         What it does: Reports 402 MONTHLY_REQUEST_COUNT
-        Purpose: Monthly exhaustion really does persist, so it must keep the
-                 exponential backoff the rate-limit path opts out of
+        Purpose: The account is excluded by quarantine, not by an ever-growing
+                 Circuit Breaker counter
         """
-        print("\n=== Test: quota exhaustion keeps exponential backoff ===")
+        print("\n=== Test: quota exhaustion sets quarantine ===")
 
         manager = self._pool(tmp_path, account_count=1)
         account_id = "/creds/account0.json"
 
+        before = time.time()
         await manager.report_failure(
             account_id, "claude-sonnet-4-5",
             ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
         )
 
         account = manager._accounts[account_id]
-        print(f"Failures: {account.failures}, rate_limited_until: {account.rate_limited_until}")
+        remaining = account.quota_exhausted_until - before
+        print(f"Quarantine: {remaining:.0f}s, failures: {account.failures}")
 
-        assert account.failures == 1
-        assert account.last_failure_time > 0
-        assert account.rate_limited_until == 0.0
+        assert 0 < remaining <= ACCOUNT_QUOTA_QUARANTINE + 1
+        assert account.failures == 0
+        assert account.stats.failed_requests == 1
+
+    @pytest.mark.asyncio
+    async def test_quota_exhausted_account_is_never_selected(self, tmp_path):
+        """
+        What it does: Exhausts one account, forces the retry dice to "retry"
+        Purpose: Unlike a Circuit Breaker cooldown, the quarantine has no
+                 probabilistic escape hatch - a 402 account must not be picked
+        """
+        print("\n=== Test: quota-exhausted account is excluded from routing ===")
+
+        manager = self._pool(tmp_path, account_count=2)
+        dead, alive = "/creds/account0.json", "/creds/account1.json"
+
+        await manager.report_failure(
+            dead, "claude-sonnet-4-5",
+            ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+        )
+
+        with patch("kiro.account_manager.random.random", return_value=0.0):
+            for _ in range(10):
+                selected = await manager.get_next_account("claude-sonnet-4-5")
+                assert selected is not None
+                assert selected.id == alive
+
+        print(f"All 10 selections routed to {alive}")
+
+    @pytest.mark.asyncio
+    async def test_quota_exhausted_pool_returns_none(self, tmp_path):
+        """
+        What it does: Exhausts every account in the pool
+        Purpose: Selection must report "nothing usable" rather than hand back a
+                 402 account and burn a live request
+        """
+        print("\n=== Test: fully exhausted pool yields no account ===")
+
+        manager = self._pool(tmp_path, account_count=2)
+        for account_id in list(manager._accounts):
+            await manager.report_failure(
+                account_id, "claude-sonnet-4-5",
+                ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+            )
+
+        with patch("kiro.account_manager.random.random", return_value=0.0):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+
+        print(f"Selected: {selected}")
+        assert selected is None
+
+    @pytest.mark.asyncio
+    async def test_quota_quarantine_expires_and_account_returns(self, tmp_path):
+        """
+        What it does: Expires the quarantine window
+        Purpose: A quota reset must bring the account back without operator action
+        """
+        print("\n=== Test: quarantine expiry restores the account ===")
+
+        manager = self._pool(tmp_path, account_count=2)
+        recovered = "/creds/account0.json"
+
+        await manager.report_failure(
+            recovered, "claude-sonnet-4-5",
+            ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+        )
+        manager._accounts[recovered].quota_exhausted_until = time.time() - 1
+
+        selected = await manager.get_next_account("claude-sonnet-4-5")
+        print(f"Selected after expiry: {selected.id}")
+
+        assert selected.id == recovered
+
+    @pytest.mark.asyncio
+    async def test_success_clears_quota_quarantine(self, tmp_path):
+        """
+        What it does: Quarantines an account, then reports a success
+        Purpose: A served request proves the quota is back, so the remaining
+                 quarantine must not keep the account parked
+        """
+        print("\n=== Test: success clears the quota quarantine ===")
+
+        manager = self._pool(tmp_path, account_count=2)
+        account_id = "/creds/account0.json"
+
+        await manager.report_failure(
+            account_id, "claude-sonnet-4-5",
+            ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+        )
+        assert manager._accounts[account_id].quota_exhausted_until > time.time()
+
+        await manager.report_success(account_id, "claude-sonnet-4-5")
+
+        print(f"quota_exhausted_until: {manager._accounts[account_id].quota_exhausted_until}")
+        assert manager._accounts[account_id].quota_exhausted_until == 0.0
+
+    @pytest.mark.asyncio
+    async def test_quota_quarantine_survives_restart(self, tmp_path):
+        """
+        What it does: Saves state, then loads it into a fresh manager
+        Purpose: Quota exhaustion outlives the process, so a restart must not
+                 hand the dead account traffic again
+        """
+        print("\n=== Test: quarantine is persisted across restart ===")
+
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+        account_id = "/creds/account0.json"
+
+        manager = self._pool(tmp_path, account_count=2)
+        manager._state_file = str(state_file)
+        await manager.report_failure(
+            account_id, "claude-sonnet-4-5",
+            ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+        )
+        saved_until = manager._accounts[account_id].quota_exhausted_until
+        await manager._save_state()
+
+        # Fresh process: same credentials, state reloaded from disk.
+        restarted = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(state_file)
+        )
+        restarted._accounts = {
+            "/creds/account0.json": Account(id="/creds/account0.json"),
+            "/creds/account1.json": Account(id="/creds/account1.json"),
+        }
+        await restarted.load_state()
+
+        reloaded = restarted._accounts[account_id].quota_exhausted_until
+        print(f"Saved: {saved_until}, reloaded: {reloaded}")
+
+        assert reloaded == saved_until
+        assert reloaded > time.time()
 
 
 class TestAccountManagerDescribePoolState:
@@ -1149,6 +1309,28 @@ class TestAccountManagerDescribePoolState:
         print(f"Description: {description}")
 
         assert f"{account_label('/creds/burst.json')}: rate limited for" in description
+        assert "cooling down" not in description
+
+    def test_describe_pool_state_reports_quota_exhaustion(self, tmp_path):
+        """
+        Test that a quota-exhausted account is named as such.
+
+        What it does: Quarantines an account for quota exhaustion
+        Purpose: A 402 exclusion lasts hours, so the 503 must not present it as
+                 a transient rate limit or cooldown
+        """
+        print("\n=== Test: describe_pool_state reports quota exhaustion ===")
+
+        manager = self._manager(tmp_path)
+        manager._accounts = {"/creds/empty.json": Account(id="/creds/empty.json")}
+        manager._accounts["/creds/empty.json"].auth_manager = MagicMock()
+        manager._accounts["/creds/empty.json"].quota_exhausted_until = time.time() + 3600
+
+        description = manager.describe_pool_state()
+        print(f"Description: {description}")
+
+        assert f"{account_label('/creds/empty.json')}: monthly quota exhausted, excluded for" in description
+        assert "rate limited" not in description
         assert "cooling down" not in description
 
     def test_describe_pool_state_expired_cooldown_is_not_reported_as_cooling(self, tmp_path):

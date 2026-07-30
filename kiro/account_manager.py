@@ -40,7 +40,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from loguru import logger
@@ -56,6 +56,7 @@ from kiro.config import (
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
     ACCOUNT_RATE_LIMIT_COOLDOWN,
+    ACCOUNT_QUOTA_QUARANTINE,
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
@@ -110,6 +111,46 @@ def account_label(account_id: str) -> str:
         12-character hex digest of the account ID
     """
     return hashlib.sha256(account_id.encode()).hexdigest()[:12]
+
+
+def account_routing_state(account: "Account", now: Optional[float] = None) -> Tuple[str, int]:
+    """
+    Classify why an account is or is not a routing target right now.
+
+    Single source of truth for both the client-facing 503 diagnostics and the
+    dashboard: the failure counter alone no longer tells the story, because a
+    rate limit and a quota exhaustion deliberately leave it untouched.
+
+    Args:
+        account: Account to classify
+        now: Reference timestamp (defaults to the current time)
+
+    Returns:
+        Tuple of (state, seconds_until_eligible). State is one of
+        "quota_exhausted", "rate_limited", "cooling_down", "uninitialized",
+        or "available"; the second element is 0 when nothing is pending.
+    """
+    now = time.time() if now is None else now
+
+    quota_remaining = account.quota_exhausted_until - now
+    if quota_remaining > 0:
+        return ("quota_exhausted", int(quota_remaining))
+
+    rate_limit_remaining = account.rate_limited_until - now
+    if rate_limit_remaining > 0:
+        return ("rate_limited", int(rate_limit_remaining))
+
+    if account.failures > 0:
+        backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
+        effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
+        remaining = effective_timeout - (now - account.last_failure_time)
+        if remaining > 0:
+            return ("cooling_down", int(remaining))
+
+    if account.auth_manager is None:
+        return ("uninitialized", 0)
+
+    return ("available", 0)
 
 
 def _format_duration(seconds: float) -> str:
@@ -174,6 +215,11 @@ class Account:
             rate rejection means "asked too quickly", not "broken", so the
             account rotates out briefly and returns at full health. Not
             persisted; the window is shorter than a restart.
+        quota_exhausted_until: Timestamp until which the account is out of
+            monthly quota (402 MONTHLY_REQUEST_COUNT). The account cannot serve
+            any request until its quota resets, so it leaves the rotation
+            entirely - no probabilistic retry reaches it. Persisted, because
+            the state outlives the process.
         models_cached_at: Timestamp of last model cache update
         stats: Usage statistics
     """
@@ -184,6 +230,7 @@ class Account:
     failures: int = 0
     last_failure_time: float = 0.0
     rate_limited_until: float = 0.0
+    quota_exhausted_until: float = 0.0
     models_cached_at: float = 0.0
     stats: AccountStats = field(default_factory=AccountStats)
 
@@ -381,6 +428,7 @@ class AccountManager:
                     account = self._accounts[account_id]
                     account.failures = data.get("failures", 0)
                     account.last_failure_time = data.get("last_failure_time", 0.0)
+                    account.quota_exhausted_until = data.get("quota_exhausted_until", 0.0)
                     account.models_cached_at = data.get("models_cached_at", 0.0)
                     
                     stats_data = data.get("stats", {})
@@ -407,6 +455,7 @@ class AccountManager:
                 account_id: {
                     "failures": account.failures,
                     "last_failure_time": account.last_failure_time,
+                    "quota_exhausted_until": account.quota_exhausted_until,
                     "models_cached_at": account.models_cached_at,
                     "stats": {
                         "total_requests": account.stats.total_requests,
@@ -676,6 +725,7 @@ class AccountManager:
         - Circuit Breaker with exponential backoff
         - Probabilistic retry for "dead" accounts (10%)
         - Short skip for rate-limited accounts (no failure penalty)
+        - Full exclusion of quota-exhausted accounts (no probabilistic retry)
         - TTL-based model cache refresh
         - Exclusion of already-tried accounts in current failover loop
         
@@ -739,6 +789,13 @@ class AccountManager:
                 
                 # Skip accounts already tried in current failover loop
                 if exclude_accounts and account_id in exclude_accounts:
+                    continue
+                
+                # Skip accounts that cannot serve any request. A quota-exhausted
+                # account is out of the rotation entirely until its quarantine
+                # expires: no probabilistic retry, because there is nothing to
+                # discover before the quota resets.
+                if account.quota_exhausted_until > time.time():
                     continue
                 
                 # Skip accounts inside their rate-limit window. This is checked
@@ -813,8 +870,11 @@ class AccountManager:
                 self._dirty = True
             
             # A success proves the account is accepting requests again, so drop
-            # any leftover rate-limit window instead of waiting it out.
+            # any leftover rate-limit or quota window instead of waiting it out.
             account.rate_limited_until = 0.0
+            if account.quota_exhausted_until:
+                account.quota_exhausted_until = 0.0
+                logger.info(f"Account {account_id} is serving again; quota quarantine cleared")
             
             # Update stats
             account.stats.total_requests += 1
@@ -894,6 +954,22 @@ class AccountManager:
                 )
                 return
             
+            # Special case: the monthly quota is gone, so this account cannot
+            # serve anything until it resets. Take it out of the rotation for a
+            # long quarantine rather than leaving the Circuit Breaker to leak
+            # probabilistic retries into an account that can only answer 402.
+            if reason == "MONTHLY_REQUEST_COUNT":
+                account.quota_exhausted_until = time.time() + ACCOUNT_QUOTA_QUARANTINE
+                account.stats.total_requests += 1
+                account.stats.failed_requests += 1
+                self._dirty = True
+                logger.warning(
+                    f"Account {account_id} monthly quota exhausted: "
+                    f"status={status_code}, reason={reason}, "
+                    f"excluded from routing for {_format_duration(ACCOUNT_QUOTA_QUARANTINE)}"
+                )
+                return
+            
             # Update failure count (only for RECOVERABLE)
             if error_type == ErrorType.RECOVERABLE:
                 account.failures += 1
@@ -946,29 +1022,24 @@ class AccountManager:
                 parts.append(f"{label}: already tried in this request")
                 continue
 
-            rate_limit_remaining = account.rate_limited_until - now
-            if rate_limit_remaining > 0:
+            state, seconds = account_routing_state(account, now)
+
+            if state == "quota_exhausted":
                 parts.append(
-                    f"{label}: rate limited for {_format_duration(rate_limit_remaining)}"
+                    f"{label}: monthly quota exhausted, excluded for "
+                    f"{_format_duration(seconds)}"
                 )
-                continue
-
-            if account.failures > 0:
-                backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
-                effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
-                remaining = effective_timeout - (now - account.last_failure_time)
-                if remaining > 0:
-                    parts.append(
-                        f"{label}: cooling down for {_format_duration(remaining)} "
-                        f"after {account.failures} consecutive failure(s)"
-                    )
-                    continue
-
-            if account.auth_manager is None:
+            elif state == "rate_limited":
+                parts.append(f"{label}: rate limited for {_format_duration(seconds)}")
+            elif state == "cooling_down":
+                parts.append(
+                    f"{label}: cooling down for {_format_duration(seconds)} "
+                    f"after {account.failures} consecutive failure(s)"
+                )
+            elif state == "uninitialized":
                 parts.append(f"{label}: not initialized")
-                continue
-
-            parts.append(f"{label}: available")
+            else:
+                parts.append(f"{label}: available")
 
         return "; ".join(parts)
 

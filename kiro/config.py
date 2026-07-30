@@ -513,6 +513,15 @@ ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILIST
 # usable pool (observed live: 1m -> 2m -> 4m ... -> 1h within four minutes).
 ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", "10"))
 
+# Quarantine in seconds for an account whose monthly quota is exhausted
+# (402 MONTHLY_REQUEST_COUNT). Such an account cannot serve any request until
+# its quota resets, so it leaves the rotation entirely: no probabilistic retry
+# reaches it, unlike a Circuit Breaker cooldown. Persisted across restarts
+# because the state outlives the process. Default 6h re-checks a few times a
+# day, which is enough to notice a reset or a plan upgrade without spending
+# live requests on a known-empty account.
+ACCOUNT_QUOTA_QUARANTINE: int = int(os.getenv("ACCOUNT_QUOTA_QUARANTINE", "21600"))
+
 # ==================================================================================================
 # Account Cache Settings
 # ==================================================================================================

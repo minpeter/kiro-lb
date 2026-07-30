@@ -22,9 +22,18 @@ export type AccountUsage = {
   error?: string | null;
 };
 
+export type AccountRoutingState =
+  | "available"
+  | "rate_limited"
+  | "quota_exhausted"
+  | "cooling_down"
+  | "uninitialized";
+
 export type Account = {
   id: string;
   initialized: boolean;
+  routingState: AccountRoutingState;
+  eligibleInSeconds: number;
   requests: number;
   failures: number;
   cooldownSeconds: number;
