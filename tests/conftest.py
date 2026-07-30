@@ -95,11 +95,16 @@ def setup_test_environment(tmp_path_factory):
     # container paths, so the environment must be isolated too.
     original_environ = {
         key: os.environ.get(key)
-        for key in ("ACCOUNTS_CONFIG_FILE", "ACCOUNTS_STATE_FILE", "DASHBOARD_DATA_DIR")
+        for key in ("ACCOUNTS_CONFIG_FILE", "ACCOUNTS_STATE_FILE", "DASHBOARD_DATA_DIR", "PROXY_API_KEY")
     }
     os.environ["ACCOUNTS_CONFIG_FILE"] = str(creds_file)
     os.environ["ACCOUNTS_STATE_FILE"] = str(tmp_dir / "state.json")
     os.environ["DASHBOARD_DATA_DIR"] = str(tmp_dir / "dashboard")
+    # config.PROXY_API_KEY falls back to a built-in default, but the data-plane
+    # authenticator reads PROXY_API_KEY straight from the environment. Without a
+    # local .env (as in CI) the two disagree and every authenticated route
+    # answers 401, so pin the environment to whatever config actually resolved.
+    os.environ["PROXY_API_KEY"] = kiro.config.PROXY_API_KEY
 
     import main
     main.ACCOUNTS_CONFIG_FILE = str(creds_file)
