@@ -522,6 +522,11 @@ ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", 
 # live requests on a known-empty account.
 ACCOUNT_QUOTA_QUARANTINE: int = int(os.getenv("ACCOUNT_QUOTA_QUARANTINE", "21600"))
 
+# Number of recent per-account routing outcomes kept in memory for the
+# dashboard request-rate chart. At ~1 request/s this covers roughly 2 hours,
+# which is enough to see a rate-limit burst form and clear.
+ROUTING_EVENT_HISTORY: int = int(os.getenv("ROUTING_EVENT_HISTORY", "8000"))
+
 # ==================================================================================================
 # Account Cache Settings
 # ==================================================================================================

@@ -40,6 +40,19 @@ export type Account = {
   usage?: AccountUsage | null;
 };
 
+export type AccountRateSeries = {
+  account: string;
+  success: number[];
+  rateLimited: number[];
+  failure: number[];
+};
+
+export type RequestRate = {
+  bucketSeconds: number;
+  bucketStarts: number[];
+  accounts: AccountRateSeries[];
+};
+
 export type RequestLog = {
   created_at: number;
   route: string;

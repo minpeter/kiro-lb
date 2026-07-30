@@ -38,9 +38,10 @@ import json
 import os
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import httpx
 from loguru import logger
@@ -57,6 +58,7 @@ from kiro.config import (
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
     ACCOUNT_RATE_LIMIT_COOLDOWN,
     ACCOUNT_QUOTA_QUARANTINE,
+    ROUTING_EVENT_HISTORY,
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
@@ -236,6 +238,26 @@ class Account:
 
 
 @dataclass
+class RoutingEvent:
+    """
+    One routing outcome for one account, as the router learned it.
+
+    The dashboard request log cannot answer "how close is this account to its
+    rate limit": it records the client-facing result, so a 429 that failover
+    recovered from is filed as a 200, and it carries no account attribution.
+    These events are recorded per account at the moment of the upstream verdict.
+
+    Attributes:
+        at: Unix timestamp of the outcome
+        account_id: Internal account ID
+        outcome: "success", "rate_limited", "quota_exhausted", or "failure"
+    """
+    at: float
+    account_id: str
+    outcome: str
+
+
+@dataclass
 class ModelAccountList:
     """
     List of accounts for a specific model.
@@ -283,6 +305,9 @@ class AccountManager:
         self._dirty = False
         self._credentials_config: List[Dict] = []
         self._current_account_index: int = 0  # GLOBAL sticky index for all models
+        # Bounded ring of recent routing outcomes for the dashboard rate chart.
+        # Memory-only: this is observability, not state the router depends on.
+        self._routing_events: Deque[RoutingEvent] = deque(maxlen=ROUTING_EVENT_HISTORY)
     
     async def load_credentials(self) -> None:
         """
@@ -879,6 +904,7 @@ class AccountManager:
             # Update stats
             account.stats.total_requests += 1
             account.stats.successful_requests += 1
+            self._record_routing_event(account_id, "success")
             self._dirty = True
             
             # Dynamic learning: add model to mapping if successful
@@ -945,6 +971,7 @@ class AccountManager:
                 account.rate_limited_until = time.time() + ACCOUNT_RATE_LIMIT_COOLDOWN
                 account.stats.total_requests += 1
                 account.stats.failed_requests += 1
+                self._record_routing_event(account_id, "rate_limited")
                 self._dirty = True
                 logger.warning(
                     f"Account {account_id} rate limited: "
@@ -962,6 +989,7 @@ class AccountManager:
                 account.quota_exhausted_until = time.time() + ACCOUNT_QUOTA_QUARANTINE
                 account.stats.total_requests += 1
                 account.stats.failed_requests += 1
+                self._record_routing_event(account_id, "quota_exhausted")
                 self._dirty = True
                 logger.warning(
                     f"Account {account_id} monthly quota exhausted: "
@@ -988,12 +1016,72 @@ class AccountManager:
             # Update stats
             account.stats.total_requests += 1
             account.stats.failed_requests += 1
+            self._record_routing_event(account_id, "failure")
             self._dirty = True
             
             # GLOBAL STICKY: Do NOT change _current_account_index on failure
             # It only changes on success (GLOBAL sticky behavior)
             # Failover happens through exclude_accounts in get_next_account()
     
+    def _record_routing_event(self, account_id: str, outcome: str) -> None:
+        self._routing_events.append(RoutingEvent(at=time.time(), account_id=account_id, outcome=outcome))
+
+    def request_rate_series(self, window_seconds: int, bucket_seconds: int) -> Dict[str, object]:
+        """
+        Bucket recent routing outcomes into a per-account time series.
+
+        Answers the question the request log cannot: how many requests each
+        account absorbed per unit of time, and where its 429s landed. Buckets
+        are aligned to absolute time so successive polls return stable
+        boundaries instead of shifting under the caller.
+
+        Args:
+            window_seconds: How far back to report
+            bucket_seconds: Width of one bucket
+
+        Returns:
+            Dict with the bucket width, bucket start timestamps, and one entry
+            per account holding its per-bucket success/rate-limit/failure counts.
+        """
+        now = time.time()
+        latest_start = int(now // bucket_seconds) * bucket_seconds
+        bucket_count = max(1, window_seconds // bucket_seconds)
+        starts = [latest_start - offset * bucket_seconds for offset in range(bucket_count - 1, -1, -1)]
+        index_of = {start: position for position, start in enumerate(starts)}
+
+        counters: Dict[str, Dict[str, List[int]]] = {
+            account_id: {
+                "success": [0] * bucket_count,
+                "rateLimited": [0] * bucket_count,
+                "failure": [0] * bucket_count,
+            }
+            for account_id in self._accounts
+        }
+
+        for event in self._routing_events:
+            position = index_of.get(int(event.at // bucket_seconds) * bucket_seconds)
+            if position is None:
+                continue
+            buckets = counters.get(event.account_id)
+            if buckets is None:
+                continue
+            if event.outcome == "success":
+                key = "success"
+            elif event.outcome == "rate_limited":
+                key = "rateLimited"
+            else:
+                key = "failure"
+            buckets[key][position] += 1
+
+        return {
+            "bucketSeconds": bucket_seconds,
+            "bucketStarts": starts,
+            "accounts": [
+                {"account": account_label(account_id), **buckets}
+                for account_id, buckets in counters.items()
+            ],
+        }
+
     def describe_pool_state(self, exclude_accounts: Optional[set] = None) -> str:
         """
         Describe why each account is or is not usable right now.

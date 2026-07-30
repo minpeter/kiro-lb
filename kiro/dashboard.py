@@ -372,6 +372,14 @@ async def dashboard_accounts(request: Request) -> dict[str, list[dict[str, Any]]
     return {"accounts": [_account_view(account) for account in request.app.state.account_manager._accounts.values()]}
 
 
+@router.get("/api/dashboard/request-rate")
+async def dashboard_request_rate(request: Request, window: int = 900, bucket: int = 15) -> dict[str, Any]:
+    _require_auth(request)
+    bucket = max(5, min(bucket, 300))
+    window = max(bucket, min(window, 6 * 60 * 60))
+    return request.app.state.account_manager.request_rate_series(window, bucket)
+
+
 @router.get("/api/dashboard/models")
 async def dashboard_models(request: Request) -> dict[str, list[dict[str, str]]]:
     _require_auth(request)

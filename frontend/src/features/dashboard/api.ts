@@ -1,4 +1,4 @@
-import type { Account, ApiKey, Overview, RegistrationForm, RequestLogPage } from "./types";
+import type { Account, ApiKey, Overview, RegistrationForm, RequestLogPage, RequestRate } from "./types";
 
 export const AUTH_REQUIRED = "Dashboard authentication required";
 
@@ -32,6 +32,8 @@ export const dashboardApi = {
   accounts: () => request<{ accounts: Account[] }>("/api/dashboard/accounts"),
   requestLogs: (limit: number, offset: number) =>
     request<RequestLogPage>(`/api/dashboard/request-logs?limit=${limit}&offset=${offset}`),
+  requestRate: (windowSeconds: number, bucketSeconds: number) =>
+    request<RequestRate>(`/api/dashboard/request-rate?window=${windowSeconds}&bucket=${bucketSeconds}`),
   apiKeys: () => request<{ apiKeys: ApiKey[] }>("/api/dashboard/keys"),
   refreshUsage: () => request<{ accounts: unknown[] }>("/api/dashboard/accounts/refresh-usage", { method: "POST" }),
   createApiKey: (name: string) => request<{ apiKey: string }>("/api/dashboard/keys", { method: "POST", body: JSON.stringify({ name }) }),

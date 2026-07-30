@@ -46,6 +46,19 @@ export function CardTableSkeleton({ rows, columns }: { rows?: number; columns?: 
   );
 }
 
+export function ChartSkeleton({ rows = 2 }: { rows?: number }) {
+  return (
+    <div className="space-y-5" data-testid="chart-skeleton">
+      {Array.from({ length: rows }).map((_, row) => (
+        <div key={row} className="space-y-1.5">
+          <Skeleton className="h-3.5 w-40" />
+          <Skeleton className="h-24 w-full" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function DashboardSkeleton() {
   return (
     <div className="space-y-6" data-testid="dashboard-skeleton">

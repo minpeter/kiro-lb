@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { RefreshCw } from "lucide-react";
+import { Radio, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -47,11 +47,39 @@ export type AppHeaderProps = {
   overview?: Overview;
   isLoading: boolean;
   isMutating: boolean;
+  isLive: boolean;
+  lastUpdatedAt?: number;
+  onToggleLive: () => void;
   onRefresh: () => void;
   onSignOut: () => void;
 };
 
-export function AppHeader({ overview, isLoading, isMutating, onRefresh, onSignOut }: AppHeaderProps) {
+function LiveToggle({ isLive, lastUpdatedAt, onToggle }: { isLive: boolean; lastUpdatedAt?: number; onToggle: () => void }) {
+  const stamp = lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString() : "never";
+  return (
+    <Button
+      variant={isLive ? "secondary" : "outline"}
+      size="sm"
+      onClick={onToggle}
+      aria-pressed={isLive}
+      title={`Last updated ${stamp}`}
+    >
+      <Radio className={isLive ? "animate-pulse text-emerald-500" : ""} />
+      {isLive ? "Live" : "Paused"}
+    </Button>
+  );
+}
+
+export function AppHeader({
+  overview,
+  isLoading,
+  isMutating,
+  isLive,
+  lastUpdatedAt,
+  onToggleLive,
+  onRefresh,
+  onSignOut,
+}: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-10 border-b bg-background/90 backdrop-blur">
       <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-4">
@@ -62,7 +90,8 @@ export function AppHeader({ overview, isLoading, isMutating, onRefresh, onSignOu
             <HeaderFacts overview={overview} isLoading={isLoading} />
           </div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
+          <LiveToggle isLive={isLive} lastUpdatedAt={lastUpdatedAt} onToggle={onToggleLive} />
           <Button variant="outline" size="sm" disabled={isMutating} onClick={onRefresh}>
             <RefreshCw className={isMutating ? "animate-spin" : ""} />
             Refresh usage

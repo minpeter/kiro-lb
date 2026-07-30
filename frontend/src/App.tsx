@@ -11,6 +11,7 @@ import { ApiKeysPanel } from "@/features/dashboard/components/api-keys-panel";
 import { LoginCard } from "@/features/dashboard/components/login-card";
 import { RegisterAccountCard } from "@/features/dashboard/components/register-account-card";
 import { RequestLogTable } from "@/features/dashboard/components/request-log-table";
+import { RequestRateChart } from "@/features/dashboard/components/request-rate-chart";
 import { AppHeader, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
 
@@ -38,6 +39,9 @@ export default function App() {
         overview={overview}
         isLoading={isLoading}
         isMutating={isMutating}
+        isLive={dashboard.isLive}
+        lastUpdatedAt={dashboard.lastUpdatedAt}
+        onToggleLive={() => dashboard.setIsLive(!dashboard.isLive)}
         onRefresh={() => void runAction(dashboardApi.refreshUsage)}
         onSignOut={() => void dashboard.signOut()}
       />
@@ -81,6 +85,8 @@ export default function App() {
               </CardContent>
             </Card>
 
+            <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
+
             <RequestLogTable
               page={dashboard.logs}
               isLoading={isLoading || dashboard.isLogsLoading}
@@ -91,6 +97,7 @@ export default function App() {
 
           <TabsContent value="accounts" className="space-y-6">
             <AccountsPanel accounts={dashboard.accounts} isLoading={isLoading} />
+            <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
             <RegisterAccountCard onRegistered={dashboard.reload} />
           </TabsContent>
 
