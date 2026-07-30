@@ -16,7 +16,7 @@ import string
 import time
 import uuid
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -24,11 +24,17 @@ from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
 
+if TYPE_CHECKING:
+    from kiro.debug_logger import DebugLogger
+
 # Import debug_logger
+debug_logger: Optional["DebugLogger"] = None
 try:
-    from kiro.debug_logger import debug_logger
+    from kiro.debug_logger import debug_logger as _loaded_debug_logger
 except ImportError:
-    debug_logger = None
+    pass
+else:
+    debug_logger = _loaded_debug_logger
 
 
 # ==================================================================================================
@@ -576,6 +582,7 @@ async def handle_native_web_search(request, request_data, auth_manager, api_form
                 "error": {"type": "api_error", "message": "Web search failed. Please try again."},
             },
         )
+    assert tool_use_id is not None
 
     # Count tokens WITHOUT Claude correction (MCP API, not model)
     input_tokens = count_message_tokens(

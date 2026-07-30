@@ -294,7 +294,7 @@ class AwsEventStreamParser:
                     earliest_pos = pos
                     earliest_type = event_type
 
-            if earliest_pos == -1:
+            if earliest_pos == -1 or earliest_type is None:
                 break
 
             # Find JSON end

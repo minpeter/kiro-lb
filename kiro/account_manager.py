@@ -354,6 +354,7 @@ class AccountManager:
                 continue  # Skip path processing for refresh_token
 
             # Handle folder scanning for json/sqlite types
+            assert path is not None
             expanded_path = Path(path).expanduser()
             if expanded_path.is_dir():
                 logger.info(f"Scanning folder for credentials: {path}")
@@ -667,6 +668,10 @@ class AccountManager:
         account = self._accounts.get(account_id)
         if not account or not account.auth_manager:
             return
+
+        # These dependencies are initialized atomically with the auth manager.
+        assert account.model_cache is not None
+        assert account.model_resolver is not None
 
         # Check if using runtime endpoint (no dynamic model list available)
         if _is_runtime_endpoint(account.auth_manager):

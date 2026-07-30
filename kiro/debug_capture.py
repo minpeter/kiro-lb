@@ -167,7 +167,7 @@ class CaptureState:
 
         try:
             failure = redact_patterns(error_message)
-            validation = {"valid": True, "failure": None}
+            validation: dict[str, Any] = {"valid": True, "failure": None}
             if self.translated_sse:
                 from kiro.sse_validation import (
                     StreamProtocolError,

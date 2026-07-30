@@ -683,7 +683,7 @@ async def dashboard_request_rate(request: Request, window: int = 900, bucket: in
 async def dashboard_models(request: Request) -> dict[str, list[dict[str, str]]]:
     _require_auth(request)
     models = request.app.state.account_manager.get_all_available_models() or FALLBACK_MODELS
-    return {"models": [{"id": item.get("modelId", item) if isinstance(item, dict) else item} for item in models]}
+    return {"models": [{"id": item["modelId"] if isinstance(item, dict) else item} for item in models]}
 
 
 @router.get("/api/dashboard/request-logs")

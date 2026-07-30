@@ -6,7 +6,8 @@ Contains functions for handling validation errors and other exceptions
 in a JSON-serialization compatible format.
 """
 
-from typing import Any, Dict, List
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
@@ -14,7 +15,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 
-def sanitize_validation_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def sanitize_validation_errors(errors: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """
     Converts validation errors to JSON-serializable format.
 
@@ -27,9 +28,9 @@ def sanitize_validation_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, A
     Returns:
         List of errors with bytes converted to strings
     """
-    sanitized = []
+    sanitized: list[dict[str, Any]] = []
     for error in errors:
-        sanitized_error = {}
+        sanitized_error: dict[str, Any] = {}
         for key, value in error.items():
             if isinstance(value, bytes):
                 # Convert bytes to string

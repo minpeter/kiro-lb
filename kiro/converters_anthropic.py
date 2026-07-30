@@ -107,7 +107,7 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
     Returns:
         List of tool results in unified format
     """
-    tool_results = []
+    tool_results: List[Dict[str, Any]] = []
 
     if not isinstance(content, list):
         return tool_results
@@ -200,7 +200,7 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
     Returns:
         List of tool calls in unified format
     """
-    tool_calls = []
+    tool_calls: List[Dict[str, Any]] = []
 
     if not isinstance(content, list):
         return tool_calls

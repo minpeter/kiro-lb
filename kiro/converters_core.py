@@ -266,7 +266,7 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not schema:
         return {}
 
-    result = {}
+    result: Dict[str, Any] = {}
 
     for key, value in schema.items():
         # Skip empty required arrays
@@ -736,14 +736,14 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
 
     for msg in messages:
         # Check if this message has any tool content
-        has_tool_calls = bool(msg.tool_calls)
-        has_tool_results = bool(msg.tool_results)
+        tool_calls = msg.tool_calls
+        tool_results = msg.tool_results
 
-        if has_tool_calls or has_tool_results:
-            if has_tool_calls:
-                total_tool_calls_stripped += len(msg.tool_calls)
-            if has_tool_results:
-                total_tool_results_stripped += len(msg.tool_results)
+        if tool_calls or tool_results:
+            if tool_calls:
+                total_tool_calls_stripped += len(tool_calls)
+            if tool_results:
+                total_tool_results_stripped += len(tool_results)
 
             # Start with existing text content
             existing_content = extract_text_content(msg.content)
@@ -753,14 +753,14 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                 content_parts.append(existing_content)
 
             # Convert tool_calls to text (for assistant messages)
-            if has_tool_calls:
-                tool_text = tool_calls_to_text(msg.tool_calls)
+            if tool_calls:
+                tool_text = tool_calls_to_text(tool_calls)
                 if tool_text:
                     content_parts.append(tool_text)
 
             # Convert tool_results to text (for user messages)
-            if has_tool_results:
-                result_text = tool_results_to_text(msg.tool_results)
+            if tool_results:
+                result_text = tool_results_to_text(tool_results)
                 if result_text:
                     content_parts.append(result_text)
 
@@ -812,7 +812,7 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
     if not messages:
         return [], False
 
-    result = []
+    result: List[UnifiedMessage] = []
     converted_any_tool_results = False
 
     for msg in messages:
@@ -876,7 +876,7 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
     if not messages:
         return []
 
-    merged = []
+    merged: List[UnifiedMessage] = []
     # Statistics for summary logging
     merge_counts = {"user": 0, "assistant": 0}
     total_tool_calls_merged = 0
@@ -1127,7 +1127,7 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         if msg.role == "user":
             content = extract_text_content(msg.content)
 
-            user_input = {
+            user_input: Dict[str, Any] = {
                 "content": content,
                 "modelId": model_id,
                 "origin": "AI_EDITOR",
@@ -1165,7 +1165,7 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         elif msg.role == "assistant":
             content = extract_text_content(msg.content)
 
-            assistant_response = {"content": content}
+            assistant_response: Dict[str, Any] = {"content": content}
 
             # Process tool_calls
             tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
@@ -1310,7 +1310,7 @@ def build_kiro_payload(
             user_input_context["toolResults"] = tool_results
 
     # Build userInputMessage
-    user_input_message = {
+    user_input_message: Dict[str, Any] = {
         "content": current_content,
         "modelId": model_id,
         "origin": "AI_EDITOR",
@@ -1325,7 +1325,7 @@ def build_kiro_payload(
         user_input_message["userInputMessageContext"] = user_input_context
 
     # Assemble final payload
-    payload = {
+    payload: Dict[str, Any] = {
         "conversationState": {
             "chatTriggerType": "MANUAL",
             "conversationId": conversation_id,

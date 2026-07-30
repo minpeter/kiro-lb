@@ -9,7 +9,7 @@ and other common utilities.
 import hashlib
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from loguru import logger
 
@@ -81,7 +81,7 @@ def generate_completion_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex}"
 
 
-def generate_conversation_id(messages: List[Dict[str, Any]] = None) -> str:
+def generate_conversation_id(messages: Optional[List[Dict[str, Any]]] = None) -> str:
     """
     Generates a stable conversation ID based on message history.
 

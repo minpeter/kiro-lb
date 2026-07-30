@@ -365,11 +365,12 @@ FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 # - errors: save logs only for failed requests (4xx, 5xx)
 # - all: save logs for every request (overwrites on each request)
 _DEBUG_MODE_RAW: str = os.getenv("DEBUG_MODE", "").lower()
+DEBUG_MODE: str
 
 if _DEBUG_MODE_RAW in ("off", "errors", "all"):
-    DEBUG_MODE: str = _DEBUG_MODE_RAW
+    DEBUG_MODE = _DEBUG_MODE_RAW
 else:
-    DEBUG_MODE: str = "off"
+    DEBUG_MODE = "off"
 
 # Directory for debug log files
 DEBUG_DIR: str = os.getenv("DEBUG_DIR", "debug_logs")

@@ -32,8 +32,10 @@ from kiro.parsers import (
 
 if TYPE_CHECKING:
     from kiro.cache import ModelInfoCache
+    from kiro.debug_logger import DebugLogger
 
 # Import debug_logger for logging
+debug_logger: Optional["DebugLogger"]
 try:
     from kiro.debug_logger import debug_logger
 except ImportError:

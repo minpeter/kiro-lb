@@ -926,6 +926,7 @@ class KiroAuthManager:
         """
         async with self._lock:
             await self._refresh_token_request()
+            assert self._access_token is not None
             return self._access_token
 
     @property

@@ -42,8 +42,10 @@ from kiro.usage_tracking import record_token_usage
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
     from kiro.cache import ModelInfoCache
+    from kiro.debug_logger import DebugLogger
 
 # Import debug_logger for logging
+debug_logger: Optional["DebugLogger"]
 try:
     from kiro.debug_logger import debug_logger
 except ImportError:

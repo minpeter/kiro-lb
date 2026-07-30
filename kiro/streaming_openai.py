@@ -47,8 +47,10 @@ from kiro.utils import generate_completion_id
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
     from kiro.cache import ModelInfoCache
+    from kiro.debug_logger import DebugLogger
 
 # Import debug_logger for logging
+debug_logger: Optional["DebugLogger"]
 try:
     from kiro.debug_logger import debug_logger
 except ImportError:
@@ -382,7 +384,7 @@ async def stream_kiro_to_openai_internal(
             yield _openai_sse(tool_calls_chunk)
 
         # Final chunk with usage
-        final_chunk = {
+        final_chunk: dict[str, Any] = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created_time,
@@ -655,7 +657,7 @@ async def collect_stream_response(
             continue
 
     # Form final response
-    message = {"role": "assistant", "content": full_content}
+    message: dict[str, Any] = {"role": "assistant", "content": full_content}
     if full_reasoning_content:
         message["reasoning"] = full_reasoning_content
     if tool_calls:

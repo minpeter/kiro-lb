@@ -8,7 +8,7 @@ Reference: https://docs.anthropic.com/en/api/messages
 """
 
 import json
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -33,11 +33,17 @@ from kiro.tokenizer import estimate_request_tokens
 from kiro.usage_tracking import current_api_key_id
 from kiro.utils import generate_conversation_id
 
+if TYPE_CHECKING:
+    from kiro.debug_logger import DebugLogger
+
 # Import debug_logger
+debug_logger: Optional["DebugLogger"]
 try:
-    from kiro.debug_logger import debug_logger
+    import kiro.debug_logger as debug_logger_module
 except ImportError:
     debug_logger = None
+else:
+    debug_logger = debug_logger_module.debug_logger
 
 
 # --- Security scheme ---
@@ -201,7 +207,7 @@ async def messages(
 
         last_error_message = None
         last_error_status = None
-        tried_accounts = set()  # Track tried accounts in current failover loop
+        tried_accounts: set[str] = set()  # Track tried accounts in current failover loop
 
         for attempt in range(MAX_ATTEMPTS):
             # Get next available account (excluding already tried)
@@ -279,6 +285,7 @@ async def messages(
             # Prepare data for token counting
             messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
             tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+            system_for_tokenizer: str | list[dict[str, Any]] | None
             if isinstance(request_data.system, list):
                 system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
             else:
@@ -480,6 +487,7 @@ async def messages(
         if len(all_accounts) == 1:
             # Single account - return its original error
             # last_error_status and last_error_message are guaranteed to be set
+            assert last_error_status is not None
             return JSONResponse(
                 status_code=last_error_status,
                 content={"type": "error", "error": {"type": "api_error", "message": last_error_message}},
@@ -752,6 +760,7 @@ async def count_tokens_endpoint(
     tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
 
     # Handle system prompt (can be string or list of content blocks)
+    system_for_tokenizer: str | list[dict[str, Any]] | None
     if isinstance(request_data.system, list):
         system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
     else:

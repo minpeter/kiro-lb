@@ -319,7 +319,7 @@ class DebugLogger:
             error_message: Error message (optional)
         """
         if not self._is_enabled():
-            return
+            return None
 
         capture = self._current_capture()
         capture_path: Optional[Path] = None
@@ -357,7 +357,7 @@ class DebugLogger:
         )
         if not has_capture_data and not has_legacy_data:
             self._clear_buffers()
-            return
+            return None
 
         try:
             self.debug_dir.mkdir(parents=True, exist_ok=True)

@@ -14,7 +14,7 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
-from typing import Optional
+from typing import Optional, TypedDict
 
 import httpx
 from fastapi import HTTPException
@@ -24,6 +24,14 @@ from kiro.auth import KiroAuthManager
 from kiro.config import BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, MAX_RETRIES, STREAMING_READ_TIMEOUT
 from kiro.network_errors import NetworkErrorInfo, classify_network_error, get_short_error_message
 from kiro.utils import get_kiro_headers
+
+
+class RequestKwargs(TypedDict, total=False):
+    """Keyword arguments shared by httpx request construction methods."""
+
+    headers: dict
+    content: bytes
+    params: dict
 
 
 class KiroHttpClient:
@@ -195,7 +203,7 @@ class KiroHttpClient:
                 headers = get_kiro_headers(self.auth_manager, token)
 
                 # Build request kwargs based on parameters
-                request_kwargs = {"headers": headers}
+                request_kwargs: RequestKwargs = {"headers": headers}
 
                 if json_data is not None:
                     request_kwargs["content"] = json.dumps(json_data).encode()

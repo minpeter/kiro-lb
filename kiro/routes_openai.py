@@ -10,6 +10,7 @@ Contains all API endpoints:
 
 import json
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -34,11 +35,17 @@ from kiro.streaming_openai import collect_stream_response, stream_with_first_tok
 from kiro.usage_tracking import current_api_key_id
 from kiro.utils import generate_conversation_id
 
+if TYPE_CHECKING:
+    from kiro.debug_logger import DebugLogger
+
 # Import debug_logger
+debug_logger: Optional["DebugLogger"]
 try:
-    from kiro.debug_logger import debug_logger
+    import kiro.debug_logger as debug_logger_module
 except ImportError:
     debug_logger = None
+else:
+    debug_logger = debug_logger_module.debug_logger
 
 
 # --- Security scheme ---
@@ -205,7 +212,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
         last_error_message = None
         last_error_status = None
-        tried_accounts = set()  # Track tried accounts in current failover loop
+        tried_accounts: set[str] = set()  # Track tried accounts in current failover loop
 
         for attempt in range(MAX_ATTEMPTS):
             # Get next available account (excluding already tried)
@@ -345,8 +352,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
                     else:
                         # Non-streaming mode
+                        client = http_client.client
+                        assert client is not None
                         openai_response = await collect_stream_response(
-                            http_client.client,
+                            client,
                             response,
                             request_data.model,
                             model_cache,
@@ -471,6 +480,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         if len(all_accounts) == 1:
             # Single account - return its original error
             # last_error_status and last_error_message are guaranteed to be set
+            assert last_error_status is not None
             raise HTTPException(status_code=last_error_status, detail=last_error_message)
         else:
             # Multiple accounts - every account was tried and failed
@@ -640,8 +650,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
         else:
             # Non-streaming mode - collect entire response
+            client = http_client.client
+            assert client is not None
             openai_response = await collect_stream_response(
-                http_client.client,
+                client,
                 response,
                 request_data.model,
                 model_cache,

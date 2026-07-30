@@ -123,15 +123,20 @@ class InterceptHandler(logging.Handler):
             return
 
         # Get the corresponding loguru level
+        level: str | int
         try:
             level = logger.level(record.levelname).name
         except ValueError:
             level = record.levelno
 
         # Find the caller frame for correct source display
-        frame, depth = logging.currentframe(), 2
+        frame = logging.currentframe()
+        assert frame is not None
+        depth = 2
         while frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back
+            parent_frame = frame.f_back
+            assert parent_frame is not None
+            frame = parent_frame
             depth += 1
 
         logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
@@ -580,7 +585,10 @@ app.add_middleware(DebugLoggerMiddleware)
 
 
 # --- Validation Error Handler Registration ---
-app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(
+    RequestValidationError,
+    validation_exception_handler,  # type: ignore[arg-type]  # Starlette types handlers invariantly as Exception.
+)
 
 
 # --- Route Registration ---
