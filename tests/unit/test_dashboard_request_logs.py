@@ -24,9 +24,7 @@ def test_reports_total_and_window(dashboard):
 
     with dashboard._db() as conn:
         total = conn.execute("SELECT COUNT(*) FROM request_logs").fetchone()[0]
-        page = conn.execute(
-            "SELECT latency_ms FROM request_logs ORDER BY id DESC LIMIT ? OFFSET ?", (10, 0)
-        ).fetchall()
+        page = conn.execute("SELECT latency_ms FROM request_logs ORDER BY id DESC LIMIT ? OFFSET ?", (10, 0)).fetchall()
 
     assert total == 30
     # Newest first, so the highest seeded latency leads the first page.
@@ -37,9 +35,7 @@ def test_offset_pages_do_not_overlap(dashboard):
     _seed(dashboard, 12)
 
     with dashboard._db() as conn:
-        first = conn.execute(
-            "SELECT latency_ms FROM request_logs ORDER BY id DESC LIMIT ? OFFSET ?", (5, 0)
-        ).fetchall()
+        first = conn.execute("SELECT latency_ms FROM request_logs ORDER BY id DESC LIMIT ? OFFSET ?", (5, 0)).fetchall()
         second = conn.execute(
             "SELECT latency_ms FROM request_logs ORDER BY id DESC LIMIT ? OFFSET ?", (5, 5)
         ).fetchall()
@@ -95,10 +91,12 @@ def test_prune_is_safe_on_an_empty_table(dashboard):
 
 def test_rate_observations_round_trip(dashboard):
     now = time.time()
-    dashboard.record_rate_observations([
-        ("/creds/a.json", now - 10, 12, 0, "success"),
-        ("/creds/a.json", now - 5, 13, 1, "rate_limited"),
-    ])
+    dashboard.record_rate_observations(
+        [
+            ("/creds/a.json", now - 10, 12, 0, "success"),
+            ("/creds/a.json", now - 5, 13, 1, "rate_limited"),
+        ]
+    )
 
     rows = dashboard.load_rate_observations(now - 60)
 
@@ -110,10 +108,12 @@ def test_rate_observations_round_trip(dashboard):
 
 def test_rate_observations_outside_the_window_are_not_loaded(dashboard):
     now = time.time()
-    dashboard.record_rate_observations([
-        ("/creds/a.json", now - 100000, 40, 1, "rate_limited"),
-        ("/creds/a.json", now - 5, 13, 1, "rate_limited"),
-    ])
+    dashboard.record_rate_observations(
+        [
+            ("/creds/a.json", now - 100000, 40, 1, "rate_limited"),
+            ("/creds/a.json", now - 5, 13, 1, "rate_limited"),
+        ]
+    )
 
     rows = dashboard.load_rate_observations(now - 3600)
 
@@ -128,11 +128,13 @@ def test_recording_no_rate_observations_is_a_noop(dashboard):
 
 def test_prune_rate_observations_respects_retention(dashboard, monkeypatch):
     now = time.time()
-    dashboard.record_rate_observations([
-        ("/creds/a.json", now - 30 * 86400, 40, 1, "rate_limited"),
-        ("/creds/a.json", now - 2 * 86400, 20, 1, "rate_limited"),
-        ("/creds/a.json", now, 10, 0, "success"),
-    ])
+    dashboard.record_rate_observations(
+        [
+            ("/creds/a.json", now - 30 * 86400, 40, 1, "rate_limited"),
+            ("/creds/a.json", now - 2 * 86400, 20, 1, "rate_limited"),
+            ("/creds/a.json", now, 10, 0, "success"),
+        ]
+    )
 
     monkeypatch.setattr(dashboard, "RATE_OBSERVATION_RETENTION_DAYS", 7)
     removed = dashboard.prune_rate_observations()

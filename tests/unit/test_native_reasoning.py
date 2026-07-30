@@ -55,10 +55,7 @@ async def test_native_signature_survives_stream_translation():
                 }
             ]
 
-    events = [
-        event
-        async for event in _process_chunk(SignatureParser(), b"signature-frame")
-    ]
+    events = [event async for event in _process_chunk(SignatureParser(), b"signature-frame")]
 
     assert len(events) == 1
     assert events[0].type == "thinking_signature"

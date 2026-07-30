@@ -17,7 +17,6 @@ from kiro.sse_validation import (
     validate_openai_records,
 )
 
-
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
     re.compile(r"\b(?:klb|apik)_[A-Za-z0-9_-]{8,}\b"),
@@ -49,8 +48,7 @@ def replay_to_file(
 ) -> None:
     """Write the sanitized translated stream and then validate its lifecycle."""
     payload = b"".join(
-        base64.b64decode(record.get("payload_base64", ""))
-        for record in replay.get("translated_sse", [])
+        base64.b64decode(record.get("payload_base64", "")) for record in replay.get("translated_sse", [])
     )
     _write_private_atomic(output, payload)
     validate_replay(replay, protocol)
@@ -89,9 +87,7 @@ def _decode_capture_payloads(replay: dict[str, Any]) -> list[str]:
                     validate=True,
                 ).decode("utf-8")
             except (ValueError, UnicodeDecodeError) as exc:
-                raise ValueError(
-                    "Capture contains invalid base64 payload"
-                ) from exc
+                raise ValueError("Capture contains invalid base64 payload") from exc
             decoded_payloads.append(decoded)
     return decoded_payloads
 
@@ -101,16 +97,11 @@ def _contains_credential(
     decoded_payloads: list[str],
 ) -> bool:
     values = [json.dumps(replay, ensure_ascii=False), *decoded_payloads]
-    return any(
-        pattern.search(value)
-        for value in values
-        for pattern in _SECRET_PATTERNS
-    ) or any(
-        redact_patterns(value) != value
-        for value in values
-    ) or _contains_unredacted_sensitive_field(replay) or any(
-        _text_contains_unredacted_sensitive_field(value)
-        for value in decoded_payloads
+    return (
+        any(pattern.search(value) for value in values for pattern in _SECRET_PATTERNS)
+        or any(redact_patterns(value) != value for value in values)
+        or _contains_unredacted_sensitive_field(replay)
+        or any(_text_contains_unredacted_sensitive_field(value) for value in decoded_payloads)
     )
 
 
@@ -133,11 +124,7 @@ def _contains_unredacted_sensitive_field(value: Any) -> bool:
 
 def _text_contains_unredacted_sensitive_field(value: str) -> bool:
     candidates = [value]
-    candidates.extend(
-        line.removeprefix("data:").strip()
-        for line in value.splitlines()
-        if line.startswith("data:")
-    )
+    candidates.extend(line.removeprefix("data:").strip() for line in value.splitlines() if line.startswith("data:"))
     json_start = value.find("{")
     if json_start > 0:
         candidates.append(value[json_start:])
@@ -146,9 +133,7 @@ def _text_contains_unredacted_sensitive_field(value: str) -> bool:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, (dict, list)) and (
-            _contains_unredacted_sensitive_field(parsed)
-        ):
+        if isinstance(parsed, (dict, list)) and (_contains_unredacted_sensitive_field(parsed)):
             return True
     return False
 

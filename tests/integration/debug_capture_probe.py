@@ -31,12 +31,11 @@ async def _run_probe(output: Path) -> None:
 
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(DebugLoggerMiddleware)
+
     async def invalid_stream():
         begin_anthropic_stream()
         try:
-            debug_logger.log_kiro_request_body(
-                b'{"conversationState":{"currentMessage":{"content":"private"}}}'
-            )
+            debug_logger.log_kiro_request_body(b'{"conversationState":{"currentMessage":{"content":"private"}}}')
             debug_logger.log_raw_chunk(b'{"content":"answer"}')
             yield format_sse_event(
                 "message_start",
@@ -73,9 +72,7 @@ async def _run_probe(output: Path) -> None:
     listener.bind(("127.0.0.1", 0))
     listener.listen()
     port = listener.getsockname()[1]
-    server = uvicorn.Server(
-        uvicorn.Config(app, log_level="error", lifespan="on")
-    )
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="on"))
     server_task = asyncio.create_task(server.serve(sockets=[listener]))
     await asyncio.wait_for(started.wait(), timeout=5)
 
@@ -93,9 +90,7 @@ async def _run_probe(output: Path) -> None:
                 json={
                     "model": "claude-opus-5",
                     "max_tokens": 128,
-                    "messages": [
-                        {"role": "user", "content": "original private prompt"}
-                    ],
+                    "messages": [{"role": "user", "content": "original private prompt"}],
                 },
             ) as response:
                 http_status = response.status_code
@@ -109,11 +104,7 @@ async def _run_probe(output: Path) -> None:
         listener.close()
 
     failures_dir = debug_logger.debug_dir / "failures"
-    captures = sorted(
-        path
-        for path in failures_dir.iterdir()
-        if path.is_dir() and not path.name.startswith(".tmp-")
-    )
+    captures = sorted(path for path in failures_dir.iterdir() if path.is_dir() and not path.name.startswith(".tmp-"))
     replay_exit_code = 0
     if captures:
         try:
@@ -122,13 +113,18 @@ async def _run_probe(output: Path) -> None:
             failure = str(exc)
             replay_exit_code = 3
 
-    output.write_text(json.dumps({
-        "http_status": http_status,
-        "failure": failure,
-        "capture_count": len(captures),
-        "replay_exit_code": replay_exit_code,
-        "capture_dir": str(captures[-1]) if captures else None,
-    }, indent=2))
+    output.write_text(
+        json.dumps(
+            {
+                "http_status": http_status,
+                "failure": failure,
+                "capture_count": len(captures),
+                "replay_exit_code": replay_exit_code,
+                "capture_dir": str(captures[-1]) if captures else None,
+            },
+            indent=2,
+        )
+    )
 
 
 def main() -> None:

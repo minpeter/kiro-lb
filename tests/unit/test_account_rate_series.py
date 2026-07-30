@@ -225,12 +225,14 @@ async def test_a_rejection_below_served_traffic_does_not_define_the_guide(manage
 @pytest.mark.asyncio
 async def test_the_tightest_informative_rejection_wins(manager):
     now = time.time()
-    manager.load_rate_observations([
-        ("/creds/account0.json", now - 500, 18, 0, "success"),
-        ("/creds/account0.json", now - 400, 40, 1, "rate_limited"),
-        # A lower rejection still above proven-safe traffic: the tighter bound.
-        ("/creds/account0.json", now - 300, 25, 1, "rate_limited"),
-    ])
+    manager.load_rate_observations(
+        [
+            ("/creds/account0.json", now - 500, 18, 0, "success"),
+            ("/creds/account0.json", now - 400, 40, 1, "rate_limited"),
+            # A lower rejection still above proven-safe traffic: the tighter bound.
+            ("/creds/account0.json", now - 300, 25, 1, "rate_limited"),
+        ]
+    )
 
     estimate = manager.estimate_rate_limit("/creds/account0.json")
 
@@ -335,7 +337,6 @@ async def test_observations_survive_a_restart(manager, tmp_path):
     assert after["limitRpm"] == before["limitRpm"]
     assert after["safeRpm"] == before["safeRpm"]
     assert after["limitPrecisionRpm"] == before["limitPrecisionRpm"]
-
 
 
 def test_rate_window_is_reported_so_callers_can_label_the_unit(manager):

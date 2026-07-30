@@ -4,27 +4,28 @@ import json
 import re
 from typing import Any, Optional
 
-
-_SENSITIVE_KEYS = frozenset({
-    "authorization",
-    "proxyauthorization",
-    "xapikey",
-    "apikey",
-    "accesstoken",
-    "refreshtoken",
-    "idtoken",
-    "clientsecret",
-    "cookie",
-    "setcookie",
-    "signature",
-    "thinkingsignature",
-    "profilearn",
-    "password",
-    "token",
-    "secret",
-    "credential",
-    "privatekey",
-})
+_SENSITIVE_KEYS = frozenset(
+    {
+        "authorization",
+        "proxyauthorization",
+        "xapikey",
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "clientsecret",
+        "cookie",
+        "setcookie",
+        "signature",
+        "thinkingsignature",
+        "profilearn",
+        "password",
+        "token",
+        "secret",
+        "credential",
+        "privatekey",
+    }
+)
 _SENSITIVE_KEY_SUFFIXES = (
     "token",
     "secret",
@@ -38,17 +39,19 @@ _SENSITIVE_KEY_SUFFIXES = (
     "sessionid",
     "sessionkey",
 )
-_STRUCTURAL_TEXT_KEYS = frozenset({
-    "type",
-    "role",
-    "model",
-    "name",
-    "id",
-    "tooluseid",
-    "toolcallid",
-    "stopreason",
-    "finishreason",
-})
+_STRUCTURAL_TEXT_KEYS = frozenset(
+    {
+        "type",
+        "role",
+        "model",
+        "name",
+        "id",
+        "tooluseid",
+        "toolcallid",
+        "stopreason",
+        "finishreason",
+    }
+)
 _TOKEN_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
     re.compile(r"\bklb_[A-Za-z0-9_-]{8,}\b"),
@@ -59,9 +62,7 @@ _TOKEN_PATTERNS = (
         r"-----END [A-Z ]*PRIVATE KEY-----",
         re.DOTALL,
     ),
-    re.compile(
-        r"(?i)([?&](?:key|token|signature|credential)=)[^&#\s]+"
-    ),
+    re.compile(r"(?i)([?&](?:key|token|signature|credential)=)[^&#\s]+"),
 )
 
 
@@ -77,9 +78,7 @@ def sensitive_key_kind(key: Optional[str]) -> Optional[str]:
     normalized = re.sub(r"[^a-z0-9]", "", (key or "").lower())
     if normalized.endswith("signature"):
         return "signature"
-    if normalized in _SENSITIVE_KEYS or normalized.endswith(
-        _SENSITIVE_KEY_SUFFIXES
-    ):
+    if normalized in _SENSITIVE_KEYS or normalized.endswith(_SENSITIVE_KEY_SUFFIXES):
         return "credential"
     return None
 
@@ -108,11 +107,7 @@ def sanitize_value(
     if isinstance(value, list):
         return [sanitize_value(item, capture_content, key) for item in value]
     if isinstance(value, str):
-        if (
-            normalized_key == "data"
-            and len(value) >= 256
-            and re.fullmatch(r"[A-Za-z0-9+/=_-]+", value)
-        ):
+        if normalized_key == "data" and len(value) >= 256 and re.fullmatch(r"[A-Za-z0-9+/=_-]+", value):
             return "[REDACTED_BINARY]"
         try:
             encoded_json = json.loads(value)
@@ -137,18 +132,17 @@ def sanitize_bytes(data: bytes, capture_content: bool) -> bytes:
     try:
         decoded = data.decode("utf-8")
     except UnicodeDecodeError:
-        return json.dumps({
-            "$redacted_bytes": True,
-            "bytes": len(data),
-        }).encode()
+        return json.dumps(
+            {
+                "$redacted_bytes": True,
+                "bytes": len(data),
+            }
+        ).encode()
     try:
         parsed = json.loads(decoded)
     except json.JSONDecodeError:
         json_start = decoded.find("{")
-        if (
-            json_start > 0
-            and not decoded.lstrip().startswith(("data:", "event:"))
-        ):
+        if json_start > 0 and not decoded.lstrip().startswith(("data:", "event:")):
             try:
                 parsed = json.loads(decoded[json_start:])
             except json.JSONDecodeError:

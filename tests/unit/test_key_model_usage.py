@@ -184,9 +184,7 @@ async def test_openai_stream_records_usage_for_the_calling_key(dashboard, stream
     current_api_key_id.set(ROOT_KEY_ID)
     with patch("kiro.streaming_openai.parse_kiro_stream", upstream):
         with patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=[]):
-            async for _chunk in stream_kiro_to_openai(
-                client, response, "claude-sonnet-4", cache, auth
-            ):
+            async for _chunk in stream_kiro_to_openai(client, response, "claude-sonnet-4", cache, auth):
                 pass
 
     dashboard.flush_key_model_usage()
@@ -210,9 +208,7 @@ async def test_anthropic_stream_records_usage_for_the_calling_key(dashboard, str
     current_api_key_id.set(ROOT_KEY_ID)
     with patch("kiro.streaming_anthropic.parse_kiro_stream", upstream):
         with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
-            async for _chunk in stream_kiro_to_anthropic(
-                response, "claude-opus-5", cache, auth
-            ):
+            async for _chunk in stream_kiro_to_anthropic(response, "claude-opus-5", cache, auth):
                 pass
 
     dashboard.flush_key_model_usage()

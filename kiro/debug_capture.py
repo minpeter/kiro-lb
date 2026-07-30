@@ -42,20 +42,22 @@ class CaptureLogBuffer(io.StringIO):
         )
         self._state.stored_bytes += len(stored)
         if stored:
-            super().write(
-                stored.decode("utf-8", errors="replace")
-            )
-        metadata = self._state.artifact_meta.setdefault("app_logs", {
-            "original_bytes": 0,
-            "stored_bytes": 0,
-            "truncated": False,
-            "omitted_bytes": 0,
-        })
+            super().write(stored.decode("utf-8", errors="replace"))
+        metadata = self._state.artifact_meta.setdefault(
+            "app_logs",
+            {
+                "original_bytes": 0,
+                "stored_bytes": 0,
+                "truncated": False,
+                "omitted_bytes": 0,
+            },
+        )
         metadata["original_bytes"] += len(encoded)
         metadata["stored_bytes"] += len(stored)
         metadata["truncated"] = metadata["truncated"] or truncated
         metadata["omitted_bytes"] += omitted
         return len(message)
+
 
 @dataclass
 class CaptureState:
@@ -133,12 +135,15 @@ class CaptureState:
         self.sequence += 1
         if record is not None:
             getattr(self, target).append(record)
-        metadata = self.artifact_meta.setdefault(target, {
-            "original_bytes": 0,
-            "stored_bytes": 0,
-            "truncated": False,
-            "omitted_bytes": 0,
-        })
+        metadata = self.artifact_meta.setdefault(
+            target,
+            {
+                "original_bytes": 0,
+                "stored_bytes": 0,
+                "truncated": False,
+                "omitted_bytes": 0,
+            },
+        )
         metadata["original_bytes"] += len(data)
         metadata["stored_bytes"] += len(stored)
         metadata["truncated"] = metadata["truncated"] or truncated
@@ -255,9 +260,7 @@ def _translated_protocol(records: list[dict[str, Any]]) -> str:
 
 def _jsonl_bytes(records: list[dict[str, Any]]) -> bytes:
     return b"".join(
-        json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode()
-        + b"\n"
-        for record in records
+        json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode() + b"\n" for record in records
     )
 
 
@@ -283,11 +286,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _prune_completed(failures_dir: Path, retention: int) -> None:
-    completed = sorted(
-        path
-        for path in failures_dir.iterdir()
-        if path.is_dir() and not path.name.startswith(".tmp-")
-    )
+    completed = sorted(path for path in failures_dir.iterdir() if path.is_dir() and not path.name.startswith(".tmp-"))
     for stale in completed[:-retention]:
         shutil.rmtree(stale)
 

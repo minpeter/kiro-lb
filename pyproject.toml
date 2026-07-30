@@ -1,0 +1,26 @@
+# Tooling configuration only; the project is not packaged. Runtime deps stay in
+# requirements.txt, quality-gate deps in requirements-dev.txt.
+
+[tool.ruff]
+# CI and the Docker image run 3.10, which is older than a typical dev machine.
+target-version = "py310"
+line-length = 120
+extend-exclude = ["kiro/static", "frontend"]
+
+[tool.ruff.lint]
+# E501 is deliberately absent: `ruff format` owns line length, and enforcing it
+# here too only flags lines the formatter cannot split (long URLs, embedded
+# payload literals).
+select = ["E4", "E7", "E9", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-export surface: the package exposes what it imports.
+"kiro/__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["kiro", "main.py"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true

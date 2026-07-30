@@ -10,9 +10,9 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
+from kiro.sse_validation import AnthropicSSEValidator
 from kiro.streaming_anthropic import stream_kiro_to_anthropic
 from kiro.streaming_openai import stream_kiro_to_openai_internal
-from kiro.sse_validation import AnthropicSSEValidator
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -141,9 +141,7 @@ async def _run() -> dict[str, bool]:
     listener.bind(("127.0.0.1", 0))
     listener.listen()
     port = listener.getsockname()[1]
-    server = uvicorn.Server(
-        uvicorn.Config(app, log_level="error", lifespan="on")
-    )
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="on"))
     server_task = asyncio.create_task(server.serve(sockets=[listener]))
     await asyncio.wait_for(started.wait(), timeout=5)
 
@@ -152,9 +150,7 @@ async def _run() -> dict[str, bool]:
         async with httpx.AsyncClient(timeout=10) as client:
             for protocol in ("anthropic", "openai"):
                 for scenario in ("unicode", "tools"):
-                    response = await client.get(
-                        f"http://127.0.0.1:{port}/{protocol}/{scenario}"
-                    )
+                    response = await client.get(f"http://127.0.0.1:{port}/{protocol}/{scenario}")
                     results[f"{protocol}_{scenario}"] = {
                         "status": response.status_code,
                         "body": response.text,
@@ -170,9 +166,7 @@ async def _run() -> dict[str, bool]:
                 except httpx.RemoteProtocolError:
                     malformed_clean = False
                 results[f"{protocol}_malformed_clean"] = malformed_clean
-            chronology = await client.get(
-                f"http://127.0.0.1:{port}/anthropic/chronology"
-            )
+            chronology = await client.get(f"http://127.0.0.1:{port}/anthropic/chronology")
             results["anthropic_chronology"] = {
                 "status": chronology.status_code,
                 "body": chronology.text,
@@ -184,15 +178,12 @@ async def _run() -> dict[str, bool]:
             ]
 
             async def fetch_marker(protocol: str, marker: str):
-                response = await client.get(
-                    f"http://127.0.0.1:{port}/{protocol}/{marker}"
-                )
+                response = await client.get(f"http://127.0.0.1:{port}/{protocol}/{marker}")
                 return protocol, marker, response.status_code, response.text
 
-            results["parallel"] = await asyncio.gather(*(
-                fetch_marker(protocol, marker)
-                for protocol, marker in parallel_requests
-            ))
+            results["parallel"] = await asyncio.gather(
+                *(fetch_marker(protocol, marker) for protocol, marker in parallel_requests)
+            )
     finally:
         server.should_exit = True
         await asyncio.wait_for(server_task, timeout=5)
@@ -227,13 +218,15 @@ def _marker_chunks(marker: str) -> list[bytes]:
     position = 0
     width = 1
     while position < len(payload):
-        chunks.append(payload[position:position + width])
+        chunks.append(payload[position : position + width])
         position += width
         width = 1 if width == 4 else width + 1
-    chunks.extend([
-        b'{"stopReason":"END_TURN"}',
-        b'{"contextUsagePercentage":1}',
-    ])
+    chunks.extend(
+        [
+            b'{"stopReason":"END_TURN"}',
+            b'{"contextUsagePercentage":1}',
+        ]
+    )
     return chunks
 
 
@@ -248,52 +241,40 @@ def _summarize(results: dict[str, object]) -> dict[str, bool]:
     assert isinstance(openai_tools, dict)
     chronology = results["anthropic_chronology"]
     assert isinstance(chronology, dict)
-    chronology_valid, chronology_tools, chronology_signatures = (
-        _validate_chronology(str(chronology["body"]))
-    )
+    chronology_valid, chronology_tools, chronology_signatures = _validate_chronology(str(chronology["body"]))
     summary = {
         "anthropic_unicode": "你好🌍" in str(anthropic_unicode["body"]),
         "openai_unicode": "你好🌍" in str(openai_unicode["body"]),
-        "anthropic_tool_ids": all(
-            tool_id in str(anthropic_tools["body"])
-            for tool_id in ("toolu_A", "toolu_B")
-        ),
-        "openai_tool_ids": all(
-            tool_id in str(openai_tools["body"])
-            for tool_id in ("toolu_A", "toolu_B")
-        ),
-        "anthropic_malformed_clean": bool(
-            results["anthropic_malformed_clean"]
-        ),
+        "anthropic_tool_ids": all(tool_id in str(anthropic_tools["body"]) for tool_id in ("toolu_A", "toolu_B")),
+        "openai_tool_ids": all(tool_id in str(openai_tools["body"]) for tool_id in ("toolu_A", "toolu_B")),
+        "anthropic_malformed_clean": bool(results["anthropic_malformed_clean"]),
         "openai_malformed_clean": bool(results["openai_malformed_clean"]),
         "anthropic_chronology": chronology_valid,
         "anthropic_chronology_tools": chronology_tools,
         "anthropic_chronology_signatures": chronology_signatures,
         "parallel_isolated": _parallel_isolated(results["parallel"]),
     }
-    assert all([
-        summary["anthropic_unicode"],
-        summary["openai_unicode"],
-        summary["anthropic_tool_ids"],
-        summary["openai_tool_ids"],
-        not summary["anthropic_malformed_clean"],
-        not summary["openai_malformed_clean"],
-        summary["anthropic_chronology"],
-        summary["anthropic_chronology_tools"],
-        summary["anthropic_chronology_signatures"],
-        summary["parallel_isolated"],
-    ])
+    assert all(
+        [
+            summary["anthropic_unicode"],
+            summary["openai_unicode"],
+            summary["anthropic_tool_ids"],
+            summary["openai_tool_ids"],
+            not summary["anthropic_malformed_clean"],
+            not summary["openai_malformed_clean"],
+            summary["anthropic_chronology"],
+            summary["anthropic_chronology_tools"],
+            summary["anthropic_chronology_signatures"],
+            summary["parallel_isolated"],
+        ]
+    )
     return summary
 
 
 def _parallel_isolated(value: object) -> bool:
     assert isinstance(value, list)
     identifiers = {"anthropic": [], "openai": []}
-    all_markers = {
-        f"{protocol}-marker-{index:02d}"
-        for protocol in ("anthropic", "openai")
-        for index in range(16)
-    }
+    all_markers = {f"{protocol}-marker-{index:02d}" for protocol in ("anthropic", "openai") for index in range(16)}
     for item in value:
         protocol, marker, status, body = item
         if status != 200 or body.count(marker) != 1:
@@ -305,18 +286,13 @@ def _parallel_isolated(value: object) -> bool:
             if "chatcmpl-" in body:
                 return False
         else:
-            matches = set(
-                re.findall(r'"id":\s*"(chatcmpl-[^"]+)"', body)
-            )
+            matches = set(re.findall(r'"id":\s*"(chatcmpl-[^"]+)"', body))
             if re.search(r'"id":\s*"msg_', body):
                 return False
         if len(matches) != 1:
             return False
         identifiers[protocol].append(matches.pop())
-    return all(
-        len(protocol_ids) == 16 and len(set(protocol_ids)) == 16
-        for protocol_ids in identifiers.values()
-    )
+    return all(len(protocol_ids) == 16 and len(set(protocol_ids)) == 16 for protocol_ids in identifiers.values())
 
 
 def _validate_chronology(body: str) -> tuple[bool, bool, bool]:
@@ -340,11 +316,10 @@ def _validate_chronology(body: str) -> tuple[bool, bool, bool]:
             signatures.append((data["index"], data["delta"]["signature"]))
     validator.finish()
     types = [block["type"] for block in starts]
-    tool_ids = [
-        block["id"] for block in starts if block["type"] == "tool_use"
-    ]
+    tool_ids = [block["id"] for block in starts if block["type"] == "tool_use"]
     return (
-        types == [
+        types
+        == [
             "thinking",
             "text",
             "tool_use",

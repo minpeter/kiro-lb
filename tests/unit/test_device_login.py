@@ -39,7 +39,13 @@ APPROVED = {
     "identityProvider": "Google",
 }
 
-PENDING = {"status": "authorization_pending", "accessToken": None, "refreshToken": None, "profileArn": None, "identityProvider": None}
+PENDING = {
+    "status": "authorization_pending",
+    "accessToken": None,
+    "refreshToken": None,
+    "profileArn": None,
+    "identityProvider": None,
+}
 
 
 class _Response:
@@ -456,6 +462,7 @@ async def test_writing_credentials_for_an_unapproved_flow_is_refused(tmp_path):
 # Host routing: an account with no profile must not use the runtime host
 # =============================================================================
 
+
 def test_builder_id_host_differs_from_the_profile_host():
     from kiro.config import get_kiro_api_host, get_kiro_q_host
 
@@ -480,14 +487,16 @@ def test_builder_id_credentials_route_to_the_q_host(tmp_path):
 
     path = tmp_path / "builder.json"
     path.write_text(
-        _json.dumps({
-            "refreshToken": "refresh-token-value-long-enough",
-            "accessToken": "access-token",
-            "region": "us-east-1",
-            "clientId": "client-id",
-            "clientSecret": "client-secret",
-            "startUrl": "https://view.awsapps.com/start",
-        })
+        _json.dumps(
+            {
+                "refreshToken": "refresh-token-value-long-enough",
+                "accessToken": "access-token",
+                "region": "us-east-1",
+                "clientId": "client-id",
+                "clientSecret": "client-secret",
+                "startUrl": "https://view.awsapps.com/start",
+            }
+        )
     )
 
     manager = KiroAuthManager(creds_file=str(path))
@@ -516,11 +525,13 @@ def test_an_account_with_a_profile_keeps_the_runtime_host(tmp_path):
 
     path = tmp_path / "social.json"
     path.write_text(
-        _json.dumps({
-            "refreshToken": "refresh-token-value-long-enough",
-            "accessToken": "access-token",
-            "region": "us-east-1",
-        })
+        _json.dumps(
+            {
+                "refreshToken": "refresh-token-value-long-enough",
+                "accessToken": "access-token",
+                "region": "us-east-1",
+            }
+        )
     )
 
     manager = KiroAuthManager(

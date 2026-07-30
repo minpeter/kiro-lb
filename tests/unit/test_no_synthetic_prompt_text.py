@@ -50,8 +50,10 @@ def test_payload_contains_no_synthetic_instructions(messages):
 def test_assistant_prefill_sends_empty_current_turn():
     """An assistant-last request means "continue", not a new user message."""
     payload = _payload(
-        [{"role": "user", "content": "Name the first six primes."},
-         {"role": "assistant", "content": "The first six primes are 2, 3, 5,"}]
+        [
+            {"role": "user", "content": "Name the first six primes."},
+            {"role": "assistant", "content": "The first six primes are 2, 3, 5,"},
+        ]
     )
 
     state = payload["conversationState"]

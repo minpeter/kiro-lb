@@ -45,9 +45,6 @@ def record_token_usage(model: str, prompt_tokens: int, completion_tokens: int) -
 
 def drain_pending_usage() -> List[Tuple[str, str, int, int, int]]:
     with _lock:
-        drained = [
-            (key_id, model, counts[0], counts[1], counts[2])
-            for (key_id, model), counts in _pending.items()
-        ]
+        drained = [(key_id, model, counts[0], counts[1], counts[2]) for (key_id, model), counts in _pending.items()]
         _pending.clear()
     return drained

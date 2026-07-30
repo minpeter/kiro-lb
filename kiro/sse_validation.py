@@ -42,11 +42,7 @@ class AnthropicSSEValidator:
             self._fail()
         if event_type == "content_block_start":
             index = data.get("index")
-            if (
-                self.active_index is not None
-                or not isinstance(index, int)
-                or index != self.last_index + 1
-            ):
+            if self.active_index is not None or not isinstance(index, int) or index != self.last_index + 1:
                 self._fail()
             assert isinstance(index, int)
             self.active_index = index
@@ -116,15 +112,11 @@ class OpenAIStreamValidator:
             for tool_call in delta.get("tool_calls") or []:
                 index = tool_call.get("index")
                 if not isinstance(index, int):
-                    raise StreamProtocolError(
-                        "Invalid assistant content event order"
-                    )
+                    raise StreamProtocolError("Invalid assistant content event order")
                 self.tool_indices.add(index)
             if choice.get("finish_reason") is not None:
                 if self.terminal_seen:
-                    raise StreamProtocolError(
-                        "Invalid assistant content event order"
-                    )
+                    raise StreamProtocolError("Invalid assistant content event order")
                 self.terminal_seen = True
 
     def finish(self) -> None:

@@ -14,20 +14,20 @@ to convert Kiro events to their respective SSE formats.
 
 import asyncio
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 from loguru import logger
 
+from kiro.config import (
+    FIRST_TOKEN_MAX_RETRIES,
+    FIRST_TOKEN_TIMEOUT,
+)
 from kiro.parsers import (
     AwsEventStreamParser,
     MalformedToolInputError,
     deduplicate_tool_calls,
     parse_bracket_tool_calls,
-)
-from kiro.config import (
-    FIRST_TOKEN_TIMEOUT,
-    FIRST_TOKEN_MAX_RETRIES,
 )
 
 if TYPE_CHECKING:
@@ -44,13 +44,14 @@ except ImportError:
 # Data Classes
 # ==================================================================================================
 
+
 @dataclass
 class KiroEvent:
     """
     Unified event from Kiro API stream.
-    
+
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
-    
+
     Attributes:
         type: Event type (content, thinking, tool_use, usage, context_usage, error)
         content: Text content (for content events)
@@ -63,6 +64,7 @@ class KiroEvent:
         is_last_thinking_chunk: Whether this is the last thinking chunk
         stop_reason: Upstream stop reason (for stop_reason events)
     """
+
     type: str
     content: Optional[str] = None
     thinking_content: Optional[str] = None
@@ -79,7 +81,7 @@ class KiroEvent:
 class StreamResult:
     """
     Result of collecting a complete stream response.
-    
+
     Attributes:
         content: Full text content
         thinking_content: Full thinking/reasoning content
@@ -90,6 +92,7 @@ class StreamResult:
         context_usage_percentage: Context usage percentage from Kiro API
         stop_reason: Upstream stop reason, when the stream reported one
     """
+
     content: str = ""
     thinking_content: str = ""
     thinking_signature: str = ""
@@ -102,12 +105,14 @@ class StreamResult:
 
 class FirstTokenTimeoutError(Exception):
     """Exception raised when first token timeout occurs."""
+
     pass
 
 
 # ==================================================================================================
 # Kiro Stream Parsing
 # ==================================================================================================
+
 
 async def parse_kiro_stream(
     response: httpx.Response,
@@ -136,10 +141,12 @@ async def parse_kiro_stream(
             yield event
         if debug_logger:
             for frame in parser.drain_observed_frames():
-                debug_logger.log_parsed_event({
-                    "type": "raw_upstream_frame",
-                    "frame": frame,
-                })
+                debug_logger.log_parsed_event(
+                    {
+                        "type": "raw_upstream_frame",
+                        "frame": frame,
+                    }
+                )
         async for chunk in byte_iterator:
             if debug_logger:
                 debug_logger.log_raw_chunk(chunk)
@@ -149,15 +156,15 @@ async def parse_kiro_stream(
                 yield event
             if debug_logger:
                 for frame in parser.drain_observed_frames():
-                    debug_logger.log_parsed_event({
-                        "type": "raw_upstream_frame",
-                        "frame": frame,
-                    })
+                    debug_logger.log_parsed_event(
+                        {
+                            "type": "raw_upstream_frame",
+                            "frame": frame,
+                        }
+                    )
         for tool_call in parser.get_unemitted_tool_calls():
             if tool_call.get("_parse_error"):
-                raise MalformedToolInputError(
-                    "Malformed upstream tool input"
-                )
+                raise MalformedToolInputError("Malformed upstream tool input")
             event = KiroEvent(type="tool_use", tool_use=tool_call)
             if debug_logger:
                 debug_logger.log_parsed_event(asdict(event))
@@ -171,9 +178,7 @@ async def parse_kiro_stream(
         raise
 
 
-async def _process_chunk(
-    parser: AwsEventStreamParser, chunk: bytes
-) -> AsyncGenerator[KiroEvent, None]:
+async def _process_chunk(parser: AwsEventStreamParser, chunk: bytes) -> AsyncGenerator[KiroEvent, None]:
     """Translate Kiro upstream stream frames without text-level interpretation."""
     for event in parser.feed(chunk):
         if event["type"] == "content":
@@ -199,9 +204,7 @@ async def _process_chunk(
             )
         elif event["type"] == "tool_use":
             if event["data"].get("_parse_error"):
-                raise MalformedToolInputError(
-                    "Malformed upstream tool input"
-                )
+                raise MalformedToolInputError("Malformed upstream tool input")
             yield KiroEvent(type="tool_use", tool_use=event["data"])
 
 
@@ -209,16 +212,17 @@ async def _process_chunk(
 # Full Response Collection
 # ==================================================================================================
 
+
 async def collect_stream_to_result(
     response: httpx.Response,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
 ) -> StreamResult:
     """
     Collects full response from Kiro stream.
-    
+
     This function consumes the entire stream and returns a StreamResult
     with all accumulated data.
-    
+
     Args:
         response: HTTP response with stream
         first_token_timeout: First token wait timeout
@@ -228,35 +232,33 @@ async def collect_stream_to_result(
     """
     result = StreamResult()
     full_content_for_bracket_tools = ""
-    
+
     async for event in parse_kiro_stream(response, first_token_timeout):
         if event.type == "content" and event.content:
             result.content += event.content
             full_content_for_bracket_tools += event.content
-            if (
-                result.content_blocks
-                and result.content_blocks[-1]["type"] == "text"
-            ):
+            if result.content_blocks and result.content_blocks[-1]["type"] == "text":
                 result.content_blocks[-1]["text"] += event.content
             else:
-                result.content_blocks.append({
-                    "type": "text",
-                    "text": event.content,
-                })
+                result.content_blocks.append(
+                    {
+                        "type": "text",
+                        "text": event.content,
+                    }
+                )
         elif event.type == "thinking" and event.thinking_content:
             result.thinking_content += event.thinking_content
             full_content_for_bracket_tools += event.thinking_content
-            if (
-                result.content_blocks
-                and result.content_blocks[-1]["type"] == "thinking"
-            ):
+            if result.content_blocks and result.content_blocks[-1]["type"] == "thinking":
                 result.content_blocks[-1]["thinking"] += event.thinking_content
             else:
-                result.content_blocks.append({
-                    "type": "thinking",
-                    "thinking": event.thinking_content,
-                    "signature": "",
-                })
+                result.content_blocks.append(
+                    {
+                        "type": "thinking",
+                        "thinking": event.thinking_content,
+                        "signature": "",
+                    }
+                )
         elif event.type == "thinking_signature" and event.thinking_signature:
             result.thinking_signature = event.thinking_signature
             for block in reversed(result.content_blocks):
@@ -265,33 +267,33 @@ async def collect_stream_to_result(
                     break
         elif event.type == "tool_use" and event.tool_use:
             result.tool_calls.append(event.tool_use)
-            result.content_blocks.append({
-                "type": "tool_use",
-                "tool": event.tool_use,
-            })
+            result.content_blocks.append(
+                {
+                    "type": "tool_use",
+                    "tool": event.tool_use,
+                }
+            )
         elif event.type == "usage" and event.usage:
             result.usage = event.usage
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
             result.context_usage_percentage = event.context_usage_percentage
         elif event.type == "stop_reason" and event.stop_reason:
             result.stop_reason = event.stop_reason
-    
+
     # Check for bracket-style tool calls in full content
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
-        timeline_tool_ids = {
-            block["tool"].get("id")
-            for block in result.content_blocks
-            if block["type"] == "tool_use"
-        }
+        timeline_tool_ids = {block["tool"].get("id") for block in result.content_blocks if block["type"] == "tool_use"}
         for tool_call in bracket_tool_calls:
             if tool_call.get("id") not in timeline_tool_ids:
-                result.content_blocks.append({
-                    "type": "tool_use",
-                    "tool": tool_call,
-                })
-    
+                result.content_blocks.append(
+                    {
+                        "type": "tool_use",
+                        "tool": tool_call,
+                    }
+                )
+
     return result
 
 
@@ -299,21 +301,19 @@ async def collect_stream_to_result(
 # Token Counting Utilities
 # ==================================================================================================
 
+
 def calculate_tokens_from_context_usage(
-    context_usage_percentage: Optional[float],
-    completion_tokens: int,
-    model_cache: "ModelInfoCache",
-    model: str
+    context_usage_percentage: Optional[float], completion_tokens: int, model_cache: "ModelInfoCache", model: str
 ) -> Tuple[int, int, str, str]:
     """
     Calculate token counts from Kiro's context usage percentage.
-    
+
     Args:
         context_usage_percentage: Context usage percentage from Kiro API
         completion_tokens: Number of completion tokens (counted via tiktoken)
         model_cache: Model cache for getting max input tokens
         model: Model name
-    
+
     Returns:
         Tuple of (prompt_tokens, total_tokens, prompt_source, total_source)
     """
@@ -322,7 +322,7 @@ def calculate_tokens_from_context_usage(
         total_tokens = int((context_usage_percentage / 100) * max_input_tokens)
         prompt_tokens = max(0, total_tokens - completion_tokens)
         return prompt_tokens, total_tokens, "subtraction", "API Kiro"
-    
+
     # Fallback: no context usage data
     return 0, completion_tokens, "unknown", "tiktoken"
 
@@ -330,6 +330,7 @@ def calculate_tokens_from_context_usage(
 # ==================================================================================================
 # First Token Retry Logic
 # ==================================================================================================
+
 
 async def stream_with_first_token_retry(
     make_request: Callable[[], Awaitable[httpx.Response]],
@@ -342,13 +343,13 @@ async def stream_with_first_token_retry(
 ) -> AsyncGenerator[str, None]:
     """
     Generic streaming with automatic retry on first token timeout.
-    
+
     If model doesn't respond within first_token_timeout seconds,
     request is cancelled and a new one is made. Maximum max_retries attempts.
-    
+
     This is seamless for user - they just see a delay,
     but eventually get a response (or error after all attempts).
-    
+
     Args:
         make_request: Function to create new HTTP request (returns httpx.Response)
         stream_processor: Function that processes response and yields SSE strings.
@@ -364,13 +365,13 @@ async def stream_with_first_token_retry(
         on_all_retries_failed: Optional callback to create exception when all retries fail.
                               Receives (max_retries, timeout), returns Exception.
                               If None, raises generic Exception.
-    
+
     Yields:
         Strings in SSE format (format depends on stream_processor)
-    
+
     Raises:
         Exception from on_http_error or on_all_retries_failed callbacks
-    
+
     Example:
         >>> async def make_req():
         ...     return await http_client.request_with_retry("POST", url, payload, stream=True)
@@ -382,66 +383,63 @@ async def stream_with_first_token_retry(
         >>> async for chunk in stream_with_first_token_retry(make_req, process, initial_response=response):
         ...     print(chunk)
     """
-    last_error: Optional[Exception] = None
-    
     for attempt in range(max_retries):
         response: Optional[httpx.Response] = None
         try:
             # Make request
             if attempt > 0:
                 logger.warning(f"Retry attempt {attempt + 1}/{max_retries} after first token timeout")
-            
+
             # On first attempt, reuse initial_response if provided
             if attempt == 0 and initial_response is not None:
                 response = initial_response
                 logger.debug("Reusing initial response for first attempt")
             else:
                 response = await make_request()
-            
+
             if response.status_code != 200:
                 # Error from API - close response and raise exception
                 try:
                     error_content = await response.aread()
-                    error_text = error_content.decode('utf-8', errors='replace')
+                    error_text = error_content.decode("utf-8", errors="replace")
                 except Exception:
                     error_text = "Unknown error"
-                
+
                 try:
                     await response.aclose()
                 except Exception:
                     pass
-                
+
                 logger.error(f"Error from Kiro API: {response.status_code} - {error_text}")
-                
+
                 if on_http_error:
                     raise on_http_error(response.status_code, error_text)
                 else:
                     raise Exception(f"Upstream API error ({response.status_code}): {error_text}")
-            
+
             # Try to stream with first token timeout
             async for chunk in stream_processor(response):
                 yield chunk
-            
+
             # Successfully completed - exit
             return
-            
-        except FirstTokenTimeoutError as e:
-            last_error = e
+
+        except FirstTokenTimeoutError:
             logger.warning(
                 f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} failed - "
                 f"model did not respond within {first_token_timeout}s"
             )
-            
+
             # Close current response if open
             if response:
                 try:
                     await response.aclose()
                 except Exception:
                     pass
-            
+
             # Continue to next attempt
             continue
-            
+
         except Exception as e:
             # Other errors - no retry, propagate
             # Use positional argument to avoid loguru interpreting curly braces in error message as format placeholders
@@ -454,17 +452,16 @@ async def stream_with_first_token_retry(
                 except Exception:
                     pass
             raise
-    
+
     # All attempts exhausted - raise error
     logger.error(
         f"[FirstTokenTimeout] All {max_retries} attempts exhausted - "
         f"model never responded within {first_token_timeout}s per attempt"
     )
-    
+
     if on_all_retries_failed:
         raise on_all_retries_failed(max_retries, first_token_timeout)
     else:
         raise Exception(
-            f"Model did not respond within {first_token_timeout}s after {max_retries} attempts. "
-            "Please try again."
+            f"Model did not respond within {first_token_timeout}s after {max_retries} attempts. Please try again."
         )

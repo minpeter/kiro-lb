@@ -10,6 +10,7 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
+
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -19,44 +20,45 @@ load_dotenv()
 def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
     """
     Read variable value from .env file without processing escape sequences.
-    
+
     This is necessary for correct handling of Windows paths where backslashes
     (e.g., D:\\Projects\\file.json) may be incorrectly interpreted
     as escape sequences (\\a -> bell, \\n -> newline, etc.).
-    
+
     Args:
         var_name: Environment variable name
         env_file: Path to .env file (default ".env")
-    
+
     Returns:
         Raw variable value or None if not found
     """
     env_path = Path(env_file)
     if not env_path.exists():
         return None
-    
+
     try:
         # Read file as-is, without interpretation
         content = env_path.read_text(encoding="utf-8")
-        
+
         # Search for variable considering different formats:
         # VAR="value" or VAR='value' or VAR=value
         # Pattern captures value with or without quotes
         pattern = rf'^{re.escape(var_name)}=(["\']?)(.+?)\1\s*$'
-        
+
         for line in content.splitlines():
             line = line.strip()
             if line.startswith("#") or not line:
                 continue
-            
+
             match = re.match(pattern, line)
             if match:
                 # Return value as-is, without processing escape sequences
                 return match.group(2)
     except Exception:
         pass
-    
+
     return None
+
 
 # ==================================================================================================
 # Server Settings
@@ -389,12 +391,8 @@ def _bounded_debug_int(
     return value
 
 
-DEBUG_CAPTURE_CONTENT: bool = (
-    os.getenv("DEBUG_CAPTURE_CONTENT", "false").lower() == "true"
-)
-DEBUG_CAPTURE_SUCCESS: bool = (
-    os.getenv("DEBUG_CAPTURE_SUCCESS", "false").lower() == "true"
-)
+DEBUG_CAPTURE_CONTENT: bool = os.getenv("DEBUG_CAPTURE_CONTENT", "false").lower() == "true"
+DEBUG_CAPTURE_SUCCESS: bool = os.getenv("DEBUG_CAPTURE_SUCCESS", "false").lower() == "true"
 DEBUG_CAPTURE_MAX_BYTES: int = _bounded_debug_int(
     "DEBUG_CAPTURE_MAX_BYTES",
     4 * 1024 * 1024,
@@ -413,32 +411,34 @@ def _warn_timeout_configuration():
     """
     Print warning if timeout configuration is suboptimal.
     Called at application startup.
-    
+
     FIRST_TOKEN_TIMEOUT should be less than STREAMING_READ_TIMEOUT:
     - FIRST_TOKEN_TIMEOUT: time to wait for model to START responding
     - STREAMING_READ_TIMEOUT: time to wait BETWEEN chunks during streaming
     """
     if FIRST_TOKEN_TIMEOUT >= STREAMING_READ_TIMEOUT:
         import sys
+
         YELLOW = "\033[93m"
         RESET = "\033[0m"
-        
+
         warning_text = f"""
 {YELLOW}⚠️  WARNING: Suboptimal timeout configuration detected.
-    
+
     FIRST_TOKEN_TIMEOUT ({FIRST_TOKEN_TIMEOUT}s) >= STREAMING_READ_TIMEOUT ({STREAMING_READ_TIMEOUT}s)
-    
+
     These timeouts serve different purposes:
       - FIRST_TOKEN_TIMEOUT: time to wait for model to START responding (default: 15s)
       - STREAMING_READ_TIMEOUT: time to wait BETWEEN chunks during streaming (default: 300s)
-    
+
     Recommendation: FIRST_TOKEN_TIMEOUT should be LESS than STREAMING_READ_TIMEOUT.
-    
+
     Example configuration:
       FIRST_TOKEN_TIMEOUT=15
       STREAMING_READ_TIMEOUT=300{RESET}
 """
         print(warning_text, file=sys.stderr)
+
 
 # ==================================================================================================
 # Payload Size Guard Settings
@@ -562,7 +562,9 @@ USAGE_REFRESH_INTERVAL_SECONDS: int = int(os.getenv("USAGE_REFRESH_INTERVAL_SECO
 
 APP_VERSION: str = "0.1.0"
 APP_TITLE: str = "kiro-lb"
-APP_DESCRIPTION: str = "Private Kiro API load balancer. OpenAI and Anthropic compatible; never fabricates reasoning content."
+APP_DESCRIPTION: str = (
+    "Private Kiro API load balancer. OpenAI and Anthropic compatible; never fabricates reasoning content."
+)
 
 
 def get_kiro_refresh_url(region: str) -> str:
@@ -585,4 +587,3 @@ def get_kiro_q_host(region: str, is_builder_id: bool = False) -> str:
     """Return the Q API host for the region, routing Builder ID to Q Developer."""
     template = KIRO_BUILDER_ID_HOST_TEMPLATE if is_builder_id else KIRO_Q_HOST_TEMPLATE
     return template.format(region=region)
-

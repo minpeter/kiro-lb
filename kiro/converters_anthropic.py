@@ -11,20 +11,20 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from kiro.config import HIDDEN_MODELS, MODEL_ALIASES
-from kiro.model_resolver import get_model_id_for_kiro
-from kiro.native_thinking import apply_native_thinking, effort_from_anthropic
-from kiro.models_anthropic import (
-    AnthropicMessagesRequest,
-    AnthropicMessage,
-    AnthropicTool,
-)
 from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     build_kiro_payload,
-    extract_text_content,
     extract_images_from_content,
+    extract_text_content,
 )
+from kiro.model_resolver import get_model_id_for_kiro
+from kiro.models_anthropic import (
+    AnthropicMessage,
+    AnthropicMessagesRequest,
+    AnthropicTool,
+)
+from kiro.native_thinking import apply_native_thinking, effort_from_anthropic
 
 
 def convert_anthropic_content_to_text(content: Any) -> str:
@@ -229,9 +229,7 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
                     "type": "function",
                     "function": {
                         "name": tool_name,
-                        "arguments": tool_input
-                        if isinstance(tool_input, str)
-                        else tool_input,
+                        "arguments": tool_input if isinstance(tool_input, str) else tool_input,
                     },
                 }
             )
@@ -347,12 +345,9 @@ def convert_anthropic_tools(
             description = tool.description
             input_schema = tool.input_schema
 
-        unified_tools.append(
-            UnifiedTool(name=name, description=description, input_schema=input_schema)
-        )
+        unified_tools.append(UnifiedTool(name=name, description=description, input_schema=input_schema))
 
     return unified_tools if unified_tools else None
-
 
 
 def split_inline_system_messages(messages: List[Any]) -> tuple[List[Any], List[str]]:
@@ -384,9 +379,7 @@ def split_inline_system_messages(messages: List[Any]) -> tuple[List[Any], List[s
     return conversation, system_fragments
 
 
-def anthropic_to_kiro(
-    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
-) -> dict:
+def anthropic_to_kiro(request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str) -> dict:
     """
     Converts Anthropic Messages API request to Kiro API payload.
 

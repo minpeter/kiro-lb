@@ -15,7 +15,8 @@ more than GPT-4 (cl100k_base). This is due to differences in BPE vocabularies.
 """
 
 import json
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
 from loguru import logger
 
 # Lazy loading of tiktoken to speed up import
@@ -30,10 +31,10 @@ CLAUDE_CORRECTION_FACTOR = 1.15
 def _get_encoding():
     """
     Lazy initialization of tokenizer.
-    
+
     Uses cl100k_base - encoding for GPT-4/ChatGPT,
     which is close enough to Claude tokenization.
-    
+
     Returns:
         tiktoken.Encoding or None if tiktoken is unavailable
     """
@@ -41,6 +42,7 @@ def _get_encoding():
     if _encoding is None:
         try:
             import tiktoken
+
             _encoding = tiktoken.get_encoding("cl100k_base")
             logger.debug("[Tokenizer] Initialized tiktoken with cl100k_base encoding")
         except ImportError:
@@ -59,17 +61,17 @@ def _get_encoding():
 def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
     """
     Counts the number of tokens in text.
-    
+
     Args:
         text: Text to count tokens for
         apply_claude_correction: Apply correction coefficient for Claude (default True)
-    
+
     Returns:
         Number of tokens (approximate, with Claude correction)
     """
     if not text:
         return 0
-    
+
     encoding = _get_encoding()
     if encoding:
         try:
@@ -79,7 +81,7 @@ def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
             return base_tokens
         except Exception as e:
             logger.warning(f"[Tokenizer] Error encoding text: {e}")
-    
+
     # Fallback: rough estimate ~4 characters per token for English,
     # ~2-3 characters for other languages (taking average ~3.5)
     # For Claude we add correction
@@ -92,32 +94,32 @@ def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
 def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction: bool = True) -> int:
     """
     Counts tokens in a list of chat messages.
-    
+
     Accounts for OpenAI/Claude message structure:
     - role: ~1 token
     - content: text tokens
     - Service tokens between messages: ~3-4 tokens
-    
+
     Args:
         messages: List of messages in OpenAI format
         apply_claude_correction: Apply correction coefficient for Claude
-    
+
     Returns:
         Approximate number of tokens (with Claude correction)
     """
     if not messages:
         return 0
-    
+
     total_tokens = 0
-    
+
     for message in messages:
         # Base tokens per message (role, delimiters)
         total_tokens += 4  # ~4 tokens for service information
-        
+
         # Role tokens (without correction, these are short strings)
         role = message.get("role", "")
         total_tokens += count_tokens(role, apply_claude_correction=False)
-        
+
         # Content tokens
         content = message.get("content")
         if content:
@@ -152,8 +154,7 @@ def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction
                                         result_type = result_block.get("type")
                                         if result_type == "text":
                                             total_tokens += count_tokens(
-                                                result_block.get("text", ""),
-                                                apply_claude_correction=False
+                                                result_block.get("text", ""), apply_claude_correction=False
                                             )
                                         elif result_type in {"image_url", "image"}:
                                             total_tokens += 100
@@ -164,12 +165,11 @@ def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction
                         else:
                             # Unknown block fallback: estimate via JSON to avoid undercount
                             total_tokens += count_tokens(
-                                json.dumps(item, ensure_ascii=False),
-                                apply_claude_correction=False
+                                json.dumps(item, ensure_ascii=False), apply_claude_correction=False
                             )
                     else:
                         total_tokens += count_tokens(str(item), apply_claude_correction=False)
-        
+
         # tool_calls tokens (if present)
         tool_calls = message.get("tool_calls")
         if tool_calls:
@@ -178,14 +178,14 @@ def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction
                 func = tc.get("function", {})
                 total_tokens += count_tokens(func.get("name", ""), apply_claude_correction=False)
                 total_tokens += count_tokens(func.get("arguments", ""), apply_claude_correction=False)
-        
+
         # tool_call_id tokens (for tool responses)
         if message.get("tool_call_id"):
             total_tokens += count_tokens(message["tool_call_id"], apply_claude_correction=False)
-    
+
     # Final service tokens
     total_tokens += 3
-    
+
     # Apply correction to total count
     if apply_claude_correction:
         return int(total_tokens * CLAUDE_CORRECTION_FACTOR)
@@ -195,19 +195,19 @@ def count_message_tokens(messages: List[Dict[str, Any]], apply_claude_correction
 def count_tools_tokens(tools: Optional[List[Dict[str, Any]]], apply_claude_correction: bool = True) -> int:
     """
     Counts tokens in tool definitions.
-    
+
     Args:
         tools: List of tools in OpenAI format
         apply_claude_correction: Apply correction coefficient for Claude
-    
+
     Returns:
         Approximate number of tokens (with Claude correction)
     """
     if not tools:
         return 0
-    
+
     total_tokens = 0
-    
+
     for tool in tools:
         total_tokens += 4  # Service tokens
 
@@ -228,7 +228,7 @@ def count_tools_tokens(tools: Optional[List[Dict[str, Any]]], apply_claude_corre
         if params is not None:
             params_str = json.dumps(params, ensure_ascii=False)
             total_tokens += count_tokens(params_str, apply_claude_correction=False)
-    
+
     # Apply correction to total count
     if apply_claude_correction:
         return int(total_tokens * CLAUDE_CORRECTION_FACTOR)
@@ -262,8 +262,7 @@ def count_system_tokens(system_prompt: Optional[Any], apply_claude_correction: b
                 total_tokens += count_tokens(block.get("text", ""), apply_claude_correction=False)
                 if block.get("cache_control") is not None:
                     total_tokens += count_tokens(
-                        json.dumps(block.get("cache_control"), ensure_ascii=False),
-                        apply_claude_correction=False
+                        json.dumps(block.get("cache_control"), ensure_ascii=False), apply_claude_correction=False
                     )
             else:
                 total_tokens += count_tokens(str(block), apply_claude_correction=False)
@@ -279,17 +278,17 @@ def estimate_request_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
     system_prompt: Optional[Any] = None,
-    apply_claude_correction: bool = True
+    apply_claude_correction: bool = True,
 ) -> Dict[str, int]:
     """
     Estimates total number of tokens in request.
-    
+
     Args:
         messages: List of messages
         tools: List of tools (optional)
         system_prompt: System prompt (optional, string or Anthropic content blocks)
         apply_claude_correction: Apply correction coefficient for Claude
-    
+
     Returns:
         Dictionary with token breakdown:
         - messages_tokens: message tokens
@@ -300,10 +299,10 @@ def estimate_request_tokens(
     messages_tokens = count_message_tokens(messages, apply_claude_correction=apply_claude_correction)
     tools_tokens = count_tools_tokens(tools, apply_claude_correction=apply_claude_correction)
     system_tokens = count_system_tokens(system_prompt, apply_claude_correction=apply_claude_correction)
-    
+
     return {
         "messages_tokens": messages_tokens,
         "tools_tokens": tools_tokens,
         "system_tokens": system_tokens,
-        "total_tokens": messages_tokens + tools_tokens + system_tokens
+        "total_tokens": messages_tokens + tools_tokens + system_tokens,
     }
