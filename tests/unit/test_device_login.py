@@ -292,3 +292,161 @@ async def test_registering_an_unknown_flow_is_a_not_found(dashboard, tmp_path):
         await dashboard.dashboard_register_device_login("nope", request)
 
     assert getattr(exc_info.value, "status_code", None) == 404
+
+
+# =============================================================================
+# Builder ID (AWS SSO OIDC): pending is an HTTP 400 error code, not a 200 status
+# =============================================================================
+
+REGISTRATION = {"clientId": "client-id-value", "clientSecret": "client-secret-value"}
+OIDC_AUTHORIZATION = {
+    "deviceCode": "oidc-device-code",
+    "userCode": "ABCD-EFGH",
+    "verificationUri": "https://device.sso.us-east-1.amazonaws.com/",
+    "verificationUriComplete": "https://device.sso.us-east-1.amazonaws.com/?user_code=ABCD-EFGH",
+    "expiresIn": 600,
+    "interval": 5,
+}
+OIDC_TOKEN = {
+    "accessToken": "oidc-access-token",
+    "refreshToken": "oidc-refresh-token-long-enough-for-validation",
+    "expiresIn": 3600,
+}
+
+
+def test_builder_id_provider_aliases_resolve():
+    assert resolve_provider("builder-id") == "BuilderId"
+    assert resolve_provider("builder_id") == "BuilderId"
+    assert resolve_provider("BuilderID") == "BuilderId"
+
+
+@pytest.mark.asyncio
+async def test_builder_id_start_registers_a_client_then_authorizes():
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+
+    assert flow.provider == "BuilderId"
+    assert flow.user_code == "ABCD-EFGH"
+    # Seconds here, unlike the social flow's milliseconds.
+    assert flow.interval_seconds == 5
+    assert 590 < flow.expires_at - time.time() <= 600
+    assert flow.registration is not None
+    assert flow.registration["clientId"] == "client-id-value"
+
+
+@pytest.mark.asyncio
+async def test_builder_id_view_hides_the_client_secret():
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+
+    assert "client-secret-value" not in str(flow.view())
+
+
+@pytest.mark.asyncio
+async def test_builder_id_pending_is_an_http_400_error_code():
+    """AWS signals pending by failing the call. Code that only inspects a status
+    field on a 200 response would treat this as a hard failure."""
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+
+    pending = _client(_Response({"error": "authorization_pending"}, status_code=400))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=pending):
+        polled = await poll_device_login(flow.id)
+
+    assert polled.status == "pending"
+    assert polled.token is None
+
+
+@pytest.mark.asyncio
+async def test_builder_id_slow_down_backs_off_without_failing():
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+
+    slow = _client(_Response({"error": "slow_down"}, status_code=400))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=slow):
+        polled = await poll_device_login(flow.id)
+
+    assert polled.status == "pending"
+    assert polled.interval_seconds == 10
+
+
+@pytest.mark.asyncio
+async def test_builder_id_expired_code_ends_the_flow():
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+
+    expired = _client(_Response({"error": "expired_token"}, status_code=400))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=expired):
+        polled = await poll_device_login(flow.id)
+
+    assert polled.status == "expired"
+
+
+@pytest.mark.asyncio
+async def test_builder_id_approval_carries_no_profile_arn():
+    """Builder ID cannot obtain a profile, and an empty one fails the request, so
+    the account must carry none at all to reach q.amazonaws.com."""
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=_client(_Response(OIDC_TOKEN))):
+        polled = await poll_device_login(flow.id)
+
+    assert polled.status == "approved"
+    assert polled.token is not None
+    assert polled.token["refreshToken"] == OIDC_TOKEN["refreshToken"]
+    assert polled.token["profileArn"] is None
+
+
+@pytest.mark.asyncio
+async def test_builder_id_credentials_file_carries_the_client_registration(tmp_path):
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=_client(_Response(OIDC_TOKEN))):
+        await poll_device_login(flow.id)
+
+    path = device_login.write_builder_id_credentials(flow, tmp_path / "logins")
+    document = __import__("json").loads(path.read_text())
+
+    # clientId/clientSecret are what make auth.py pick the OIDC refresh endpoint.
+    assert document["clientId"] == "client-id-value"
+    assert document["clientSecret"] == "client-secret-value"
+    assert document["refreshToken"] == OIDC_TOKEN["refreshToken"]
+    assert document["region"] == "us-east-1"
+    assert "profileArn" not in document
+    assert oct(path.stat().st_mode)[-3:] == "600"
+
+
+@pytest.mark.asyncio
+async def test_registering_builder_id_adds_a_json_account(dashboard, tmp_path):
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=_client(_Response(OIDC_TOKEN))):
+        await poll_device_login(flow.id)
+
+    request, manager = _request_with_manager(tmp_path)
+    with patch.object(manager, "_initialize_account", AsyncMock(return_value=True)):
+        result = await dashboard.dashboard_register_device_login(flow.id, request)
+
+    assert result["provider"] == "BuilderId"
+    entries = __import__("json").loads((tmp_path / "credentials.json").read_text())
+    assert entries[0]["type"] == "json"
+    assert "profile_arn" not in entries[0]
+
+
+@pytest.mark.asyncio
+async def test_writing_credentials_for_an_unapproved_flow_is_refused(tmp_path):
+    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
+    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
+        flow = await start_device_login("BuilderId")
+
+    with pytest.raises(ValueError):
+        device_login.write_builder_id_credentials(flow, tmp_path / "logins")

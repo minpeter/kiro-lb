@@ -17,27 +17,35 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Kiro social device-authorization login (Google / GitHub).
+"""Kiro device-authorization login.
 
 Adding an account previously meant placing a credential file on the server by
-hand. This runs the device flow instead: the operator opens one link, approves in
-a browser, and the resulting refresh token is registered into the pool.
+hand. This runs a device flow instead: the operator opens one link, approves in a
+browser, and the resulting credentials are registered into the pool.
 
-Ported from the kiro-auth TypeScript reference. Three details of this service
-break code written against the AWS SSO OIDC flow:
+Two unrelated services are supported and their contracts are near-inverses, so
+the polling logic is deliberately not shared:
 
-- Pending is HTTP 200 with a ``status`` field, not an error. Treating any 200 as
-  success stores ``accessToken: None``.
-- Timings are milliseconds, not seconds.
-- The response carries ``profileArn`` directly, so no profile lookup is needed.
+- Social (Google / GitHub) on ``prod.us-east-1.auth.desktop.kiro.dev``. Pending
+  is HTTP 200 with a ``status`` field, timings are milliseconds, and the response
+  carries ``profileArn``, which routes the account to ``runtime.kiro.dev``.
+- Builder ID (AWS SSO OIDC) on ``oidc.{region}.amazonaws.com``. Pending is HTTP
+  400 with an ``authorization_pending`` code, timings are seconds, and refreshing
+  needs the client registration, so the client id and secret are stored with the
+  refresh token. Builder ID has no profile and must use ``q.{region}.amazonaws.com``.
+
+Ported from the kiro-auth TypeScript reference.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
 import httpx
@@ -46,8 +54,23 @@ from loguru import logger
 AUTH_HOST = "https://prod.us-east-1.auth.desktop.kiro.dev"
 CLIENT_ID = "kiro-cli"
 
-LoginProvider = Literal["Google", "Github"]
-_PROVIDERS: Dict[str, LoginProvider] = {"google": "Google", "github": "Github"}
+BUILDER_ID_START_URL = "https://view.awsapps.com/start"
+BUILDER_ID_REGION = "us-east-1"
+BUILDER_ID_CLIENT_NAME = "kiro-cli"
+BUILDER_ID_SCOPES = [
+    "codewhisperer:completions",
+    "codewhisperer:analysis",
+    "codewhisperer:conversations",
+]
+
+LoginProvider = Literal["Google", "Github", "BuilderId"]
+_PROVIDERS: Dict[str, LoginProvider] = {
+    "google": "Google",
+    "github": "Github",
+    "builder-id": "BuilderId",
+    "builderid": "BuilderId",
+    "builder_id": "BuilderId",
+}
 
 # A pending flow is dropped once its device code can no longer be approved.
 _FLOW_GRACE_SECONDS = 60
@@ -72,6 +95,7 @@ class DeviceFlow:
     status: str = "pending"
     detail: Optional[str] = None
     token: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    registration: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
     def view(self) -> Dict[str, Any]:
         """Client-facing state. Never exposes the token or the device code."""
@@ -109,8 +133,7 @@ async def _post(client: httpx.AsyncClient, path: str, body: Dict[str, Any]) -> D
     return response.json()
 
 
-async def start_device_login(provider: LoginProvider) -> DeviceFlow:
-    """Request a device code and return the flow to show the operator."""
+async def _start_social_login(provider: LoginProvider) -> DeviceFlow:
     async with httpx.AsyncClient() as client:
         payload = await _post(
             client,
@@ -132,9 +155,6 @@ async def start_device_login(provider: LoginProvider) -> DeviceFlow:
         expires_at=time.time() + expires_in,
         interval_seconds=max(1.0, interval),
     )
-    _prune_flows()
-    _flows[flow.id] = flow
-    logger.info("Started {} device login {}", provider, flow.id)
     return flow
 
 
@@ -156,16 +176,7 @@ def _prune_flows() -> None:
             _flows.pop(flow_id, None)
 
 
-async def poll_device_login(flow_id: str) -> DeviceFlow:
-    """Ask upstream once whether the browser approval has completed."""
-    flow = get_flow(flow_id)
-    if flow.status in ("approved", "failed", "expired"):
-        return flow
-    if time.time() > flow.expires_at:
-        flow.status = "expired"
-        flow.detail = "The approval window closed before the login was confirmed"
-        return flow
-
+async def _poll_social_login(flow: DeviceFlow) -> DeviceFlow:
     async with httpx.AsyncClient() as client:
         try:
             payload = await _post(
@@ -200,6 +211,133 @@ async def poll_device_login(flow_id: str) -> DeviceFlow:
     return flow
 
 
+async def _oidc_call(region: str, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Call AWS SSO OIDC, raising DeviceLoginError carrying the error code.
+
+    Pending is signalled by HTTP 400 with ``error: authorization_pending``, so the
+    code has to survive the failure path rather than the success path.
+    """
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"https://oidc.{region}.amazonaws.com{path}", json=body, timeout=20)
+    payload: Dict[str, Any] = {}
+    if response.text:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+    if response.status_code >= 400:
+        code = payload.get("error") or response.headers.get("x-amzn-errortype", "").split(":")[0]
+        message = payload.get("error_description") or payload.get("message") or response.text
+        raise DeviceLoginError(f"{code or f'HTTP_{response.status_code}'}: {message}")
+    return payload
+
+
+async def _start_builder_id_login() -> DeviceFlow:
+    registration = await _oidc_call(
+        BUILDER_ID_REGION,
+        "/client/register",
+        {"clientName": BUILDER_ID_CLIENT_NAME, "clientType": "public", "scopes": BUILDER_ID_SCOPES},
+    )
+    authorization = await _oidc_call(
+        BUILDER_ID_REGION,
+        "/device_authorization",
+        {
+            "clientId": registration["clientId"],
+            "clientSecret": registration["clientSecret"],
+            "startUrl": BUILDER_ID_START_URL,
+        },
+    )
+
+    # Seconds here, unlike the social flow's milliseconds.
+    expires_in = float(authorization.get("expiresIn") or 600)
+    interval = float(authorization.get("interval") or 5)
+
+    flow = DeviceFlow(
+        id=secrets.token_urlsafe(12),
+        provider="BuilderId",
+        device_code=str(authorization["deviceCode"]),
+        user_code=str(authorization.get("userCode", "")),
+        verification_uri=str(authorization.get("verificationUri", "")),
+        verification_uri_complete=str(authorization.get("verificationUriComplete", "")),
+        expires_at=time.time() + expires_in,
+        interval_seconds=max(1.0, interval),
+        registration={
+            "clientId": registration["clientId"],
+            "clientSecret": registration["clientSecret"],
+            "region": BUILDER_ID_REGION,
+        },
+    )
+    return flow
+
+
+async def _poll_builder_id_login(flow: DeviceFlow) -> DeviceFlow:
+    assert flow.registration is not None
+    try:
+        payload = await _oidc_call(
+            flow.registration["region"],
+            "/token",
+            {
+                "clientId": flow.registration["clientId"],
+                "clientSecret": flow.registration["clientSecret"],
+                "deviceCode": flow.device_code,
+                "grantType": "urn:ietf:params:oauth:grant-type:device_code",
+            },
+        )
+    except DeviceLoginError as exc:
+        reason = str(exc)
+        if "authorization_pending" in reason or "AuthorizationPending" in reason:
+            return flow
+        if "slow_down" in reason or "SlowDown" in reason:
+            flow.interval_seconds += 5
+            return flow
+        flow.status = "expired" if "expired_token" in reason or "ExpiredToken" in reason else "failed"
+        flow.detail = reason
+        return flow
+
+    access_token = payload.get("accessToken")
+    if not access_token:
+        flow.status = "failed"
+        flow.detail = "Builder ID returned no access token"
+        return flow
+
+    flow.token = {
+        "accessToken": access_token,
+        "refreshToken": payload.get("refreshToken"),
+        "expiresIn": payload.get("expiresIn"),
+        # Builder ID cannot obtain a profile; ListAvailableProfiles answers 403.
+        # Sending an empty profileArn upstream fails the request outright, so the
+        # account must carry none at all.
+        "profileArn": None,
+    }
+    flow.status = "approved"
+    flow.detail = None
+    return flow
+
+
+async def start_device_login(provider: LoginProvider) -> DeviceFlow:
+    """Request a device code and return the flow to show the operator."""
+    flow = await (_start_builder_id_login() if provider == "BuilderId" else _start_social_login(provider))
+    _prune_flows()
+    _flows[flow.id] = flow
+    logger.info("Started {} device login {}", provider, flow.id)
+    return flow
+
+
+async def poll_device_login(flow_id: str) -> DeviceFlow:
+    """Ask upstream once whether the browser approval has completed."""
+    flow = get_flow(flow_id)
+    if flow.status in ("approved", "failed", "expired"):
+        return flow
+    if time.time() > flow.expires_at:
+        flow.status = "expired"
+        flow.detail = "The approval window closed before the login was confirmed"
+        return flow
+
+    if flow.provider == "BuilderId":
+        return await _poll_builder_id_login(flow)
+    return await _poll_social_login(flow)
+
+
 async def await_approval(flow_id: str, timeout_seconds: float) -> DeviceFlow:
     """Poll at the upstream-advertised interval until resolved or timed out."""
     flow = get_flow(flow_id)
@@ -210,3 +348,31 @@ async def await_approval(flow_id: str, timeout_seconds: float) -> DeviceFlow:
             return flow
         await asyncio.sleep(flow.interval_seconds)
     return flow
+
+
+def write_builder_id_credentials(flow: DeviceFlow, directory: Path) -> Path:
+    """Persist a Builder ID login as a JSON credential file and return its path.
+
+    Builder ID refresh needs the client registration, not just the refresh token,
+    so it cannot use the inline refresh_token entry the social flow uses. The
+    field names are the ones auth.py reads, and clientId/clientSecret are what
+    make it detect AWS SSO OIDC rather than the Kiro Desktop endpoint.
+    """
+    if not flow.token or not flow.registration:
+        raise ValueError("Builder ID login is not approved")
+
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"builder-id-{flow.id}.json"
+    expires_in = float(flow.token.get("expiresIn") or 3600)
+    document = {
+        "refreshToken": flow.token.get("refreshToken"),
+        "accessToken": flow.token.get("accessToken"),
+        "expiresAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + expires_in)),
+        "region": flow.registration["region"],
+        "clientId": flow.registration["clientId"],
+        "clientSecret": flow.registration["clientSecret"],
+        "startUrl": BUILDER_ID_START_URL,
+    }
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path

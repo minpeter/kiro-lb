@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, ExternalLink, Github, LogIn, X } from "lucide-react";
+import { Check, Cloud, ExternalLink, Github, LogIn, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,8 +8,16 @@ import type { DeviceLoginFlow, DeviceLoginProvider } from "../types";
 
 const POLL_INTERVAL_MS = 2500;
 
+const PROVIDERS: { id: DeviceLoginProvider; label: string }[] = [
+  { id: "builder-id", label: "AWS Builder ID" },
+  { id: "google", label: "Google" },
+  { id: "github", label: "GitHub" },
+];
+
 function ProviderIcon({ provider }: { provider: DeviceLoginProvider }) {
-  return provider === "github" ? <Github /> : <LogIn />;
+  if (provider === "github") return <Github />;
+  if (provider === "builder-id") return <Cloud />;
+  return <LogIn />;
 }
 
 export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<void> }) {
@@ -137,10 +145,10 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
           </div>
         ) : (
           <div className="flex flex-wrap gap-2">
-            {(["google", "github"] as DeviceLoginProvider[]).map((provider) => (
-              <Button key={provider} disabled={busy} onClick={() => void start(provider)}>
-                <ProviderIcon provider={provider} />
-                Sign in with {provider === "github" ? "GitHub" : "Google"}
+            {PROVIDERS.map(({ id, label }) => (
+              <Button key={id} disabled={busy} onClick={() => void start(id)}>
+                <ProviderIcon provider={id} />
+                Sign in with {label}
               </Button>
             ))}
           </div>

@@ -103,7 +103,7 @@ export type KeyUsage = Record<string, KeyModelUsage[]>;
 
 export type CredentialSource = "sqlite" | "json" | "refresh_token";
 
-export type DeviceLoginProvider = "google" | "github";
+export type DeviceLoginProvider = "builder-id" | "google" | "github";
 
 export type DeviceLoginFlow = {
   flowId: string;

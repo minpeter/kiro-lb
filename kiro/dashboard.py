@@ -56,6 +56,7 @@ from kiro.device_login import (
     poll_device_login,
     resolve_provider,
     start_device_login,
+    write_builder_id_credentials,
 )
 from kiro.usage_tracking import ROOT_KEY_ID, current_api_key_id, drain_pending_usage
 from kiro.usage import fetch_account_usage
@@ -601,15 +602,20 @@ async def dashboard_register_device_login(flow_id: str, request: Request) -> dic
     if not refresh_token:
         raise HTTPException(status_code=502, detail="Kiro approved the login without a refresh token")
 
+    if flow.provider == "BuilderId":
+        # Builder ID refresh needs the client registration, so it is stored as a
+        # JSON credential file next to the pool config rather than inline.
+        credential_path = write_builder_id_credentials(flow, _DATA_DIR / "logins")
+        registration = {"type": "json", "path": str(credential_path)}
+    else:
+        registration = {
+            "type": "refresh_token",
+            "refreshToken": refresh_token,
+            "profileArn": flow.token.get("profileArn") or "",
+        }
+
     try:
-        result = await register_account(
-            request.app.state.account_manager,
-            {
-                "type": "refresh_token",
-                "refreshToken": refresh_token,
-                "profileArn": flow.token.get("profileArn") or "",
-            },
-        )
+        result = await register_account(request.app.state.account_manager, registration)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
