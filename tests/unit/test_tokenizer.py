@@ -12,23 +12,22 @@ Tests:
 - Fallback when tiktoken is unavailable
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from kiro.tokenizer import (
-    count_tokens,
-    count_message_tokens,
-    count_tools_tokens,
-    count_system_tokens,
-    estimate_request_tokens,
     CLAUDE_CORRECTION_FACTOR,
-    _get_encoding
+    _get_encoding,
+    count_message_tokens,
+    count_system_tokens,
+    count_tokens,
+    count_tools_tokens,
+    estimate_request_tokens,
 )
 
 
 class TestCountTokens:
     """Tests for count_tokens function."""
-    
+
     def test_empty_string_returns_zero(self):
         """
         What it does: Checks that empty string returns 0 tokens.
@@ -38,7 +37,7 @@ class TestCountTokens:
         result = count_tokens("")
         print(f"Result: {result}")
         assert result == 0, "Empty string should return 0 tokens"
-    
+
     def test_none_returns_zero(self):
         """
         What it does: Checks that None returns 0 tokens.
@@ -48,7 +47,7 @@ class TestCountTokens:
         result = count_tokens(None)
         print(f"Result: {result}")
         assert result == 0, "None should return 0 tokens"
-    
+
     def test_simple_text_returns_positive(self):
         """
         What it does: Checks that simple text returns positive token count.
@@ -58,7 +57,7 @@ class TestCountTokens:
         result = count_tokens("Hello, world!")
         print(f"Result: {result}")
         assert result > 0, "Simple text should return positive token count"
-    
+
     def test_longer_text_returns_more_tokens(self):
         """
         What it does: Checks that longer text returns more tokens.
@@ -67,15 +66,15 @@ class TestCountTokens:
         print("Test: Comparing long and short text...")
         short_text = "Hello"
         long_text = "Hello, this is a much longer text that should have more tokens"
-        
+
         short_tokens = count_tokens(short_text)
         long_tokens = count_tokens(long_text)
-        
+
         print(f"Short text: {short_tokens} tokens")
         print(f"Long text: {long_tokens} tokens")
-        
+
         assert long_tokens > short_tokens, "Long text should have more tokens"
-    
+
     def test_claude_correction_applied_by_default(self):
         """
         What it does: Checks that Claude correction coefficient is applied by default.
@@ -83,21 +82,21 @@ class TestCountTokens:
         """
         print("Test: Claude correction coefficient...")
         text = "This is a test text for token counting"
-        
+
         with_correction = count_tokens(text, apply_claude_correction=True)
         without_correction = count_tokens(text, apply_claude_correction=False)
-        
+
         print(f"With correction: {with_correction}")
         print(f"Without correction: {without_correction}")
-        
+
         # With correction should be higher (coefficient 1.15)
         assert with_correction > without_correction, "With correction should have more tokens"
-        
+
         # Check approximate ratio
         ratio = with_correction / without_correction
         print(f"Ratio: {ratio}")
         assert 1.1 <= ratio <= 1.2, f"Ratio should be around {CLAUDE_CORRECTION_FACTOR}"
-    
+
     def test_without_claude_correction(self):
         """
         What it does: Checks token counting without correction coefficient.
@@ -105,12 +104,12 @@ class TestCountTokens:
         """
         print("Test: Without correction coefficient...")
         text = "Test text"
-        
+
         result = count_tokens(text, apply_claude_correction=False)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Should return positive token count"
-    
+
     def test_unicode_text(self):
         """
         What it does: Checks token counting for Unicode text.
@@ -118,12 +117,12 @@ class TestCountTokens:
         """
         print("Test: Unicode text...")
         text = "Привет, мир! 你好世界 🌍"
-        
+
         result = count_tokens(text)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Unicode text should return positive token count"
-    
+
     def test_multiline_text(self):
         """
         What it does: Checks token counting for multiline text.
@@ -133,12 +132,12 @@ class TestCountTokens:
         text = """Line 1
         Line 2
         Line 3"""
-        
+
         result = count_tokens(text)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Multiline text should return positive token count"
-    
+
     def test_json_text(self):
         """
         What it does: Checks token counting for JSON string.
@@ -146,45 +145,45 @@ class TestCountTokens:
         """
         print("Test: JSON text...")
         text = '{"name": "test", "value": 123, "nested": {"key": "value"}}'
-        
+
         result = count_tokens(text)
         print(f"Result: {result}")
-        
+
         assert result > 0, "JSON text should return positive token count"
 
 
 class TestCountTokensFallback:
     """Tests for fallback logic when tiktoken is unavailable."""
-    
+
     def test_fallback_when_tiktoken_unavailable(self):
         """
         What it does: Checks fallback counting when tiktoken is unavailable.
         Purpose: Ensure system works without tiktoken.
         """
         print("Test: Fallback without tiktoken...")
-        
+
         # Mock _get_encoding to return None
-        with patch('kiro.tokenizer._get_encoding', return_value=None):
+        with patch("kiro.tokenizer._get_encoding", return_value=None):
             result = count_tokens("Hello world test")
             print(f"Result: {result}")
-            
+
             # Fallback: len(text) // 4 + 1, then * 1.15
             # "Hello world test" = 16 characters
             # 16 // 4 + 1 = 5
             # 5 * 1.15 = 5.75 -> 5
             assert result > 0, "Fallback should return positive number"
-    
+
     def test_fallback_without_correction(self):
         """
         What it does: Checks fallback without correction coefficient.
         Purpose: Ensure fallback works with apply_claude_correction=False.
         """
         print("Test: Fallback without correction...")
-        
-        with patch('kiro.tokenizer._get_encoding', return_value=None):
+
+        with patch("kiro.tokenizer._get_encoding", return_value=None):
             result = count_tokens("Test", apply_claude_correction=False)
             print(f"Result: {result}")
-            
+
             # "Test" = 4 characters
             # 4 // 4 + 1 = 2
             assert result > 0, "Fallback should return positive number"
@@ -192,7 +191,7 @@ class TestCountTokensFallback:
 
 class TestCountMessageTokens:
     """Tests for count_message_tokens function."""
-    
+
     def test_empty_list_returns_zero(self):
         """
         What it does: Checks that empty list returns 0 tokens.
@@ -202,7 +201,7 @@ class TestCountMessageTokens:
         result = count_message_tokens([])
         print(f"Result: {result}")
         assert result == 0, "Empty list should return 0 tokens"
-    
+
     def test_none_returns_zero(self):
         """
         What it does: Checks that None returns 0 tokens.
@@ -212,7 +211,7 @@ class TestCountMessageTokens:
         result = count_message_tokens(None)
         print(f"Result: {result}")
         assert result == 0, "None should return 0 tokens"
-    
+
     def test_single_user_message(self):
         """
         What it does: Checks token counting for single user message.
@@ -220,12 +219,12 @@ class TestCountMessageTokens:
         """
         print("Test: Single user message...")
         messages = [{"role": "user", "content": "Hello, AI!"}]
-        
+
         result = count_message_tokens(messages)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Should return positive token count"
-    
+
     def test_multiple_messages(self):
         """
         What it does: Checks token counting for multiple messages.
@@ -236,16 +235,16 @@ class TestCountMessageTokens:
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Hello!"},
             {"role": "assistant", "content": "Hi there! How can I help you?"},
-            {"role": "user", "content": "What is the weather?"}
+            {"role": "user", "content": "What is the weather?"},
         ]
-        
+
         result = count_message_tokens(messages)
         print(f"Result: {result}")
-        
+
         # More messages = more tokens
         single_message = count_message_tokens([messages[0]])
         assert result > single_message, "Multiple messages should have more tokens"
-    
+
     def test_message_with_tool_calls(self):
         """
         What it does: Checks token counting for message with tool_calls.
@@ -260,39 +259,30 @@ class TestCountMessageTokens:
                     {
                         "id": "call_123",
                         "type": "function",
-                        "function": {
-                            "name": "get_weather",
-                            "arguments": '{"location": "Moscow"}'
-                        }
+                        "function": {"name": "get_weather", "arguments": '{"location": "Moscow"}'},
                     }
-                ]
+                ],
             }
         ]
-        
+
         result = count_message_tokens(messages)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Message with tool_calls should have tokens"
-    
+
     def test_message_with_tool_call_id(self):
         """
         What it does: Checks token counting for tool response message.
         Purpose: Ensure tool_call_id is counted.
         """
         print("Test: Tool response message...")
-        messages = [
-            {
-                "role": "tool",
-                "content": "The weather in Moscow is sunny, 25°C",
-                "tool_call_id": "call_123"
-            }
-        ]
-        
+        messages = [{"role": "tool", "content": "The weather in Moscow is sunny, 25°C", "tool_call_id": "call_123"}]
+
         result = count_message_tokens(messages)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Tool response should have tokens"
-    
+
     def test_message_with_list_content(self):
         """
         What it does: Checks token counting for multimodal content.
@@ -304,16 +294,16 @@ class TestCountMessageTokens:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "What is in this image?"},
-                    {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
-                ]
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}},
+                ],
             }
         ]
-        
+
         result = count_message_tokens(messages)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Multimodal content should have tokens"
-    
+
     def test_without_claude_correction(self):
         """
         What it does: Checks token counting without correction coefficient.
@@ -321,15 +311,15 @@ class TestCountMessageTokens:
         """
         print("Test: Without correction coefficient...")
         messages = [{"role": "user", "content": "Test message"}]
-        
+
         with_correction = count_message_tokens(messages, apply_claude_correction=True)
         without_correction = count_message_tokens(messages, apply_claude_correction=False)
-        
+
         print(f"С коррекцией: {with_correction}")
         print(f"Без коррекции: {without_correction}")
-        
+
         assert with_correction > without_correction, "With correction should be higher"
-    
+
     def test_message_with_empty_content(self):
         """
         What it does: Checks token counting for message with empty content.
@@ -337,13 +327,13 @@ class TestCountMessageTokens:
         """
         print("Test: Empty content...")
         messages = [{"role": "user", "content": ""}]
-        
+
         result = count_message_tokens(messages)
         print(f"Result: {result}")
-        
+
         # Should have service tokens (role, separators)
         assert result > 0, "Even empty message should have service tokens"
-    
+
     def test_message_with_none_content(self):
         """
         What it does: Checks token counting for message with None content.
@@ -351,10 +341,10 @@ class TestCountMessageTokens:
         """
         print("Test: None content...")
         messages = [{"role": "assistant", "content": None}]
-        
+
         result = count_message_tokens(messages)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Message with None content should have service tokens"
 
     def test_anthropic_tool_use_and_tool_result_blocks(self):
@@ -366,14 +356,7 @@ class TestCountMessageTokens:
         messages = [
             {
                 "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "toolu_123",
-                        "name": "get_weather",
-                        "input": {"city": "Tokyo"}
-                    }
-                ]
+                "content": [{"type": "tool_use", "id": "toolu_123", "name": "get_weather", "input": {"city": "Tokyo"}}],
             },
             {
                 "role": "user",
@@ -382,10 +365,10 @@ class TestCountMessageTokens:
                         "type": "tool_result",
                         "tool_use_id": "toolu_123",
                         "content": [{"type": "text", "text": "晴天 26C"}],
-                        "is_error": False
+                        "is_error": False,
                     }
-                ]
-            }
+                ],
+            },
         ]
 
         result = count_message_tokens(messages, apply_claude_correction=False)
@@ -395,7 +378,7 @@ class TestCountMessageTokens:
 
 class TestCountToolsTokens:
     """Tests for count_tools_tokens function."""
-    
+
     def test_none_returns_zero(self):
         """
         What it does: Checks that None returns 0 tokens.
@@ -405,7 +388,7 @@ class TestCountToolsTokens:
         result = count_tools_tokens(None)
         print(f"Result: {result}")
         assert result == 0, "None should return 0 tokens"
-    
+
     def test_empty_list_returns_zero(self):
         """
         What it does: Checks that empty list returns 0 tokens.
@@ -415,7 +398,7 @@ class TestCountToolsTokens:
         result = count_tools_tokens([])
         print(f"Result: {result}")
         assert result == 0, "Empty list should return 0 tokens"
-    
+
     def test_single_tool(self):
         """
         What it does: Checks token counting for single tool.
@@ -430,20 +413,18 @@ class TestCountToolsTokens:
                     "description": "Get the current weather for a location",
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "location": {"type": "string", "description": "City name"}
-                        },
-                        "required": ["location"]
-                    }
-                }
+                        "properties": {"location": {"type": "string", "description": "City name"}},
+                        "required": ["location"],
+                    },
+                },
             }
         ]
-        
+
         result = count_tools_tokens(tools)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Tool should have tokens"
-    
+
     def test_multiple_tools(self):
         """
         What it does: Checks token counting for multiple tools.
@@ -456,27 +437,27 @@ class TestCountToolsTokens:
                 "function": {
                     "name": "get_weather",
                     "description": "Get weather",
-                    "parameters": {"type": "object", "properties": {}}
-                }
+                    "parameters": {"type": "object", "properties": {}},
+                },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "search_web",
                     "description": "Search the web",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            }
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
         ]
-        
+
         result = count_tools_tokens(tools)
         single_tool = count_tools_tokens([tools[0]])
-        
+
         print(f"Two tools: {result}")
         print(f"One tool: {single_tool}")
-        
+
         assert result > single_tool, "More tools = more tokens"
-    
+
     def test_tool_with_complex_parameters(self):
         """
         What it does: Checks token counting for tool with complex parameters.
@@ -499,25 +480,22 @@ class TestCountToolsTokens:
                                 "properties": {
                                     "street": {"type": "string"},
                                     "city": {"type": "string"},
-                                    "country": {"type": "string"}
-                                }
+                                    "country": {"type": "string"},
+                                },
                             },
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"}
-                            }
+                            "tags": {"type": "array", "items": {"type": "string"}},
                         },
-                        "required": ["name", "age"]
-                    }
-                }
+                        "required": ["name", "age"],
+                    },
+                },
             }
         ]
-        
+
         result = count_tools_tokens(tools)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Complex tool should have tokens"
-    
+
     def test_tool_without_parameters(self):
         """
         What it does: Checks token counting for tool without parameters.
@@ -525,20 +503,14 @@ class TestCountToolsTokens:
         """
         print("Test: Without parameters...")
         tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "no_params_func",
-                    "description": "A function without parameters"
-                }
-            }
+            {"type": "function", "function": {"name": "no_params_func", "description": "A function without parameters"}}
         ]
-        
+
         result = count_tools_tokens(tools)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Tool without parameters should have tokens"
-    
+
     def test_tool_with_empty_description(self):
         """
         What it does: Checks token counting for tool with empty description.
@@ -548,38 +520,29 @@ class TestCountToolsTokens:
         tools = [
             {
                 "type": "function",
-                "function": {
-                    "name": "func",
-                    "description": "",
-                    "parameters": {"type": "object", "properties": {}}
-                }
+                "function": {"name": "func", "description": "", "parameters": {"type": "object", "properties": {}}},
             }
         ]
-        
+
         result = count_tools_tokens(tools)
         print(f"Result: {result}")
-        
+
         assert result > 0, "Tool with empty description should have tokens"
-    
+
     def test_non_function_tool_type(self):
         """
         What it does: Checks handling of tool with type != "function".
         Purpose: Ensure non-function tools are handled.
         """
         print("Test: Non-function tool...")
-        tools = [
-            {
-                "type": "other_type",
-                "some_field": "value"
-            }
-        ]
-        
+        tools = [{"type": "other_type", "some_field": "value"}]
+
         result = count_tools_tokens(tools)
         print(f"Result: {result}")
-        
+
         # Should have at least service tokens
         assert result >= 0, "Non-function tool shouldn't break counting"
-    
+
     def test_without_claude_correction(self):
         """
         What it does: Checks token counting without correction coefficient.
@@ -592,17 +555,17 @@ class TestCountToolsTokens:
                 "function": {
                     "name": "test_func",
                     "description": "Test function",
-                    "parameters": {"type": "object", "properties": {}}
-                }
+                    "parameters": {"type": "object", "properties": {}},
+                },
             }
         ]
-        
+
         with_correction = count_tools_tokens(tools, apply_claude_correction=True)
         without_correction = count_tools_tokens(tools, apply_claude_correction=False)
-        
+
         print(f"С коррекцией: {with_correction}")
         print(f"Без коррекции: {without_correction}")
-        
+
         assert with_correction > without_correction, "With correction should be higher"
 
     def test_openai_flat_tool_format(self):
@@ -614,11 +577,7 @@ class TestCountToolsTokens:
             {
                 "name": "search_docs",
                 "description": "Search docs by keyword",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"]
-                }
+                "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
             }
         ]
 
@@ -634,23 +593,17 @@ class TestCountToolsTokens:
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "recursive": {"type": "boolean", "description": "Recursive search"}
+                "recursive": {"type": "boolean", "description": "Recursive search"},
             },
-            "required": ["path"]
+            "required": ["path"],
         }
-        openai_tools = [{
-            "type": "function",
-            "function": {
-                "name": "search_files",
-                "description": "Search files",
-                "parameters": shared_schema
+        openai_tools = [
+            {
+                "type": "function",
+                "function": {"name": "search_files", "description": "Search files", "parameters": shared_schema},
             }
-        }]
-        anthropic_tools = [{
-            "name": "search_files",
-            "description": "Search files",
-            "input_schema": shared_schema
-        }]
+        ]
+        anthropic_tools = [{"name": "search_files", "description": "Search files", "input_schema": shared_schema}]
 
         openai_tokens = count_tools_tokens(openai_tools, apply_claude_correction=False)
         anthropic_tokens = count_tools_tokens(anthropic_tools, apply_claude_correction=False)
@@ -717,7 +670,7 @@ class TestCountSystemTokens:
 
 class TestEstimateRequestTokens:
     """Tests for estimate_request_tokens function."""
-    
+
     def test_messages_only(self):
         """
         What it does: Checks token estimation for messages only.
@@ -725,20 +678,20 @@ class TestEstimateRequestTokens:
         """
         print("Test: Messages only...")
         messages = [{"role": "user", "content": "Hello!"}]
-        
+
         result = estimate_request_tokens(messages)
         print(f"Result: {result}")
-        
+
         assert "messages_tokens" in result
         assert "tools_tokens" in result
         assert "system_tokens" in result
         assert "total_tokens" in result
-        
+
         assert result["messages_tokens"] > 0
         assert result["tools_tokens"] == 0
         assert result["system_tokens"] == 0
         assert result["total_tokens"] == result["messages_tokens"]
-    
+
     def test_messages_with_tools(self):
         """
         What it does: Checks token estimation for messages with tools.
@@ -752,18 +705,18 @@ class TestEstimateRequestTokens:
                 "function": {
                     "name": "get_weather",
                     "description": "Get weather",
-                    "parameters": {"type": "object", "properties": {}}
-                }
+                    "parameters": {"type": "object", "properties": {}},
+                },
             }
         ]
-        
+
         result = estimate_request_tokens(messages, tools=tools)
         print(f"Result: {result}")
-        
+
         assert result["messages_tokens"] > 0
         assert result["tools_tokens"] > 0
         assert result["total_tokens"] == result["messages_tokens"] + result["tools_tokens"]
-    
+
     def test_messages_with_system_prompt(self):
         """
         What it does: Checks token estimation with separate system prompt.
@@ -772,10 +725,10 @@ class TestEstimateRequestTokens:
         print("Test: With system prompt...")
         messages = [{"role": "user", "content": "Hello!"}]
         system_prompt = "You are a helpful assistant."
-        
+
         result = estimate_request_tokens(messages, system_prompt=system_prompt)
         print(f"Result: {result}")
-        
+
         assert result["messages_tokens"] > 0
         assert result["system_tokens"] > 0
         assert result["total_tokens"] == result["messages_tokens"] + result["system_tokens"]
@@ -797,36 +750,29 @@ class TestEstimateRequestTokens:
 
         assert result["system_tokens"] > 0
         assert result["total_tokens"] == result["messages_tokens"] + result["system_tokens"]
-    
+
     def test_full_request(self):
         """
         What it does: Checks token estimation for full request.
         Purpose: Ensure all components sum correctly.
         """
         print("Test: Full request...")
-        messages = [
-            {"role": "user", "content": "What is the weather in Moscow?"}
-        ]
+        messages = [{"role": "user", "content": "What is the weather in Moscow?"}]
         tools = [
             {
                 "type": "function",
                 "function": {
                     "name": "get_weather",
                     "description": "Get weather for a location",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "location": {"type": "string"}
-                        }
-                    }
-                }
+                    "parameters": {"type": "object", "properties": {"location": {"type": "string"}}},
+                },
             }
         ]
         system_prompt = "You are a weather assistant."
-        
+
         result = estimate_request_tokens(messages, tools=tools, system_prompt=system_prompt)
         print(f"Result: {result}")
-        
+
         expected_total = result["messages_tokens"] + result["tools_tokens"] + result["system_tokens"]
         assert result["total_tokens"] == expected_total, "Total should be sum of components"
 
@@ -835,38 +781,29 @@ class TestEstimateRequestTokens:
         What it does: Simulates Anthropic /v1/messages with tools+system scenario.
         Purpose: Verify estimate_request_tokens no longer undercounts flat tools.
         """
-        messages = [
-            {"role": "user", "content": "请先读取项目结构，再回答。"}
-        ]
+        messages = [{"role": "user", "content": "请先读取项目结构，再回答。"}]
         tools = [
             {
                 "name": "read_file",
                 "description": "Read a file from workspace",
                 "input_schema": {
                     "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Absolute path"}
-                    },
-                    "required": ["path"]
-                }
+                    "properties": {"path": {"type": "string", "description": "Absolute path"}},
+                    "required": ["path"],
+                },
             }
         ]
         system_prompt = [{"type": "text", "text": "你是代码助手。"}]
 
         result = estimate_request_tokens(
-            messages,
-            tools=tools,
-            system_prompt=system_prompt,
-            apply_claude_correction=False
+            messages, tools=tools, system_prompt=system_prompt, apply_claude_correction=False
         )
 
         assert result["messages_tokens"] > 0
         assert result["tools_tokens"] > 4
         assert result["system_tokens"] > 0
-        assert result["total_tokens"] == (
-            result["messages_tokens"] + result["tools_tokens"] + result["system_tokens"]
-        )
-    
+        assert result["total_tokens"] == (result["messages_tokens"] + result["tools_tokens"] + result["system_tokens"])
+
     def test_empty_messages(self):
         """
         What it does: Checks token estimation for empty message list.
@@ -875,14 +812,14 @@ class TestEstimateRequestTokens:
         print("Test: Empty messages...")
         result = estimate_request_tokens([])
         print(f"Result: {result}")
-        
+
         assert result["messages_tokens"] == 0
         assert result["total_tokens"] == 0
 
 
 class TestClaudeCorrectionFactor:
     """Tests for Claude correction coefficient."""
-    
+
     def test_correction_factor_value(self):
         """
         What it does: Checks correction coefficient value.
@@ -890,7 +827,7 @@ class TestClaudeCorrectionFactor:
         """
         print(f"Correction coefficient: {CLAUDE_CORRECTION_FACTOR}")
         assert CLAUDE_CORRECTION_FACTOR == 1.15, "Coefficient should be 1.15"
-    
+
     def test_correction_increases_token_count(self):
         """
         What it does: Checks that correction increases token count.
@@ -898,81 +835,85 @@ class TestClaudeCorrectionFactor:
         """
         print("Test: Correction increases tokens...")
         text = "This is a test text for checking the correction factor"
-        
+
         with_correction = count_tokens(text, apply_claude_correction=True)
         without_correction = count_tokens(text, apply_claude_correction=False)
-        
+
         print(f"With correction: {with_correction}")
         print(f"Without correction: {without_correction}")
-        
+
         assert with_correction > without_correction
-        
+
         # Check that difference is approximately 15%
         increase_percent = (with_correction - without_correction) / without_correction * 100
         print(f"Increase: {increase_percent:.1f}%")
-        
+
         # Allow rounding error
         assert 10 <= increase_percent <= 20, "Increase should be around 15%"
+
+
 class TestGetEncoding:
     """Tests for _get_encoding function."""
-    
+
     def test_returns_encoding_when_tiktoken_available(self):
         """
         What it does: Checks that _get_encoding returns encoding when tiktoken is available.
         Purpose: Ensure correct tiktoken initialization.
         """
         print("Test: tiktoken available...")
-        
+
         # Reset global variable for clean test
         import kiro.tokenizer as tokenizer_module
+
         original_encoding = tokenizer_module._encoding
         tokenizer_module._encoding = None
-        
+
         try:
             encoding = _get_encoding()
             print(f"Encoding: {encoding}")
-            
+
             # If tiktoken is installed, should return encoding
             if encoding is not None:
-                assert hasattr(encoding, 'encode'), "Encoding should have encode method"
+                assert hasattr(encoding, "encode"), "Encoding should have encode method"
         finally:
             # Restore
             tokenizer_module._encoding = original_encoding
-    
+
     def test_caches_encoding(self):
         """
         What it does: Checks that encoding is cached.
         Purpose: Ensure lazy initialization.
         """
         print("Test: Encoding caching...")
-        
+
         encoding1 = _get_encoding()
         encoding2 = _get_encoding()
-        
+
         print(f"Encoding 1: {encoding1}")
         print(f"Encoding 2: {encoding2}")
-        
+
         # Should return same object
         assert encoding1 is encoding2, "Encoding should be cached"
-    
+
     def test_handles_import_error(self):
         """
         What it does: Checks ImportError handling when tiktoken is missing.
         Purpose: Ensure system works without tiktoken.
         """
         print("Test: ImportError...")
-        
+
         import kiro.tokenizer as tokenizer_module
+
         original_encoding = tokenizer_module._encoding
         tokenizer_module._encoding = None
-        
+
         try:
             # Мокируем import tiktoken чтобы выбросить ImportError
-            with patch.dict('sys.modules', {'tiktoken': None}):
-                with patch('builtins.__import__', side_effect=ImportError("No module named 'tiktoken'")):
+            with patch.dict("sys.modules", {"tiktoken": None}):
+                with patch("builtins.__import__", side_effect=ImportError("No module named 'tiktoken'")):
                     # Сбрасываем кэш
                     tokenizer_module._encoding = None
-                    
+
                     # Должен вернуть None и не упасть
                     # Примечание: из-за кэширования этот тест может не работать идеально
                     # но главное - проверить что код не падает
@@ -983,21 +924,21 @@ class TestGetEncoding:
 
 class TestTokenizerIntegration:
     """Integration tests for tokenizer."""
-    
+
     def test_realistic_chat_request(self):
         """
         What it does: Checks token counting for realistic chat request.
         Purpose: Ensure correct work on real data.
         """
         print("Test: Realistic chat request...")
-        
+
         messages = [
             {"role": "system", "content": "You are a helpful AI assistant. Be concise and accurate."},
             {"role": "user", "content": "What is the capital of France?"},
             {"role": "assistant", "content": "The capital of France is Paris."},
-            {"role": "user", "content": "What is its population?"}
+            {"role": "user", "content": "What is its population?"},
         ]
-        
+
         tools = [
             {
                 "type": "function",
@@ -1006,54 +947,50 @@ class TestTokenizerIntegration:
                     "description": "Search the web for information",
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Search query"}
-                        },
-                        "required": ["query"]
-                    }
-                }
+                        "properties": {"query": {"type": "string", "description": "Search query"}},
+                        "required": ["query"],
+                    },
+                },
             }
         ]
-        
+
         result = estimate_request_tokens(messages, tools=tools)
         print(f"Result: {result}")
-        
+
         # Check reasonable values
         assert result["messages_tokens"] > 50, "Messages should have > 50 tokens"
         assert result["tools_tokens"] > 20, "Tools should have > 20 tokens"
         assert result["total_tokens"] > 70, "Total should be > 70 tokens"
-    
+
     def test_large_context(self):
         """
         What it does: Checks token counting for large context.
         Purpose: Ensure performance on large data.
         """
         print("Test: Large context...")
-        
+
         # Создаём большой текст
         large_text = "This is a test sentence. " * 1000  # ~5000 слов
-        
+
         messages = [{"role": "user", "content": large_text}]
-        
+
         result = estimate_request_tokens(messages)
         print(f"Токенов в большом тексте: {result['total_tokens']}")
-        
+
         # Should have many tokens
         assert result["total_tokens"] > 1000, "Large text should have > 1000 tokens"
-    
+
     def test_consistency_across_calls(self):
         """
         What it does: Checks consistency of counting on repeated calls.
         Purpose: Ensure results are deterministic.
         """
         print("Test: Consistency...")
-        
+
         text = "This is a test for consistency checking"
-        
+
         results = [count_tokens(text) for _ in range(5)]
         print(f"Результаты: {results}")
-        
+
         # All results should be identical
         assert len(set(results)) == 1, "Results should be consistent"
-    
-    

@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import json
 import os
 import secrets
 import sqlite3
@@ -23,12 +22,12 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
 from kiro.account_manager import account_label, account_routing_state
+from kiro.accounts_admin import register_account
 from kiro.config import (
     FALLBACK_MODELS,
     RATE_OBSERVATION_RETENTION_DAYS,
     REQUEST_LOG_RETENTION_DAYS,
 )
-from kiro.accounts_admin import register_account
 from kiro.device_login import (
     DeviceLoginError,
     discard_flow,
@@ -37,8 +36,8 @@ from kiro.device_login import (
     start_device_login,
     write_builder_id_credentials,
 )
-from kiro.usage_tracking import ROOT_KEY_ID, current_api_key_id, drain_pending_usage
 from kiro.usage import fetch_account_usage
+from kiro.usage_tracking import ROOT_KEY_ID, drain_pending_usage
 
 router = APIRouter(tags=["dashboard"])
 
@@ -220,7 +219,10 @@ def flush_key_model_usage() -> int:
                     completion_tokens = completion_tokens + excluded.completion_tokens,
                     requests = requests + excluded.requests,
                     updated_at = excluded.updated_at""",
-                [(key_id, model, prompt, completion, requests, now) for key_id, model, prompt, completion, requests in pending],
+                [
+                    (key_id, model, prompt, completion, requests, now)
+                    for key_id, model, prompt, completion, requests in pending
+                ],
             )
         return len(pending)
     except Exception:
@@ -238,14 +240,16 @@ def key_model_usage() -> dict[str, list[dict[str, Any]]]:
         return {}
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        grouped.setdefault(row["key_id"], []).append({
-            "model": row["model"],
-            "promptTokens": row["prompt_tokens"],
-            "completionTokens": row["completion_tokens"],
-            "totalTokens": row["prompt_tokens"] + row["completion_tokens"],
-            "requests": row["requests"],
-            "updatedAt": row["updated_at"],
-        })
+        grouped.setdefault(row["key_id"], []).append(
+            {
+                "model": row["model"],
+                "promptTokens": row["prompt_tokens"],
+                "completionTokens": row["completion_tokens"],
+                "totalTokens": row["prompt_tokens"] + row["completion_tokens"],
+                "requests": row["requests"],
+                "updatedAt": row["updated_at"],
+            }
+        )
     return grouped
 
 
@@ -282,7 +286,13 @@ def create_data_api_key(name: str) -> tuple[str, dict[str, Any]]:
             "INSERT INTO api_keys(id, name, key_prefix, salt, key_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (key_id, name.strip() or "Unnamed key", key_prefix, salt, _hash_api_key(raw_key, salt), created_at),
         )
-    return raw_key, {"id": key_id, "name": name.strip() or "Unnamed key", "prefix": key_prefix, "createdAt": created_at, "revokedAt": None}
+    return raw_key, {
+        "id": key_id,
+        "name": name.strip() or "Unnamed key",
+        "prefix": key_prefix,
+        "createdAt": created_at,
+        "revokedAt": None,
+    }
 
 
 def identify_data_api_key(value: str) -> str | None:
@@ -316,13 +326,26 @@ def verify_data_api_key(value: str) -> bool:
 
 def list_data_api_keys() -> list[dict[str, Any]]:
     with _db() as conn:
-        rows = conn.execute("SELECT id, name, key_prefix, created_at, revoked_at FROM api_keys ORDER BY created_at DESC").fetchall()
-    return [{"id": r["id"], "name": r["name"], "prefix": r["key_prefix"], "createdAt": r["created_at"], "revokedAt": r["revoked_at"]} for r in rows]
+        rows = conn.execute(
+            "SELECT id, name, key_prefix, created_at, revoked_at FROM api_keys ORDER BY created_at DESC"
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "prefix": r["key_prefix"],
+            "createdAt": r["created_at"],
+            "revokedAt": r["revoked_at"],
+        }
+        for r in rows
+    ]
 
 
 def revoke_data_api_key(key_id: str) -> bool:
     with _db() as conn:
-        result = conn.execute("UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (int(time.time()), key_id))
+        result = conn.execute(
+            "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (int(time.time()), key_id)
+        )
     return result.rowcount > 0
 
 
@@ -348,12 +371,19 @@ def _cached_usage(account_id: str) -> dict[str, Any] | None:
     if not row:
         return None
     return {
-        "subscriptionTitle": row["subscription_title"], "subscriptionType": row["subscription_type"],
-        "resourceType": row["resource_type"], "currentUsage": row["current_usage"],
-        "usageLimit": row["usage_limit"], "usagePercent": row["usage_percent"], "unit": row["unit"],
-        "nextDateReset": row["next_date_reset"], "daysUntilReset": row["days_until_reset"],
-        "overageStatus": row["overage_status"], "overageUsed": row["overage_used"],
-        "updatedAt": row["updated_at"], "error": row["error"],
+        "subscriptionTitle": row["subscription_title"],
+        "subscriptionType": row["subscription_type"],
+        "resourceType": row["resource_type"],
+        "currentUsage": row["current_usage"],
+        "usageLimit": row["usage_limit"],
+        "usagePercent": row["usage_percent"],
+        "unit": row["unit"],
+        "nextDateReset": row["next_date_reset"],
+        "daysUntilReset": row["days_until_reset"],
+        "overageStatus": row["overage_status"],
+        "overageUsed": row["overage_used"],
+        "updatedAt": row["updated_at"],
+        "error": row["error"],
     }
 
 
@@ -367,7 +397,21 @@ async def refresh_account_usage(account: Any) -> dict[str, Any]:
                 """INSERT INTO account_usage(account_id, subscription_title, subscription_type, resource_type, current_usage, usage_limit, usage_percent, unit, next_date_reset, days_until_reset, overage_status, overage_used, updated_at, error)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(account_id) DO UPDATE SET subscription_title=excluded.subscription_title, subscription_type=excluded.subscription_type, resource_type=excluded.resource_type, current_usage=excluded.current_usage, usage_limit=excluded.usage_limit, usage_percent=excluded.usage_percent, unit=excluded.unit, next_date_reset=excluded.next_date_reset, days_until_reset=excluded.days_until_reset, overage_status=excluded.overage_status, overage_used=excluded.overage_used, updated_at=excluded.updated_at, error=NULL""",
-                (account.id, usage["subscriptionTitle"], usage["subscriptionType"], usage["resourceType"], usage["currentUsage"], usage["usageLimit"], usage["usagePercent"], usage["unit"], str(usage["nextDateReset"] or ""), usage["daysUntilReset"], usage["overageStatus"], usage["overageUsed"], updated_at),
+                (
+                    account.id,
+                    usage["subscriptionTitle"],
+                    usage["subscriptionType"],
+                    usage["resourceType"],
+                    usage["currentUsage"],
+                    usage["usageLimit"],
+                    usage["usagePercent"],
+                    usage["unit"],
+                    str(usage["nextDateReset"] or ""),
+                    usage["daysUntilReset"],
+                    usage["overageStatus"],
+                    usage["overageUsed"],
+                    updated_at,
+                ),
             )
         return {**usage, "updatedAt": updated_at, "error": None}
     except Exception as exc:
@@ -430,7 +474,14 @@ async def dashboard_login(request: Request, response: Response) -> dict[str, boo
         raise HTTPException(status_code=401, detail="Invalid password")
     token = secrets.token_urlsafe(32)
     _sessions[token] = time.time() + _SESSION_TTL_SECONDS
-    response.set_cookie(_COOKIE, token, httponly=True, samesite="strict", secure=request.url.scheme == "https", max_age=_SESSION_TTL_SECONDS)
+    response.set_cookie(
+        _COOKIE,
+        token,
+        httponly=True,
+        samesite="strict",
+        secure=request.url.scheme == "https",
+        max_age=_SESSION_TTL_SECONDS,
+    )
     return {"ok": True}
 
 
@@ -450,14 +501,16 @@ async def dashboard_list_keys(request: Request) -> dict[str, list[dict[str, Any]
     # and it cannot be revoked from here because it lives in the environment.
     legacy = os.getenv("PROXY_API_KEY", "")
     if legacy:
-        keys.append({
-            "id": ROOT_KEY_ID,
-            "name": "Root key (environment)",
-            "prefix": legacy[:4] + "…",
-            "createdAt": None,
-            "revokedAt": None,
-            "readOnly": True,
-        })
+        keys.append(
+            {
+                "id": ROOT_KEY_ID,
+                "name": "Root key (environment)",
+                "prefix": legacy[:4] + "…",
+                "createdAt": None,
+                "revokedAt": None,
+                "readOnly": True,
+            }
+        )
     keys.extend({**key, "readOnly": False} for key in list_data_api_keys())
     return {"apiKeys": keys}
 
@@ -630,7 +683,7 @@ async def dashboard_request_rate(request: Request, window: int = 900, bucket: in
 async def dashboard_models(request: Request) -> dict[str, list[dict[str, str]]]:
     _require_auth(request)
     models = request.app.state.account_manager.get_all_available_models() or FALLBACK_MODELS
-    return {"models": [{"id": item.get("modelId", item) if isinstance(item, dict) else item} for item in models]}
+    return {"models": [{"id": item["modelId"] if isinstance(item, dict) else item} for item in models]}
 
 
 @router.get("/api/dashboard/request-logs")

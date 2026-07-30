@@ -13,12 +13,7 @@ def test_parallel_streams_are_isolated() -> None:
     completed = subprocess.run(
         [
             sys.executable,
-            str(
-                repository
-                / "tests"
-                / "integration"
-                / "parser_integrity_probe.py"
-            ),
+            str(repository / "tests" / "integration" / "parser_integrity_probe.py"),
         ],
         cwd=repository,
         env=environment,

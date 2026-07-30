@@ -36,9 +36,7 @@ def _openai(messages, **kwargs):
 
 
 def _anthropic(messages, **kwargs):
-    request = AnthropicMessagesRequest(
-        model="claude-sonnet-4.6", max_tokens=256, messages=messages, **kwargs
-    )
+    request = AnthropicMessagesRequest(model="claude-sonnet-4.6", max_tokens=256, messages=messages, **kwargs)
     return json.dumps(anthropic_to_kiro(request, "test", "profile"))
 
 

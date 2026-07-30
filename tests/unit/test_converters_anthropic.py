@@ -12,34 +12,27 @@ Tests for Anthropic Messages API to Kiro format conversion:
 - Full Anthropic → Kiro payload conversion
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
-
 from kiro.converters_anthropic import (
     convert_anthropic_content_to_text,
-    extract_system_prompt,
-    extract_tool_results_from_anthropic_content,
-    extract_images_from_tool_results,
-    extract_tool_uses_from_anthropic_content,
     convert_anthropic_messages,
     convert_anthropic_tools,
-    anthropic_to_kiro,
+    extract_images_from_tool_results,
+    extract_system_prompt,
+    extract_tool_results_from_anthropic_content,
+    extract_tool_uses_from_anthropic_content,
 )
 from kiro.converters_core import (
-    UnifiedMessage,
     UnifiedTool,
     convert_tool_results_to_kiro_format,
 )
 from kiro.models_anthropic import (
-    AnthropicMessagesRequest,
     AnthropicMessage,
     AnthropicTool,
-    TextContentBlock,
-    ToolUseContentBlock,
-    ToolResultContentBlock,
     SystemContentBlock,
+    TextContentBlock,
+    ToolResultContentBlock,
+    ToolUseContentBlock,
 )
-
 
 # ==================================================================================================
 # Tests for convert_anthropic_content_to_text
@@ -176,9 +169,7 @@ class TestExtractSystemPrompt:
         print("Action: Extracting system prompt...")
         result = extract_system_prompt(system)
 
-        print(
-            f"Comparing result: Expected 'You are a helpful assistant.', Got '{result}'"
-        )
+        print(f"Comparing result: Expected 'You are a helpful assistant.', Got '{result}'")
         assert result == "You are a helpful assistant."
 
     def test_extracts_from_list_with_text_blocks(self):
@@ -195,9 +186,7 @@ class TestExtractSystemPrompt:
         print("Action: Extracting system prompt...")
         result = extract_system_prompt(system)
 
-        print(
-            f"Comparing result: Expected 'You are helpful.\\nBe concise.', Got '{result}'"
-        )
+        print(f"Comparing result: Expected 'You are helpful.\\nBe concise.', Got '{result}'")
         assert result == "You are helpful.\nBe concise."
 
     def test_extracts_from_list_with_cache_control(self):
@@ -217,9 +206,7 @@ class TestExtractSystemPrompt:
         print("Action: Extracting system prompt...")
         result = extract_system_prompt(system)
 
-        print(
-            f"Comparing result: Expected 'You are a helpful assistant.', Got '{result}'"
-        )
+        print(f"Comparing result: Expected 'You are a helpful assistant.', Got '{result}'")
         assert result == "You are a helpful assistant."
 
     def test_extracts_from_pydantic_system_content_blocks(self):
@@ -355,9 +342,7 @@ class TestExtractToolResultsFromAnthropicContent:
         Purpose: Ensure tool_result blocks are extracted correctly.
         """
         print("Setup: Content with tool_result block...")
-        content = [
-            {"type": "tool_result", "tool_use_id": "call_123", "content": "Result text"}
-        ]
+        content = [{"type": "tool_result", "tool_use_id": "call_123", "content": "Result text"}]
 
         print("Action: Extracting tool results...")
         result = extract_tool_results_from_anthropic_content(content)
@@ -374,11 +359,7 @@ class TestExtractToolResultsFromAnthropicContent:
         Purpose: Ensure Pydantic models are handled correctly.
         """
         print("Setup: Content with Pydantic ToolResultContentBlock...")
-        content = [
-            ToolResultContentBlock(
-                type="tool_result", tool_use_id="call_456", content="Pydantic result"
-            )
-        ]
+        content = [ToolResultContentBlock(type="tool_result", tool_use_id="call_456", content="Pydantic result")]
 
         print("Action: Extracting tool results...")
         result = extract_tool_results_from_anthropic_content(content)
@@ -850,11 +831,7 @@ class TestExtractToolUsesFromAnthropicContent:
         Purpose: Ensure Pydantic models are handled correctly.
         """
         print("Setup: Content with Pydantic ToolUseContentBlock...")
-        content = [
-            ToolUseContentBlock(
-                type="tool_use", id="call_456", name="search", input={"query": "test"}
-            )
-        ]
+        content = [ToolUseContentBlock(type="tool_use", id="call_456", name="search", input={"query": "test"})]
 
         print("Action: Extracting tool uses...")
         result = extract_tool_uses_from_anthropic_content(content)
@@ -1146,19 +1123,13 @@ class TestConvertAnthropicMessages:
 
         print("Checking images field...")
         assert result[0].images is not None, "images field should not be None"
-        assert len(result[0].images) == 1, (
-            f"Expected 1 image, got {len(result[0].images)}"
-        )
+        assert len(result[0].images) == 1, f"Expected 1 image, got {len(result[0].images)}"
 
         image = result[0].images[0]
-        print(
-            f"Comparing image: Expected media_type='image/jpeg', Got '{image.get('media_type')}'"
-        )
+        print(f"Comparing image: Expected media_type='image/jpeg', Got '{image.get('media_type')}'")
         assert image["media_type"] == "image/jpeg"
 
-        print(
-            f"Comparing image data: Expected {test_image_base64[:20]}..., Got {image.get('data', '')[:20]}..."
-        )
+        print(f"Comparing image data: Expected {test_image_base64[:20]}..., Got {image.get('data', '')[:20]}...")
         assert image["data"] == test_image_base64
 
     def test_images_only_extracted_from_user_role(self):
@@ -1197,9 +1168,7 @@ class TestConvertAnthropicMessages:
         assert len(result[0].images) == 1
 
         print("Checking assistant message has no images...")
-        assert result[1].images is None, (
-            "Assistant messages should not have images extracted"
-        )
+        assert result[1].images is None, "Assistant messages should not have images extracted"
 
     def test_extracts_multiple_images_from_user_message(self):
         """
@@ -1245,14 +1214,10 @@ class TestConvertAnthropicMessages:
         print("Action: Converting messages...")
         result = convert_anthropic_messages(messages)
 
-        print(
-            f"Result images count: {len(result[0].images) if result[0].images else 0}"
-        )
+        print(f"Result images count: {len(result[0].images) if result[0].images else 0}")
 
         assert result[0].images is not None
-        assert len(result[0].images) == 3, (
-            f"Expected 3 images, got {len(result[0].images)}"
-        )
+        assert len(result[0].images) == 3, f"Expected 3 images, got {len(result[0].images)}"
 
         print("Checking image media types...")
         media_types = [img["media_type"] for img in result[0].images]
@@ -1446,14 +1411,16 @@ class TestConvertAnthropicTools:
 
 class TestAnthropicToolResultStatus:
     def test_preserves_is_error_in_kiro_status(self):
-        extracted = extract_tool_results_from_anthropic_content([
-            {
-                "type": "tool_result",
-                "tool_use_id": "toolu_A",
-                "is_error": True,
-                "content": "database unavailable",
-            }
-        ])
+        extracted = extract_tool_results_from_anthropic_content(
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_A",
+                    "is_error": True,
+                    "content": "database unavailable",
+                }
+            ]
+        )
 
         converted = convert_tool_results_to_kiro_format(extracted)
 

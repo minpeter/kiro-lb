@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
 from kiro.debug_replay import main
 from kiro.debug_sanitize import sanitize_bytes, sanitize_value
 from kiro.sse_validation import (
@@ -46,9 +47,7 @@ def _write_replay(
         "client_request": {},
         "kiro_request": {},
         "upstream_chunks": [],
-        "translated_sse": [
-            _record(index, chunk) for index, chunk in enumerate(chunks)
-        ],
+        "translated_sse": [_record(index, chunk) for index, chunk in enumerate(chunks)],
     }
     path.write_text(json.dumps(replay))
     return replay
@@ -79,34 +78,34 @@ class TestDebugReplay:
 
     def test_openai_rejects_content_after_finish_reason(self):
         validator = OpenAIStreamValidator()
-        validator.accept({
-            "choices": [
-                {
-                    "delta": {},
-                    "finish_reason": "stop",
-                }
-            ]
-        })
-
-        with pytest.raises(StreamProtocolError):
-            validator.accept({
+        validator.accept(
+            {
                 "choices": [
                     {
-                        "delta": {"content": "late"},
-                        "finish_reason": None,
+                        "delta": {},
+                        "finish_reason": "stop",
                     }
                 ]
-            })
+            }
+        )
+
+        with pytest.raises(StreamProtocolError):
+            validator.accept(
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": "late"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
 
     @pytest.mark.asyncio
     async def test_fixed_translator_replays_capture_without_order_failure(
         self,
     ):
-        fixture_path = (
-            Path(__file__).parents[1]
-            / "fixtures"
-            / "invalid_assistant_content_event_order.json"
-        )
+        fixture_path = Path(__file__).parents[1] / "fixtures" / "invalid_assistant_content_event_order.json"
         fixture = json.loads(fixture_path.read_text())
 
         async def raw_events(*args, **kwargs):
@@ -131,25 +130,16 @@ class TestDebugReplay:
             ):
                 chunks.append(chunk)
 
-        records = [
-            _record(index, chunk)
-            for index, chunk in enumerate(chunks)
-        ]
+        records = [_record(index, chunk) for index, chunk in enumerate(chunks)]
         validate_anthropic_records(records)
 
     def test_historical_fixture_replays_invalid_order(self, capsys):
-        fixture = (
-            Path(__file__).parents[1]
-            / "fixtures"
-            / "invalid_assistant_content_event_order.json"
-        )
+        fixture = Path(__file__).parents[1] / "fixtures" / "invalid_assistant_content_event_order.json"
 
         exit_code = main(["validate", str(fixture)])
 
         assert exit_code == 3
-        assert capsys.readouterr().err.strip() == (
-            "Invalid assistant content event order"
-        )
+        assert capsys.readouterr().err.strip() == ("Invalid assistant content event order")
 
     def test_replays_invalid_assistant_content_order(
         self,
@@ -183,9 +173,7 @@ class TestDebugReplay:
         exit_code = main(["validate", str(replay_path)])
 
         assert exit_code == 3
-        assert capsys.readouterr().err.strip() == (
-            "Invalid assistant content event order"
-        )
+        assert capsys.readouterr().err.strip() == ("Invalid assistant content event order")
 
     def test_valid_capture_exits_cleanly(self, tmp_path):
         replay_path = tmp_path / "replay.json"
@@ -247,14 +235,16 @@ class TestDebugReplay:
         ]
         _write_replay(replay_path, chunks)
 
-        exit_code = main([
-            "replay",
-            str(replay_path),
-            "--protocol",
-            "anthropic",
-            "--output",
-            str(output),
-        ])
+        exit_code = main(
+            [
+                "replay",
+                str(replay_path),
+                "--protocol",
+                "anthropic",
+                "--output",
+                str(output),
+            ]
+        )
 
         assert exit_code == 3
         assert output.read_text() == "".join(chunks)
@@ -268,11 +258,13 @@ class TestDebugReplay:
         output = tmp_path / "fixture.json"
         _write_replay(replay_path, [], capture_content=True)
 
-        exit_code = main([
-            "export-fixture",
-            str(replay_path),
-            str(output),
-        ])
+        exit_code = main(
+            [
+                "export-fixture",
+                str(replay_path),
+                str(output),
+            ]
+        )
 
         assert exit_code == 2
         assert "content enabled" in capsys.readouterr().err
@@ -290,11 +282,13 @@ class TestDebugReplay:
             ["Authorization: Bearer encoded-secret-token\n"],
         )
 
-        exit_code = main([
-            "export-fixture",
-            str(replay_path),
-            str(output),
-        ])
+        exit_code = main(
+            [
+                "export-fixture",
+                str(replay_path),
+                str(output),
+            ]
+        )
 
         assert exit_code == 2
         assert "credential pattern" in capsys.readouterr().err
@@ -308,16 +302,21 @@ class TestDebugReplay:
         assert "private-prefix" not in prefixed
         assert '"chars":15' in prefixed
 
-        sanitized = sanitize_value({
-            "providerToken": "provider-value",
-            "awsAccessKeyId": "aws-value",
-            "browserSession": "session-value",
-            "customSignature": "signature-value",
-            "arguments": json.dumps({
-                "nestedProviderToken": "nested-value",
-                "message": "visible",
-            }),
-        }, capture_content=True)
+        sanitized = sanitize_value(
+            {
+                "providerToken": "provider-value",
+                "awsAccessKeyId": "aws-value",
+                "browserSession": "session-value",
+                "customSignature": "signature-value",
+                "arguments": json.dumps(
+                    {
+                        "nestedProviderToken": "nested-value",
+                        "message": "visible",
+                    }
+                ),
+            },
+            capture_content=True,
+        )
         assert sanitized["providerToken"] == "[REDACTED]"
         assert sanitized["awsAccessKeyId"] == "[REDACTED]"
         assert sanitized["browserSession"] == "[REDACTED]"
@@ -339,9 +338,7 @@ class TestDebugReplay:
         replay["translated_sse"][0]["payload_base64"] = payload
         replay_path.write_text(json.dumps(replay))
 
-        assert main([
-            "export-fixture", str(replay_path), str(output)
-        ]) == 2
+        assert main(["export-fixture", str(replay_path), str(output)]) == 2
         assert "invalid base64" in capsys.readouterr().err
         assert not output.exists()
 
@@ -364,9 +361,7 @@ class TestDebugReplay:
             replay["client_request"] = {"aws_session_token": "opaque-value"}
             replay_path.write_text(json.dumps(replay))
 
-        assert main([
-            "export-fixture", str(replay_path), str(output)
-        ]) == 2
+        assert main(["export-fixture", str(replay_path), str(output)]) == 2
         assert "credential pattern" in capsys.readouterr().err
         assert not output.exists()
 
@@ -385,9 +380,7 @@ class TestDebugReplay:
             real_replace(source, destination)
 
         with patch("kiro.debug_replay.os.replace", inspect_replace):
-            assert main([
-                "export-fixture", str(replay_path), str(output)
-            ]) == 0
+            assert main(["export-fixture", str(replay_path), str(output)]) == 0
 
         assert observed and observed[0][1] == output
         assert output.stat().st_mode & 0o777 == 0o600
@@ -407,12 +400,17 @@ class TestDebugReplay:
             ],
         )
 
-        assert main([
-            "replay",
-            str(replay_path),
-            "--protocol",
-            "anthropic",
-            "--output",
-            str(output),
-        ]) == 0
+        assert (
+            main(
+                [
+                    "replay",
+                    str(replay_path),
+                    "--protocol",
+                    "anthropic",
+                    "--output",
+                    str(output),
+                ]
+            )
+            == 0
+        )
         assert output.stat().st_mode & 0o777 == 0o600

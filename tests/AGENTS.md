@@ -1,6 +1,6 @@
 # tests/ — pytest suite
 
-1694 tests, ~42k lines. Unit tests dominate (44 modules); integration tests
+1694 tests, ~44k lines. Unit tests dominate (44 modules); 4 integration modules
 exercise route and stream wiring. Full run is under 10 seconds because nothing
 touches network.
 
@@ -9,8 +9,9 @@ touches network.
 ```
 tests/
 ├── conftest.py            # session fixtures incl. network blocking
+├── fixtures/              # recorded bad-order payloads for validation tests
 ├── unit/                  # 44 modules, roughly one per kiro/ module
-└── integration/           # route/stream flows + manual probes
+└── integration/           # 4 route/stream flow modules + 2 live probes
 ```
 
 ## WHERE TO LOOK
@@ -31,13 +32,19 @@ tests/
 
 ## CONVENTIONS
 
-- `block_all_network_calls` in `conftest.py:419` is session-scoped and autouse.
-  Real network access fails the test; mock at the httpx layer.
-- `setup_test_environment` (`conftest.py:44`) is also autouse and points
-  credentials/state at a tmp path. Never let a test read the real `data/`.
+- `block_all_network_calls` (`conftest.py:420`) is session-scoped and autouse. It
+  patches `httpx.AsyncClient` in `kiro.auth`, `kiro.http_client`,
+  `kiro.streaming_openai`, and `kiro.account_manager`; real network access fails
+  the test. Fake streams come back as a real async `aiter_bytes` generator, so
+  code under test sees bytes, not a coroutine mock.
+- `setup_test_environment` (`conftest.py:45`) is also autouse and repoints
+  `ACCOUNTS_CONFIG_FILE`, `ACCOUNTS_STATE_FILE`, and `DASHBOARD_DATA_DIR` at a
+  tmp path. Never let a test read the real `data/`.
 - Naming is enforced by `pytest.ini`: `test_*.py`, `Test*`, `test_*`.
 - Classes group by outcome: `Test*Success`, `Test*Errors`, `Test*EdgeCases`.
 - Add tests to the existing module for a subsystem; new files only for new modules.
+- Upstream stream bytes come from the `mock_kiro_*_chunks` fixtures or from
+  patching the parser to emit `KiroEvent`s directly; do not hand-roll a client.
 - Protocol tests assert parsed structure and event order, not prose or exact
   prompt sentences.
 

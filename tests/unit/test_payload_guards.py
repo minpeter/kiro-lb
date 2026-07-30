@@ -7,10 +7,7 @@ Tests check_payload_size() and trim_payload_to_limit() functions.
 
 import json
 
-import pytest
-
 from kiro.payload_guards import (
-    PayloadTrimStats,
     check_payload_size,
     trim_payload_to_limit,
 )
@@ -20,19 +17,13 @@ def _make_payload(num_pairs=5, content_size=100):
     """Helper: build a minimal Kiro-shaped payload with N user/assistant pairs."""
     history = []
     for i in range(num_pairs):
-        history.append({
-            "userInputMessage": {"content": f"user message {i} " + "x" * content_size}
-        })
-        history.append({
-            "assistantResponseMessage": {"content": f"assistant message {i} " + "y" * content_size}
-        })
+        history.append({"userInputMessage": {"content": f"user message {i} " + "x" * content_size}})
+        history.append({"assistantResponseMessage": {"content": f"assistant message {i} " + "y" * content_size}})
     return {
         "conversationState": {
             "chatTriggerType": "MANUAL",
             "conversationId": "test-conv",
-            "currentMessage": {
-                "userInputMessage": {"content": "current message", "modelId": "test"}
-            },
+            "currentMessage": {"userInputMessage": {"content": "current message", "modelId": "test"}},
             "history": history,
         },
         "profileArn": "arn:aws:test",
@@ -40,7 +31,6 @@ def _make_payload(num_pairs=5, content_size=100):
 
 
 class TestCheckPayloadSize:
-
     def test_check_payload_size_returns_bytes(self):
         """Correct byte count for a simple payload."""
         payload = {"key": "value"}
@@ -59,7 +49,6 @@ class TestCheckPayloadSize:
 
 
 class TestTrimPayloadToLimit:
-
     def test_trim_does_nothing_when_under_limit(self):
         """No-op when payload is small."""
         payload = _make_payload(num_pairs=2, content_size=10)

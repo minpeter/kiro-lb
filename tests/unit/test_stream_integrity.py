@@ -5,17 +5,17 @@ repeated deltas were dropped as "replays", and the upstream stop reason was
 ignored so a truncated turn looked like a clean finish.
 """
 
-import pytest
 import httpx
+import pytest
 
 from kiro.parsers import AwsEventStreamParser
-from kiro.streaming_core import parse_kiro_stream
 from kiro.stop_reasons import (
     is_truncated,
     normalize,
     to_anthropic_stop_reason,
     to_openai_finish_reason,
 )
+from kiro.streaming_core import parse_kiro_stream
 
 
 def _frames(*contents: str) -> bytes:

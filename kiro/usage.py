@@ -24,6 +24,7 @@ def _usage_region(account: Account) -> str:
     The profile ARN is authoritative. Otherwise derive the region from the
     resolved API host, which already accounts for per-account overrides.
     """
+    assert account.auth_manager is not None
     profile_arn = account.auth_manager.profile_arn or ""
     parts = profile_arn.split(":")
     if len(parts) >= 4 and parts[2] == "codewhisperer":

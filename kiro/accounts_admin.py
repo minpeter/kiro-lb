@@ -48,9 +48,7 @@ def _validate_sqlite(path: Path) -> None:
         raise ValueError("SQLite credential file does not exist in the server filesystem")
     try:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
-            found = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='auth_kv'"
-            ).fetchone()
+            found = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='auth_kv'").fetchone()
     except Exception as exc:
         raise ValueError(f"Cannot read SQLite credential database: {exc}") from exc
     if not found:

@@ -24,9 +24,7 @@ def _openai_model_id(model: str) -> str:
 
 
 def _anthropic_model_id(model: str) -> str:
-    request = AnthropicMessagesRequest(
-        model=model, max_tokens=32, messages=[{"role": "user", "content": "hi"}]
-    )
+    request = AnthropicMessagesRequest(model=model, max_tokens=32, messages=[{"role": "user", "content": "hi"}])
     payload = anthropic_to_kiro(request, "test", "profile")
     return payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
 

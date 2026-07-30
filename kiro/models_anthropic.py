@@ -8,10 +8,9 @@ Anthropic's Messages API specification.
 Reference: https://docs.anthropic.com/en/api/messages
 """
 
-import time
 from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, Field, model_validator
 
+from pydantic import BaseModel, Field, model_validator
 
 # ==================================================================================================
 # Content Block Models
@@ -84,9 +83,9 @@ class ToolResultContentBlock(BaseModel):
 
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
-    content: Optional[
-        Union[str, List[Union["TextContentBlock", "ImageContentBlock", "ToolReferenceContentBlock"]]]
-    ] = None
+    content: Optional[Union[str, List[Union["TextContentBlock", "ImageContentBlock", "ToolReferenceContentBlock"]]]] = (
+        None
+    )
     is_error: Optional[bool] = None
 
     model_config = {"extra": "allow"}
@@ -185,11 +184,11 @@ class AnthropicMessage(BaseModel):
 class AnthropicTool(BaseModel):
     """
     Tool definition in Anthropic format.
-    
+
     Supports both user-defined tools and server-side tools (Anthropic):
     - User-defined tools: require input_schema
     - Server-side tools: use type field (e.g., "web_search_20250305")
-    
+
     Attributes:
         type: Tool type for server-side tools (e.g., "web_search_20250305")
         name: Tool name (must match pattern ^[a-zA-Z0-9_-]{1,64}$)
@@ -200,35 +199,32 @@ class AnthropicTool(BaseModel):
         blocked_domains: Blocked domains for web_search (optional)
         user_location: User location for web_search (optional)
     """
-    
+
     # Server-side tool fields (Anthropic spec)
     type: Optional[str] = None
-    
+
     # Common fields
     name: str
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None  # Now optional for server-side tools
-    
+
     # Server-side tool parameters (Anthropic spec - accepted but not enforced)
     max_uses: Optional[int] = None
     allowed_domains: Optional[List[str]] = None
     blocked_domains: Optional[List[str]] = None
     user_location: Optional[Dict[str, Any]] = None
-    
+
     model_config = {"extra": "allow"}  # Forward compatibility
-    
+
     @model_validator(mode="after")
     def validate_tool_consistency(self):
         """Validate that user-defined tools have input_schema."""
         is_server_side = self.type is not None
-        
+
         if not is_server_side:
             # User-defined tool: input_schema is required
             if self.input_schema is None:
-                raise ValueError(
-                    "input_schema is required for user-defined tools "
-                    "(those without a 'type' field)"
-                )
+                raise ValueError("input_schema is required for user-defined tools (those without a 'type' field)")
         return self
 
 
@@ -331,24 +327,24 @@ class AnthropicMessagesRequest(BaseModel):
 class AnthropicCountTokensRequest(BaseModel):
     """
     Request to Anthropic Count Tokens API (/v1/messages/count_tokens).
-    
+
     Similar to AnthropicMessagesRequest but without generation parameters.
     Used to estimate token count before making actual request.
-    
+
     Attributes:
         model: Model ID (e.g., "claude-sonnet-4-5")
         messages: List of conversation messages
         system: System prompt (optional, string or list of content blocks)
         tools: List of available tools
     """
-    
+
     model: str
     messages: List[AnthropicMessage] = Field(min_length=1)
-    
+
     # Optional parameters - only those that affect token count
     system: Optional[SystemPrompt] = None
     tools: Optional[List[AnthropicTool]] = None
-    
+
     model_config = {"extra": "allow"}
 
 
@@ -396,9 +392,7 @@ class AnthropicMessagesResponse(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: List[Union[ThinkingContentBlock, TextContentBlock, ToolUseContentBlock]]
     model: str
-    stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
-    ] = None
+    stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]] = None
     stop_sequence: Optional[str] = None
     usage: AnthropicUsage
 
