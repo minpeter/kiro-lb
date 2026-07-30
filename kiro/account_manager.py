@@ -55,6 +55,7 @@ from kiro.config import (
     ACCOUNT_RECOVERY_TIMEOUT,
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
+    ACCOUNT_RATE_LIMIT_COOLDOWN,
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
@@ -168,6 +169,11 @@ class Account:
         model_resolver: Model resolver (lazy initialized)
         failures: Consecutive failure count (for Circuit Breaker)
         last_failure_time: Timestamp of last failure
+        rate_limited_until: Timestamp until which the account is rate limited.
+            Set by a 429 and deliberately kept out of the Circuit Breaker: a
+            rate rejection means "asked too quickly", not "broken", so the
+            account rotates out briefly and returns at full health. Not
+            persisted; the window is shorter than a restart.
         models_cached_at: Timestamp of last model cache update
         stats: Usage statistics
     """
@@ -177,6 +183,7 @@ class Account:
     model_resolver: Optional[ModelResolver] = None
     failures: int = 0
     last_failure_time: float = 0.0
+    rate_limited_until: float = 0.0
     models_cached_at: float = 0.0
     stats: AccountStats = field(default_factory=AccountStats)
 
@@ -668,6 +675,7 @@ class AccountManager:
         - Sticky behavior (prefer successful account)
         - Circuit Breaker with exponential backoff
         - Probabilistic retry for "dead" accounts (10%)
+        - Short skip for rate-limited accounts (no failure penalty)
         - TTL-based model cache refresh
         - Exclusion of already-tried accounts in current failover loop
         
@@ -731,6 +739,12 @@ class AccountManager:
                 
                 # Skip accounts already tried in current failover loop
                 if exclude_accounts and account_id in exclude_accounts:
+                    continue
+                
+                # Skip accounts inside their rate-limit window. This is checked
+                # before the Circuit Breaker and has no probabilistic retry:
+                # retrying a rate-limited account only earns another 429.
+                if account.rate_limited_until > time.time():
                     continue
                 
                 # Check Circuit Breaker (Half-Open state with exponential backoff)
@@ -798,6 +812,10 @@ class AccountManager:
                 account.failures = 0
                 self._dirty = True
             
+            # A success proves the account is accepting requests again, so drop
+            # any leftover rate-limit window instead of waiting it out.
+            account.rate_limited_until = 0.0
+            
             # Update stats
             account.stats.total_requests += 1
             account.stats.successful_requests += 1
@@ -859,6 +877,23 @@ class AccountManager:
                 )
                 return
             
+            # Special case: a request-rate rejection means the account was asked
+            # too quickly, not that it is broken. Park it for a few seconds
+            # without touching the Circuit Breaker so a momentary burst cannot
+            # escalate into an hour-long exclusion and shrink the usable pool.
+            if reason == "USER_REQUEST_RATE_EXCEEDED":
+                account.rate_limited_until = time.time() + ACCOUNT_RATE_LIMIT_COOLDOWN
+                account.stats.total_requests += 1
+                account.stats.failed_requests += 1
+                self._dirty = True
+                logger.warning(
+                    f"Account {account_id} rate limited: "
+                    f"status={status_code}, reason={reason}, "
+                    f"cooldown={_format_duration(ACCOUNT_RATE_LIMIT_COOLDOWN)} "
+                    f"(failures unchanged at {account.failures})"
+                )
+                return
+            
             # Update failure count (only for RECOVERABLE)
             if error_type == ErrorType.RECOVERABLE:
                 account.failures += 1
@@ -909,6 +944,13 @@ class AccountManager:
 
             if exclude_accounts and account_id in exclude_accounts:
                 parts.append(f"{label}: already tried in this request")
+                continue
+
+            rate_limit_remaining = account.rate_limited_until - now
+            if rate_limit_remaining > 0:
+                parts.append(
+                    f"{label}: rate limited for {_format_duration(rate_limit_remaining)}"
+                )
                 continue
 
             if account.failures > 0:

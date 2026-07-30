@@ -27,7 +27,7 @@ from kiro.account_manager import (
     _format_duration
 )
 from kiro.account_errors import ErrorType
-from kiro.config import ACCOUNT_RECOVERY_TIMEOUT
+from kiro.config import ACCOUNT_RATE_LIMIT_COOLDOWN, ACCOUNT_RECOVERY_TIMEOUT
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
@@ -884,6 +884,181 @@ class TestAccountManagerGetNextAccount:
         assert account is not None  # Single account always returns
 
 
+class TestAccountManagerRateLimitCooldown:
+    """
+    Tests for the 429 USER_REQUEST_RATE_EXCEEDED path.
+
+    A rate rejection must rotate the account out briefly without feeding the
+    Circuit Breaker: escalating a momentary burst into exponential backoff
+    shrinks the usable pool (observed live: 1m -> 2m -> ... -> 1h in 4 minutes).
+    """
+
+    def _pool(self, tmp_path, account_count: int = 2) -> AccountManager:
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+        for index in range(account_count):
+            account_id = f"/creds/account{index}.json"
+            account = Account(id=account_id)
+            account.auth_manager = MagicMock()
+            account.models_cached_at = time.time()
+            manager._accounts[account_id] = account
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_does_not_increment_failures(self, tmp_path):
+        """
+        What it does: Reports repeated 429 USER_REQUEST_RATE_EXCEEDED
+        Purpose: The Circuit Breaker must stay untouched no matter how many
+                 rate rejections arrive, so backoff cannot escalate
+        """
+        print("\n=== Test: rate limit leaves failure counter alone ===")
+
+        manager = self._pool(tmp_path, account_count=1)
+        account_id = "/creds/account0.json"
+
+        for _ in range(5):
+            await manager.report_failure(
+                account_id, "claude-sonnet-4-5",
+                ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+            )
+
+        account = manager._accounts[account_id]
+        print(f"Failures: {account.failures}, failed_requests: {account.stats.failed_requests}")
+
+        assert account.failures == 0
+        assert account.last_failure_time == 0.0
+        # The failure is still counted as a failed request for the operator
+        assert account.stats.failed_requests == 5
+        assert account.stats.total_requests == 5
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_sets_short_fixed_window(self, tmp_path):
+        """
+        What it does: Reports one 429 and inspects the cooldown window
+        Purpose: The window must be the fixed short cooldown, not a backoff step
+        """
+        print("\n=== Test: rate limit uses a short fixed window ===")
+
+        manager = self._pool(tmp_path, account_count=1)
+        account_id = "/creds/account0.json"
+
+        before = time.time()
+        await manager.report_failure(
+            account_id, "claude-sonnet-4-5",
+            ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+        )
+
+        remaining = manager._accounts[account_id].rate_limited_until - before
+        print(f"Cooldown window: {remaining:.1f}s (configured {ACCOUNT_RATE_LIMIT_COOLDOWN}s)")
+
+        assert 0 < remaining <= ACCOUNT_RATE_LIMIT_COOLDOWN + 1
+        assert remaining < ACCOUNT_RECOVERY_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_account_is_skipped_then_returns(self, tmp_path):
+        """
+        What it does: Rate limits the sticky account, then expires the window
+        Purpose: Selection must rotate away during the window and come back
+                 afterwards at full health
+        """
+        print("\n=== Test: rate-limited account is skipped, then reused ===")
+
+        manager = self._pool(tmp_path, account_count=2)
+        first, second = "/creds/account0.json", "/creds/account1.json"
+
+        await manager.report_failure(
+            first, "claude-sonnet-4-5",
+            ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+        )
+
+        # Within the window: rotate to the other account.
+        selected = await manager.get_next_account("claude-sonnet-4-5")
+        print(f"During window selected: {selected.id}")
+        assert selected.id == second
+
+        # Expire the window without sleeping.
+        manager._accounts[first].rate_limited_until = time.time() - 1
+
+        selected = await manager.get_next_account("claude-sonnet-4-5")
+        print(f"After window selected: {selected.id}")
+        assert selected.id == first
+        assert manager._accounts[first].failures == 0
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_account_has_no_probabilistic_retry(self, tmp_path):
+        """
+        What it does: Rate limits the only usable account and forces the
+                      Circuit Breaker's retry dice to "retry"
+        Purpose: Retrying a rate-limited account only earns another 429, so the
+                 probabilistic escape hatch must not apply to this state
+        """
+        print("\n=== Test: rate-limit window ignores probabilistic retry ===")
+
+        manager = self._pool(tmp_path, account_count=2)
+        first, second = "/creds/account0.json", "/creds/account1.json"
+
+        for account_id in (first, second):
+            await manager.report_failure(
+                account_id, "claude-sonnet-4-5",
+                ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+            )
+
+        with patch("kiro.account_manager.random.random", return_value=0.0):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+
+        print(f"Selected: {selected}")
+        assert selected is None
+
+    @pytest.mark.asyncio
+    async def test_success_clears_rate_limit_window(self, tmp_path):
+        """
+        What it does: Rate limits an account, then reports a success
+        Purpose: A success proves the account accepts requests again, so the
+                 leftover window must not keep it parked
+        """
+        print("\n=== Test: success clears the rate-limit window ===")
+
+        manager = self._pool(tmp_path, account_count=2)
+        account_id = "/creds/account0.json"
+
+        await manager.report_failure(
+            account_id, "claude-sonnet-4-5",
+            ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+        )
+        assert manager._accounts[account_id].rate_limited_until > time.time()
+
+        await manager.report_success(account_id, "claude-sonnet-4-5")
+
+        print(f"rate_limited_until: {manager._accounts[account_id].rate_limited_until}")
+        assert manager._accounts[account_id].rate_limited_until == 0.0
+
+    @pytest.mark.asyncio
+    async def test_quota_exhaustion_still_uses_circuit_breaker(self, tmp_path):
+        """
+        What it does: Reports 402 MONTHLY_REQUEST_COUNT
+        Purpose: Monthly exhaustion really does persist, so it must keep the
+                 exponential backoff the rate-limit path opts out of
+        """
+        print("\n=== Test: quota exhaustion keeps exponential backoff ===")
+
+        manager = self._pool(tmp_path, account_count=1)
+        account_id = "/creds/account0.json"
+
+        await manager.report_failure(
+            account_id, "claude-sonnet-4-5",
+            ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+        )
+
+        account = manager._accounts[account_id]
+        print(f"Failures: {account.failures}, rate_limited_until: {account.rate_limited_until}")
+
+        assert account.failures == 1
+        assert account.last_failure_time > 0
+        assert account.rate_limited_until == 0.0
+
+
 class TestAccountManagerDescribePoolState:
     """
     Tests for AccountManager.describe_pool_state() - 503 diagnostics.
@@ -954,6 +1129,27 @@ class TestAccountManagerDescribePoolState:
 
         # Credential paths must never leak to a client-visible error
         assert "/creds/" not in description
+
+    def test_describe_pool_state_reports_rate_limit_separately(self, tmp_path):
+        """
+        Test that a rate-limited account is not reported as available.
+
+        What it does: Parks an account in its rate-limit window
+        Purpose: The 503 must name a rate-limit burst as such, since it clears
+                 in seconds while a cooldown does not
+        """
+        print("\n=== Test: describe_pool_state reports rate limiting ===")
+
+        manager = self._manager(tmp_path)
+        manager._accounts = {"/creds/burst.json": Account(id="/creds/burst.json")}
+        manager._accounts["/creds/burst.json"].auth_manager = MagicMock()
+        manager._accounts["/creds/burst.json"].rate_limited_until = time.time() + 10
+
+        description = manager.describe_pool_state()
+        print(f"Description: {description}")
+
+        assert f"{account_label('/creds/burst.json')}: rate limited for" in description
+        assert "cooling down" not in description
 
     def test_describe_pool_state_expired_cooldown_is_not_reported_as_cooling(self, tmp_path):
         """

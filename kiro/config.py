@@ -505,6 +505,14 @@ ACCOUNT_MAX_BACKOFF_MULTIPLIER: float = float(os.getenv("ACCOUNT_MAX_BACKOFF_MUL
 # Default: 0.1 (10% chance) - prevents permanent "stuck" state
 ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILISTIC_RETRY_CHANCE", "0.1"))
 
+# Cooldown in seconds for a request-rate rejection (429 USER_REQUEST_RATE_EXCEEDED).
+# A rate rejection means the account was asked too quickly, not that it is broken,
+# so it is kept out of the Circuit Breaker: the account rotates out for a few
+# seconds and returns at full health. Feeding it into the exponential backoff
+# instead escalated a momentary burst into hour-long exclusions and shrank the
+# usable pool (observed live: 1m -> 2m -> 4m ... -> 1h within four minutes).
+ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", "10"))
+
 # ==================================================================================================
 # Account Cache Settings
 # ==================================================================================================
