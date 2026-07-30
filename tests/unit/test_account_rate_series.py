@@ -168,48 +168,103 @@ async def test_evenly_spread_traffic_reports_its_true_rate(manager):
 
 
 @pytest.mark.asyncio
-async def test_ceiling_is_the_lowest_rate_that_drew_a_rejection(manager):
+async def test_guide_sits_at_or_above_cleanly_served_traffic(manager):
     now = time.time()
-    events = [(now - 600 + index * 0.05, "success") for index in range(50)]
-    events.append((now - 599, "rate_limited"))
-    # A later, smaller burst also gets rejected: it is the tighter upper bound.
-    events += [(now - 300 + index * 0.05, "success") for index in range(20)]
-    events.append((now - 299, "rate_limited"))
+    events = [(now - 300 + index * 0.05, "success") for index in range(30)]
+    events.append((now - 300 + 30 * 0.05, "rate_limited"))
+    for at, outcome in sorted(events):
+        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    assert series["limitRpm"] == 31
+    assert series["limitRpm"] >= max(series["peakRpm"])
+    assert series["limitUnknownReason"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_below_served_traffic_does_not_define_the_guide(manager):
+    """A 429 at 1/min while 14/min succeeds is not a rate ceiling.
+
+    Observed live: taking the lowest rejection unconditionally pinned the guide
+    to the bottom of the chart, so the traffic area always covered it and the
+    line stopped being a warning.
+    """
+    now = time.time()
+    events = [(now - 800, "rate_limited")]
+    events += [(now - 300 + index * 0.05, "success") for index in range(14)]
+    for at, outcome in sorted(events):
+        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    assert series["limitRpm"] is None
+    assert series["rateLimitSamples"] == 1
+    assert series["informativeSamples"] == 0
+    assert series["limitUnknownReason"] == "rejections seen only below the rate this account serves cleanly"
+
+
+@pytest.mark.asyncio
+async def test_the_tightest_informative_rejection_wins(manager):
+    now = time.time()
+    # Two bursts rejected above cleanly served traffic. The lower rejection is
+    # the tighter upper bound on the limit.
+    events = [(now - 600 + index * 0.05, "success") for index in range(20)]
+    events.append((now - 600 + 20 * 0.05, "rate_limited"))
+    events += [(now - 200 + index * 0.05, "success") for index in range(19)]
+    events.append((now - 200 + 19 * 0.05, "rate_limited"))
     for at, outcome in sorted(events):
         manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
 
     series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
 
     assert series["rateLimitSamples"] == 2
-    assert series["ceilingRpm"] == 21
-    assert series["ceilingRpm"] < max(series["peakRpm"])
+    assert series["informativeSamples"] == 2
+    assert series["limitRpm"] == 20
 
 
 @pytest.mark.asyncio
-async def test_ceiling_is_absent_until_a_rejection_is_observed(manager):
-    await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
-
-    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
-
-    assert series["ceilingRpm"] is None
-    assert series["rateLimitSamples"] == 0
-
-
-@pytest.mark.asyncio
-async def test_served_peak_brackets_the_limit_from_below(manager):
+async def test_a_rejection_contradicted_by_a_higher_clean_rate_is_excluded(manager):
     now = time.time()
-    events = [(now - 600 + index * 0.05, "success") for index in range(15)]
-    events += [(now - 300 + index * 0.05, "success") for index in range(25)]
-    # The rejection arrives after the burst, so 25 is the most served cleanly.
-    events.append((now - 300 + 25 * 0.05, "rate_limited"))
+    # 40/min served cleanly, then a rejection at 26/min: the upstream limit
+    # cannot be below a rate it already served, so this sample is discarded.
+    events = [(now - 600 + index * 0.05, "success") for index in range(40)]
+    events += [(now - 200 + index * 0.05, "success") for index in range(25)]
+    events.append((now - 200 + 25 * 0.05, "rate_limited"))
     for at, outcome in sorted(events):
         manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
 
     series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
 
+    assert series["servedPeakRpm"] == 40
+    assert series["rateLimitSamples"] == 1
+    assert series["informativeSamples"] == 0
+    assert series["limitRpm"] is None
+
+
+@pytest.mark.asyncio
+async def test_guide_is_absent_until_a_rejection_is_observed(manager):
+    await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    assert series["limitRpm"] is None
+    assert series["rateLimitSamples"] == 0
+    assert series["limitUnknownReason"] == "no rate rejection observed yet"
+
+
+@pytest.mark.asyncio
+async def test_served_peak_is_reported_as_the_known_safe_rate(manager):
+    now = time.time()
+    for index in range(25):
+        manager._routing_events.append(
+            RoutingEvent(at=now - 300 + index * 0.05, account_id="/creds/account0.json", outcome="success")
+        )
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
     assert series["servedPeakRpm"] == 25
-    assert series["ceilingRpm"] == 26
-    assert series["servedPeakRpm"] < series["ceilingRpm"]
+    assert series["limitRpm"] is None
 
 
 def test_rate_window_is_reported_so_callers_can_label_the_unit(manager):

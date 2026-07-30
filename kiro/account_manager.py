@@ -1050,12 +1050,17 @@ class AccountManager:
         bucket therefore also reports the highest RPM observed inside it,
         measured as a sliding RATE_WINDOW_SECONDS count at each request instant.
 
-        Kiro publishes no rate limit, so the ceiling is derived from behavior:
-        the lowest RPM that drew a 429 is the tightest upper bound on the real
-        limit, and the highest RPM served cleanly is a lower bound. The limit
-        lies between them. A single 429 arriving at an unusually low RPM pulls
-        the bound down, so the sample count travels with it and callers must
-        present the pair as observed, not official.
+        Kiro publishes no rate limit, so the guide line is derived from behavior
+        and is only drawn where the evidence supports one. A rejection is only
+        informative if it happened at or above the highest rate the account has
+        served cleanly: a 429 at 1/min while 14/min succeeds is not a rate
+        ceiling, it is a rejection caused by something else (concurrency, a
+        shared upstream quota, a transient). Those samples are counted but
+        excluded from the estimate. Among the informative ones the lowest RPM is
+        the tightest upper bound on the real limit, so the guide sits there,
+        above normal traffic, and traffic approaching it is the warning. When no
+        informative sample exists the guide is absent rather than pinned to the
+        floor, and the reason travels with it.
 
         Args:
             window_seconds: How far back to report
@@ -1064,7 +1069,7 @@ class AccountManager:
         Returns:
             Dict with the bucket width, bucket start timestamps, the RPM
             averaging window, and one entry per account holding its per-bucket
-            counts, per-bucket peak RPM, and observed rate bracket.
+            counts, per-bucket peak RPM, the guide line, and why it is absent.
         """
         now = time.time()
         latest_start = int(now // bucket_seconds) * bucket_seconds
@@ -1079,9 +1084,8 @@ class AccountManager:
             rate_limited = [0] * bucket_count
             failure = [0] * bucket_count
             peak_rpm = [0] * bucket_count
-            ceiling_rpm: Optional[int] = None
             served_peak_rpm = 0
-            rate_limit_samples = 0
+            rejection_rpms: List[int] = []
 
             # Sliding request count over RATE_WINDOW_SECONDS. The ring is append
             # ordered, so a single left pointer covers every instant in one pass.
@@ -1092,8 +1096,7 @@ class AccountManager:
                 rpm = position - left + 1
 
                 if event.outcome == "rate_limited":
-                    rate_limit_samples += 1
-                    ceiling_rpm = rpm if ceiling_rpm is None else min(ceiling_rpm, rpm)
+                    rejection_rpms.append(rpm)
                 elif event.outcome == "success":
                     served_peak_rpm = max(served_peak_rpm, rpm)
 
@@ -1109,15 +1112,27 @@ class AccountManager:
                     failure[bucket] += 1
                 peak_rpm[bucket] = max(peak_rpm[bucket], rpm)
 
+            # Only rejections at or above cleanly served traffic bound the rate.
+            informative = [rpm for rpm in rejection_rpms if rpm >= served_peak_rpm]
+            limit_rpm = min(informative) if informative else None
+            if limit_rpm is not None:
+                unknown_reason = None
+            elif rejection_rpms:
+                unknown_reason = "rejections seen only below the rate this account serves cleanly"
+            else:
+                unknown_reason = "no rate rejection observed yet"
+
             accounts.append({
                 "account": account_label(account_id),
                 "success": success,
                 "rateLimited": rate_limited,
                 "failure": failure,
                 "peakRpm": peak_rpm,
-                "ceilingRpm": ceiling_rpm,
+                "limitRpm": limit_rpm,
+                "limitUnknownReason": unknown_reason,
                 "servedPeakRpm": served_peak_rpm,
-                "rateLimitSamples": rate_limit_samples,
+                "rateLimitSamples": len(rejection_rpms),
+                "informativeSamples": len(informative),
             })
 
         return {

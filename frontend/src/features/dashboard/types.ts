@@ -46,11 +46,12 @@ export type AccountRateSeries = {
   rateLimited: number[];
   failure: number[];
   peakRpm: number[];
-  /** Lowest RPM that drew a 429: the tightest upper bound on the real limit. */
-  ceilingRpm: number | null;
-  /** Highest RPM served cleanly: a lower bound on the real limit. */
+  /** Lowest RPM that drew a 429 at or above cleanly served traffic, or null. */
+  limitRpm: number | null;
+  limitUnknownReason: string | null;
   servedPeakRpm: number;
   rateLimitSamples: number;
+  informativeSamples: number;
 };
 
 export type RequestRate = {
