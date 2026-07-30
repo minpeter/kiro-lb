@@ -1,14 +1,15 @@
 # tests/ — pytest suite
 
-1588 tests, ~41.9k lines. Unit tests dominate; integration tests exercise route
-and stream wiring. Full run is under 5 seconds because nothing touches network.
+1694 tests, ~42k lines. Unit tests dominate (44 modules); integration tests
+exercise route and stream wiring. Full run is under 10 seconds because nothing
+touches network.
 
 ## STRUCTURE
 
 ```
 tests/
 ├── conftest.py            # session fixtures incl. network blocking
-├── unit/                  # 40 modules, one per kiro/ module
+├── unit/                  # 44 modules, roughly one per kiro/ module
 └── integration/           # route/stream flows + manual probes
 ```
 
@@ -23,11 +24,17 @@ tests/
 | Credentials/token lifecycle | `unit/test_auth_manager.py` |
 | Frame reassembly, bracket tools | `unit/test_parsers.py` |
 | Capture/replay privacy | `unit/test_debug_replay.py`, `integration/test_debug_capture_replay.py` |
+| Device login + Builder ID host | `unit/test_device_login.py` |
+| Per-key token attribution | `unit/test_key_model_usage.py` |
+| Rate chart series | `unit/test_account_rate_series.py` |
+| Dashboard views/logs | `unit/test_dashboard_account_view.py`, `unit/test_dashboard_request_logs.py` |
 
 ## CONVENTIONS
 
 - `block_all_network_calls` in `conftest.py:419` is session-scoped and autouse.
   Real network access fails the test; mock at the httpx layer.
+- `setup_test_environment` (`conftest.py:44`) is also autouse and points
+  credentials/state at a tmp path. Never let a test read the real `data/`.
 - Naming is enforced by `pytest.ini`: `test_*.py`, `Test*`, `test_*`.
 - Classes group by outcome: `Test*Success`, `Test*Errors`, `Test*EdgeCases`.
 - Add tests to the existing module for a subsystem; new files only for new modules.
