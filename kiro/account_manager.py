@@ -38,10 +38,9 @@ import json
 import os
 import random
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from loguru import logger
@@ -58,7 +57,6 @@ from kiro.config import (
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
     ACCOUNT_RATE_LIMIT_COOLDOWN,
     ACCOUNT_QUOTA_QUARANTINE,
-    ROUTING_EVENT_HISTORY,
     RATE_WINDOW_SECONDS,
     RATE_ESTIMATE_WINDOW_SECONDS,
     ACCOUNT_CACHE_TTL,
@@ -240,34 +238,14 @@ class Account:
 
 
 @dataclass
-class RoutingEvent:
-    """
-    One routing outcome for one account, as the router learned it.
-
-    The dashboard request log cannot answer "how close is this account to its
-    rate limit": it records the client-facing result, so a 429 that failover
-    recovered from is filed as a 200, and it carries no account attribution.
-    These events are recorded per account at the moment of the upstream verdict.
-
-    Attributes:
-        at: Unix timestamp of the outcome
-        account_id: Internal account ID
-        outcome: "success", "rate_limited", "quota_exhausted", or "failure"
-    """
-    at: float
-    account_id: str
-    outcome: str
-
-
-@dataclass
 class RateObservation:
     """
-    The request rate an account was running when the upstream ruled on it.
+    One routing verdict: when, which account, at what rate, and how it ended.
 
-    Persisted, unlike RoutingEvent: the inferred rate limit must survive a
-    restart or every deploy resets the estimate to nothing. Only the rate at each
-    verdict is stored, not every event, so the data path takes no extra write per
-    request.
+    Persisted, so both the rate chart and the inferred limit survive a restart.
+    Storing the rate alongside the outcome is what makes that possible: a request
+    count can only be derived from a full event history, which a fresh process
+    does not have.
 
     Attributes:
         at: Unix timestamp of the verdict
@@ -279,6 +257,7 @@ class RateObservation:
     account_id: str
     rpm: int
     rejected: bool
+    outcome: str = "success"
 
 
 @dataclass
@@ -331,8 +310,7 @@ class AccountManager:
         self._current_account_index: int = 0  # GLOBAL sticky index for all models
         # Bounded ring of recent routing outcomes for the dashboard rate chart.
         # Memory-only: this is observability, not state the router depends on.
-        self._routing_events: Deque[RoutingEvent] = deque(maxlen=ROUTING_EVENT_HISTORY)
-        # Rate observations outlive the process; see RateObservation.
+        # Routing history outlives the process; see RateObservation.
         self._rate_observations: List[RateObservation] = []
         self._unsaved_rate_observations: List[RateObservation] = []
     
@@ -1052,35 +1030,39 @@ class AccountManager:
     
     def _record_routing_event(self, account_id: str, outcome: str) -> None:
         at = time.time()
-        self._routing_events.append(RoutingEvent(at=at, account_id=account_id, outcome=outcome))
 
-        if outcome not in ("success", "rate_limited"):
-            return
-
-        # Rate at this instant, counted from the events already in the ring.
+        # Rate at this instant, counted from persisted observations so the figure
+        # is correct on the first request after a restart instead of reporting 1.
         cutoff = at - RATE_WINDOW_SECONDS
         rpm = sum(
             1
-            for event in self._routing_events
-            if event.account_id == account_id and event.at > cutoff
-        )
+            for observation in reversed(self._rate_observations)
+            if observation.at > cutoff and observation.account_id == account_id
+        ) + 1
+
         observation = RateObservation(
-            at=at, account_id=account_id, rpm=rpm, rejected=outcome == "rate_limited"
+            at=at,
+            account_id=account_id,
+            rpm=rpm,
+            rejected=outcome == "rate_limited",
+            outcome=outcome,
         )
         self._rate_observations.append(observation)
         self._unsaved_rate_observations.append(observation)
 
-    def drain_unsaved_rate_observations(self) -> List[Tuple[str, float, int, int]]:
+    def drain_unsaved_rate_observations(self) -> List[Tuple[str, float, int, int, str]]:
         """Hand over rate observations not yet written to the dashboard store."""
         pending = self._unsaved_rate_observations
         self._unsaved_rate_observations = []
-        return [(item.account_id, item.at, item.rpm, int(item.rejected)) for item in pending]
+        return [(item.account_id, item.at, item.rpm, int(item.rejected), item.outcome) for item in pending]
 
-    def load_rate_observations(self, rows: List[Tuple[str, float, int, int]]) -> None:
+    def load_rate_observations(self, rows: List[Tuple[str, float, int, int, str]]) -> None:
         """Restore persisted rate observations after a restart."""
         restored = [
-            RateObservation(account_id=account_id, at=at, rpm=rpm, rejected=bool(rejected))
-            for account_id, at, rpm, rejected in rows
+            RateObservation(
+                account_id=account_id, at=at, rpm=rpm, rejected=bool(rejected), outcome=outcome
+            )
+            for account_id, at, rpm, rejected, outcome in rows
         ]
         self._rate_observations = restored + self._rate_observations
 
@@ -1140,12 +1122,12 @@ class AccountManager:
             "estimateWindowSeconds": RATE_ESTIMATE_WINDOW_SECONDS,
         }
 
-    def _events_by_account(self) -> Dict[str, List[RoutingEvent]]:
-        grouped: Dict[str, List[RoutingEvent]] = {account_id: [] for account_id in self._accounts}
-        for event in self._routing_events:
-            bucket = grouped.get(event.account_id)
+    def _observations_by_account(self) -> Dict[str, List[RateObservation]]:
+        grouped: Dict[str, List[RateObservation]] = {account_id: [] for account_id in self._accounts}
+        for observation in self._rate_observations:
+            bucket = grouped.get(observation.account_id)
             if bucket is not None:
-                bucket.append(event)
+                bucket.append(observation)
         return grouped
 
     def request_rate_series(self, window_seconds: int, bucket_seconds: int) -> Dict[str, object]:
@@ -1185,31 +1167,24 @@ class AccountManager:
 
         accounts: List[Dict[str, object]] = []
 
-        for account_id, events in self._events_by_account().items():
+        for account_id, observations in self._observations_by_account().items():
             success = [0] * bucket_count
             rate_limited = [0] * bucket_count
             failure = [0] * bucket_count
             peak_rpm = [0] * bucket_count
 
-            # Sliding request count over RATE_WINDOW_SECONDS. The ring is append
-            # ordered, so a single left pointer covers every instant in one pass.
-            left = 0
-            for position, event in enumerate(events):
-                while events[left].at <= event.at - RATE_WINDOW_SECONDS:
-                    left += 1
-                rpm = position - left + 1
-
-                bucket = index_of.get(int(event.at // bucket_seconds) * bucket_seconds)
+            for observation in observations:
+                bucket = index_of.get(int(observation.at // bucket_seconds) * bucket_seconds)
                 if bucket is None:
                     continue
 
-                if event.outcome == "success":
+                if observation.outcome == "success":
                     success[bucket] += 1
-                elif event.outcome == "rate_limited":
+                elif observation.outcome == "rate_limited":
                     rate_limited[bucket] += 1
                 else:
                     failure[bucket] += 1
-                peak_rpm[bucket] = max(peak_rpm[bucket], rpm)
+                peak_rpm[bucket] = max(peak_rpm[bucket], observation.rpm)
 
             accounts.append({
                 "account": account_label(account_id),

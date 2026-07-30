@@ -102,9 +102,15 @@ def initialize_dashboard_store() -> None:
                 account_id TEXT NOT NULL,
                 observed_at REAL NOT NULL,
                 rpm INTEGER NOT NULL,
-                rejected INTEGER NOT NULL
+                rejected INTEGER NOT NULL,
+                outcome TEXT NOT NULL DEFAULT 'success'
             )"""
         )
+        # Additive migration for stores created before outcomes were recorded.
+        rate_columns = {row["name"] for row in conn.execute("PRAGMA table_info(rate_observations)")}
+        if "outcome" not in rate_columns:
+            conn.execute("ALTER TABLE rate_observations ADD COLUMN outcome TEXT NOT NULL DEFAULT 'success'")
+            conn.execute("UPDATE rate_observations SET outcome = 'rate_limited' WHERE rejected = 1")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_rate_observations_account ON rate_observations(account_id, observed_at)"
         )
@@ -173,27 +179,27 @@ def prune_request_logs() -> int:
         return 0
 
 
-def record_rate_observations(rows: list[tuple[str, float, int, int]]) -> None:
-    """Persist (account_id, observed_at, rpm, rejected) rate samples."""
+def record_rate_observations(rows: list[tuple[str, float, int, int, str]]) -> None:
+    """Persist (account_id, observed_at, rpm, rejected, outcome) rate samples."""
     if not rows:
         return
     try:
         with _db() as conn:
             conn.executemany(
-                "INSERT INTO rate_observations(account_id, observed_at, rpm, rejected) VALUES (?, ?, ?, ?)",
+                "INSERT INTO rate_observations(account_id, observed_at, rpm, rejected, outcome) VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
     except Exception:
         pass
 
 
-def load_rate_observations(since: float) -> list[tuple[str, float, int, int]]:
+def load_rate_observations(since: float) -> list[tuple[str, float, int, int, str]]:
     try:
         with _db() as conn:
             return [
-                (row["account_id"], row["observed_at"], row["rpm"], row["rejected"])
+                (row["account_id"], row["observed_at"], row["rpm"], row["rejected"], row["outcome"])
                 for row in conn.execute(
-                    "SELECT account_id, observed_at, rpm, rejected FROM rate_observations"
+                    "SELECT account_id, observed_at, rpm, rejected, outcome FROM rate_observations"
                     " WHERE observed_at >= ? ORDER BY observed_at",
                     (since,),
                 )

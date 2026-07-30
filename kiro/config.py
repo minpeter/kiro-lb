@@ -522,21 +522,17 @@ ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", 
 # live requests on a known-empty account.
 ACCOUNT_QUOTA_QUARANTINE: int = int(os.getenv("ACCOUNT_QUOTA_QUARANTINE", "21600"))
 
-# Number of recent per-account routing outcomes kept in memory for the
-# dashboard request-rate chart. At ~1 request/s this covers roughly 2 hours,
-# which is enough to see a rate-limit burst form and clear.
-ROUTING_EVENT_HISTORY: int = int(os.getenv("ROUTING_EVENT_HISTORY", "8000"))
-
 # Averaging window for the dashboard's requests-per-minute figure. Kiro rejects
 # on instantaneous speed, so the chart measures a sliding count over this many
 # seconds at each request instant rather than averaging a whole bucket.
 RATE_WINDOW_SECONDS: int = int(os.getenv("RATE_WINDOW_SECONDS", "60"))
 
-# How far back rate observations count toward the inferred limit. A bound taken
-# from the lowest rejection never rises on its own, so an upstream limit that
-# was raised would stay pinned to the old value forever. Ageing samples out lets
-# the estimate recover. Default 24h keeps enough samples to stay tight while
-# adapting within a day.
+# How far back rate observations count toward the inferred limit and how much
+# routing history the dashboard chart can show. A bound taken from the lowest
+# rejection never rises on its own, so an upstream limit that was raised would
+# stay pinned to the old value forever; ageing samples out lets the estimate
+# recover. Default 24h keeps enough samples to stay tight while adapting within
+# a day.
 RATE_ESTIMATE_WINDOW_SECONDS: int = int(os.getenv("RATE_ESTIMATE_WINDOW_SECONDS", "86400"))
 
 # Retention for persisted rate observations, which outlive the estimate window

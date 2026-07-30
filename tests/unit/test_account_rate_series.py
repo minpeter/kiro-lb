@@ -11,12 +11,8 @@ from typing import Any
 import pytest
 
 from kiro.account_errors import ErrorType
-from kiro.account_manager import Account, AccountManager, RoutingEvent, account_label
-from kiro.config import (
-    RATE_ESTIMATE_WINDOW_SECONDS,
-    RATE_WINDOW_SECONDS,
-    ROUTING_EVENT_HISTORY,
-)
+from kiro.account_manager import Account, AccountManager, RateObservation, account_label
+from kiro.config import RATE_ESTIMATE_WINDOW_SECONDS, RATE_WINDOW_SECONDS
 
 
 @pytest.fixture
@@ -110,7 +106,7 @@ def test_buckets_are_aligned_to_absolute_time(manager):
 @pytest.mark.asyncio
 async def test_events_older_than_the_window_are_dropped(manager):
     await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
-    manager._routing_events[0].at = time.time() - 3600
+    manager._rate_observations[0].at = time.time() - 3600
 
     series = _series_for(manager.request_rate_series(60, 15), "/creds/account0.json")
 
@@ -118,17 +114,21 @@ async def test_events_older_than_the_window_are_dropped(manager):
 
 
 @pytest.mark.asyncio
-async def test_history_is_bounded(manager):
-    for _ in range(ROUTING_EVENT_HISTORY + 50):
+async def test_history_is_bounded_by_the_estimate_window(manager):
+    for _ in range(20):
         await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+    for observation in manager._rate_observations[:15]:
+        observation.at -= RATE_ESTIMATE_WINDOW_SECONDS + 1
 
-    assert len(manager._routing_events) == ROUTING_EVENT_HISTORY
+    manager.request_rate_series(900, 5)
+
+    assert len(manager._rate_observations) == 5
 
 
 @pytest.mark.asyncio
 async def test_events_for_an_unknown_account_are_ignored(manager):
     await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
-    manager._routing_events[0].account_id = "/creds/removed.json"
+    manager._rate_observations[0].account_id = "/creds/removed.json"
 
     payload = manager.request_rate_series(60, 15)
 
@@ -147,9 +147,15 @@ async def test_credential_paths_are_never_exposed(manager):
 @pytest.mark.asyncio
 async def test_peak_rpm_reflects_a_burst_not_the_bucket_average(manager):
     now = time.time()
-    burst = [(now - 300 + index * 0.05, "success") for index in range(40)]
-    for at, outcome in burst:
-        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+    for index in range(40):
+        manager._rate_observations.append(
+            RateObservation(
+                at=now - 300 + index * 0.05,
+                account_id="/creds/account0.json",
+                rpm=index + 1,
+                rejected=False,
+            )
+        )
 
     series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
 
@@ -161,8 +167,13 @@ async def test_peak_rpm_reflects_a_burst_not_the_bucket_average(manager):
 async def test_evenly_spread_traffic_reports_its_true_rate(manager):
     now = time.time()
     for index in range(30):
-        manager._routing_events.append(
-            RoutingEvent(at=now - 300 + index * 2, account_id="/creds/account0.json", outcome="success")
+        manager._rate_observations.append(
+            RateObservation(
+                at=now - 300 + index * 2,
+                account_id="/creds/account0.json",
+                rpm=index + 1,
+                rejected=False,
+            )
         )
 
     series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
@@ -204,8 +215,7 @@ async def test_a_rejection_below_served_traffic_does_not_define_the_guide(manage
 
     estimate = manager.estimate_rate_limit("/creds/account0.json")
 
-    # 15, not 14: the rejected attempt was also a request at that rate.
-    assert estimate["safeRpm"] == 15
+    assert estimate["safeRpm"] == 14
     assert estimate["limitRpm"] is None
     assert estimate["rateLimitSamples"] == 1
     assert estimate["informativeSamples"] == 0
@@ -216,10 +226,10 @@ async def test_a_rejection_below_served_traffic_does_not_define_the_guide(manage
 async def test_the_tightest_informative_rejection_wins(manager):
     now = time.time()
     manager.load_rate_observations([
-        ("/creds/account0.json", now - 500, 18, 0),
-        ("/creds/account0.json", now - 400, 40, 1),
+        ("/creds/account0.json", now - 500, 18, 0, "success"),
+        ("/creds/account0.json", now - 400, 40, 1, "rate_limited"),
         # A lower rejection still above proven-safe traffic: the tighter bound.
-        ("/creds/account0.json", now - 300, 25, 1),
+        ("/creds/account0.json", now - 300, 25, 1, "rate_limited"),
     ])
 
     estimate = manager.estimate_rate_limit("/creds/account0.json")
@@ -332,3 +342,62 @@ def test_rate_window_is_reported_so_callers_can_label_the_unit(manager):
     payload = manager.request_rate_series(900, 5)
 
     assert payload["rateWindowSeconds"] == RATE_WINDOW_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_chart_history_survives_a_restart(manager, tmp_path):
+    """The chart read a memory-only ring, so every deploy blanked it."""
+    for _ in range(6):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+    await manager.report_failure(
+        "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
+    )
+    before = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+    rows = manager.drain_unsaved_rate_observations()
+
+    restarted = AccountManager(
+        credentials_file=str(tmp_path / "credentials.json"),
+        state_file=str(tmp_path / "state.json"),
+    )
+    restarted._accounts["/creds/account0.json"] = Account(id="/creds/account0.json")
+    blank = _series_for(restarted.request_rate_series(900, 5), "/creds/account0.json")
+    assert sum(blank["success"]) == 0
+
+    restarted.load_rate_observations(rows)
+    after = _series_for(restarted.request_rate_series(900, 5), "/creds/account0.json")
+
+    assert sum(after["success"]) == sum(before["success"]) == 6
+    assert sum(after["rateLimited"]) == sum(before["rateLimited"]) == 1
+    assert max(after["peakRpm"]) == max(before["peakRpm"])
+
+
+@pytest.mark.asyncio
+async def test_rate_is_correct_on_the_first_request_after_a_restart(manager, tmp_path):
+    """Rate was counted from the memory ring, so a fresh process reported 1/min
+    however hard the account was actually being driven."""
+    for _ in range(10):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+    rows = manager.drain_unsaved_rate_observations()
+
+    restarted = AccountManager(
+        credentials_file=str(tmp_path / "credentials.json"),
+        state_file=str(tmp_path / "state.json"),
+    )
+    restarted._accounts["/creds/account0.json"] = Account(id="/creds/account0.json")
+    restarted.load_rate_observations(rows)
+
+    await restarted.report_success("/creds/account0.json", "claude-sonnet-4-5")
+
+    assert restarted._rate_observations[-1].rpm == 11
+
+
+@pytest.mark.asyncio
+async def test_non_rate_failures_are_still_charted(manager):
+    await manager.report_failure(
+        "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+    )
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    assert sum(series["failure"]) == 1
+    assert sum(series["rateLimited"]) == 0
