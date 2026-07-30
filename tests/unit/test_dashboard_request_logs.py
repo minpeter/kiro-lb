@@ -1,6 +1,7 @@
 """Pagination contract tests for the dashboard request-log API."""
 
 import importlib
+import time
 
 import pytest
 
@@ -48,3 +49,45 @@ def test_offset_pages_do_not_overlap(dashboard):
     assert len(first_values) == 5
     assert len(second_values) == 5
     assert first_values.isdisjoint(second_values)
+
+
+def test_prune_removes_rows_past_retention(dashboard, monkeypatch):
+    now = int(time.time())
+    with dashboard._db() as conn:
+        conn.executemany(
+            "INSERT INTO request_logs(created_at, route, model, status_code, latency_ms) VALUES (?,?,?,?,?)",
+            [
+                (now - 30 * 86400, "/v1/messages", "m", 200, 10),
+                (now - 8 * 86400, "/v1/messages", "m", 200, 10),
+                (now - 6 * 86400, "/v1/messages", "m", 200, 10),
+                (now, "/v1/messages", "m", 200, 10),
+            ],
+        )
+
+    monkeypatch.setattr(dashboard, "REQUEST_LOG_RETENTION_DAYS", 7)
+    removed = dashboard.prune_request_logs()
+
+    with dashboard._db() as conn:
+        remaining = conn.execute("SELECT COUNT(*) FROM request_logs").fetchone()[0]
+        oldest = conn.execute("SELECT MIN(created_at) FROM request_logs").fetchone()[0]
+
+    assert removed == 2
+    assert remaining == 2
+    assert oldest >= now - 7 * 86400
+
+
+def test_prune_keeps_everything_inside_retention(dashboard, monkeypatch):
+    _seed(dashboard, 5)
+
+    monkeypatch.setattr(dashboard, "REQUEST_LOG_RETENTION_DAYS", 7)
+    removed = dashboard.prune_request_logs()
+
+    with dashboard._db() as conn:
+        remaining = conn.execute("SELECT COUNT(*) FROM request_logs").fetchone()[0]
+
+    assert removed == 0
+    assert remaining == 5
+
+
+def test_prune_is_safe_on_an_empty_table(dashboard):
+    assert dashboard.prune_request_logs() == 0

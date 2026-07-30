@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 
 from kiro.account_errors import ErrorType
-from kiro.account_manager import Account, AccountManager, account_label
-from kiro.config import ROUTING_EVENT_HISTORY
+from kiro.account_manager import Account, AccountManager, RoutingEvent, account_label
+from kiro.config import RATE_WINDOW_SECONDS, ROUTING_EVENT_HISTORY
 
 
 @pytest.fixture
@@ -138,3 +138,81 @@ async def test_credential_paths_are_never_exposed(manager):
     payload = manager.request_rate_series(60, 15)
 
     assert all("/creds/" not in entry["account"] for entry in payload["accounts"])
+
+
+@pytest.mark.asyncio
+async def test_peak_rpm_reflects_a_burst_not_the_bucket_average(manager):
+    now = time.time()
+    burst = [(now - 300 + index * 0.05, "success") for index in range(40)]
+    for at, outcome in burst:
+        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    # 40 requests inside one second: a bucket total would report far less load.
+    assert max(series["peakRpm"]) == 40
+
+
+@pytest.mark.asyncio
+async def test_evenly_spread_traffic_reports_its_true_rate(manager):
+    now = time.time()
+    for index in range(30):
+        manager._routing_events.append(
+            RoutingEvent(at=now - 300 + index * 2, account_id="/creds/account0.json", outcome="success")
+        )
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    # 30 requests at one per 2s: never more than 30 inside any 60s window.
+    assert max(series["peakRpm"]) == 30
+
+
+@pytest.mark.asyncio
+async def test_ceiling_is_the_lowest_rate_that_drew_a_rejection(manager):
+    now = time.time()
+    events = [(now - 600 + index * 0.05, "success") for index in range(50)]
+    events.append((now - 599, "rate_limited"))
+    # A later, smaller burst also gets rejected: it is the tighter upper bound.
+    events += [(now - 300 + index * 0.05, "success") for index in range(20)]
+    events.append((now - 299, "rate_limited"))
+    for at, outcome in sorted(events):
+        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    assert series["rateLimitSamples"] == 2
+    assert series["ceilingRpm"] == 21
+    assert series["ceilingRpm"] < max(series["peakRpm"])
+
+
+@pytest.mark.asyncio
+async def test_ceiling_is_absent_until_a_rejection_is_observed(manager):
+    await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    assert series["ceilingRpm"] is None
+    assert series["rateLimitSamples"] == 0
+
+
+@pytest.mark.asyncio
+async def test_served_peak_brackets_the_limit_from_below(manager):
+    now = time.time()
+    events = [(now - 600 + index * 0.05, "success") for index in range(15)]
+    events += [(now - 300 + index * 0.05, "success") for index in range(25)]
+    # The rejection arrives after the burst, so 25 is the most served cleanly.
+    events.append((now - 300 + 25 * 0.05, "rate_limited"))
+    for at, outcome in sorted(events):
+        manager._routing_events.append(RoutingEvent(at=at, account_id="/creds/account0.json", outcome=outcome))
+
+    series = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
+
+    assert series["servedPeakRpm"] == 25
+    assert series["ceilingRpm"] == 26
+    assert series["servedPeakRpm"] < series["ceilingRpm"]
+
+
+def test_rate_window_is_reported_so_callers_can_label_the_unit(manager):
+    payload = manager.request_rate_series(900, 5)
+
+    assert payload["rateWindowSeconds"] == RATE_WINDOW_SECONDS

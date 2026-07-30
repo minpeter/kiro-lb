@@ -95,6 +95,7 @@ from kiro.dashboard import (
     router as dashboard_router,
     initialize_dashboard_store,
     record_request,
+    prune_request_logs,
     refresh_all_account_usage,
 )
 
@@ -533,6 +534,15 @@ async def lifespan(app: FastAPI):
         logger.warning("Initial Kiro usage refresh failed: {}", exc)
     usage_task = asyncio.create_task(refresh_usage_periodically())
 
+    async def prune_request_logs_periodically() -> None:
+        while True:
+            removed = await asyncio.to_thread(prune_request_logs)
+            if removed:
+                logger.info("Pruned {} request-log row(s) past retention", removed)
+            await asyncio.sleep(3600)
+
+    prune_task = asyncio.create_task(prune_request_logs_periodically())
+
     logger.info("Account system initialized successfully")
 
     yield
@@ -541,7 +551,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application...")
     
     # Cancel background tasks.
-    for task in (save_task, usage_task):
+    for task in (save_task, usage_task, prune_task):
         task.cancel()
     for task in (save_task, usage_task):
         try:

@@ -5,9 +5,9 @@ import type { Account, ApiKey, Overview, RequestLogPage, RequestRate } from "./t
 const DEFAULT_PAGE_SIZE = 25;
 const EMPTY_LOGS: RequestLogPage = { logs: [], total: 0, limit: DEFAULT_PAGE_SIZE, offset: 0, hasMore: false };
 const RATE_WINDOW_SECONDS = 900;
-const RATE_BUCKET_SECONDS = 15;
-/** Live refresh cadence. One bucket width, so each poll can add at most one column. */
-export const REFRESH_INTERVAL_MS = RATE_BUCKET_SECONDS * 1000;
+const RATE_BUCKET_SECONDS = 5;
+/** Live refresh cadence. Each poll costs ~2ms of server work, all of it local. */
+export const REFRESH_INTERVAL_MS = 1000;
 
 export type DashboardState = {
   overview?: Overview;
@@ -102,6 +102,25 @@ export function useDashboard(): DashboardState {
     }
   }, [handleFailure, limit, loadLogs, offset]);
 
+  // Live tick. Only the time-varying panels are refetched: API keys do not
+  // change on their own, and refetching the log page every second would fight
+  // the operator's pagination.
+  const refreshLive = useCallback(async () => {
+    try {
+      const [nextOverview, nextAccounts, nextRate] = await Promise.all([
+        dashboardApi.overview(),
+        dashboardApi.accounts(),
+        dashboardApi.requestRate(RATE_WINDOW_SECONDS, RATE_BUCKET_SECONDS),
+      ]);
+      setOverview(nextOverview);
+      setAccounts(nextAccounts.accounts);
+      setRate(nextRate);
+      setLastUpdatedAt(Date.now());
+    } catch (cause) {
+      handleFailure(cause);
+    }
+  }, [handleFailure]);
+
   useEffect(() => {
     void reload();
     // Refetch only the log window when pagination changes.
@@ -109,37 +128,25 @@ export function useDashboard(): DashboardState {
   }, []);
 
   // Live polling. A hidden tab stops fetching and resumes on focus, so a
-  // dashboard left open overnight does not keep hitting the API.
+  // dashboard left open overnight does not keep hitting the API. Overlapping
+  // ticks are impossible because the next timer is armed after the fetch settles.
   useEffect(() => {
     if (!isLive || !isAuthenticated) return;
 
+    let stopped = false;
     let timer: number | undefined;
 
-    const tick = () => {
-      if (document.visibilityState === "visible") void reload();
+    const tick = async () => {
+      if (document.visibilityState === "visible") await refreshLive();
+      if (!stopped) timer = window.setTimeout(tick, REFRESH_INTERVAL_MS);
     };
 
-    const start = () => {
-      window.clearInterval(timer);
-      timer = window.setInterval(tick, REFRESH_INTERVAL_MS);
-    };
-
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") {
-        void reload();
-        start();
-      } else {
-        window.clearInterval(timer);
-      }
-    };
-
-    start();
-    document.addEventListener("visibilitychange", onVisibility);
+    timer = window.setTimeout(tick, REFRESH_INTERVAL_MS);
     return () => {
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisibility);
+      stopped = true;
+      window.clearTimeout(timer);
     };
-  }, [isAuthenticated, isLive, reload]);
+  }, [isAuthenticated, isLive, refreshLive]);
 
   useEffect(() => {
     if (!isAuthenticated) return;

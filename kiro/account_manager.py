@@ -59,6 +59,7 @@ from kiro.config import (
     ACCOUNT_RATE_LIMIT_COOLDOWN,
     ACCOUNT_QUOTA_QUARANTINE,
     ROUTING_EVENT_HISTORY,
+    RATE_WINDOW_SECONDS,
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
@@ -1026,22 +1027,44 @@ class AccountManager:
     def _record_routing_event(self, account_id: str, outcome: str) -> None:
         self._routing_events.append(RoutingEvent(at=time.time(), account_id=account_id, outcome=outcome))
 
+    def _events_by_account(self) -> Dict[str, List[RoutingEvent]]:
+        grouped: Dict[str, List[RoutingEvent]] = {account_id: [] for account_id in self._accounts}
+        for event in self._routing_events:
+            bucket = grouped.get(event.account_id)
+            if bucket is not None:
+                bucket.append(event)
+        return grouped
+
     def request_rate_series(self, window_seconds: int, bucket_seconds: int) -> Dict[str, object]:
         """
-        Bucket recent routing outcomes into a per-account time series.
+        Report per-account request rate, peak load, and the observed rate ceiling.
 
-        Answers the question the request log cannot: how many requests each
-        account absorbed per unit of time, and where its 429s landed. Buckets
-        are aligned to absolute time so successive polls return stable
-        boundaries instead of shifting under the caller.
+        Answers what the request log cannot: how hard each account was driven and
+        where its 429s landed. The log records the client-facing result, so a 429
+        that failover recovered from is filed as a 200 and carries no account.
+
+        Bucket totals alone hide the thing that actually trips a rate limit. A
+        bucket holding 30 requests looks like a steady rate, but the upstream
+        rejects on instantaneous speed, so 30 requests packed into two seconds
+        and 30 spread evenly are different events with the same total. Each
+        bucket therefore also reports the highest RPM observed inside it,
+        measured as a sliding RATE_WINDOW_SECONDS count at each request instant.
+
+        Kiro publishes no rate limit, so the ceiling is derived from behavior:
+        the lowest RPM that drew a 429 is the tightest upper bound on the real
+        limit, and the highest RPM served cleanly is a lower bound. The limit
+        lies between them. A single 429 arriving at an unusually low RPM pulls
+        the bound down, so the sample count travels with it and callers must
+        present the pair as observed, not official.
 
         Args:
             window_seconds: How far back to report
             bucket_seconds: Width of one bucket
 
         Returns:
-            Dict with the bucket width, bucket start timestamps, and one entry
-            per account holding its per-bucket success/rate-limit/failure counts.
+            Dict with the bucket width, bucket start timestamps, the RPM
+            averaging window, and one entry per account holding its per-bucket
+            counts, per-bucket peak RPM, and observed rate bracket.
         """
         now = time.time()
         latest_start = int(now // bucket_seconds) * bucket_seconds
@@ -1049,37 +1072,59 @@ class AccountManager:
         starts = [latest_start - offset * bucket_seconds for offset in range(bucket_count - 1, -1, -1)]
         index_of = {start: position for position, start in enumerate(starts)}
 
-        counters: Dict[str, Dict[str, List[int]]] = {
-            account_id: {
-                "success": [0] * bucket_count,
-                "rateLimited": [0] * bucket_count,
-                "failure": [0] * bucket_count,
-            }
-            for account_id in self._accounts
-        }
+        accounts: List[Dict[str, object]] = []
 
-        for event in self._routing_events:
-            position = index_of.get(int(event.at // bucket_seconds) * bucket_seconds)
-            if position is None:
-                continue
-            buckets = counters.get(event.account_id)
-            if buckets is None:
-                continue
-            if event.outcome == "success":
-                key = "success"
-            elif event.outcome == "rate_limited":
-                key = "rateLimited"
-            else:
-                key = "failure"
-            buckets[key][position] += 1
+        for account_id, events in self._events_by_account().items():
+            success = [0] * bucket_count
+            rate_limited = [0] * bucket_count
+            failure = [0] * bucket_count
+            peak_rpm = [0] * bucket_count
+            ceiling_rpm: Optional[int] = None
+            served_peak_rpm = 0
+            rate_limit_samples = 0
+
+            # Sliding request count over RATE_WINDOW_SECONDS. The ring is append
+            # ordered, so a single left pointer covers every instant in one pass.
+            left = 0
+            for position, event in enumerate(events):
+                while events[left].at <= event.at - RATE_WINDOW_SECONDS:
+                    left += 1
+                rpm = position - left + 1
+
+                if event.outcome == "rate_limited":
+                    rate_limit_samples += 1
+                    ceiling_rpm = rpm if ceiling_rpm is None else min(ceiling_rpm, rpm)
+                elif event.outcome == "success":
+                    served_peak_rpm = max(served_peak_rpm, rpm)
+
+                bucket = index_of.get(int(event.at // bucket_seconds) * bucket_seconds)
+                if bucket is None:
+                    continue
+
+                if event.outcome == "success":
+                    success[bucket] += 1
+                elif event.outcome == "rate_limited":
+                    rate_limited[bucket] += 1
+                else:
+                    failure[bucket] += 1
+                peak_rpm[bucket] = max(peak_rpm[bucket], rpm)
+
+            accounts.append({
+                "account": account_label(account_id),
+                "success": success,
+                "rateLimited": rate_limited,
+                "failure": failure,
+                "peakRpm": peak_rpm,
+                "ceilingRpm": ceiling_rpm,
+                "servedPeakRpm": served_peak_rpm,
+                "rateLimitSamples": rate_limit_samples,
+            })
 
         return {
             "bucketSeconds": bucket_seconds,
             "bucketStarts": starts,
-            "accounts": [
-                {"account": account_label(account_id), **buckets}
-                for account_id, buckets in counters.items()
-            ],
+            "rateWindowSeconds": RATE_WINDOW_SECONDS,
+            "accounts": accounts,
         }
 
     def describe_pool_state(self, exclude_accounts: Optional[set] = None) -> str:
