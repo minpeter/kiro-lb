@@ -26,7 +26,6 @@ services:
       DEBUG_CAPTURE_SUCCESS: ${DEBUG_CAPTURE_SUCCESS:-false}
       DEBUG_CAPTURE_MAX_BYTES: ${DEBUG_CAPTURE_MAX_BYTES:-4194304}
       DEBUG_CAPTURE_RETENTION: ${DEBUG_CAPTURE_RETENTION:-10}
-      OPENAI_SINGLE_BLOCK_TOOL_COMPAT: ${OPENAI_SINGLE_BLOCK_TOOL_COMPAT:-true}
     volumes:
       # Dashboard-managed credentials stay writable; the host CLI store is
       # discovery-only and must never be modified by the gateway container.

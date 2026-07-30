@@ -342,7 +342,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     auth_manager=auth_manager,
                                     initial_response=response,
                                     request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer
+                                    request_tools=tools_for_tokenizer,
+                                    include_reasoning=request_data.include_reasoning,
+                                    parallel_tool_calls=request_data.parallel_tool_calls is not False,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -382,7 +384,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             model_cache,
                             auth_manager,
                             request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer
+                            request_tools=tools_for_tokenizer,
+                            include_reasoning=request_data.include_reasoning,
+                            parallel_tool_calls=request_data.parallel_tool_calls is not False,
                         )
                         
                         await http_client.close()
@@ -639,7 +643,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         auth_manager=auth_manager,
                         initial_response=response,
                         request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer
+                        request_tools=tools_for_tokenizer,
+                        include_reasoning=request_data.include_reasoning,
+                        parallel_tool_calls=request_data.parallel_tool_calls is not False,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -685,7 +691,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 model_cache,
                 auth_manager,
                 request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer
+                request_tools=tools_for_tokenizer,
+                include_reasoning=request_data.include_reasoning,
+                parallel_tool_calls=request_data.parallel_tool_calls is not False,
             )
             
             await http_client.close()

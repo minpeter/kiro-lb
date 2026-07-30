@@ -41,7 +41,6 @@ from kiro.utils import generate_completion_id
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
-    OPENAI_SINGLE_BLOCK_TOOL_COMPAT,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
 from kiro.stop_reasons import is_truncated, to_openai_finish_reason
@@ -111,7 +110,9 @@ async def stream_kiro_to_openai_internal(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    include_reasoning: bool = True,
+    parallel_tool_calls: bool = True,
 ) -> AsyncGenerator[str, None]:
     """
     Internal generator for converting Kiro stream to OpenAI format.
@@ -149,31 +150,36 @@ async def stream_kiro_to_openai_internal(
     """
     completion_id = generate_completion_id()
     created_time = int(time.time())
-    first_chunk = True
+    first_chunk = False
     
     metering_data = None
     context_usage_percentage = None
     full_content = ""
     full_thinking_content = ""  # Accumulated thinking content for non-streaming
     upstream_stop_reason = None
-    defer_content_until_tool_outcome = (
-        OPENAI_SINGLE_BLOCK_TOOL_COMPAT and bool(request_tools)
-    )
-    deferred_content_emitted = False
-    
     streaming_error_occurred = False
     tool_calls_from_stream = []
     
     begin_openai_stream()
     try:
+        yield _openai_sse({
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }],
+        })
+
         # Use streaming_core.parse_kiro_stream for unified event parsing
         # This handles AWS SSE parsing, first token timeout, and thinking parser
         async for event in parse_kiro_stream(response, first_token_timeout):
             if event.type == "content" and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
-                if defer_content_until_tool_outcome:
-                    continue
                 
                 # Format as OpenAI chunk
                 delta = {"content": event.content}
@@ -192,13 +198,10 @@ async def stream_kiro_to_openai_internal(
                 yield _openai_sse(openai_chunk)
 
             elif event.type == "thinking" and event.thinking_content:
-                # Native Kiro adaptive-thinking event. No prompt tags or
-                # text heuristics are involved; emit the upstream text in the
-                # OpenAI-compatible reasoning_content field.
                 full_thinking_content += event.thinking_content
-                if defer_content_until_tool_outcome:
+                if not include_reasoning:
                     continue
-                delta = {"reasoning_content": event.thinking_content}
+                delta = {"reasoning": event.thinking_content}
                 if first_chunk:
                     delta["role"] = "assistant"
                     first_chunk = False
@@ -277,7 +280,6 @@ async def stream_kiro_to_openai_internal(
                             
                             # Accumulate for token counting
                             full_content += summary
-                            deferred_content_emitted = True
                             
                             # Skip normal tool_use processing
                             continue
@@ -303,60 +305,12 @@ async def stream_kiro_to_openai_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
-        if (
-            OPENAI_SINGLE_BLOCK_TOOL_COMPAT
-            and request_tools
-            and len(all_tool_calls) > 1
-        ):
+        if not parallel_tool_calls and len(all_tool_calls) > 1:
             logger.info(
-                "Serializing native tool execution: forwarding the first of "
+                "parallel_tool_calls=false: forwarding the first of "
                 f"{len(all_tool_calls)} calls"
             )
             all_tool_calls = all_tool_calls[:1]
-
-        if (
-            defer_content_until_tool_outcome
-            and full_thinking_content
-            and not full_content
-            and not all_tool_calls
-        ):
-            delta = {"reasoning_content": full_thinking_content}
-            if first_chunk:
-                delta["role"] = "assistant"
-                first_chunk = False
-            yield _openai_sse({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": None,
-                }],
-            })
-
-        if (
-            defer_content_until_tool_outcome
-            and full_content
-            and not all_tool_calls
-            and not deferred_content_emitted
-        ):
-            delta = {"content": full_content}
-            if first_chunk:
-                delta["role"] = "assistant"
-                first_chunk = False
-            yield _openai_sse({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": None,
-                }],
-            })
         
         # Detect content truncation (missing completion signals)
         content_was_truncated = (
@@ -511,7 +465,9 @@ async def stream_kiro_to_openai(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    include_reasoning: bool = True,
+    parallel_tool_calls: bool = True,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to OpenAI format.
@@ -534,7 +490,9 @@ async def stream_kiro_to_openai(
     async for chunk in stream_kiro_to_openai_internal(
         client, response, model, model_cache, auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        include_reasoning=include_reasoning,
+        parallel_tool_calls=parallel_tool_calls,
     ):
         yield chunk
 
@@ -549,7 +507,9 @@ async def stream_with_first_token_retry(
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    include_reasoning: bool = True,
+    parallel_tool_calls: bool = True,
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout.
@@ -614,7 +574,9 @@ async def stream_with_first_token_retry(
             auth_manager,
             first_token_timeout=first_token_timeout,
             request_messages=request_messages,
-            request_tools=request_tools
+            request_tools=request_tools,
+            include_reasoning=include_reasoning,
+            parallel_tool_calls=parallel_tool_calls,
         ):
             yield chunk
     
@@ -637,7 +599,9 @@ async def collect_stream_response(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    include_reasoning: bool = True,
+    parallel_tool_calls: bool = True,
 ) -> dict:
     """
     Collect full response from streaming stream.
@@ -671,7 +635,9 @@ async def collect_stream_response(
         model_cache,
         auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        include_reasoning=include_reasoning,
+        parallel_tool_calls=parallel_tool_calls,
     ):
         if not chunk_str.startswith("data:"):
             continue
@@ -687,8 +653,8 @@ async def collect_stream_response(
             delta = chunk_data.get("choices", [{}])[0].get("delta", {})
             if "content" in delta:
                 full_content += delta["content"]
-            if "reasoning_content" in delta:
-                full_reasoning_content += delta["reasoning_content"]
+            if "reasoning" in delta:
+                full_reasoning_content += delta["reasoning"]
             if "tool_calls" in delta:
                 tool_calls.extend(delta["tool_calls"])
             
@@ -707,7 +673,7 @@ async def collect_stream_response(
     # Form final response
     message = {"role": "assistant", "content": full_content}
     if full_reasoning_content:
-        message["reasoning_content"] = full_reasoning_content
+        message["reasoning"] = full_reasoning_content
     if tool_calls:
         # For non-streaming response remove index field from tool_calls,
         # as it's only required for streaming chunks

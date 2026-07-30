@@ -80,6 +80,8 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
     tool_calls: Optional[List[Any]] = None
     tool_call_id: Optional[str] = None
+    reasoning: Optional[str] = None
+    reasoning_content: Optional[str] = None
     
     model_config = {"extra": "allow"}
 
@@ -167,6 +169,7 @@ class ChatCompletionRequest(BaseModel):
     # Reasoning (OpenAI reasoning models)
     # Supports all official reasoning_effort levels from OpenAI API
     reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]] = None
+    include_reasoning: bool = True
     
     # Tools (function calling)
     tools: Optional[List[Tool]] = None

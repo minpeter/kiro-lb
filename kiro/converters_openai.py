@@ -158,7 +158,7 @@ def convert_openai_messages_to_unified(messages: List[ChatMessage]) -> Tuple[str
     non_system_messages = []
     
     for msg in messages:
-        if msg.role == "system":
+        if msg.role in ("system", "developer"):
             system_prompt += extract_text_content(msg.content) + "\n"
         else:
             non_system_messages.append(msg)

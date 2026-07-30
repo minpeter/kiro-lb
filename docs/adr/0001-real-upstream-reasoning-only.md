@@ -8,7 +8,7 @@ Accepted — 2026-07-29.
 
 The upstream `kiro-gateway` fork implemented “extended thinking” by injecting
 XML-like instructions into a user prompt and parsing model-generated text back
-into OpenAI `reasoning_content` or Anthropic thinking blocks. That is not an
+into OpenAI `reasoning` or Anthropic thinking blocks. That is not an
 upstream Kiro protocol capability and misrepresents ordinary output as verified
 model reasoning.
 
@@ -25,7 +25,7 @@ Opus 4.7, and Sonnet 4.6 return structured `{ "text": ... }` adaptive
 reasoning frames when a command-level `additionalModelRequestFields` payload
 contains `thinking: { type: "adaptive", display: "summarized" }` and
 `output_config: { effort: "max" }`. The proxy maps only those upstream frames
-to OpenAI `reasoning_content`; it never extracts reasoning from normal content.
+to OpenAI `reasoning`; it never extracts reasoning from normal content.
 
 ## Consequences
 

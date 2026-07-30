@@ -160,6 +160,19 @@ class TestConvertOpenAIMessagesToUnified:
             "Reply with TURN2_OK",
         ]
 
+    def test_developer_message_joins_system_prompt(self):
+        messages = [
+            ChatMessage(role="developer", content="Follow project rules"),
+            ChatMessage(role="user", content="Run the task"),
+        ]
+
+        system_prompt, unified = convert_openai_messages_to_unified(messages)
+
+        assert system_prompt == "Follow project rules"
+        assert [(message.role, message.content) for message in unified] == [
+            ("user", "Run the task"),
+        ]
+
     def test_preserves_tool_result_continuation_sequence(self):
         messages = [
             ChatMessage(role="user", content="Call echo_value"),

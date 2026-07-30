@@ -402,9 +402,6 @@ DEBUG_CAPTURE_CONTENT: bool = (
 DEBUG_CAPTURE_SUCCESS: bool = (
     os.getenv("DEBUG_CAPTURE_SUCCESS", "false").lower() == "true"
 )
-OPENAI_SINGLE_BLOCK_TOOL_COMPAT: bool = (
-    os.getenv("OPENAI_SINGLE_BLOCK_TOOL_COMPAT", "false").lower() == "true"
-)
 DEBUG_CAPTURE_MAX_BYTES: int = _bounded_debug_int(
     "DEBUG_CAPTURE_MAX_BYTES",
     4 * 1024 * 1024,

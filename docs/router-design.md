@@ -58,7 +58,7 @@ Sending an invalid object fails the entire request with
 verbatim from client input.
 
 The parser treats Kiro's separate `{ "text": ... }` adaptive frames as native
-reasoning and serializes them as OpenAI `reasoning_content` or Anthropic
+reasoning and serializes them as OpenAI `reasoning` or Anthropic
 thinking blocks. Normal `{ "content": ... }` frames remain final-answer
 content. No XML prompt tags or text heuristics are used.
 
