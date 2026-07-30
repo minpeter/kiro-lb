@@ -23,9 +23,11 @@ from kiro.account_manager import (
     AccountStats,
     ModelAccountList,
     AccountManager,
+    account_label,
     _format_duration
 )
 from kiro.account_errors import ErrorType
+from kiro.config import ACCOUNT_RECOVERY_TIMEOUT
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
@@ -880,6 +882,101 @@ class TestAccountManagerGetNextAccount:
         # Assert
         print(f"Got account: {account is not None}")
         assert account is not None  # Single account always returns
+
+
+class TestAccountManagerDescribePoolState:
+    """
+    Tests for AccountManager.describe_pool_state() - 503 diagnostics.
+    """
+
+    def _manager(self, tmp_path) -> AccountManager:
+        return AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+
+    def test_describe_pool_state_empty_pool(self, tmp_path):
+        """
+        Test description when no accounts are configured.
+
+        What it does: Describes an empty pool
+        Purpose: The 503 must say the pool is empty rather than stay silent
+        """
+        print("\n=== Test: describe_pool_state with empty pool ===")
+
+        manager = self._manager(tmp_path)
+
+        description = manager.describe_pool_state()
+        print(f"Description: {description}")
+
+        assert description == "no accounts configured"
+
+    def test_describe_pool_state_reports_cooldown_and_exclusion(self, tmp_path):
+        """
+        Test that cooldown, already-tried, and uninitialized states are named.
+
+        What it does: Builds a mixed pool and inspects the description
+        Purpose: An operator must be able to tell a rate-limit burst apart
+                 from cooldowns or auth failures from the 503 body alone
+        """
+        print("\n=== Test: describe_pool_state reports per-account reasons ===")
+
+        manager = self._manager(tmp_path)
+        manager._accounts = {
+            "/creds/cooling.json": Account(id="/creds/cooling.json"),
+            "/creds/tried.json": Account(id="/creds/tried.json"),
+            "/creds/fresh.json": Account(id="/creds/fresh.json"),
+            "/creds/ready.json": Account(id="/creds/ready.json"),
+        }
+
+        # Cooling down: 1 failure -> ACCOUNT_RECOVERY_TIMEOUT (60s default)
+        manager._accounts["/creds/cooling.json"].failures = 1
+        manager._accounts["/creds/cooling.json"].last_failure_time = time.time()
+
+        # Already used up its attempt in this request
+        manager._accounts["/creds/tried.json"].auth_manager = MagicMock()
+
+        # Initialized and healthy
+        manager._accounts["/creds/ready.json"].auth_manager = MagicMock()
+
+        description = manager.describe_pool_state({"/creds/tried.json"})
+        print(f"Description: {description}")
+
+        cooling_label = account_label("/creds/cooling.json")
+        tried_label = account_label("/creds/tried.json")
+        fresh_label = account_label("/creds/fresh.json")
+        ready_label = account_label("/creds/ready.json")
+
+        assert f"{cooling_label}: cooling down for" in description
+        assert f"{tried_label}: already tried in this request" in description
+        assert f"{fresh_label}: not initialized" in description
+        assert f"{ready_label}: available" in description
+
+        # Credential paths must never leak to a client-visible error
+        assert "/creds/" not in description
+
+    def test_describe_pool_state_expired_cooldown_is_not_reported_as_cooling(self, tmp_path):
+        """
+        Test that an account past its backoff window is not shown as cooling down.
+
+        What it does: Sets a stale failure timestamp
+        Purpose: Half-Open accounts are selectable, so the message must not
+                 claim they are still in cooldown
+        """
+        print("\n=== Test: describe_pool_state with expired cooldown ===")
+
+        manager = self._manager(tmp_path)
+        manager._accounts = {"/creds/recovered.json": Account(id="/creds/recovered.json")}
+        manager._accounts["/creds/recovered.json"].failures = 1
+        manager._accounts["/creds/recovered.json"].last_failure_time = (
+            time.time() - ACCOUNT_RECOVERY_TIMEOUT - 1
+        )
+        manager._accounts["/creds/recovered.json"].auth_manager = MagicMock()
+
+        description = manager.describe_pool_state()
+        print(f"Description: {description}")
+
+        assert description == f"{account_label('/creds/recovered.json')}: available"
 
 
 class TestAccountManagerReportSuccess:

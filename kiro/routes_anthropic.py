@@ -252,8 +252,13 @@ async def messages(
                         }
                     )
                 else:
-                    # Multiple accounts - generic error with context
-                    detail = "No available accounts for this model."
+                    # Multiple accounts - no account is currently selectable.
+                    # Report the pool state so the operator can tell a rate-limit
+                    # burst apart from cooldowns or auth failures.
+                    detail = (
+                        "No available accounts for this model. "
+                        f"Pool state: {account_manager.describe_pool_state(tried_accounts)}."
+                    )
                     if last_error_message:
                         detail += f" Error from last account: {last_error_message}"
                     return JSONResponse(
@@ -544,8 +549,11 @@ async def messages(
                 }
             )
         else:
-            # Multiple accounts - generic error with context
-            detail = "All accounts failed after full circle."
+            # Multiple accounts - every account was tried and failed
+            detail = (
+                f"All {len(all_accounts)} accounts failed after full circle. "
+                f"Pool state: {account_manager.describe_pool_state()}."
+            )
             if last_error_message:
                 detail += f" Error from last account: {last_error_message}"
             return JSONResponse(

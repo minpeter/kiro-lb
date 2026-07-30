@@ -93,6 +93,24 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
     return "://runtime." in auth_manager.api_host
 
 
+def account_label(account_id: str) -> str:
+    """
+    Build a stable, non-secret label for an account.
+
+    Account IDs are credential file paths (or refresh-token hashes), so they are
+    never exposed to API clients. The label is the same short digest the
+    dashboard shows for an account, which lets an operator match a client-facing
+    error against a row in the accounts view.
+
+    Args:
+        account_id: Internal account ID
+
+    Returns:
+        12-character hex digest of the account ID
+    """
+    return hashlib.sha256(account_id.encode()).hexdigest()[:12]
+
+
 def _format_duration(seconds: float) -> str:
     """
     Format duration in human-readable format.
@@ -865,6 +883,53 @@ class AccountManager:
             # It only changes on success (GLOBAL sticky behavior)
             # Failover happens through exclude_accounts in get_next_account()
     
+    def describe_pool_state(self, exclude_accounts: Optional[set] = None) -> str:
+        """
+        Describe why each account is or is not usable right now.
+
+        Used to explain a 503 to the caller: "no available accounts" alone does
+        not say whether the pool is rate-limited, cooling down after failures,
+        or failing to authenticate. Account IDs are reduced to short digests so
+        credential paths never reach a client.
+
+        Args:
+            exclude_accounts: Account IDs already tried in the current request
+
+        Returns:
+            Semicolon-separated per-account state, or a note that the pool is empty
+        """
+        if not self._accounts:
+            return "no accounts configured"
+
+        now = time.time()
+        parts: List[str] = []
+
+        for account_id, account in self._accounts.items():
+            label = account_label(account_id)
+
+            if exclude_accounts and account_id in exclude_accounts:
+                parts.append(f"{label}: already tried in this request")
+                continue
+
+            if account.failures > 0:
+                backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
+                effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
+                remaining = effective_timeout - (now - account.last_failure_time)
+                if remaining > 0:
+                    parts.append(
+                        f"{label}: cooling down for {_format_duration(remaining)} "
+                        f"after {account.failures} consecutive failure(s)"
+                    )
+                    continue
+
+            if account.auth_manager is None:
+                parts.append(f"{label}: not initialized")
+                continue
+
+            parts.append(f"{label}: available")
+
+        return "; ".join(parts)
+
     def get_first_account(self) -> Account:
         """
         Get first initialized account (for legacy mode).

@@ -20,8 +20,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from datetime import datetime, timezone
 
-from kiro.account_manager import AccountManager, Account, AccountStats
+from fastapi import HTTPException
+
+from kiro.account_manager import AccountManager, Account, AccountStats, account_label
 from kiro.account_errors import ErrorType
+from kiro.config import ACCOUNT_RECOVERY_TIMEOUT
 
 
 # =============================================================================
@@ -495,3 +498,152 @@ class TestAccountSystemFullFlow:
         assert refresh_called is True
         assert account.models_cached_at > original_cached_at
         print("✓ Cache was refreshed on usage when TTL expired")
+
+
+# =============================================================================
+# Integration Tests: 503 Diagnostics When The Pool Is Exhausted
+# =============================================================================
+
+class TestAccountSystemExhaustedPoolDiagnostics:
+    """
+    Verifies the client-visible 503 explains why no account was usable.
+
+    A bare "No available accounts for this model." cannot be acted on: it does
+    not say whether the pool is rate-limited, cooling down, or unauthenticated.
+    These tests drive the real route handlers so a regression in the message
+    fails here rather than in production logs.
+    """
+
+    def _exhausted_manager(self, tmp_path, account_count: int = 3) -> AccountManager:
+        """Build a manager whose every account is inside its cooldown window."""
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"),
+            state_file=str(tmp_path / "state.json")
+        )
+        now = time.time()
+        for index in range(account_count):
+            account_id = f"/creds/account{index}.json"
+            account = Account(id=account_id)
+            account.auth_manager = MagicMock()
+            account.failures = 2
+            account.last_failure_time = now
+            manager._accounts[account_id] = account
+        return manager
+
+    def _request(self, manager: AccountManager) -> MagicMock:
+        request = MagicMock()
+        request.app.state.account_system = True
+        request.app.state.account_manager = manager
+        request.app.state.http_client = MagicMock()
+        return request
+
+    def _no_probabilistic_retry(self):
+        """Pin the Circuit Breaker's 10% probabilistic retry to "skip".
+
+        get_next_account() otherwise lets a cooling account through at random,
+        which would make these assertions pass or fail by chance.
+        """
+        return patch("kiro.account_manager.random.random", return_value=1.0)
+
+    @pytest.mark.asyncio
+    async def test_openai_503_names_every_cooling_account(self, tmp_path):
+        """
+        What it does: Calls /v1/chat/completions logic with a fully cooling pool
+        Purpose: The 503 detail must name each account and its cooldown reason
+        """
+        print("\n=== Test: OpenAI 503 reports pool state ===")
+
+        from kiro.models_openai import ChatCompletionRequest
+        from kiro.routes_openai import chat_completions
+
+        manager = self._exhausted_manager(tmp_path)
+        request_data = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False
+        )
+
+        with self._no_probabilistic_retry():
+            with pytest.raises(HTTPException) as exc_info:
+                await chat_completions(self._request(manager), request_data)
+
+        detail = exc_info.value.detail
+        print(f"Status: {exc_info.value.status_code}")
+        print(f"Detail: {detail}")
+
+        assert exc_info.value.status_code == 503
+        assert "No available accounts for this model." in detail
+        for account_id in manager._accounts:
+            assert f"{account_label(account_id)}: cooling down for" in detail
+        # Credential paths must not reach the client
+        assert "/creds/" not in detail
+
+    @pytest.mark.asyncio
+    async def test_anthropic_503_names_every_cooling_account(self, tmp_path):
+        """
+        What it does: Calls /v1/messages logic with a fully cooling pool
+        Purpose: Anthropic must carry the same diagnostics as OpenAI
+        """
+        print("\n=== Test: Anthropic 503 reports pool state ===")
+
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        from kiro.routes_anthropic import messages
+
+        manager = self._exhausted_manager(tmp_path)
+        request_data = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=64,
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False
+        )
+
+        with self._no_probabilistic_retry():
+            response = await messages(self._request(manager), request_data)
+
+        body = json.loads(bytes(response.body))
+        message = body["error"]["message"]
+        print(f"Status: {response.status_code}")
+        print(f"Message: {message}")
+
+        assert response.status_code == 503
+        assert "No available accounts for this model." in message
+        for account_id in manager._accounts:
+            assert f"{account_label(account_id)}: cooling down for" in message
+        assert "/creds/" not in message
+
+    @pytest.mark.asyncio
+    async def test_503_distinguishes_uninitialized_from_cooling(self, tmp_path):
+        """
+        What it does: Mixes a cooling account with an account that fails to init
+        Purpose: The operator must be able to tell auth failures from rate limits
+        """
+        print("\n=== Test: 503 distinguishes uninitialized accounts ===")
+
+        from kiro.models_openai import ChatCompletionRequest
+        from kiro.routes_openai import chat_completions
+
+        manager = self._exhausted_manager(tmp_path, account_count=1)
+        broken_id = "/creds/broken.json"
+        manager._accounts[broken_id] = Account(id=broken_id)
+
+        cooling_id = "/creds/account0.json"
+
+        # Initialization failure keeps auth_manager None, so the account is
+        # reported as not initialized rather than rate-limited.
+        request_data = ChatCompletionRequest(
+            model="claude-sonnet-4-5",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False
+        )
+        with self._no_probabilistic_retry(), patch.object(
+            manager, "_initialize_account", AsyncMock(return_value=False)
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await chat_completions(self._request(manager), request_data)
+
+        detail = exc_info.value.detail
+        print(f"Detail: {detail}")
+
+        assert exc_info.value.status_code == 503
+        assert f"{account_label(cooling_id)}: cooling down for" in detail
+        assert f"{account_label(broken_id)}: not initialized" in detail
