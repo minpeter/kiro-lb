@@ -156,6 +156,10 @@ jobs:
       - name: Upload Trivy results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()  # Upload even if previous step fails
+        # Reporting only, like the scanner's own exit-code: 0. Code scanning
+        # ingestion needs Advanced Security, which this private repo lacks, and a
+        # rejected upload must not fail an otherwise healthy build.
+        continue-on-error: true
         with:
           sarif_file: 'trivy-results.sarif'
           category: 'docker-image'
