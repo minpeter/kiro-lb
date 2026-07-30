@@ -450,3 +450,82 @@ async def test_writing_credentials_for_an_unapproved_flow_is_refused(tmp_path):
 
     with pytest.raises(ValueError):
         device_login.write_builder_id_credentials(flow, tmp_path / "logins")
+
+
+# =============================================================================
+# Host routing: an account with no profile must not use the runtime host
+# =============================================================================
+
+def test_builder_id_host_differs_from_the_profile_host():
+    from kiro.config import get_kiro_api_host, get_kiro_q_host
+
+    assert get_kiro_api_host("us-east-1", is_builder_id=False) == "https://runtime.us-east-1.kiro.dev"
+    assert get_kiro_api_host("us-east-1", is_builder_id=True) == "https://q.us-east-1.amazonaws.com"
+    assert get_kiro_q_host("us-east-1", is_builder_id=True) == "https://q.us-east-1.amazonaws.com"
+
+
+def test_host_selection_defaults_to_the_profile_host():
+    """Callers that predate Builder ID must keep their existing behaviour."""
+    from kiro.config import get_kiro_api_host
+
+    assert get_kiro_api_host("eu-central-1") == "https://runtime.eu-central-1.kiro.dev"
+
+
+def test_builder_id_credentials_route_to_the_q_host(tmp_path):
+    """A Builder ID account sent to runtime.kiro.dev fails every request with
+    400 profileArn is required, which is what this routing prevents."""
+    import json as _json
+
+    from kiro.auth import AuthType, KiroAuthManager
+
+    path = tmp_path / "builder.json"
+    path.write_text(
+        _json.dumps({
+            "refreshToken": "refresh-token-value-long-enough",
+            "accessToken": "access-token",
+            "region": "us-east-1",
+            "clientId": "client-id",
+            "clientSecret": "client-secret",
+            "startUrl": "https://view.awsapps.com/start",
+        })
+    )
+
+    manager = KiroAuthManager(creds_file=str(path))
+
+    assert manager.auth_type == AuthType.AWS_SSO_OIDC
+    assert manager.profile_arn is None
+    assert manager.api_host == "https://q.us-east-1.amazonaws.com"
+
+
+def test_a_social_account_without_a_profile_keeps_the_runtime_host(tmp_path):
+    """Absence of a profile alone is not Builder ID: a Kiro Desktop account
+    configured without one still belongs on the runtime host."""
+    from kiro.auth import AuthType, KiroAuthManager
+
+    manager = KiroAuthManager(refresh_token="social-refresh-token", region="us-east-1")
+
+    assert manager.auth_type == AuthType.KIRO_DESKTOP
+    assert manager.profile_arn is None
+    assert manager.api_host == "https://runtime.us-east-1.kiro.dev"
+
+
+def test_an_account_with_a_profile_keeps_the_runtime_host(tmp_path):
+    import json as _json
+
+    from kiro.auth import KiroAuthManager
+
+    path = tmp_path / "social.json"
+    path.write_text(
+        _json.dumps({
+            "refreshToken": "refresh-token-value-long-enough",
+            "accessToken": "access-token",
+            "region": "us-east-1",
+        })
+    )
+
+    manager = KiroAuthManager(
+        creds_file=str(path),
+        profile_arn="arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK",
+    )
+
+    assert manager.api_host == "https://runtime.us-east-1.kiro.dev"

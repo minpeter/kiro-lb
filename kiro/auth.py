@@ -217,16 +217,23 @@ class KiroAuthManager:
         # Set up URLs with correct regions:
         # - OIDC refresh: uses SSO region (for token refresh)
         # - API/Q hosts: use determined API region (for Q Developer API calls)
+        #
+        # An account using SSO OIDC with no profile ARN is AWS Builder ID, which
+        # the runtime host rejects with 400 "profileArn is required for this
+        # request". Auth type and credentials are both resolved by this point.
+        is_builder_id = self._auth_type == AuthType.AWS_SSO_OIDC and not self._profile_arn
         sso_region_for_oidc = self._sso_region or region
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
-        self._api_host = get_kiro_api_host(final_api_region)
-        self._q_host = get_kiro_q_host(final_api_region)
+        self._api_host = get_kiro_api_host(final_api_region, is_builder_id)
+        self._q_host = get_kiro_q_host(final_api_region, is_builder_id)
         
         # Log initialized endpoints for diagnostics (helps with DNS issues like #58, #132, #133)
         logger.info(
             f"Auth manager initialized: "
             f"sso_region={sso_region_for_oidc}, "
             f"api_region={final_api_region}, "
+            f"auth_type={self._auth_type.name}, "
+            f"profile_arn={'present' if self._profile_arn else 'absent'}, "
             f"api_host={self._api_host}, "
             f"q_host={self._q_host}"
         )

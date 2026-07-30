@@ -184,6 +184,17 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Host for accounts that reach Q Developer without a profile, which in practice
+# means AWS Builder ID (SSO OIDC auth that has no profile ARN). The runtime host
+# rejects those with 400 "profileArn is required for this request", and Builder ID
+# cannot obtain a profile at all: ListAvailableProfiles answers 403 and an empty
+# profileArn fails as REQUEST_BODY_INVALID.
+#
+# Social accounts are a different case: they normally carry a profile, but one
+# configured without it still belongs on the runtime host, so absence of a profile
+# alone is not the test.
+KIRO_BUILDER_ID_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -582,12 +593,14 @@ def get_aws_sso_oidc_url(region: str) -> str:
     return AWS_SSO_OIDC_URL_TEMPLATE.format(region=region)
 
 
-def get_kiro_api_host(region: str) -> str:
-    """Return API host for the specified region."""
-    return KIRO_API_HOST_TEMPLATE.format(region=region)
+def get_kiro_api_host(region: str, is_builder_id: bool = False) -> str:
+    """Return the API host for the region, routing Builder ID to Q Developer."""
+    template = KIRO_BUILDER_ID_HOST_TEMPLATE if is_builder_id else KIRO_API_HOST_TEMPLATE
+    return template.format(region=region)
 
 
-def get_kiro_q_host(region: str) -> str:
-    """Return Q API host for the specified region."""
-    return KIRO_Q_HOST_TEMPLATE.format(region=region)
+def get_kiro_q_host(region: str, is_builder_id: bool = False) -> str:
+    """Return the Q API host for the region, routing Builder ID to Q Developer."""
+    template = KIRO_BUILDER_ID_HOST_TEMPLATE if is_builder_id else KIRO_Q_HOST_TEMPLATE
+    return template.format(region=region)
 
