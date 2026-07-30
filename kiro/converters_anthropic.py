@@ -187,8 +187,6 @@ def extract_images_from_tool_results(content: Any) -> List[Dict[str, Any]]:
 
     return images
 
-    return tool_results
-
 
 def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
     """
