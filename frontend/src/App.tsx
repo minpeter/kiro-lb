@@ -8,7 +8,6 @@ import { AccountsPanel } from "@/features/dashboard/components/accounts-panel";
 import { ApiKeysPanel } from "@/features/dashboard/components/api-keys-panel";
 import { DeviceLoginCard } from "@/features/dashboard/components/device-login-card";
 import { LoginCard } from "@/features/dashboard/components/login-card";
-import { RegisterAccountCard } from "@/features/dashboard/components/register-account-card";
 import { RequestLogTable } from "@/features/dashboard/components/request-log-table";
 import { RequestRateChart } from "@/features/dashboard/components/request-rate-chart";
 import { AppHeader, StatCard } from "@/features/dashboard/components/shell";
@@ -85,7 +84,6 @@ export default function App() {
             <AccountsPanel accounts={dashboard.accounts} isLoading={isLoading} />
             <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
             <DeviceLoginCard onRegistered={dashboard.reload} />
-            <RegisterAccountCard onRegistered={dashboard.reload} />
           </TabsContent>
 
           <TabsContent value="keys">

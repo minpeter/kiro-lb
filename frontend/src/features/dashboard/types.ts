@@ -101,8 +101,6 @@ export type KeyModelUsage = {
 
 export type KeyUsage = Record<string, KeyModelUsage[]>;
 
-export type CredentialSource = "sqlite" | "json" | "refresh_token";
-
 export type DeviceLoginProvider = "builder-id" | "google" | "github";
 
 export type DeviceLoginFlow = {
@@ -114,15 +112,6 @@ export type DeviceLoginFlow = {
   verificationUri: string;
   verificationUriComplete: string;
   expiresInSeconds: number;
-};
-
-export type RegistrationForm = {
-  type: CredentialSource;
-  path: string;
-  refreshToken: string;
-  profileArn: string;
-  region: string;
-  apiRegion: string;
 };
 
 export const TAB_IDS = ["overview", "accounts", "keys"] as const;

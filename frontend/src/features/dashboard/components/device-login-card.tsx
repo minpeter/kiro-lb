@@ -1,24 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, Cloud, ExternalLink, Github, LogIn, X } from "lucide-react";
+import type { ComponentType } from "react";
+import { Check, ExternalLink, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { dashboardApi } from "../api";
 import type { DeviceLoginFlow, DeviceLoginProvider } from "../types";
+import { AwsMark, GithubMark, GoogleMark } from "./provider-marks";
 
 const POLL_INTERVAL_MS = 2500;
 
-const PROVIDERS: { id: DeviceLoginProvider; label: string }[] = [
-  { id: "builder-id", label: "AWS Builder ID" },
-  { id: "google", label: "Google" },
-  { id: "github", label: "GitHub" },
+const PROVIDERS: { id: DeviceLoginProvider; label: string; mark: ComponentType<{ size?: number }> }[] = [
+  { id: "builder-id", label: "AWS Builder ID", mark: AwsMark },
+  { id: "google", label: "Google", mark: GoogleMark },
+  { id: "github", label: "GitHub", mark: GithubMark },
 ];
-
-function ProviderIcon({ provider }: { provider: DeviceLoginProvider }) {
-  if (provider === "github") return <Github />;
-  if (provider === "builder-id") return <Cloud />;
-  return <LogIn />;
-}
 
 export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<void> }) {
   const [flow, setFlow] = useState<DeviceLoginFlow>();
@@ -144,11 +140,17 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
             </div>
           </div>
         ) : (
-          <div className="flex flex-wrap gap-2">
-            {PROVIDERS.map(({ id, label }) => (
-              <Button key={id} disabled={busy} onClick={() => void start(id)}>
-                <ProviderIcon provider={id} />
-                Sign in with {label}
+          <div className="grid gap-2 sm:grid-cols-3">
+            {PROVIDERS.map(({ id, label, mark: Mark }) => (
+              <Button
+                key={id}
+                variant="outline"
+                disabled={busy}
+                onClick={() => void start(id)}
+                className="h-11 justify-center gap-2.5 font-medium"
+              >
+                <Mark />
+                Continue with {label}
               </Button>
             ))}
           </div>

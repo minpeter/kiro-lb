@@ -5,7 +5,6 @@ import type {
   DeviceLoginProvider,
   KeyUsage,
   Overview,
-  RegistrationForm,
   RequestLogPage,
   RequestRate,
 } from "./types";
@@ -49,11 +48,6 @@ export const dashboardApi = {
   refreshUsage: () => request<{ accounts: unknown[] }>("/api/dashboard/accounts/refresh-usage", { method: "POST" }),
   createApiKey: (name: string) => request<{ apiKey: string }>("/api/dashboard/keys", { method: "POST", body: JSON.stringify({ name }) }),
   revokeApiKey: (id: string) => request<{ ok: boolean }>(`/api/dashboard/keys/${id}`, { method: "DELETE" }),
-  registerAccount: (form: RegistrationForm) =>
-    request<{ accountId: string; type: string; initialized: boolean }>("/api/dashboard/accounts", {
-      method: "POST",
-      body: JSON.stringify(form),
-    }),
   startDeviceLogin: (provider: DeviceLoginProvider) =>
     request<DeviceLoginFlow>("/api/dashboard/accounts/device-login", {
       method: "POST",
