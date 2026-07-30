@@ -28,6 +28,7 @@ keys, refresh tokens, or OAuth credentials are written to its SQLite database.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -49,6 +50,7 @@ from kiro.config import (
     REQUEST_LOG_RETENTION_DAYS,
 )
 from kiro.accounts_admin import register_account
+from kiro.usage_tracking import ROOT_KEY_ID, current_api_key_id, drain_pending_usage
 from kiro.usage import fetch_account_usage
 
 router = APIRouter(tags=["dashboard"])
@@ -118,6 +120,19 @@ def initialize_dashboard_store() -> None:
             )"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)")
+        # Per-key, per-model token totals. Cumulative rather than per-request so
+        # the table stays bounded by keys x models instead of traffic volume.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS key_model_usage (
+                key_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                requests INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (key_id, model)
+            )"""
+        )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS account_usage (
                 account_id TEXT PRIMARY KEY,
@@ -196,6 +211,51 @@ def prune_rate_observations() -> int:
         return 0
 
 
+def flush_key_model_usage() -> int:
+    """Fold accumulated per-key token counts into the store."""
+    pending = drain_pending_usage()
+    if not pending:
+        return 0
+    now = int(time.time())
+    try:
+        with _db() as conn:
+            conn.executemany(
+                """INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key_id, model) DO UPDATE SET
+                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    requests = requests + excluded.requests,
+                    updated_at = excluded.updated_at""",
+                [(key_id, model, prompt, completion, requests, now) for key_id, model, prompt, completion, requests in pending],
+            )
+        return len(pending)
+    except Exception:
+        return 0
+
+
+def key_model_usage() -> dict[str, list[dict[str, Any]]]:
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT key_id, model, prompt_tokens, completion_tokens, requests, updated_at"
+                " FROM key_model_usage ORDER BY prompt_tokens + completion_tokens DESC"
+            ).fetchall()
+    except Exception:
+        return {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["key_id"], []).append({
+            "model": row["model"],
+            "promptTokens": row["prompt_tokens"],
+            "completionTokens": row["completion_tokens"],
+            "totalTokens": row["prompt_tokens"] + row["completion_tokens"],
+            "requests": row["requests"],
+            "updatedAt": row["updated_at"],
+        })
+    return grouped
+
+
 def record_request(route: str, model: str | None, status_code: int, latency_ms: int) -> None:
     """Persist non-sensitive data-plane request metadata only."""
     try:
@@ -232,21 +292,33 @@ def create_data_api_key(name: str) -> tuple[str, dict[str, Any]]:
     return raw_key, {"id": key_id, "name": name.strip() or "Unnamed key", "prefix": key_prefix, "createdAt": created_at, "revokedAt": None}
 
 
-def verify_data_api_key(value: str) -> bool:
-    """Accept the legacy env key or an active, hashed dashboard-managed key."""
+def identify_data_api_key(value: str) -> str | None:
+    """Return the id of the key that matches, or None.
+
+    The legacy environment key answers as ROOT_KEY_ID: it has no row of its own
+    but still needs to be attributable in per-key usage.
+    """
     legacy = os.getenv("PROXY_API_KEY", "")
     if legacy and hmac.compare_digest(value, legacy):
-        return True
+        return ROOT_KEY_ID
     if not value.startswith("klb_"):
-        return False
+        return None
     try:
         with _db() as conn:
             rows = conn.execute(
-                "SELECT salt, key_hash FROM api_keys WHERE key_prefix = ? AND revoked_at IS NULL", (value[:12],)
+                "SELECT id, salt, key_hash FROM api_keys WHERE key_prefix = ? AND revoked_at IS NULL", (value[:12],)
             ).fetchall()
-        return any(hmac.compare_digest(_hash_api_key(value, row["salt"]), row["key_hash"]) for row in rows)
+        for row in rows:
+            if hmac.compare_digest(_hash_api_key(value, row["salt"]), row["key_hash"]):
+                return row["id"]
+        return None
     except Exception:
-        return False
+        return None
+
+
+def verify_data_api_key(value: str) -> bool:
+    """Accept the legacy env key or an active, hashed dashboard-managed key."""
+    return identify_data_api_key(value) is not None
 
 
 def list_data_api_keys() -> list[dict[str, Any]]:
@@ -379,7 +451,31 @@ async def dashboard_logout(request: Request, response: Response) -> dict[str, bo
 @router.get("/api/dashboard/keys")
 async def dashboard_list_keys(request: Request) -> dict[str, list[dict[str, Any]]]:
     _require_auth(request)
-    return {"apiKeys": list_data_api_keys()}
+    keys: list[dict[str, Any]] = []
+    # The legacy environment key authenticates real traffic but has no row, so
+    # it is listed as a read-only root entry: usage must be attributable to it,
+    # and it cannot be revoked from here because it lives in the environment.
+    legacy = os.getenv("PROXY_API_KEY", "")
+    if legacy:
+        keys.append({
+            "id": ROOT_KEY_ID,
+            "name": "Root key (environment)",
+            "prefix": legacy[:4] + "…",
+            "createdAt": None,
+            "revokedAt": None,
+            "readOnly": True,
+        })
+    keys.extend({**key, "readOnly": False} for key in list_data_api_keys())
+    return {"apiKeys": keys}
+
+
+@router.get("/api/dashboard/keys/usage")
+async def dashboard_key_usage(request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    # Fold in-memory counts first so the response reflects traffic that has not
+    # hit the periodic flush yet.
+    await asyncio.to_thread(flush_key_model_usage)
+    return {"usage": key_model_usage()}
 
 
 @router.post("/api/dashboard/keys")
@@ -396,6 +492,8 @@ async def dashboard_create_key(request: Request) -> dict[str, Any]:
 @router.delete("/api/dashboard/keys/{key_id}")
 async def dashboard_revoke_key(key_id: str, request: Request) -> dict[str, bool]:
     _require_auth(request)
+    if key_id == ROOT_KEY_ID:
+        raise HTTPException(status_code=400, detail="The root key is set in the environment and cannot be revoked here")
     if not revoke_data_api_key(key_id):
         raise HTTPException(status_code=404, detail="Active API key not found")
     return {"ok": True}

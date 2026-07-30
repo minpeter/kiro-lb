@@ -53,7 +53,8 @@ from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
-from kiro.dashboard import verify_data_api_key
+from kiro.dashboard import identify_data_api_key
+from kiro.usage_tracking import current_api_key_id
 
 # Import debug_logger
 try:
@@ -84,9 +85,11 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     if not auth_header or not auth_header.startswith("Bearer "):
         logger.warning("Access attempt with missing API key.")
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    if not verify_data_api_key(auth_header.removeprefix("Bearer ")):
+    key_id = identify_data_api_key(auth_header.removeprefix("Bearer "))
+    if key_id is None:
         logger.warning("Access attempt with invalid API key.")
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    current_api_key_id.set(key_id)
     return True
 
 

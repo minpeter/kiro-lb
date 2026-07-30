@@ -55,7 +55,8 @@ from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
-from kiro.dashboard import verify_data_api_key
+from kiro.dashboard import identify_data_api_key
+from kiro.usage_tracking import current_api_key_id
 
 # Import debug_logger
 try:
@@ -94,8 +95,11 @@ async def verify_anthropic_api_key(
     """
     # Check x-api-key first (Anthropic native), then Bearer compatibility.
     candidate = x_api_key or (authorization.removeprefix("Bearer ") if authorization and authorization.startswith("Bearer ") else "")
-    if candidate and verify_data_api_key(candidate):
-        return True
+    if candidate:
+        key_id = identify_data_api_key(candidate)
+        if key_id is not None:
+            current_api_key_id.set(key_id)
+            return True
 
     logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
     raise HTTPException(

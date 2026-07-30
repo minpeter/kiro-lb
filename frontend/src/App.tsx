@@ -89,6 +89,7 @@ export default function App() {
           <TabsContent value="keys">
             <ApiKeysPanel
               apiKeys={dashboard.apiKeys}
+              keyUsage={dashboard.keyUsage}
               isLoading={isLoading}
               isMutating={isMutating}
               onCreate={createKey}

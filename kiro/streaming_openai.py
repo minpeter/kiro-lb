@@ -43,6 +43,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+from kiro.usage_tracking import record_token_usage
 from kiro.stop_reasons import is_truncated, to_openai_finish_reason
 from kiro.sse_validation import (
     StreamProtocolError,
@@ -422,6 +423,8 @@ async def stream_kiro_to_openai_internal(
             f"completion_tokens={completion_tokens} (tiktoken), "
             f"total_tokens={total_tokens} ({total_source})"
         )
+
+        record_token_usage(model, prompt_tokens, completion_tokens)
 
         yield _openai_sse(final_chunk)
         yield _openai_done()

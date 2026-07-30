@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AUTH_REQUIRED, dashboardApi } from "./api";
-import type { Account, ApiKey, Overview, RequestLogPage, RequestRate } from "./types";
+import type { Account, ApiKey, KeyUsage, Overview, RequestLogPage, RequestRate } from "./types";
 
 const DEFAULT_PAGE_SIZE = 25;
 const EMPTY_LOGS: RequestLogPage = { logs: [], total: 0, limit: DEFAULT_PAGE_SIZE, offset: 0, hasMore: false };
@@ -13,6 +13,7 @@ export type DashboardState = {
   overview?: Overview;
   accounts: Account[];
   apiKeys: ApiKey[];
+  keyUsage: KeyUsage;
   logs: RequestLogPage;
   rate?: RequestRate;
   /** True only for the initial load, so refreshes do not flash skeletons. */
@@ -36,6 +37,7 @@ export function useDashboard(): DashboardState {
   const [overview, setOverview] = useState<Overview>();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
+  const [keyUsage, setKeyUsage] = useState<KeyUsage>({});
   const [logs, setLogs] = useState<RequestLogPage>(EMPTY_LOGS);
   const [rate, setRate] = useState<RequestRate>();
   const [isLive, setIsLive] = useState(true);
@@ -58,6 +60,7 @@ export function useDashboard(): DashboardState {
     setApiKeys([]);
     setLogs(EMPTY_LOGS);
     setRate(undefined);
+    setKeyUsage({});
     // A missing session is the expected state before sign-in, not an error.
     setError(message === AUTH_REQUIRED ? "" : message);
   }, []);
@@ -81,16 +84,18 @@ export function useDashboard(): DashboardState {
 
   const reload = useCallback(async () => {
     try {
-      const [nextOverview, nextAccounts, nextKeys, nextRate] = await Promise.all([
+      const [nextOverview, nextAccounts, nextKeys, nextRate, nextKeyUsage] = await Promise.all([
         dashboardApi.overview(),
         dashboardApi.accounts(),
         dashboardApi.apiKeys(),
         dashboardApi.requestRate(RATE_WINDOW_SECONDS, RATE_BUCKET_SECONDS),
+        dashboardApi.keyUsage(),
       ]);
       setOverview(nextOverview);
       setAccounts(nextAccounts.accounts);
       setApiKeys(nextKeys.apiKeys);
       setRate(nextRate);
+      setKeyUsage(nextKeyUsage.usage);
       setIsAuthenticated(true);
       setLastUpdatedAt(Date.now());
       setError("");
@@ -107,14 +112,16 @@ export function useDashboard(): DashboardState {
   // the operator's pagination.
   const refreshLive = useCallback(async () => {
     try {
-      const [nextOverview, nextAccounts, nextRate] = await Promise.all([
+      const [nextOverview, nextAccounts, nextRate, nextKeyUsage] = await Promise.all([
         dashboardApi.overview(),
         dashboardApi.accounts(),
         dashboardApi.requestRate(RATE_WINDOW_SECONDS, RATE_BUCKET_SECONDS),
+        dashboardApi.keyUsage(),
       ]);
       setOverview(nextOverview);
       setAccounts(nextAccounts.accounts);
       setRate(nextRate);
+      setKeyUsage(nextKeyUsage.usage);
       setLastUpdatedAt(Date.now());
     } catch (cause) {
       handleFailure(cause);
@@ -193,6 +200,7 @@ export function useDashboard(): DashboardState {
     overview,
     accounts,
     apiKeys,
+    keyUsage,
     logs,
     rate,
     isLoading,

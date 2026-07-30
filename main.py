@@ -99,6 +99,7 @@ from kiro.dashboard import (
     record_rate_observations,
     load_rate_observations,
     prune_rate_observations,
+    flush_key_model_usage,
     refresh_all_account_usage,
 )
 
@@ -566,6 +567,7 @@ async def lifespan(app: FastAPI):
             try:
                 await flush_rate_observations()
                 await asyncio.to_thread(prune_rate_observations)
+                await asyncio.to_thread(flush_key_model_usage)
             except Exception as exc:
                 logger.warning("Rate observation persistence failed: {}", exc)
 
@@ -582,9 +584,10 @@ async def lifespan(app: FastAPI):
     for task in (save_task, usage_task, prune_task, rate_task):
         task.cancel()
 
-    # Keep the rate estimate across restarts.
+    # Keep the rate estimate and per-key usage across restarts.
     try:
         await flush_rate_observations()
+        await asyncio.to_thread(flush_key_model_usage)
     except Exception as exc:
         logger.warning("Final rate observation flush failed: {}", exc)
     for task in (save_task, usage_task):

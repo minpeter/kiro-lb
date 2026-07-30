@@ -84,9 +84,22 @@ export type ApiKey = {
   id: string;
   name: string;
   prefix: string;
-  createdAt: number;
+  createdAt: number | null;
   revokedAt?: number | null;
+  /** The environment root key: attributable in usage, but not editable here. */
+  readOnly: boolean;
 };
+
+export type KeyModelUsage = {
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  requests: number;
+  updatedAt: number;
+};
+
+export type KeyUsage = Record<string, KeyModelUsage[]>;
 
 export type CredentialSource = "sqlite" | "json" | "refresh_token";
 
