@@ -418,7 +418,6 @@ async def dashboard_overview(request: Request) -> dict[str, Any]:
         "averageLatencyMs": round(totals["avg_latency"]),
         "accounts": {"total": len(accounts), "initialized": sum(a.auth_manager is not None for a in accounts)},
         "models": len(manager.get_all_available_models() or FALLBACK_MODELS),
-        "reasoning": "Native upstream reasoning is not currently exposed by Kiro; kiro-lb never fabricates it.",
     }
 
 

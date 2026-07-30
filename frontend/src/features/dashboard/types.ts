@@ -5,7 +5,6 @@ export type Overview = {
   averageLatencyMs: number;
   accounts: { total: number; initialized: number };
   models: number;
-  reasoning: string;
 };
 
 export type AccountUsage = {

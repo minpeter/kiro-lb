@@ -1,7 +1,5 @@
 import { Activity, Gauge, ServerCog, ShieldCheck } from "lucide-react";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Skeleton } from "@/components/ui/skeleton";
 import { dashboardApi } from "@/features/dashboard/api";
 import { formatLatency } from "@/features/dashboard/format";
 import { useDashboard } from "@/features/dashboard/use-dashboard";
@@ -71,19 +69,6 @@ export default function App() {
                 </>
               )}
             </section>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>Native reasoning policy</CardTitle>
-                <CardDescription>
-                  {isLoading || !overview ? <Skeleton className="h-3.5 w-80" /> : overview.reasoning}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="text-sm text-muted-foreground">
-                Verified adaptive-thinking models: Claude Opus 4.6, Opus 4.7, Opus 4.8, Opus 5, and Sonnet 4.6. Reasoning is
-                forwarded only from Kiro's native upstream events, never derived from response text.
-              </CardContent>
-            </Card>
 
             <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
 
