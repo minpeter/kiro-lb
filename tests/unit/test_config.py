@@ -621,6 +621,70 @@ class TestFallbackModelsConfig:
             print("  Verification: modelId is not empty...")
             assert len(model["modelId"]) > 0, f"Model {i} modelId is empty"
 
+    def test_fallback_models_carry_real_token_limits(self):
+        """
+        What it does: Verifies every fallback model declares the upstream maxInputTokens.
+        Purpose: Runtime endpoint accounts never reach /ListAvailableModels, so the
+                 fallback list is their only source of token limits. Without it every
+                 model silently assumes DEFAULT_MAX_INPUT_TOKENS and context usage is
+                 misreported by up to 5x for the 1M models.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        for model in FALLBACK_MODELS:
+            limits = model.get("tokenLimits")
+            assert isinstance(limits, dict), f"{model['modelId']} has no tokenLimits"
+            assert isinstance(limits.get("maxInputTokens"), int), f"{model['modelId']} has no integer maxInputTokens"
+            assert isinstance(limits.get("maxOutputTokens"), int), f"{model['modelId']} has no integer maxOutputTokens"
+
+    def test_fallback_token_limits_match_upstream_values(self):
+        """
+        What it does: Pins the maxInputTokens values reported by Kiro's
+                      /ListAvailableModels for the models that are not 200k.
+        Purpose: The whole point of the fallback limits is that they differ from
+                 DEFAULT_MAX_INPUT_TOKENS. A regression that reset them to 200000 would
+                 otherwise pass every other assertion in this file.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        by_id = {m["modelId"]: m["tokenLimits"]["maxInputTokens"] for m in FALLBACK_MODELS}
+        expected = {
+            "auto": 1000000,
+            "claude-opus-5": 1000000,
+            "claude-sonnet-5": 1000000,
+            "claude-opus-4.8": 1000000,
+            "claude-opus-4.7": 1000000,
+            "claude-opus-4.6": 1000000,
+            "claude-sonnet-4.6": 1000000,
+            "qwen3-coder-next": 256000,
+            "minimax-m2.5": 196000,
+            "minimax-m2.1": 196000,
+            "deepseek-3.2": 164000,
+        }
+
+        for model_id, max_input in expected.items():
+            assert by_id[model_id] == max_input, f"{model_id}: expected {max_input}, got {by_id[model_id]}"
+
+    def test_fallback_limits_reach_the_model_cache(self):
+        """
+        What it does: Verifies get_max_input_tokens returns the real per-model limit
+                      after the cache is filled from FALLBACK_MODELS.
+        Purpose: This is the path a runtime-endpoint account actually takes
+                 (account_manager falls back to FALLBACK_MODELS), so the limits must
+                 survive cache.update() rather than only existing in the constant.
+        """
+        import asyncio
+
+        from kiro.cache import ModelInfoCache
+        from kiro.config import DEFAULT_MAX_INPUT_TOKENS, FALLBACK_MODELS
+
+        cache = ModelInfoCache()
+        asyncio.run(cache.update(FALLBACK_MODELS))
+
+        assert cache.get_max_input_tokens("claude-opus-4.7") == 1000000
+        assert cache.get_max_input_tokens("deepseek-3.2") == 164000
+        assert cache.get_max_input_tokens("claude-sonnet-4.5") == DEFAULT_MAX_INPUT_TOKENS
+
     def test_fallback_models_contain_claude_models(self):
         """
         What it does: Verifies that fallback models include Claude models.
