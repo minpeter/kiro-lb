@@ -22,6 +22,7 @@ from kiro.tokenizer import (
     count_tokens,
     count_tools_tokens,
     estimate_request_tokens,
+    resolve_token_profile,
 )
 
 
@@ -79,9 +80,11 @@ class TestCountTokens:
         """
         What it does: Checks that Claude correction coefficient is applied by default.
         Purpose: Ensure apply_claude_correction=True by default.
+        Note: the measured correction is CJK-only - Latin slope is 1.00 - so the
+        fixture is Hangul.
         """
         print("Test: Claude correction coefficient...")
-        text = "This is a test text for token counting"
+        text = "게이트웨이는 업스트림이 보고하는 컨텍스트 사용률을 토큰으로 역산합니다"
 
         with_correction = count_tokens(text, apply_claude_correction=True)
         without_correction = count_tokens(text, apply_claude_correction=False)
@@ -310,7 +313,7 @@ class TestCountMessageTokens:
         Purpose: Ensure apply_claude_correction=False works.
         """
         print("Test: Without correction coefficient...")
-        messages = [{"role": "user", "content": "Test message"}]
+        messages = [{"role": "user", "content": "컨텍스트 사용률 퍼센트를 토큰 수로 역산합니다"}]
 
         with_correction = count_message_tokens(messages, apply_claude_correction=True)
         without_correction = count_message_tokens(messages, apply_claude_correction=False)
@@ -554,7 +557,7 @@ class TestCountToolsTokens:
                 "type": "function",
                 "function": {
                     "name": "test_func",
-                    "description": "Test function",
+                    "description": "컨텍스트 사용률을 토큰 수로 역산하는 도구입니다",
                     "parameters": {"type": "object", "properties": {}},
                 },
             }
@@ -661,8 +664,11 @@ class TestCountSystemTokens:
         assert result > 0
 
     def test_claude_correction_applied(self):
-        """Checks that Claude correction coefficient is applied."""
-        text = "You are a helpful assistant that answers questions about programming and software engineering."
+        """Checks that Claude correction coefficient is applied.
+
+        Hangul fixture: the measured Latin slope is 1.00, so only CJK is corrected.
+        """
+        text = "당신은 프로그래밍과 소프트웨어 공학 질문에 답하는 도움이 되는 조수입니다."
         without = count_system_tokens(text, apply_claude_correction=False)
         with_corr = count_system_tokens(text, apply_claude_correction=True)
         assert with_corr > without
@@ -834,7 +840,7 @@ class TestClaudeCorrectionFactor:
         Purpose: Ensure coefficient is applied correctly.
         """
         print("Test: Correction increases tokens...")
-        text = "This is a test text for checking the correction factor"
+        text = "게이트웨이는 업스트림이 보고하는 컨텍스트 사용률을 토큰으로 역산합니다"
 
         with_correction = count_tokens(text, apply_claude_correction=True)
         without_correction = count_tokens(text, apply_claude_correction=False)
@@ -862,11 +868,11 @@ class TestGetEncoding:
         """
         print("Test: tiktoken available...")
 
-        # Reset global variable for clean test
+        # Reset the cache for a clean test
         import kiro.tokenizer as tokenizer_module
 
-        original_encoding = tokenizer_module._encoding
-        tokenizer_module._encoding = None
+        original_encodings = dict(tokenizer_module._encodings)
+        tokenizer_module._encodings.clear()
 
         try:
             encoding = _get_encoding()
@@ -877,7 +883,8 @@ class TestGetEncoding:
                 assert hasattr(encoding, "encode"), "Encoding should have encode method"
         finally:
             # Restore
-            tokenizer_module._encoding = original_encoding
+            tokenizer_module._encodings.clear()
+            tokenizer_module._encodings.update(original_encodings)
 
     def test_caches_encoding(self):
         """
@@ -904,22 +911,17 @@ class TestGetEncoding:
 
         import kiro.tokenizer as tokenizer_module
 
-        original_encoding = tokenizer_module._encoding
-        tokenizer_module._encoding = None
+        original_encodings = dict(tokenizer_module._encodings)
+        tokenizer_module._encodings.clear()
 
         try:
             # Мокируем import tiktoken чтобы выбросить ImportError
             with patch.dict("sys.modules", {"tiktoken": None}):
                 with patch("builtins.__import__", side_effect=ImportError("No module named 'tiktoken'")):
-                    # Сбрасываем кэш
-                    tokenizer_module._encoding = None
-
-                    # Должен вернуть None и не упасть
-                    # Примечание: из-за кэширования этот тест может не работать идеально
-                    # но главное - проверить что код не падает
-                    pass
+                    assert _get_encoding() is None, "Missing tiktoken must degrade to None, not raise"
         finally:
-            tokenizer_module._encoding = original_encoding
+            tokenizer_module._encodings.clear()
+            tokenizer_module._encodings.update(original_encodings)
 
 
 class TestTokenizerIntegration:
@@ -994,3 +996,97 @@ class TestTokenizerIntegration:
 
         # All results should be identical
         assert len(set(results)) == 1, "Results should be consistent"
+
+
+class TestTokenProfileResolution:
+    """Per-family encoding and correction selection.
+
+    Measured against upstream contextUsagePercentage (see the slope table in
+    kiro/tokenizer.py): every family has its own tokenizer, so one blanket
+    factor on cl100k_base cannot describe them all.
+    """
+
+    def test_gpt_family_uses_o200k(self):
+        profile = resolve_token_profile("gpt-5.6-sol")
+        assert profile.encoding_name == "o200k_base"
+
+    def test_claude_family_uses_cl100k(self):
+        profile = resolve_token_profile("claude-opus-4.7")
+        assert profile.encoding_name == "cl100k_base"
+
+    def test_unknown_model_falls_back_to_claude_profile(self):
+        assert resolve_token_profile("some-unreleased-model") == resolve_token_profile("claude-sonnet-4")
+
+    def test_none_model_falls_back_to_claude_profile(self):
+        assert resolve_token_profile(None) == resolve_token_profile("claude-sonnet-4")
+
+    def test_gpt_and_claude_disagree_on_korean(self):
+        korean = "게이트웨이는 업스트림이 제공하는 컨텍스트 사용률 퍼센트를 토큰 수로 역산합니다."
+
+        gpt = count_tokens(korean, model="gpt-5.6-sol")
+        claude = count_tokens(korean, model="claude-opus-4.7")
+
+        assert gpt < claude, f"o200k-based GPT count should be lower for Korean: gpt={gpt} claude={claude}"
+
+    def test_latin_text_gets_no_inflation(self):
+        """Measured cl100k slope is 1.000 for English on every family, so the
+        Claude factor must not inflate Latin text."""
+        english = "The gateway back-calculates a token count from the context usage percentage."
+
+        counted = count_tokens(english, model="claude-opus-4.7")
+        raw = count_tokens(english, apply_claude_correction=False, model="claude-opus-4.7")
+
+        assert counted == raw, f"Latin text must not be inflated: {counted} != {raw}"
+
+    def test_hangul_text_keeps_the_measured_claude_factor(self):
+        """Claude's measured Hangul slope is 1.158-1.166, which is what the
+        1.15 constant actually describes."""
+        korean = "게이트웨이는 업스트림이 제공하는 컨텍스트 사용률 퍼센트를 토큰 수로 역산합니다."
+
+        counted = count_tokens(korean, model="claude-opus-4.7")
+        raw = count_tokens(korean, apply_claude_correction=False, model="claude-opus-4.7")
+
+        ratio = counted / raw
+        assert 1.10 <= ratio <= 1.20, f"Hangul ratio should sit near the measured 1.16, got {ratio}"
+
+    def test_estimate_request_tokens_honours_the_model(self):
+        messages = [{"role": "user", "content": "한국어 문장입니다. 토크나이저를 확인합니다."}]
+
+        gpt = estimate_request_tokens(messages, model="gpt-5.6-sol")["total_tokens"]
+        claude = estimate_request_tokens(messages, model="claude-opus-4.7")["total_tokens"]
+
+        assert gpt < claude, f"model must reach the tokenizer: gpt={gpt} claude={claude}"
+
+
+class TestFallbackHandlesCJK:
+    """The no-tiktoken fallback must not undercount CJK by ~3.5x."""
+
+    def test_korean_fallback_is_close_to_real_count(self):
+        korean = "게이트웨이는 업스트림이 제공하는 컨텍스트 사용률 퍼센트를 토큰 수로 역산합니다. " * 4
+
+        real = count_tokens(korean, apply_claude_correction=False)
+        with patch("kiro.tokenizer._get_encoding", return_value=None):
+            estimated = count_tokens(korean, apply_claude_correction=False)
+
+        ratio = estimated / real
+        assert 0.65 <= ratio <= 1.35, f"Korean fallback ratio out of bounds: {ratio} (est={estimated} real={real})"
+
+    def test_english_fallback_stays_close_to_real_count(self):
+        english = "The gateway back-calculates a token count from the context usage percentage. " * 4
+
+        real = count_tokens(english, apply_claude_correction=False)
+        with patch("kiro.tokenizer._get_encoding", return_value=None):
+            estimated = count_tokens(english, apply_claude_correction=False)
+
+        ratio = estimated / real
+        assert 0.65 <= ratio <= 1.35, f"English fallback ratio out of bounds: {ratio} (est={estimated} real={real})"
+
+    def test_han_fallback_is_close_to_real_count(self):
+        chinese = "网关根据上游提供的上下文使用率百分比反算令牌数量。但是上游不提供输出令牌数。" * 4
+
+        real = count_tokens(chinese, apply_claude_correction=False)
+        with patch("kiro.tokenizer._get_encoding", return_value=None):
+            estimated = count_tokens(chinese, apply_claude_correction=False)
+
+        ratio = estimated / real
+        assert 0.65 <= ratio <= 1.35, f"Han fallback ratio out of bounds: {ratio} (est={estimated} real={real})"

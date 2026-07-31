@@ -784,6 +784,7 @@ async def count_tokens_endpoint(
         tools=tools_for_tokenizer,
         system_prompt=system_for_tokenizer,
         apply_claude_correction=True,  # CRITICAL: Enable correction for Claude models
+        model=request_data.model,
     )
 
     input_tokens = request_token_stats["total_tokens"]
