@@ -51,7 +51,7 @@ folded into this file; do not link to them.
 | Request/response schemas | `kiro/models_openai.py`, `kiro/models_anthropic.py` | Extra-open models preserve unknown fields |
 | Extended thinking budgets | `kiro/native_thinking.py` | Budget must be >= 1024; unknown fields rejected upstream |
 | Failure capture/replay | `kiro/debug_capture.py`, `kiro/debug_replay.py`, `kiro/debug_sanitize.py` | Redacted by default |
-| Payload size repair | `kiro/payload_guards.py` | Kiro rejects ~615KB+ (`payload_guards.py:5`) |
+| Payload size repair | `kiro/payload_guards.py` | Measured cutoff: 1,085,435 bytes pass, 1,086,459 fail (`config.py:456`) |
 
 ## CODE MAP
 

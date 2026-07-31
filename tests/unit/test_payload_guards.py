@@ -255,7 +255,7 @@ class TestOversizedPayloadWithoutAutoTrim:
         from kiro.payload_guards import check_payload_size
 
         monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
-        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 600000)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1085435)
 
         result = cc.build_kiro_payload(
             messages=[cc.UnifiedMessage(role="user", content="hello")],
@@ -266,7 +266,7 @@ class TestOversizedPayloadWithoutAutoTrim:
             profile_arn=None,
         )
 
-        assert check_payload_size(result.payload) < 600000
+        assert check_payload_size(result.payload) < 1085435
 
 
 class TestOversizedPayloadReturns400:

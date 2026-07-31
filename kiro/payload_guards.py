@@ -2,8 +2,10 @@
 """
 Payload size guard for Kiro API requests.
 
-The Kiro API rejects payloads exceeding ~615KB with a misleading
-"Improperly formed request." (reason: null) error. This module provides:
+The Kiro API rejects oversized payloads with 400
+"Input content length exceeds threshold." (reason:
+CONTENT_LENGTH_EXCEEDS_THRESHOLD). Measured boundary: 1,085,435 bytes pass and
+1,086,459 bytes fail. This module provides:
 - Pre-flight size checking
 - Auto-trimming of oldest history entries to fit under the limit
 
@@ -29,9 +31,9 @@ class PayloadTrimStats:
 class PayloadTooLargeError(Exception):
     """Raised when a payload exceeds the limit and auto-trimming is disabled.
 
-    Kiro answers an oversized payload with "Improperly formed request." and a null
-    reason, which names neither the size nor the limit. Failing here instead keeps
-    the actual numbers in the message so the caller can act on them.
+    Kiro answers an oversized payload with CONTENT_LENGTH_EXCEEDS_THRESHOLD,
+    which names neither the size nor the limit. Failing here instead keeps the
+    actual numbers in the message so the caller can act on them.
     """
 
     payload_bytes: int

@@ -453,12 +453,16 @@ def _warn_timeout_configuration():
 # Payload Size Guard Settings
 # ==================================================================================================
 
-# Payload size limit in bytes (Kiro API rejects > ~615KB with cryptic 400 error)
-# Default 600KB provides safety margin below the ~615KB hard limit
-KIRO_MAX_PAYLOAD_BYTES: int = int(os.getenv("KIRO_MAX_PAYLOAD_BYTES", "600000"))
+# Payload size limit in bytes. Measured against the live upstream
+# (generateAssistantResponse, claude-haiku-4.5, ASCII history, no tools) by
+# bisecting the reject boundary: 1,085,435 bytes returned 200, and 1,086,459
+# bytes returned 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD. The default is the
+# largest size measured to pass. The upstream may count characters rather than
+# bytes, so multi-byte (e.g. CJK) conversations can trip this guard early.
+KIRO_MAX_PAYLOAD_BYTES: int = int(os.getenv("KIRO_MAX_PAYLOAD_BYTES", "1085435"))
 
 # Auto-trim payload when over limit (default: false - disabled)
-# Enable this if you use many tools (30+) and hit "Improperly formed request" errors
+# Enable this if you use many tools (30+) and hit payload size errors
 # When false, returns a clear error instead of trimming
 AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("true", "1", "yes")
 
