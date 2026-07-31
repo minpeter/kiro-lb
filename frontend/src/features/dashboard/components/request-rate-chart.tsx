@@ -21,6 +21,7 @@ function loadFactor(series: AccountRateSeries): number | null {
 function AccountRatePanel({ series, rate }: { series: AccountRateSeries; rate: RequestRate }) {
   const buckets = Math.max(rate.bucketStarts.length - 1, 1);
   const peak = Math.max(...series.peakRpm, 0);
+  const hasTraffic = series.peakRpm.some(Boolean);
   const load = loadFactor(series);
   const nearLimit = load !== null && load >= WARN_FRACTION;
   const rateLimited = series.rateLimited.reduce((sum, value) => sum + value, 0);
@@ -53,55 +54,64 @@ function AccountRatePanel({ series, rate }: { series: AccountRateSeries; rate: R
         </span>
       </div>
 
-      <div className="relative">
-        <svg
-          viewBox={`0 0 ${buckets} ${CHART_HEIGHT}`}
-          preserveAspectRatio="none"
-          className="h-28 w-full"
-          role="img"
-          aria-label={`Peak requests per minute for account ${series.account}: ${peak} per minute${
-            series.limitRpm === null ? ", no observed limit" : `, observed limit ${series.limitRpm} per minute`
-          }`}
-        >
-          {limitY !== null && (
-            <rect x={0} y={0} width={buckets} height={limitY} fill={LIMIT_STROKE} opacity={0.06} />
-          )}
-          {/* Uncertainty band: the limit is somewhere between safe and rejected. */}
-          {limitY !== null && series.safeRpm > 0 && (
-            <rect
-              x={0}
-              y={limitY}
-              width={buckets}
-              height={Math.max(y(series.safeRpm) - limitY, 0)}
-              fill={LIMIT_STROKE}
-              opacity={0.08}
-            />
-          )}
-          <path d={area} fill={traffic} opacity={0.28} />
-          <path d={line} fill="none" stroke={traffic} strokeWidth={1} vectorEffect="non-scaling-stroke" />
-          {limitY !== null && (
-            <line
-              x1={0}
-              x2={buckets}
-              y1={limitY}
-              y2={limitY}
-              stroke={LIMIT_STROKE}
-              strokeWidth={1}
-              strokeDasharray="4 3"
-              vectorEffect="non-scaling-stroke"
-            />
-          )}
-        </svg>
-        {series.limitRpm !== null && limitY !== null && (
-          <Badge
-            variant="destructive"
-            className="absolute left-0 -translate-y-1/2 text-[10px]"
-            style={{ top: `${(limitY / CHART_HEIGHT) * 100}%` }}
+      {/* An idle account keeps its panel: the grid must not change shape with
+          traffic, or an account that served nothing looks like one that is not
+          in the pool at all. */}
+      {!hasTraffic ? (
+        <div className="flex h-28 items-center justify-center rounded-md border border-dashed border-border/60">
+          <p className="text-xs text-muted-foreground">No traffic in this window</p>
+        </div>
+      ) : (
+        <div className="relative">
+          <svg
+            viewBox={`0 0 ${buckets} ${CHART_HEIGHT}`}
+            preserveAspectRatio="none"
+            className="h-28 w-full"
+            role="img"
+            aria-label={`Peak requests per minute for account ${series.account}: ${peak} per minute${
+              series.limitRpm === null ? ", no observed limit" : `, observed limit ${series.limitRpm} per minute`
+            }`}
           >
-            ~{series.limitRpm}/min
-          </Badge>
-        )}
-      </div>
+            {limitY !== null && (
+              <rect x={0} y={0} width={buckets} height={limitY} fill={LIMIT_STROKE} opacity={0.06} />
+            )}
+            {/* Uncertainty band: the limit is somewhere between safe and rejected. */}
+            {limitY !== null && series.safeRpm > 0 && (
+              <rect
+                x={0}
+                y={limitY}
+                width={buckets}
+                height={Math.max(y(series.safeRpm) - limitY, 0)}
+                fill={LIMIT_STROKE}
+                opacity={0.08}
+              />
+            )}
+            <path d={area} fill={traffic} opacity={0.28} />
+            <path d={line} fill="none" stroke={traffic} strokeWidth={1} vectorEffect="non-scaling-stroke" />
+            {limitY !== null && (
+              <line
+                x1={0}
+                x2={buckets}
+                y1={limitY}
+                y2={limitY}
+                stroke={LIMIT_STROKE}
+                strokeWidth={1}
+                strokeDasharray="4 3"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+          </svg>
+          {series.limitRpm !== null && limitY !== null && (
+            <Badge
+              variant="destructive"
+              className="absolute left-0 -translate-y-1/2 text-[10px]"
+              style={{ top: `${(limitY / CHART_HEIGHT) * 100}%` }}
+            >
+              ~{series.limitRpm}/min
+            </Badge>
+          )}
+        </div>
+      )}
 
       <p className="text-xs text-muted-foreground">
         {series.limitRpm === null ? (
@@ -126,7 +136,9 @@ function AccountRatePanel({ series, rate }: { series: AccountRateSeries; rate: R
 }
 
 export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLoading: boolean }) {
-  const hasTraffic = rate?.accounts.some((series) => series.peakRpm.some(Boolean));
+  // Emptiness is a per-account fact, so it is reported inside each panel. The
+  // card only collapses when there is no account to chart at all.
+  const hasAccounts = (rate?.accounts.length ?? 0) > 0;
 
   return (
     <Card>
@@ -143,8 +155,12 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
       <CardContent>
         {isLoading || !rate ? (
           <ChartSkeleton />
-        ) : !hasTraffic ? (
-          <EmptyState icon={Activity} title="No traffic in this window" description="Routing outcomes appear here as requests arrive." />
+        ) : !hasAccounts ? (
+          <EmptyState
+            icon={Activity}
+            title="No accounts to chart"
+            description="Rate history appears once an account joins the pool."
+          />
         ) : (
           <div className="grid gap-3 lg:grid-cols-2">
             {rate.accounts.map((series) => (
