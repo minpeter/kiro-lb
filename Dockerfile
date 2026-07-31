@@ -7,7 +7,8 @@ FROM python:3.10-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
 
 # Create non-root user for security
 RUN groupadd -r kiro && useradd -r -g kiro kiro
@@ -19,6 +20,15 @@ RUN chown kiro:kiro /app
 # Install dependencies first (better layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Bake the tiktoken vocabularies into the image. tiktoken ships no BPE data: it
+# downloads it from openaipublic.blob.core.windows.net on first use and caches it
+# under a temp dir, so without this every fresh container pays a ~5.3MB download
+# on its first token count, and a network-restricted deployment silently falls
+# back to character-based estimation instead of counting.
+RUN mkdir -p /opt/tiktoken-cache \
+    && python -c "import tiktoken; [tiktoken.get_encoding(n) for n in ('cl100k_base', 'o200k_base')]" \
+    && chmod -R a+rX /opt/tiktoken-cache
 
 # Copy application code
 COPY --chown=kiro:kiro . .
