@@ -273,6 +273,24 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # runtime endpoint never reach that API and would otherwise fall back to
 # DEFAULT_MAX_INPUT_TOKENS for every model. Assuming 200k for a 1M model
 # understates reported context usage by 5x.
+#
+# Four values deliberately do NOT mirror the reported figure. claude-opus-4.7,
+# claude-opus-4.8, claude-opus-5 and claude-sonnet-5 advertise 1000000, but the
+# runtime endpoint charges 1.50x per cl100k token against that number while every
+# other model charges 1.00x. Measured slopes, English text, two payload sizes so
+# the fixed per-request overhead cancels:
+#
+#   claude-opus-4.7  1.5018    claude-opus-4.6    0.999
+#   claude-opus-4.8  1.4974    claude-sonnet-4.6  1.000
+#   claude-opus-5    1.4963    auto               0.999
+#   claude-sonnet-5  1.4984    gpt-5.6-sol        0.999
+#
+# A tokenizer cannot make English denser than Korean (1.158 on the same model), so
+# the 1.5x is not tokenization: the real window is two thirds of the advertised
+# one. Inverting each slope gives 665853, 667824, 668300 and 667364 - all within
+# 0.3% of 666667 - so contextUsagePercentage on these four is a percentage of
+# 666667, not of 1000000. Keeping 1000000 here inflated every derived token count
+# by 1.5x and made clients compact far too late.
 FALLBACK_MODELS: List[Dict[str, Any]] = [
     {"modelId": "auto", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000}},
     {"modelId": "claude-sonnet-4", "tokenLimits": {"maxInputTokens": 200000, "maxOutputTokens": 64000}},
@@ -281,10 +299,10 @@ FALLBACK_MODELS: List[Dict[str, Any]] = [
     {"modelId": "claude-haiku-4.5", "tokenLimits": {"maxInputTokens": 200000, "maxOutputTokens": 64000}},
     {"modelId": "claude-opus-4.5", "tokenLimits": {"maxInputTokens": 200000, "maxOutputTokens": 64000}},
     {"modelId": "claude-opus-4.6", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000}},
-    {"modelId": "claude-opus-4.7", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 128000}},
-    {"modelId": "claude-opus-4.8", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 128000}},
-    {"modelId": "claude-opus-5", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 128000}},
-    {"modelId": "claude-sonnet-5", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000}},
+    {"modelId": "claude-opus-4.7", "tokenLimits": {"maxInputTokens": 666667, "maxOutputTokens": 128000}},
+    {"modelId": "claude-opus-4.8", "tokenLimits": {"maxInputTokens": 666667, "maxOutputTokens": 128000}},
+    {"modelId": "claude-opus-5", "tokenLimits": {"maxInputTokens": 666667, "maxOutputTokens": 128000}},
+    {"modelId": "claude-sonnet-5", "tokenLimits": {"maxInputTokens": 666667, "maxOutputTokens": 64000}},
     {"modelId": "deepseek-3.2", "tokenLimits": {"maxInputTokens": 164000, "maxOutputTokens": 64000}},
     {"modelId": "glm-5", "tokenLimits": {"maxInputTokens": 200000, "maxOutputTokens": 64000}},
     {"modelId": "minimax-m2.1", "tokenLimits": {"maxInputTokens": 196000, "maxOutputTokens": 64000}},

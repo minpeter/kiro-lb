@@ -639,21 +639,24 @@ class TestFallbackModelsConfig:
 
     def test_fallback_token_limits_match_upstream_values(self):
         """
-        What it does: Pins the maxInputTokens values reported by Kiro's
-                      /ListAvailableModels for the models that are not 200k.
+        What it does: Pins the maxInputTokens values for the models that are not 200k.
         Purpose: The whole point of the fallback limits is that they differ from
                  DEFAULT_MAX_INPUT_TOKENS. A regression that reset them to 200000 would
                  otherwise pass every other assertion in this file.
+        Note: the four 666667 values are measured, not reported. /ListAvailableModels
+                 advertises 1000000 for them, but the runtime endpoint charges 1.5x per
+                 token against that figure, which only resolves if the real window is
+                 two thirds of it. See FALLBACK_MODELS for the measurement.
         """
         from kiro.config import FALLBACK_MODELS
 
         by_id = {m["modelId"]: m["tokenLimits"]["maxInputTokens"] for m in FALLBACK_MODELS}
         expected = {
             "auto": 1000000,
-            "claude-opus-5": 1000000,
-            "claude-sonnet-5": 1000000,
-            "claude-opus-4.8": 1000000,
-            "claude-opus-4.7": 1000000,
+            "claude-opus-5": 666667,
+            "claude-sonnet-5": 666667,
+            "claude-opus-4.8": 666667,
+            "claude-opus-4.7": 666667,
             "claude-opus-4.6": 1000000,
             "claude-sonnet-4.6": 1000000,
             "qwen3-coder-next": 256000,
@@ -681,7 +684,8 @@ class TestFallbackModelsConfig:
         cache = ModelInfoCache()
         asyncio.run(cache.update(FALLBACK_MODELS))
 
-        assert cache.get_max_input_tokens("claude-opus-4.7") == 1000000
+        assert cache.get_max_input_tokens("claude-opus-4.7") == 666667
+        assert cache.get_max_input_tokens("claude-opus-4.6") == 1000000
         assert cache.get_max_input_tokens("deepseek-3.2") == 164000
         assert cache.get_max_input_tokens("claude-sonnet-4.5") == DEFAULT_MAX_INPUT_TOKENS
 
