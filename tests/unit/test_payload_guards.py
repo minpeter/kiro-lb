@@ -7,6 +7,8 @@ Tests check_payload_size() and trim_payload_to_limit() functions.
 
 import json
 
+import pytest
+
 from kiro.payload_guards import (
     check_payload_size,
     trim_payload_to_limit,
@@ -190,3 +192,126 @@ class TestTrimPayloadToLimit:
         assert not stats.trimmed
         assert stats.original_entries == 0
         assert stats.final_entries == 0
+
+
+class TestOversizedPayloadWithoutAutoTrim:
+    """The guard must refuse an oversized payload instead of sending it blind.
+
+    config.py documents "When false, returns a clear error instead of trimming",
+    but the branch was never written: build_kiro_payload only acted when
+    AUTO_TRIM_PAYLOAD was true, so the default configuration shipped a payload
+    Kiro answers with a cryptic 400 that names no size.
+    """
+
+    def _oversized_request(self):
+        from kiro.converters_core import UnifiedMessage
+
+        # One message big enough to clear any sane byte limit on its own.
+        return [UnifiedMessage(role="user", content="x" * 5000)]
+
+    def test_raises_payload_too_large_when_trim_disabled(self, monkeypatch):
+        import kiro.converters_core as cc
+        from kiro.payload_guards import PayloadTooLargeError
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1000)
+
+        with pytest.raises(PayloadTooLargeError) as exc_info:
+            cc.build_kiro_payload(
+                messages=self._oversized_request(),
+                system_prompt="",
+                model_id="auto",
+                tools=None,
+                conversation_id="conv-oversized",
+                profile_arn=None,
+            )
+
+        error = exc_info.value
+        # The whole point is actionability: the operator must learn both numbers.
+        assert error.payload_bytes > 1000
+        assert error.limit_bytes == 1000
+        assert str(error.payload_bytes) in str(error)
+        assert str(error.limit_bytes) in str(error)
+
+    def test_trims_instead_of_raising_when_trim_enabled(self, monkeypatch):
+        import kiro.converters_core as cc
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", True)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1000)
+
+        result = cc.build_kiro_payload(
+            messages=self._oversized_request(),
+            system_prompt="",
+            model_id="auto",
+            tools=None,
+            conversation_id="conv-oversized",
+            profile_arn=None,
+        )
+
+        assert result.payload["conversationState"]["conversationId"] == "conv-oversized"
+
+    def test_under_limit_payload_is_untouched_when_trim_disabled(self, monkeypatch):
+        import kiro.converters_core as cc
+        from kiro.payload_guards import check_payload_size
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 600000)
+
+        result = cc.build_kiro_payload(
+            messages=[cc.UnifiedMessage(role="user", content="hello")],
+            system_prompt="",
+            model_id="auto",
+            tools=None,
+            conversation_id="conv-small",
+            profile_arn=None,
+        )
+
+        assert check_payload_size(result.payload) < 600000
+
+
+class TestOversizedPayloadReturns400:
+    """An oversized request is the caller's to fix, so it must be a 400, not a 500.
+
+    PayloadTooLargeError is raised from build_kiro_payload deep inside the route.
+    Without explicit handling it lands in the generic `except Exception` branch and
+    the client sees an opaque 500 that hides the actionable byte counts.
+    """
+
+    def _payload(self, model="claude-sonnet-4.5"):
+        return {"model": model, "messages": [{"role": "user", "content": "x" * 4000}]}
+
+    def test_openai_route_returns_400_naming_the_size(self, test_client, valid_proxy_api_key, monkeypatch):
+        import kiro.converters_core as cc
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 500)
+
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json=self._payload(),
+        )
+
+        assert response.status_code == 400, response.text
+        body = response.text
+        assert "500" in body  # the configured limit
+        assert "AUTO_TRIM_PAYLOAD" in body
+
+    def test_anthropic_route_returns_400_naming_the_size(self, test_client, valid_proxy_api_key, monkeypatch):
+        import kiro.converters_core as cc
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 500)
+
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4.5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "x" * 4000}],
+            },
+        )
+
+        assert response.status_code == 400, response.text
+        assert "AUTO_TRIM_PAYLOAD" in response.text

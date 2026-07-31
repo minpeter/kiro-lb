@@ -26,6 +26,27 @@ class PayloadTrimStats:
     trimmed: bool
 
 
+class PayloadTooLargeError(Exception):
+    """Raised when a payload exceeds the limit and auto-trimming is disabled.
+
+    Kiro answers an oversized payload with "Improperly formed request." and a null
+    reason, which names neither the size nor the limit. Failing here instead keeps
+    the actual numbers in the message so the caller can act on them.
+    """
+
+    payload_bytes: int
+    limit_bytes: int
+
+    def __init__(self, payload_bytes: int, limit_bytes: int) -> None:
+        self.payload_bytes = payload_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(
+            f"Request payload is {payload_bytes} bytes, over the {limit_bytes} byte limit Kiro accepts. "
+            f"Shorten the conversation or send fewer tools. Set AUTO_TRIM_PAYLOAD=true to drop the "
+            f"oldest history instead (this silently loses earlier context)."
+        )
+
+
 def check_payload_size(payload: Dict[str, Any]) -> int:
     """Return the serialized byte size of the payload as UTF-8 JSON."""
     return len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))

@@ -23,7 +23,7 @@ from kiro.config import (
     KIRO_MAX_PAYLOAD_BYTES,
     TOOL_DESCRIPTION_MAX_LENGTH,
 )
-from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+from kiro.payload_guards import PayloadTooLargeError, check_payload_size, trim_payload_to_limit
 
 # ==================================================================================================
 # Data Classes for Unified Message Format
@@ -1341,14 +1341,23 @@ def build_kiro_payload(
     if profile_arn:
         payload["profileArn"] = profile_arn
 
-    # Payload size guard — auto-trim if enabled
-    if AUTO_TRIM_PAYLOAD:
-        payload_size = check_payload_size(payload)
-        if payload_size > KIRO_MAX_PAYLOAD_BYTES:
+    # Payload size guard. Kiro answers an oversized payload with a cryptic
+    # "Improperly formed request." that names no size, so either trim it or fail
+    # here with the real numbers. Trimming is opt-in because it silently discards
+    # the oldest turns.
+    payload_size = check_payload_size(payload)
+    if payload_size > KIRO_MAX_PAYLOAD_BYTES:
+        if AUTO_TRIM_PAYLOAD:
             stats = trim_payload_to_limit(payload, KIRO_MAX_PAYLOAD_BYTES)
             logger.info(
                 f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
                 f"({stats.original_bytes} -> {stats.final_bytes} bytes)"
             )
+        else:
+            logger.warning(
+                f"Payload {payload_size} bytes exceeds the {KIRO_MAX_PAYLOAD_BYTES} byte limit "
+                f"and AUTO_TRIM_PAYLOAD is disabled"
+            )
+            raise PayloadTooLargeError(payload_size, KIRO_MAX_PAYLOAD_BYTES)
 
     return KiroPayloadResult(payload=payload, tool_documentation=tool_documentation)

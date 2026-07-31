@@ -25,6 +25,7 @@ from kiro.models_anthropic import (
     AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
 )
+from kiro.payload_guards import PayloadTooLargeError
 from kiro.streaming_anthropic import (
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
@@ -257,6 +258,12 @@ async def messages(
 
             try:
                 kiro_payload = anthropic_to_kiro(request_data, conversation_id, profile_arn_for_payload)
+            except PayloadTooLargeError as e:
+                logger.error(f"Payload too large: {e}")
+                return JSONResponse(
+                    status_code=400,
+                    content={"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}},
+                )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
                 return JSONResponse(
@@ -537,6 +544,11 @@ async def messages(
 
     try:
         kiro_payload = anthropic_to_kiro(request_data, conversation_id, profile_arn_for_payload)
+    except PayloadTooLargeError as e:
+        logger.error(f"Payload too large: {e}")
+        return JSONResponse(
+            status_code=400, content={"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}
+        )
     except ValueError as e:
         logger.error(f"Conversion error: {e}")
         return JSONResponse(
