@@ -400,6 +400,11 @@ async def stream_kiro_to_openai_internal(
         if metering_data:
             final_chunk["usage"]["credits_used"] = metering_data
 
+        # Kiro reports no token counts, only this percentage, so forward it verbatim
+        # instead of leaving the derived token estimate as the client's only signal.
+        if context_usage_percentage is not None:
+            final_chunk["usage"]["context_usage_percentage"] = context_usage_percentage
+
         # Log final token values being sent to client
         logger.debug(
             f"[Usage] {model}: "

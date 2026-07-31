@@ -676,8 +676,12 @@ async def stream_kiro_to_anthropic(
             stop_reason = "end_turn"
 
         # Send message_delta with stop_reason and usage
-        usage_payload = {"output_tokens": output_tokens}
+        usage_payload: Dict[str, Any] = {"output_tokens": output_tokens}
         usage_payload.update(upstream_cache_usage)
+        # Kiro reports no token counts, only this percentage, so forward it verbatim
+        # instead of leaving the derived token estimate as the client's only signal.
+        if context_usage_percentage is not None:
+            usage_payload["context_usage_percentage"] = context_usage_percentage
 
         yield format_sse_event(
             "message_delta",
@@ -869,6 +873,8 @@ async def collect_anthropic_response(
 
     usage_payload: Dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
     usage_payload.update(upstream_cache_usage)
+    if result.context_usage_percentage is not None:
+        usage_payload["context_usage_percentage"] = result.context_usage_percentage
 
     return {
         "id": message_id,
