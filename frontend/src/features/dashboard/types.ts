@@ -8,6 +8,8 @@ export type Overview = {
 };
 
 export type AccountUsage = {
+  /** Upstream account email, present once a quota poll has reported it. */
+  email?: string | null;
   subscriptionTitle?: string;
   subscriptionType?: string;
   currentUsage?: number;
@@ -26,6 +28,7 @@ export type AccountRoutingState =
   | "rate_limited"
   | "quota_exhausted"
   | "cooling_down"
+  | "suspended"
   | "uninitialized";
 
 export type Account = {

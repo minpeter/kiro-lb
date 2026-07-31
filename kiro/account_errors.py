@@ -13,6 +13,10 @@ requests that will fail on all accounts.
 from enum import Enum
 from typing import Optional
 
+from kiro.kiro_errors import SUSPENSION_REASON, is_suspension_error
+
+__all__ = ["ErrorType", "classify_error", "is_suspension_error", "SUSPENSION_REASON"]
+
 
 class ErrorType(Enum):
     """

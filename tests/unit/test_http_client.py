@@ -221,6 +221,7 @@ class TestKiroHttpClientRequestWithRetry:
 
         mock_response_403 = AsyncMock()
         mock_response_403.status_code = 403
+        mock_response_403.aread = AsyncMock(return_value=b'{"message": "Forbidden", "reason": null}')
 
         mock_response_200 = AsyncMock()
         mock_response_200.status_code = 200
@@ -239,6 +240,39 @@ class TestKiroHttpClientRequestWithRetry:
         print("Verification: force_refresh() called...")
         mock_auth_manager_for_http.force_refresh.assert_called_once()
         assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_403_account_suspension_is_returned_without_refresh(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies a suspension 403 short-circuits instead of refreshing.
+        Purpose: A suspended account answers 403 with a perfectly valid token, so
+                 refreshing burns the retry budget and hides the verdict behind a
+                 timeout; the response must reach the route so it can fail over.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        suspended = AsyncMock()
+        suspended.status_code = 403
+        suspended.aread = AsyncMock(
+            return_value=(
+                b'{"message": "Your User ID (94c89418) temporarily is suspended. '
+                b'We have locked your account as a security precaution.", "reason": null}'
+            )
+        )
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(return_value=suspended)
+
+        with patch.object(http_client, "_get_client", return_value=mock_client):
+            with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                response = await http_client.request_with_retry(
+                    "POST", "https://api.example.com/test", {"data": "value"}
+                )
+
+        assert response.status_code == 403
+        mock_auth_manager_for_http.force_refresh.assert_not_called()
+        assert mock_client.request.await_count == 1
 
     @pytest.mark.asyncio
     async def test_429_triggers_backoff(self, mock_auth_manager_for_http):

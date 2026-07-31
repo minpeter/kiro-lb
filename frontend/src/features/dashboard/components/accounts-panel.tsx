@@ -1,4 +1,4 @@
-import { ServerCog } from "lucide-react";
+import { AtSign, Ban, ServerCog } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
@@ -13,6 +13,7 @@ const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
   rate_limited: "rate limited",
   quota_exhausted: "quota exhausted",
   cooling_down: "cooling down",
+  suspended: "BANNED",
   uninitialized: "pending",
 };
 
@@ -21,14 +22,41 @@ function RoutingStateCell({ account }: { account: Account }) {
   const state = account.routingState;
   const label = ROUTING_STATE_LABEL[state] ?? state;
   const variant = state === "available" ? "secondary" : state === "uninitialized" ? "outline" : "destructive";
+  const suspended = state === "suspended";
   return (
     <div className="space-y-1">
-      <Badge variant={variant}>{label}</Badge>
-      {account.eligibleInSeconds > 0 && (
-        <p className="text-xs tabular-nums text-muted-foreground">
-          back in {formatDuration(account.eligibleInSeconds)}
-        </p>
+      <Badge variant={variant} className={suspended ? "font-semibold tracking-wide" : undefined}>
+        {suspended && <Ban size={12} />}
+        {label}
+      </Badge>
+      {suspended ? (
+        <p className="text-xs text-destructive">locked by Kiro; contact support</p>
+      ) : (
+        account.eligibleInSeconds > 0 && (
+          <p className="text-xs tabular-nums text-muted-foreground">
+            back in {formatDuration(account.eligibleInSeconds)}
+          </p>
+        )
       )}
+    </div>
+  );
+}
+
+/**
+ * Identity of one pool account: the upstream email when the quota poll has
+ * reported it, with the hashed credential label underneath. The label stays
+ * visible either way because it is what client-facing 503 diagnostics name.
+ */
+function AccountCell({ account }: { account: Account }) {
+  const email = account.usage?.email;
+  if (!email) return <span className="font-mono text-xs">{account.id}</span>;
+  return (
+    <div className="flex min-w-0 flex-col gap-0.5">
+      <span className="flex min-w-0 items-center gap-1.5 font-medium" title={email}>
+        <AtSign size={13} className="shrink-0 text-muted-foreground" />
+        <span className="truncate">{email}</span>
+      </span>
+      <span className="pl-[1.15rem] font-mono text-xs text-muted-foreground">{account.id}</span>
     </div>
   );
 }
@@ -77,7 +105,9 @@ export function AccountsPanel({ accounts, isLoading }: { accounts: Account[]; is
             <TableBody>
               {accounts.map((account) => (
                 <TableRow key={account.id}>
-                  <TableCell className="font-mono text-xs">{account.id}</TableCell>
+                  <TableCell className="max-w-56">
+                    <AccountCell account={account} />
+                  </TableCell>
                   <TableCell>
                     <RoutingStateCell account={account} />
                   </TableCell>

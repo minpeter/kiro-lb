@@ -128,6 +128,7 @@ def initialize_dashboard_store() -> None:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS account_usage (
                 account_id TEXT PRIMARY KEY,
+                email TEXT,
                 subscription_title TEXT,
                 subscription_type TEXT,
                 resource_type TEXT,
@@ -145,7 +146,7 @@ def initialize_dashboard_store() -> None:
         )
         # Additive migration for stores created before overage tracking existed.
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(account_usage)")}
-        for column, ddl in (("overage_status", "TEXT"), ("overage_used", "REAL")):
+        for column, ddl in (("overage_status", "TEXT"), ("overage_used", "REAL"), ("email", "TEXT")):
             if column not in existing:
                 conn.execute(f"ALTER TABLE account_usage ADD COLUMN {column} {ddl}")
 
@@ -371,6 +372,7 @@ def _cached_usage(account_id: str) -> dict[str, Any] | None:
     if not row:
         return None
     return {
+        "email": row["email"],
         "subscriptionTitle": row["subscription_title"],
         "subscriptionType": row["subscription_type"],
         "resourceType": row["resource_type"],
@@ -394,11 +396,12 @@ async def refresh_account_usage(account: Any) -> dict[str, Any]:
         usage = await fetch_account_usage(account)
         with _db() as conn:
             conn.execute(
-                """INSERT INTO account_usage(account_id, subscription_title, subscription_type, resource_type, current_usage, usage_limit, usage_percent, unit, next_date_reset, days_until_reset, overage_status, overage_used, updated_at, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                ON CONFLICT(account_id) DO UPDATE SET subscription_title=excluded.subscription_title, subscription_type=excluded.subscription_type, resource_type=excluded.resource_type, current_usage=excluded.current_usage, usage_limit=excluded.usage_limit, usage_percent=excluded.usage_percent, unit=excluded.unit, next_date_reset=excluded.next_date_reset, days_until_reset=excluded.days_until_reset, overage_status=excluded.overage_status, overage_used=excluded.overage_used, updated_at=excluded.updated_at, error=NULL""",
+                """INSERT INTO account_usage(account_id, email, subscription_title, subscription_type, resource_type, current_usage, usage_limit, usage_percent, unit, next_date_reset, days_until_reset, overage_status, overage_used, updated_at, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(account_id) DO UPDATE SET email=excluded.email, subscription_title=excluded.subscription_title, subscription_type=excluded.subscription_type, resource_type=excluded.resource_type, current_usage=excluded.current_usage, usage_limit=excluded.usage_limit, usage_percent=excluded.usage_percent, unit=excluded.unit, next_date_reset=excluded.next_date_reset, days_until_reset=excluded.days_until_reset, overage_status=excluded.overage_status, overage_used=excluded.overage_used, updated_at=excluded.updated_at, error=NULL""",
                 (
                     account.id,
+                    usage["email"],
                     usage["subscriptionTitle"],
                     usage["subscriptionType"],
                     usage["resourceType"],

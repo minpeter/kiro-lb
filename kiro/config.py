@@ -548,6 +548,13 @@ ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", 
 # live requests on a known-empty account.
 ACCOUNT_QUOTA_QUARANTINE: int = int(os.getenv("ACCOUNT_QUOTA_QUARANTINE", "21600"))
 
+# An upstream suspension is not a timed condition: the account stays locked until
+# Kiro support restores it. The window only bounds how long the gateway trusts a
+# stale verdict, so it is deliberately long - a suspended account must never draw
+# traffic, and the probabilistic retry that rescues a merely broken account would
+# only earn another 403 here.
+ACCOUNT_SUSPENSION_QUARANTINE: int = int(os.getenv("ACCOUNT_SUSPENSION_QUARANTINE", "86400"))
+
 # Averaging window for the dashboard's requests-per-minute figure. Kiro rejects
 # on instantaneous speed, so the chart measures a sliding count over this many
 # seconds at each request instant rather than averaging a whole bucket.

@@ -18,7 +18,31 @@ Example:
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+#: Reason code for an upstream account suspension. The runtime host sends it in
+#: the ``reason`` field; the legacy ``q.*`` host sends the same verdict with
+#: ``reason: null`` and only the message to go on, so both are recognized.
+SUSPENSION_REASON = "TEMPORARILY_SUSPENDED"
+
+_SUSPENSION_MARKERS = ("temporarily suspended", "temporarily is suspended", "locked your account", "locked it as a")
+
+
+def is_suspension_error(status_code: int, message: Optional[str], reason: Optional[str] = None) -> bool:
+    """Report whether an upstream refusal means the account itself is locked.
+
+    Only an authorization refusal carries this meaning. The same wording in a
+    validation error would be an echo of the payload, not a verdict about the
+    account, so the status code is part of the test.
+    """
+    if status_code != 403:
+        return False
+    if reason == SUSPENSION_REASON:
+        return True
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _SUSPENSION_MARKERS)
 
 
 @dataclass
@@ -79,6 +103,19 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
     reason = error_json.get("reason")
     if reason is None:
         reason = "UNKNOWN"
+
+    # A suspension may arrive with no reason code (legacy host), so it has to be
+    # recognized from the message too before the generic branches collapse it
+    # into "unknown error".
+    if is_suspension_error(403, original_message, error_json.get("reason")):
+        return KiroErrorInfo(
+            reason=SUSPENSION_REASON,
+            user_message=(
+                "Account suspended by Kiro. This account is locked upstream and cannot serve requests "
+                "until support restores it."
+            ),
+            original_message=original_message,
+        )
 
     # Map known reasons to user-friendly messages
     if reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD":

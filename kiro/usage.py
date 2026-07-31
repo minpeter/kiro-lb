@@ -69,6 +69,11 @@ async def fetch_account_usage(account: Account) -> dict[str, Any]:
     breakdown = breakdowns[0] if breakdowns else {}
     subscription = payload.get("subscriptionInfo") or {}
     overage = payload.get("overageConfiguration") or {}
+    # The request asks for the identity block (isEmailRequired), which is the
+    # only way to tell two accounts apart on the dashboard: account IDs are
+    # hashed credential paths. The user ID stays out; it identifies nothing an
+    # operator can act on.
+    user_info = payload.get("userInfo") or {}
     # Credit usage is fractional: the integer fields round 695.17 down to 695,
     # so prefer the precise values and fall back only when they are absent.
     current = _number(breakdown.get("currentUsageWithPrecision"))
@@ -81,6 +86,7 @@ async def fetch_account_usage(account: Account) -> dict[str, Any]:
     if overage_used is None:
         overage_used = _number(breakdown.get("currentOverages"))
     return {
+        "email": user_info.get("email") or None,
         "subscriptionTitle": subscription.get("subscriptionTitle") or subscription.get("type") or "Unknown",
         "subscriptionType": subscription.get("type") or "Unknown",
         "resourceType": breakdown.get("resourceType") or "AGENTIC_REQUEST",

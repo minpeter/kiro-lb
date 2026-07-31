@@ -3,7 +3,8 @@
 HTTP client for Kiro API with retry logic support.
 
 Handles:
-- 403: automatic token refresh and retry
+- 403: automatic token refresh and retry, unless the body says the account is
+  suspended - a lock is not a token problem and refreshing only wastes retries
 - 429: exponential backoff
 - 5xx: exponential backoff
 - Timeouts: exponential backoff
@@ -22,6 +23,7 @@ from loguru import logger
 
 from kiro.auth import KiroAuthManager
 from kiro.config import BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.kiro_errors import is_suspension_error
 from kiro.network_errors import NetworkErrorInfo, classify_network_error, get_short_error_message
 from kiro.utils import get_kiro_headers
 
@@ -225,8 +227,25 @@ class KiroHttpClient:
                 if response.status_code == 200:
                     return response
 
-                # 403 - token expired, refresh and retry
+                # 403 - either an expired token or a suspended account. Only the
+                # first is worth refreshing: a suspension keeps answering 403 with
+                # a perfectly valid token, so refreshing burns the whole retry
+                # budget and hides the verdict behind a timeout.
                 if response.status_code == 403:
+                    body = b""
+                    try:
+                        body = await response.aread()
+                    except Exception:
+                        body = b""
+                    text = body.decode("utf-8", errors="replace")
+                    reason = None
+                    try:
+                        reason = json.loads(text).get("reason")
+                    except Exception:
+                        reason = None
+                    if is_suspension_error(403, text, reason):
+                        logger.error("Received 403 account suspension; returning immediately for account failover")
+                        return response
                     logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
                     if stream:
                         await response.aclose()

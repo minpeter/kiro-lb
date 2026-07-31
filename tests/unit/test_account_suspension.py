@@ -1,0 +1,202 @@
+"""Upstream account suspension is a permanent denial, not a token problem.
+
+A suspended Builder ID answers ``403 AccessDeniedException`` with the message
+"Your User ID (...) temporarily is suspended", while its refresh token stays
+valid. Treating that as an expired token makes the gateway refresh
+successfully, retry, get 403 again, and burn the whole retry budget; the
+account then only ever reaches ``cooling_down``, which leaks 10% of routing
+attempts into an account that can never recover on its own.
+"""
+
+import time
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from kiro.account_errors import ErrorType, classify_error, is_suspension_error
+from kiro.account_manager import Account, AccountManager, account_routing_state
+from kiro.config import ACCOUNT_SUSPENSION_QUARANTINE
+from kiro.kiro_errors import SUSPENSION_REASON, enhance_kiro_error
+
+_SUSPENDED_BODY = {
+    "message": (
+        "Your User ID (94c89418-e061-709a-d0aa-0715ab00c707) temporarily is suspended. "
+        "We've locked your account as a security precaution. To restore access, please "
+        "contact our support team to verify your identity: "
+        "https://app.kiro.dev/account/usage?support_form"
+    ),
+    "reason": None,
+}
+
+# The runtime host words it differently and supplies a real reason code; both
+# hosts must be recognized because a Builder ID account can land on either.
+_SUSPENDED_BODY_RUNTIME = {
+    "message": (
+        "Your User ID is temporarily suspended. We detected unusual user activity and locked it "
+        "as a security precaution. To restore access, please contact our support team to verify "
+        "your identity: https://support.aws.amazon.com/#/contacts/kiro"
+    ),
+    "reason": "TEMPORARILY_SUSPENDED",
+}
+
+
+class TestSuspensionDetection:
+    def test_suspension_body_is_recognized(self):
+        assert is_suspension_error(403, _SUSPENDED_BODY["message"]) is True
+
+    def test_runtime_host_reason_code_is_recognized(self):
+        assert is_suspension_error(403, _SUSPENDED_BODY_RUNTIME["message"], "TEMPORARILY_SUSPENDED") is True
+
+    def test_runtime_host_wording_alone_is_recognized(self):
+        assert is_suspension_error(403, _SUSPENDED_BODY_RUNTIME["message"]) is True
+
+    def test_enhance_kiro_error_labels_the_runtime_suspension(self):
+        info = enhance_kiro_error(_SUSPENDED_BODY_RUNTIME)
+
+        assert info.reason == SUSPENSION_REASON
+        assert "suspended" in info.user_message.lower()
+
+    def test_enhance_kiro_error_labels_the_suspension(self):
+        info = enhance_kiro_error(_SUSPENDED_BODY)
+
+        assert info.reason == SUSPENSION_REASON
+        assert "suspended" in info.user_message.lower()
+
+    def test_plain_403_is_not_a_suspension(self):
+        assert is_suspension_error(403, "Improperly formed request.") is False
+
+    def test_suspension_wording_on_another_status_is_not_a_suspension(self):
+        # Only an authorization refusal carries this meaning; the same words in a
+        # 400 body would be a payload echo, not an account verdict.
+        assert is_suspension_error(400, _SUSPENDED_BODY["message"]) is False
+
+    def test_missing_message_is_not_a_suspension(self):
+        assert is_suspension_error(403, None) is False
+
+    def test_suspension_classifies_as_recoverable_for_failover(self):
+        assert classify_error(403, SUSPENSION_REASON) == ErrorType.RECOVERABLE
+
+    def test_ordinary_403_still_classifies_as_recoverable(self):
+        assert classify_error(403, None) == ErrorType.RECOVERABLE
+
+
+def _account(account_id: str = "/creds/banned.json") -> Account:
+    account = Account(id=account_id)
+    account.auth_manager = MagicMock()
+    return account
+
+
+class TestSuspendedAccountState:
+    def test_routing_state_reports_suspended(self):
+        account = _account()
+        account.suspended_until = time.time() + 3600
+
+        state, eligible_in = account_routing_state(account)
+
+        assert state == "suspended"
+        assert 3500 < eligible_in <= 3600
+
+    def test_suspension_outranks_cooldown_and_quota(self):
+        account = _account()
+        account.suspended_until = time.time() + 3600
+        account.quota_exhausted_until = time.time() + 60
+        account.failures = 5
+        account.last_failure_time = time.time()
+
+        state, _ = account_routing_state(account)
+
+        assert state == "suspended"
+
+    def test_expired_suspension_returns_to_available(self):
+        account = _account()
+        account.suspended_until = time.time() - 1
+
+        state, eligible_in = account_routing_state(account)
+
+        assert state == "available"
+        assert eligible_in == 0
+
+
+@pytest.fixture
+def manager(tmp_path):
+    mgr = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+    mgr._save_state = AsyncMock()
+    return mgr
+
+
+class TestSuspensionQuarantine:
+    def test_report_failure_quarantines_a_suspended_account(self, manager):
+        import asyncio
+
+        account = _account()
+        manager._accounts[account.id] = account
+
+        asyncio.run(
+            manager.report_failure(account.id, "claude-sonnet-4.5", ErrorType.RECOVERABLE, 403, SUSPENSION_REASON)
+        )
+
+        remaining = account.suspended_until - time.time()
+        assert remaining == pytest.approx(ACCOUNT_SUSPENSION_QUARANTINE, abs=5)
+        # The Circuit Breaker must stay untouched: the exclusion is already
+        # total, and inflating failures only lengthens an unrelated backoff.
+        assert account.failures == 0
+        assert account.stats.failed_requests == 1
+
+    def test_suspended_account_is_never_selected(self, manager):
+        import asyncio
+
+        banned = _account("/creds/banned.json")
+        banned.suspended_until = time.time() + 3600
+        healthy = _account("/creds/healthy.json")
+        healthy.models_cached_at = time.time()
+        manager._accounts[banned.id] = banned
+        manager._accounts[healthy.id] = healthy
+
+        # Probabilistic retry must not reach a suspended account, so repeat
+        # enough times that a 10% leak would be overwhelmingly likely to show.
+        picks = {asyncio.run(manager.get_next_account("claude-sonnet-4.5")).id for _ in range(200)}
+
+        assert picks == {healthy.id}
+
+    def test_pool_of_only_suspended_accounts_yields_nothing(self, manager):
+        import asyncio
+
+        first = _account("/creds/a.json")
+        second = _account("/creds/b.json")
+        for account in (first, second):
+            account.suspended_until = time.time() + 3600
+            manager._accounts[account.id] = account
+
+        assert asyncio.run(manager.get_next_account("claude-sonnet-4.5")) is None
+
+    def test_success_clears_a_stale_suspension(self, manager):
+        import asyncio
+
+        account = _account()
+        account.suspended_until = time.time() + 3600
+        manager._accounts[account.id] = account
+
+        asyncio.run(manager.report_success(account.id, "claude-sonnet-4.5"))
+
+        assert account.suspended_until == 0.0
+
+
+class TestSuspensionPersistence:
+    def test_suspension_survives_a_restart(self, tmp_path):
+        import asyncio
+        import json
+
+        state_file = tmp_path / "state.json"
+        mgr = AccountManager(str(tmp_path / "credentials.json"), str(state_file))
+        account = _account()
+        account.suspended_until = time.time() + 3600
+        mgr._accounts[account.id] = account
+        asyncio.run(mgr._save_state())
+
+        saved = json.loads(state_file.read_text())
+        assert saved["accounts"][account.id]["suspended_until"] == pytest.approx(account.suspended_until)
+
+        reloaded = AccountManager(str(tmp_path / "credentials.json"), str(state_file))
+        reloaded._accounts[account.id] = _account()
+        asyncio.run(reloaded.load_state())
+        assert reloaded._accounts[account.id].suspended_until == pytest.approx(account.suspended_until)

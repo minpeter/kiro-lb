@@ -36,6 +36,7 @@ from kiro.config import (
     ACCOUNT_QUOTA_QUARANTINE,
     ACCOUNT_RATE_LIMIT_COOLDOWN,
     ACCOUNT_RECOVERY_TIMEOUT,
+    ACCOUNT_SUSPENSION_QUARANTINE,
     FALLBACK_MODELS,
     HIDDEN_FROM_LIST,
     HIDDEN_MODELS,
@@ -45,6 +46,7 @@ from kiro.config import (
     STATE_SAVE_INTERVAL_SECONDS,
 )
 from kiro.http_client import KiroHttpClient
+from kiro.kiro_errors import SUSPENSION_REASON
 from kiro.model_resolver import ModelResolver, normalize_model_name
 
 
@@ -109,10 +111,17 @@ def account_routing_state(account: "Account", now: Optional[float] = None) -> Tu
 
     Returns:
         Tuple of (state, seconds_until_eligible). State is one of
-        "quota_exhausted", "rate_limited", "cooling_down", "uninitialized",
-        or "available"; the second element is 0 when nothing is pending.
+        "suspended", "quota_exhausted", "rate_limited", "cooling_down",
+        "uninitialized", or "available"; the second element is 0 when nothing
+        is pending.
     """
     now = time.time() if now is None else now
+
+    # A suspension outranks every other exclusion: the others describe a
+    # condition that clears on its own, this one does not.
+    suspension_remaining = account.suspended_until - now
+    if suspension_remaining > 0:
+        return ("suspended", int(suspension_remaining))
 
     quota_remaining = account.quota_exhausted_until - now
     if quota_remaining > 0:
@@ -203,6 +212,11 @@ class Account:
             any request until its quota resets, so it leaves the rotation
             entirely - no probabilistic retry reaches it. Persisted, because
             the state outlives the process.
+        suspended_until: Timestamp until which the account is locked upstream
+            (403 with a suspension message). Unlike every other exclusion this
+            one cannot expire on its own - only Kiro support lifts it - so the
+            account leaves the rotation completely and the Circuit Breaker is
+            left untouched. Persisted; a restart must not resurrect it.
         models_cached_at: Timestamp of last model cache update
         stats: Usage statistics
     """
@@ -215,6 +229,7 @@ class Account:
     last_failure_time: float = 0.0
     rate_limited_until: float = 0.0
     quota_exhausted_until: float = 0.0
+    suspended_until: float = 0.0
     models_cached_at: float = 0.0
     stats: AccountStats = field(default_factory=AccountStats)
 
@@ -443,6 +458,7 @@ class AccountManager:
                     account.failures = data.get("failures", 0)
                     account.last_failure_time = data.get("last_failure_time", 0.0)
                     account.quota_exhausted_until = data.get("quota_exhausted_until", 0.0)
+                    account.suspended_until = data.get("suspended_until", 0.0)
                     account.models_cached_at = data.get("models_cached_at", 0.0)
 
                     stats_data = data.get("stats", {})
@@ -470,6 +486,7 @@ class AccountManager:
                     "failures": account.failures,
                     "last_failure_time": account.last_failure_time,
                     "quota_exhausted_until": account.quota_exhausted_until,
+                    "suspended_until": account.suspended_until,
                     "models_cached_at": account.models_cached_at,
                     "stats": {
                         "total_requests": account.stats.total_requests,
@@ -797,6 +814,13 @@ class AccountManager:
                 if exclude_accounts and account_id in exclude_accounts:
                     continue
 
+                # An upstream suspension takes the account out of the rotation
+                # completely. No probabilistic retry: the lock is lifted by Kiro
+                # support, never by another request, and each attempt still costs
+                # a full retry storm plus a user-visible failure.
+                if account.suspended_until > time.time():
+                    continue
+
                 # Skip accounts that cannot serve any request. A quota-exhausted
                 # account is out of the rotation entirely until its quarantine
                 # expires: no probabilistic retry, because there is nothing to
@@ -880,6 +904,9 @@ class AccountManager:
             # A success proves the account is accepting requests again, so drop
             # any leftover rate-limit or quota window instead of waiting it out.
             account.rate_limited_until = 0.0
+            if account.suspended_until:
+                account.suspended_until = 0.0
+                logger.info(f"Account {account_id} is serving again; suspension lifted")
             if account.quota_exhausted_until:
                 account.quota_exhausted_until = 0.0
                 logger.info(f"Account {account_id} is serving again; quota quarantine cleared")
@@ -955,6 +982,25 @@ class AccountManager:
                     f"status={status_code}, reason={reason}, "
                     f"cooldown={_format_duration(ACCOUNT_RATE_LIMIT_COOLDOWN)} "
                     f"(failures unchanged at {account.failures})"
+                )
+                return
+
+            # Special case: the account itself is locked upstream. No number of
+            # retries or token refreshes can change that, so park it for a long
+            # quarantine and leave the Circuit Breaker alone - inflating failures
+            # would only add an unrelated backoff to an account already fully
+            # excluded.
+            if reason == SUSPENSION_REASON:
+                account.suspended_until = time.time() + ACCOUNT_SUSPENSION_QUARANTINE
+                account.stats.total_requests += 1
+                account.stats.failed_requests += 1
+                self._record_routing_event(account_id, "suspended")
+                self._dirty = True
+                logger.error(
+                    f"Account {account_id} is SUSPENDED upstream: "
+                    f"status={status_code}, reason={reason}, "
+                    f"excluded from routing for {_format_duration(ACCOUNT_SUSPENSION_QUARANTINE)}. "
+                    f"Kiro support must restore this account."
                 )
                 return
 
