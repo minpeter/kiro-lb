@@ -19,9 +19,18 @@ from typing_extensions import Annotated
 
 class OpenAIModel(BaseModel):
     """
-    Data model for describing an AI model in OpenAI format.
+    One model entry, carrying both the OpenAI and the Anthropic field sets.
 
-    Used in the /v1/models endpoint response.
+    Claude Code 2.1.126+ discovers gateway models through GET /v1/models and only
+    parses the Anthropic-native shape (type / display_name / created_at), while
+    OpenAI clients read object / created / owned_by. Both routers mount on the
+    same app, so a second registration of the same path would be shadowed; one
+    superset response serves both SDKs instead, and each ignores the other's
+    unknown fields.
+
+    context_window and max_input_tokens are vendor extensions. They exist because
+    the gateway already resolves each real limit, and without them every client
+    has to hardcode a window that the upstream sometimes over-reports.
     """
 
     id: str
@@ -30,16 +39,28 @@ class OpenAIModel(BaseModel):
     owned_by: str = "anthropic"
     description: Optional[str] = None
 
+    type: str = "model"
+    display_name: Optional[str] = None
+    created_at: Optional[str] = None
+
+    context_window: Optional[int] = None
+    max_input_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
+
 
 class ModelList(BaseModel):
     """
-    List of models in OpenAI format.
+    Model list response for GET /v1/models.
 
-    Response of GET /v1/models endpoint.
+    object/data satisfy the OpenAI list wrapper; has_more/first_id/last_id
+    satisfy the Anthropic page wrapper.
     """
 
     object: str = "list"
     data: List[OpenAIModel]
+    has_more: bool = False
+    first_id: Optional[str] = None
+    last_id: Optional[str] = None
 
 
 # ==================================================================================================

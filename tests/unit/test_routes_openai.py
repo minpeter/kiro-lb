@@ -330,10 +330,12 @@ class TestModelsEndpoint:
             assert model["object"] == "model", "Model object type should be 'model'"
             assert "owned_by" in model, "Model missing 'owned_by' field"
 
-    def test_models_owned_by_anthropic(self, test_client, valid_proxy_api_key):
+    def test_models_are_attributed_to_their_own_vendor(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies models are owned by Anthropic.
-        Purpose: Ensure correct model attribution.
+        What it does: Verifies each Claude model is attributed to Anthropic while
+            other families keep their own vendor.
+        Purpose: Ensure correct model attribution. Kiro fronts several vendors, so
+            a blanket "anthropic" owner would mislabel the GPT and Qwen families.
         """
         print("Action: GET /v1/models with valid auth...")
         response = test_client.get("/v1/models", headers={"Authorization": f"Bearer {valid_proxy_api_key}"})
@@ -342,7 +344,10 @@ class TestModelsEndpoint:
         assert response.status_code == 200
 
         for model in response.json()["data"]:
-            assert model["owned_by"] == "anthropic"
+            if model["id"].startswith("claude"):
+                assert model["owned_by"] == "anthropic"
+            else:
+                assert model["owned_by"] != "anthropic", model["id"]
 
 
 # =============================================================================
@@ -1420,3 +1425,73 @@ class TestChatCompletionsLegacyMode:
 
         assert failover_enabled is False
         print("✅ Legacy mode correctly skips failover loop")
+
+
+class TestModelsEndpointMetadata:
+    """The model list must carry usable, truthful metadata for both SDKs.
+
+    Claude Code 2.1.126+ discovers gateway models by GET {base_url}/v1/models and
+    only parses the Anthropic-native shape, while OpenAI clients need the OpenAI
+    shape. Both routers mount on the same app, so one route serves a superset of
+    the two schemas rather than a second, shadowed registration.
+    """
+
+    def _models(self, test_client, key, headers=None):
+        h = {"Authorization": f"Bearer {key}"}
+        if headers:
+            h.update(headers)
+        response = test_client.get("/v1/models", headers=h)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def test_accepts_anthropic_x_api_key_auth(self, test_client, valid_proxy_api_key):
+        """Claude Code sends x-api-key, not Bearer, when discovering models."""
+        response = test_client.get("/v1/models", headers={"x-api-key": valid_proxy_api_key})
+
+        assert response.status_code == 200, response.text
+        assert response.json()["data"], "model list must not be empty"
+
+    def test_carries_the_anthropic_page_wrapper(self, test_client, valid_proxy_api_key):
+        body = self._models(test_client, valid_proxy_api_key)
+
+        assert body["object"] == "list"
+        assert body["has_more"] is False
+        assert body["first_id"] == body["data"][0]["id"]
+        assert body["last_id"] == body["data"][-1]["id"]
+
+    def test_each_entry_carries_both_schemas(self, test_client, valid_proxy_api_key):
+        entry = self._models(test_client, valid_proxy_api_key)["data"][0]
+
+        assert entry["object"] == "model"
+        assert entry["type"] == "model"
+        assert isinstance(entry["created"], int)
+        assert entry["created_at"].endswith("Z")
+        assert entry["display_name"]
+
+    def test_context_window_comes_from_the_measured_limits(self, test_client, valid_proxy_api_key):
+        """The gateway already knows each real window; clients should not have to
+        hardcode it. claude-opus-5 was measured at 666667, not the advertised 1M."""
+        by_id = {m["id"]: m for m in self._models(test_client, valid_proxy_api_key)["data"]}
+
+        assert by_id["claude-opus-5"]["context_window"] == 666667
+        assert by_id["claude-opus-5"]["max_input_tokens"] == 666667
+        assert by_id["claude-opus-4.6"]["context_window"] == 1000000
+        assert by_id["gpt-5.6-sol"]["context_window"] == 272000
+
+    def test_owner_reflects_the_real_vendor(self, test_client, valid_proxy_api_key):
+        """Every entry claimed owned_by=anthropic, including the GPT and Qwen
+        families. Kiro serves several vendors, so the owner must be derived."""
+        by_id = {m["id"]: m for m in self._models(test_client, valid_proxy_api_key)["data"]}
+
+        assert by_id["claude-opus-5"]["owned_by"] == "anthropic"
+        assert by_id["gpt-5.6-sol"]["owned_by"] == "openai"
+        assert by_id["deepseek-3.2"]["owned_by"] == "deepseek"
+        assert by_id["qwen3-coder-next"]["owned_by"] == "alibaba"
+        assert by_id["minimax-m2.5"]["owned_by"] == "minimax"
+        assert by_id["glm-5"]["owned_by"] == "zhipu"
+
+    def test_description_is_not_a_blanket_claude_claim(self, test_client, valid_proxy_api_key):
+        by_id = {m["id"]: m for m in self._models(test_client, valid_proxy_api_key)["data"]}
+
+        assert "Claude" not in by_id["gpt-5.6-sol"]["description"]
+        assert "Claude" not in by_id["deepseek-3.2"]["description"]

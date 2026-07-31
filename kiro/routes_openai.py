@@ -9,8 +9,9 @@ Contains all API endpoints:
 """
 
 import json
+import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Security
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -79,6 +80,45 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     return True
 
 
+# Model discovery is the one data-plane route both client families hit with their
+# own auth style: Claude Code sends x-api-key, OpenAI clients send Bearer. The
+# chat routes keep their protocol-specific verifiers.
+anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+
+async def verify_models_api_key(
+    auth_header: str = Security(api_key_header),
+    x_api_key: str = Security(anthropic_api_key_header),
+) -> bool:
+    """
+    Verify the API key on /v1/models, accepting Bearer or x-api-key.
+
+    Args:
+        auth_header: Authorization header value
+        x_api_key: x-api-key header value used by Anthropic clients
+
+    Returns:
+        True if key is valid
+
+    Raises:
+        HTTPException: 401 if key is invalid or missing
+    """
+    if auth_header and auth_header.startswith("Bearer "):
+        raw_key = auth_header.removeprefix("Bearer ")
+    elif x_api_key:
+        raw_key = x_api_key
+    else:
+        logger.warning("Access attempt with missing API key.")
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    key_id = identify_data_api_key(raw_key)
+    if key_id is None:
+        logger.warning("Access attempt with invalid API key.")
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    current_api_key_id.set(key_id)
+    return True
+
+
 # --- Router ---
 router = APIRouter()
 
@@ -105,13 +145,70 @@ async def health():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat(), "version": APP_VERSION}
 
 
-@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
+# Model ID prefix -> the vendor that actually owns it. Kiro fronts several
+# vendors, so a blanket owned_by="anthropic" mislabels most of the catalog.
+_MODEL_OWNERS = (
+    ("claude", "anthropic"),
+    ("gpt-", "openai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("deepseek", "deepseek"),
+    ("qwen", "alibaba"),
+    ("minimax", "minimax"),
+    ("glm", "zhipu"),
+)
+
+
+def _model_owner(model_id: str) -> str:
+    """Resolve the owning vendor from the model id, defaulting to the gateway."""
+    normalized = model_id.strip().lower()
+    for prefix, owner in _MODEL_OWNERS:
+        if normalized.startswith(prefix):
+            return owner
+    return "kiro"
+
+
+def _display_name(model_id: str) -> str:
+    """Human label for the Anthropic display_name field."""
+    return f"{model_id} (Kiro)"
+
+
+def _resolve_model_limits(request: Request, model_ids: List[str]) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
+    """
+    Look up (maxInputTokens, maxOutputTokens) per model from the account caches.
+
+    The gateway already resolves these limits for payload sizing, so the endpoint
+    reuses them rather than making clients hardcode a window. Entries missing
+    from every cache stay None instead of being guessed.
+    """
+    caches = []
+    account_manager = request.app.state.account_manager
+    for account in account_manager._accounts.values():
+        cache = getattr(account, "model_cache", None)
+        if cache is not None:
+            caches.append(cache)
+
+    limits: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
+    for model_id in model_ids:
+        for cache in caches:
+            info = cache.get(model_id)
+            if not info:
+                continue
+            token_limits = info.get("tokenLimits") or {}
+            limits[model_id] = (token_limits.get("maxInputTokens"), token_limits.get("maxOutputTokens"))
+            break
+    return limits
+
+
+@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_models_api_key)])
 async def get_models(request: Request):
     """
     Return list of available models.
 
-    Models are loaded at startup (blocking) and cached.
-    This endpoint returns the cached list.
+    Serves the OpenAI and Anthropic schemas as one superset response, because both
+    routers mount on the same app and a second /v1/models registration would be
+    shadowed. Claude Code 2.1.126+ reads the Anthropic fields for gateway model
+    discovery; OpenAI clients read theirs and ignore the rest.
 
     Args:
         request: FastAPI Request for accessing app.state
@@ -130,13 +227,33 @@ async def get_models(request: Request):
         account = request.app.state.account_manager.get_first_account()
         available_model_ids = account.model_resolver.get_available_models()
 
-    # Build OpenAI-compatible model list
-    openai_models = [
-        OpenAIModel(id=model_id, owned_by="anthropic", description="Claude model via Kiro API")
-        for model_id in available_model_ids
-    ]
+    limits = _resolve_model_limits(request, available_model_ids)
+    created = int(time.time())
+    created_at = datetime.fromtimestamp(created, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
-    return ModelList(data=openai_models)
+    openai_models = []
+    for model_id in available_model_ids:
+        owner = _model_owner(model_id)
+        max_input, max_output = limits.get(model_id, (None, None))
+        openai_models.append(
+            OpenAIModel(
+                id=model_id,
+                owned_by=owner,
+                description=f"{model_id} via Kiro API",
+                display_name=_display_name(model_id),
+                created=created,
+                created_at=created_at,
+                context_window=max_input,
+                max_input_tokens=max_input,
+                max_tokens=max_output,
+            )
+        )
+
+    return ModelList(
+        data=openai_models,
+        first_id=openai_models[0].id if openai_models else None,
+        last_id=openai_models[-1].id if openai_models else None,
+    )
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
