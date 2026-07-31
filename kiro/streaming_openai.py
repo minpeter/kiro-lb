@@ -330,7 +330,7 @@ async def stream_kiro_to_openai_internal(
             finish_reason = "stop"
 
         # Count completion_tokens (output) using tiktoken
-        completion_tokens = count_tokens(full_content + full_thinking_content)
+        completion_tokens = count_tokens(full_content + full_thinking_content, model=model)
 
         # Calculate total_tokens based on context_usage_percentage from Kiro API
         # context_usage shows TOTAL percentage of context usage (input + output)
@@ -343,9 +343,9 @@ async def stream_kiro_to_openai_internal(
         # IMPORTANT: Don't apply correction coefficient for prompt_tokens,
         # as it was calibrated for completion_tokens
         if prompt_source == "unknown" and request_messages:
-            prompt_tokens = count_message_tokens(request_messages, apply_claude_correction=False)
+            prompt_tokens = count_message_tokens(request_messages, apply_claude_correction=False, model=model)
             if request_tools:
-                prompt_tokens += count_tools_tokens(request_tools, apply_claude_correction=False)
+                prompt_tokens += count_tools_tokens(request_tools, apply_claude_correction=False, model=model)
             total_tokens = prompt_tokens + completion_tokens
             prompt_source = "tiktoken"
             total_source = "tiktoken"
@@ -399,11 +399,6 @@ async def stream_kiro_to_openai_internal(
 
         if metering_data:
             final_chunk["usage"]["credits_used"] = metering_data
-
-        # Kiro reports no token counts, only this percentage, so forward it verbatim
-        # instead of leaving the derived token estimate as the client's only signal.
-        if context_usage_percentage is not None:
-            final_chunk["usage"]["context_usage_percentage"] = context_usage_percentage
 
         # Log final token values being sent to client
         logger.debug(

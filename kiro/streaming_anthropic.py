@@ -165,6 +165,7 @@ async def stream_kiro_to_anthropic(
             tools=request_tools,
             system_prompt=request_system,
             apply_claude_correction=False,
+            model=model,
         )
         input_tokens = request_token_stats["total_tokens"]
 
@@ -651,9 +652,10 @@ async def stream_kiro_to_anthropic(
             )
 
         # Calculate output tokens
-        output_tokens = count_tokens(full_content + full_thinking_content)
+        output_tokens = count_tokens(full_content + full_thinking_content, model=model)
 
         # Calculate total tokens from context usage if available
+        input_tokens_from_upstream = False
         if context_usage_percentage is not None:
             prompt_tokens, _, prompt_source, _ = calculate_tokens_from_context_usage(
                 context_usage_percentage, output_tokens, model_cache, model
@@ -662,6 +664,7 @@ async def stream_kiro_to_anthropic(
             # Only override local estimate when upstream context usage is available
             if prompt_source != "unknown":
                 input_tokens = prompt_tokens
+                input_tokens_from_upstream = True
 
         # Prefer the reason the upstream actually reported; Anthropic clients
         # use stop_reason to decide whether the turn completed.
@@ -678,10 +681,10 @@ async def stream_kiro_to_anthropic(
         # Send message_delta with stop_reason and usage
         usage_payload: Dict[str, Any] = {"output_tokens": output_tokens}
         usage_payload.update(upstream_cache_usage)
-        # Kiro reports no token counts, only this percentage, so forward it verbatim
-        # instead of leaving the derived token estimate as the client's only signal.
-        if context_usage_percentage is not None:
-            usage_payload["context_usage_percentage"] = context_usage_percentage
+        # message_start could only carry a local estimate, since Kiro reports context
+        # usage after generation. Restate input_tokens here once it is upstream-derived.
+        if input_tokens_from_upstream:
+            usage_payload["input_tokens"] = input_tokens
 
         yield format_sse_event(
             "message_delta",
@@ -762,6 +765,7 @@ async def collect_anthropic_response(
             tools=request_tools,
             system_prompt=request_system,
             apply_claude_correction=False,
+            model=model,
         )
         input_tokens = request_token_stats["total_tokens"]
 
@@ -827,7 +831,7 @@ async def collect_anthropic_response(
         )
 
     # Calculate output tokens
-    output_tokens = count_tokens(result.content + result.thinking_content)
+    output_tokens = count_tokens(result.content + result.thinking_content, model=model)
 
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:
@@ -873,8 +877,6 @@ async def collect_anthropic_response(
 
     usage_payload: Dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
     usage_payload.update(upstream_cache_usage)
-    if result.context_usage_percentage is not None:
-        usage_payload["context_usage_percentage"] = result.context_usage_percentage
 
     return {
         "id": message_id,
