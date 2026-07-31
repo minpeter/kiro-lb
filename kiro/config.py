@@ -475,8 +475,10 @@ def _warn_timeout_configuration():
 # (generateAssistantResponse, claude-haiku-4.5, ASCII history, no tools) by
 # bisecting the reject boundary: 1,085,435 bytes returned 200, and 1,086,459
 # bytes returned 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD. The default is the
-# largest size measured to pass. The upstream may count characters rather than
-# bytes, so multi-byte (e.g. CJK) conversations can trip this guard early.
+# largest size measured to pass. A later Korean probe pushed 2,070,175 UTF-8
+# bytes through successfully and failed only on the context window, so this
+# threshold is not a plain wire-byte count and the guard is deliberately
+# conservative for multi-byte text.
 KIRO_MAX_PAYLOAD_BYTES: int = int(os.getenv("KIRO_MAX_PAYLOAD_BYTES", "1085435"))
 
 # Auto-trim payload when over limit (default: false - disabled)

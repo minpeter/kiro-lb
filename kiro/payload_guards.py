@@ -50,8 +50,15 @@ class PayloadTooLargeError(Exception):
 
 
 def check_payload_size(payload: Dict[str, Any]) -> int:
-    """Return the serialized byte size of the payload as UTF-8 JSON."""
-    return len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    """Return the serialized byte size of the payload as UTF-8 JSON.
+
+    ensure_ascii=False matches how the routes actually serialize the upstream
+    body (routes_openai.py, routes_anthropic.py). With the default True, a Hangul
+    character measures as the 6 bytes of a \\uXXXX escape instead of the 3 bytes
+    UTF-8 puts on the wire, so a Korean conversation was rejected at roughly half
+    the size Kiro accepts.
+    """
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
 def _strip_empty_tool_uses(history: list) -> None:

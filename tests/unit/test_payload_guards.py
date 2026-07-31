@@ -36,17 +36,34 @@ class TestCheckPayloadSize:
     def test_check_payload_size_returns_bytes(self):
         """Correct byte count for a simple payload."""
         payload = {"key": "value"}
-        expected = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        expected = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         assert check_payload_size(payload) == expected
 
+    def test_check_payload_size_matches_the_wire_encoding(self):
+        """The guard must measure what the routes actually send.
+
+        routes_openai.py and routes_anthropic.py serialize the upstream body with
+        ensure_ascii=False. Measuring with the default ensure_ascii=True counts a
+        Hangul character as the 6 bytes of a \\uXXXX escape instead of the 3 bytes
+        UTF-8 puts on the wire, which rejected Korean conversations at roughly
+        half the size Kiro accepts.
+        """
+        payload = {
+            "content": "\uac8c\uc774\ud2b8\uc6e8\uc774\ub294 \uc5c5\uc2a4\ud2b8\ub9bc\uc774 \ubcf4\uace0\ud569\ub2c8\ub2e4"
+        }
+
+        wire = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        escaped = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+
+        assert escaped > wire, "fixture must actually distinguish the two encodings"
+        assert check_payload_size(payload) == wire
+
     def test_check_payload_size_utf8(self):
-        """Non-ASCII characters counted correctly."""
+        """Non-ASCII characters counted as their real UTF-8 width."""
         payload = {"emoji": "\U0001f600", "chinese": "\u4f60\u597d"}
         size = check_payload_size(payload)
-        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         assert size == len(raw)
-        # json.dumps escapes non-ASCII by default, so byte count matches
-        # The important thing is consistency with what gets sent over the wire
         assert size > 0
 
 
