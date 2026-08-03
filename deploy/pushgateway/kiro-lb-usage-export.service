@@ -1,0 +1,10 @@
+[Unit]
+Description=Export kiro-lb request, token and account metrics to Pushgateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/home/minpeter/homelab/kiro-lb-probe/kiro-lb.env
+ExecStart=/bin/sh /home/minpeter/homelab/kiro-lb-probe/export_usage.sh
+TimeoutStartSec=25

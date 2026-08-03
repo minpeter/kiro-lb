@@ -4,6 +4,9 @@
 credentials.json
 state.json
 
+# Metrics export credentials; only the .example is tracked.
+deploy/pushgateway/kiro-lb.env
+
 # IDE
 .vscode/
 .idea/
