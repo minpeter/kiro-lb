@@ -368,6 +368,83 @@ class TestSuspensionDetectedAtInitialization:
         assert manager._accounts[account_id].suspended_until == 0.0
 
 
+class TestSuspensionDetectedOnTtlRefresh:
+    """A suspension can also arrive after an account is already healthy.
+
+    The model cache expires on ACCOUNT_CACHE_TTL and _refresh_account_models
+    re-lists. That call answers 403 once the account is locked, and treating any
+    non-200 as "keep the stale cache" left the account advertising every model
+    for as long as the process lived.
+    """
+
+    @staticmethod
+    def _healthy_account(account_id: str = "/creds/locked-later.json") -> Account:
+        from kiro.cache import ModelInfoCache
+        from kiro.model_resolver import ModelResolver
+
+        account = Account(id=account_id)
+        auth = MagicMock()
+        # A plain MagicMock q_host would make _is_runtime_endpoint short-circuit
+        # the refresh, so the legacy host is set explicitly.
+        auth.q_host = "https://q.us-east-1.amazonaws.com"
+        auth.profile_arn = None
+        account.auth_manager = auth
+        account.model_cache = ModelInfoCache()
+        account.model_resolver = ModelResolver(cache=account.model_cache, hidden_models={}, aliases={})
+        account.models_cached_at = time.time()
+        return account
+
+    def _refresh_with_response(self, manager, status_code, body):
+        import asyncio
+        import json as json_module
+        from unittest.mock import patch
+
+        response = MagicMock()
+        response.status_code = status_code
+        response.text = json_module.dumps(body)
+        response.json.return_value = body
+
+        with patch("kiro.account_manager.KiroHttpClient") as http_class:
+            client = AsyncMock()
+            client.request_with_retry = AsyncMock(return_value=response)
+            client.close = AsyncMock()
+            http_class.return_value = client
+            asyncio.run(manager._refresh_account_models(next(iter(manager._accounts))))
+
+    def test_refresh_403_quarantines_the_account(self, manager):
+        account = self._healthy_account()
+        manager._accounts[account.id] = account
+
+        self._refresh_with_response(manager, 403, _SUSPENDED_BODY)
+
+        remaining = account.suspended_until - time.time()
+        assert remaining == pytest.approx(ACCOUNT_SUSPENSION_QUARANTINE, abs=5)
+
+    def test_refresh_403_stops_the_account_being_routed_to(self, manager):
+        import asyncio
+
+        account = self._healthy_account()
+        manager._accounts[account.id] = account
+        self._refresh_with_response(manager, 403, _SUSPENDED_BODY)
+
+        healthy = _account("/creds/healthy.json")
+        healthy.models_cached_at = time.time()
+        manager._accounts[healthy.id] = healthy
+
+        picks = {asyncio.run(manager.get_next_account("claude-sonnet-4.5")).id for _ in range(50)}
+
+        assert picks == {healthy.id}
+
+    def test_an_unrelated_refresh_failure_is_not_a_suspension(self, manager):
+        """A 500 says nothing about the account; the stale cache stays usable."""
+        account = self._healthy_account()
+        manager._accounts[account.id] = account
+
+        self._refresh_with_response(manager, 500, {"message": "internal", "reason": None})
+
+        assert account.suspended_until == 0.0
+
+
 class TestSuspensionPersistence:
     def test_suspension_survives_a_restart(self, tmp_path):
         import asyncio

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import httpx
 from loguru import logger
 
 from kiro.account_errors import ErrorType
@@ -640,20 +641,10 @@ class AccountManager:
                     if response.status_code == 200:
                         data = response.json()
                         models_list = data.get("models", [])
-                    elif is_suspension_error(response.status_code, response.text, _reason_of(response.text)):
-                        # The model listing is the first upstream call an account
-                        # makes, so a suspension surfaces here before a single
-                        # client request is spent on it. Quarantine now instead of
-                        # falling back to the static list, which would leave a
-                        # locked account advertising every model and drawing
+                    elif self._quarantine_if_suspended(account_id, account, response):
+                        # A locked account must not fall back to the static list:
+                        # that is what left it advertising every model and drawing
                         # traffic it can only answer 403 to.
-                        account.suspended_until = time.time() + ACCOUNT_SUSPENSION_QUARANTINE
-                        self._dirty = True
-                        logger.error(
-                            f"Account {account_id} is SUSPENDED upstream (detected while listing models); "
-                            f"excluded from routing for {_format_duration(ACCOUNT_SUSPENSION_QUARANTINE)}. "
-                            f"Kiro support must restore this account."
-                        )
                         models_list = []
                     else:
                         # Shouldn't happen (retry handles non-200), but keep for safety
@@ -705,6 +696,25 @@ class AccountManager:
             logger.error(f"Failed to initialize account {account_id}: {e}")
             return False
 
+    def _quarantine_if_suspended(self, account_id: str, account: "Account", response: httpx.Response) -> bool:
+        """Park an account whose model listing came back as an upstream lock.
+
+        ListAvailableModels is the first upstream call an account makes, so a
+        suspension can be caught here before a client request is spent on it.
+        Returns whether the account was quarantined.
+        """
+        body = response.text
+        if not is_suspension_error(response.status_code, body, _reason_of(body)):
+            return False
+        account.suspended_until = time.time() + ACCOUNT_SUSPENSION_QUARANTINE
+        self._dirty = True
+        logger.error(
+            f"Account {account_id} is SUSPENDED upstream (detected while listing models); "
+            f"excluded from routing for {_format_duration(ACCOUNT_SUSPENSION_QUARANTINE)}. "
+            f"Kiro support must restore this account."
+        )
+        return True
+
     async def _refresh_account_models(self, account_id: str) -> None:
         """
         Refresh model cache for account (TTL refresh).
@@ -747,7 +757,12 @@ class AccountManager:
                 method="GET", url=list_models_url, json_data=None, params=params, stream=False
             )
 
-            if response.status_code == 200:
+            if response.status_code != 200:
+                # A TTL refresh is also an upstream verdict. Without this check a
+                # suspension arriving here was swallowed and the stale cache kept
+                # the locked account advertising models indefinitely.
+                self._quarantine_if_suspended(account_id, account, response)
+            else:
                 data = response.json()
                 models_list = data.get("models", [])
                 await account.model_cache.update(models_list)
