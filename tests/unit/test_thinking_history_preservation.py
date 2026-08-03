@@ -32,8 +32,8 @@ def _assistant_history_entry(messages):
     return next(entry["assistantResponseMessage"] for entry in history if "assistantResponseMessage" in entry)
 
 
-def test_thinking_block_reaches_kiro_history_content():
-    """Reasoning the client passed back must survive into the upstream history."""
+def test_thinking_block_reaches_kiro_history_as_nested_field():
+    """Reasoning the client passed back survives upstream via reasoningContent.reasoningText."""
     messages = [
         AnthropicMessage(role="user", content="Read probe.txt"),
         AnthropicMessage(
@@ -48,12 +48,12 @@ def test_thinking_block_reaches_kiro_history_content():
 
     entry = _assistant_history_entry(messages)
 
-    assert REASONING in entry["content"]
-    assert "Reading it now." in entry["content"]
+    assert entry["reasoningContent"] == {"reasoningText": {"text": REASONING, "signature": "opaque-sig"}}
+    assert entry["content"] == "Reading it now."
 
 
-def test_thinking_precedes_the_visible_text_it_explains():
-    """Reasoning came first upstream; the folded order must match that chronology."""
+def test_signed_thinking_rides_the_field_not_a_content_tag():
+    """Signed reasoning goes into the nested field; content stays clean of any tag."""
     messages = [
         AnthropicMessage(role="user", content="Read probe.txt"),
         AnthropicMessage(
@@ -66,9 +66,10 @@ def test_thinking_precedes_the_visible_text_it_explains():
         AnthropicMessage(role="user", content="thanks"),
     ]
 
-    content = _assistant_history_entry(messages)["content"]
+    entry = _assistant_history_entry(messages)
 
-    assert content.index(REASONING) < content.index("Reading it now.")
+    assert "<thinking>" not in entry["content"]
+    assert entry["reasoningContent"]["reasoningText"]["text"] == REASONING
 
 
 def test_reasoning_survives_alongside_tool_uses():
@@ -90,7 +91,7 @@ def test_reasoning_survives_alongside_tool_uses():
 
     entry = _assistant_history_entry(messages)
 
-    assert REASONING in entry["content"]
+    assert entry["reasoningContent"]["reasoningText"]["text"] == REASONING
     assert entry["toolUses"][0]["toolUseId"] == "toolu_1"
 
 
@@ -119,7 +120,10 @@ def test_reasoning_reaches_the_full_upstream_payload():
     history = payload["conversationState"]["history"]
     assistant_entries = [e["assistantResponseMessage"] for e in history if "assistantResponseMessage" in e]
 
-    assert any(REASONING in entry["content"] for entry in assistant_entries)
+    assert any(
+        entry.get("reasoningContent", {}).get("reasoningText", {}).get("text") == REASONING
+        for entry in assistant_entries
+    )
 
 
 def test_empty_thinking_block_adds_nothing():
@@ -184,8 +188,9 @@ def test_openai_reasoning_field_reaches_kiro_history():
     history = build_kiro_history(unified, "claude-opus-5")
     entry = next(e["assistantResponseMessage"] for e in history if "assistantResponseMessage" in e)
 
+    assert "reasoningContent" not in entry
+    assert "<thinking>" in entry["content"]
     assert REASONING in entry["content"]
-    assert "Reading it now." in entry["content"]
 
 
 def test_openai_legacy_reasoning_content_field_is_accepted():
@@ -200,6 +205,7 @@ def test_openai_legacy_reasoning_content_field_is_accepted():
     history = build_kiro_history(unified, "claude-opus-5")
     entry = next(e["assistantResponseMessage"] for e in history if "assistantResponseMessage" in e)
 
+    assert "reasoningContent" not in entry
     assert REASONING in entry["content"]
 
 

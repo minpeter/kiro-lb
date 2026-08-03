@@ -53,6 +53,7 @@ class UnifiedMessage:
     tool_results: Optional[List[Dict[str, Any]]] = None
     images: Optional[List[Dict[str, Any]]] = None
     reasoning: Optional[str] = None
+    reasoning_signature: Optional[str] = None
 
 
 @dataclass
@@ -91,49 +92,10 @@ class KiroPayloadResult:
 
 
 def fold_reasoning_into_content(content: str, reasoning: Optional[str]) -> str:
-    """Merge a prior assistant turn's reasoning into the text Kiro will read.
+    """Merge a prior assistant turn's reasoning into content.
 
-    Anthropic requires clients to pass ``thinking`` blocks back with the
-    ``tool_use`` they accompanied so the model can resume the reasoning it
-    paused. Kiro accepts the official field but does not act on it.
-
-    ``kiro-cli`` itself sends prior-turn reasoning as a dedicated member:
-    disassembling ``ser_assistant_response_message`` in the shipped binary shows
-    it writing ``reasoningContent``, whose serializer emits ``text`` and
-    ``signature``. Replaying that exact shape from here does not work. Measured
-    against ``q.us-east-1.amazonaws.com`` with one token placed only in the
-    model's own reasoning on a prior turn, then asked for on the next:
-
-        reasoningContent {text, signature}  (its OWN signature, verbatim)  absent
-        reasoningContent {text}             (signature omitted)            absent
-        reasoningContent {text, signature}  (text mutated one char)        absent
-        <thinking>...</thinking> in content                                RECALLED
-        nothing at all                                                     absent
-
-    Every arm ran in a fresh ``conversationId``, because Kiro keeps server-side
-    conversation state: replaying history under a reused id returns prior-turn
-    content no matter what the client sends, which makes the control pass and the
-    experiment meaningless. So the signature is not the obstacle -- a valid
-    matched pair behaves exactly like sending nothing.
-
-    The remaining variables are also closed, so this is not one probe's luck:
-    ``additionalModelRequestFields`` fails in all three placements the client
-    uses (top level, message level, both), the wire shape was matched byte-for-
-    byte against the binary's own serializer, and the user-side history message
-    has no reasoning slot at all -- ``ser_user_input_message`` emits only
-    ``content``, ``userInputMessageContext``, ``modelId``, ``cachePoint``,
-    ``type``, ``clientCacheConfig``, ``useClientCachingOnly``, ``userIntent``,
-    ``origin``, ``images``, ``documents``. Model variance is narrower than the
-    others: on ``claude-opus-4.8`` the model produced no reasoning to replay,
-    and on ``claude-opus-4.7`` it did not store the token in reasoning, so the
-    official field is untested there -- but it fails on ``claude-opus-5``, the
-    only allowlisted model that actually emits reasoning. On this endpoint
-    ``reasoningContent`` never reaches generation, and ``content`` is the only
-    channel that does.
-
-    This forwards reasoning the model itself produced on an earlier turn. It is
-    not the removed prompt-tag path, which synthesized reasoning instructions the
-    client never sent (see tests/unit/test_native_reasoning.py).
+    Fallback for reasoning the client echoed back WITHOUT a signature. Signed
+    reasoning rides the official nested field instead (see build_kiro_history).
     """
     if not reasoning:
         return content
@@ -829,6 +791,7 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                 tool_results=None,
                 images=msg.images,
                 reasoning=msg.reasoning,
+                reasoning_signature=msg.reasoning_signature,
             )
             result.append(cleaned_msg)
         else:
@@ -909,6 +872,7 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     tool_results=None,  # Remove orphaned tool_results (now in text)
                     images=msg.images,
                     reasoning=msg.reasoning,
+                    reasoning_signature=msg.reasoning_signature,
                 )
                 result.append(cleaned_msg)
                 converted_any_tool_results = True
@@ -969,9 +933,13 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
 
             # Merge reasoning the same way as content: two merged assistant turns
             # each carry their own thinking, and dropping the later one would lose
-            # the reasoning behind the tool calls just merged in above.
+            # the reasoning behind the tool calls just merged in above. Keep the
+            # latest turn's (reasoning, signature) pair intact rather than
+            # concatenating texts under a single signature, which would pair a
+            # signature with reasoning it did not seal.
             if msg.role == "assistant" and msg.reasoning:
-                last.reasoning = f"{last.reasoning}\n{msg.reasoning}" if last.reasoning else msg.reasoning
+                last.reasoning = msg.reasoning
+                last.reasoning_signature = msg.reasoning_signature
 
             # Merge tool_results for user messages
             if msg.role == "user" and msg.tool_results:
@@ -1099,6 +1067,7 @@ def normalize_message_roles(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 tool_results=msg.tool_results,
                 images=msg.images,
                 reasoning=msg.reasoning,
+                reasoning_signature=msg.reasoning_signature,
             )
             normalized.append(normalized_msg)
             converted_count += 1
@@ -1231,7 +1200,21 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         elif msg.role == "assistant":
             content = extract_text_content(msg.content)
 
-            assistant_response: Dict[str, Any] = {"content": fold_reasoning_into_content(content, msg.reasoning)}
+            assistant_response: Dict[str, Any] = {"content": content}
+
+            if msg.reasoning and msg.reasoning_signature:
+                # Signed prior-turn reasoning rides the official nested field, the
+                # only reasoning form that reaches generation on this endpoint.
+                # Kiro enforces the signature (THINKING_SIGNATURE_INVALID on empty
+                # or fabricated values), so only a client-supplied signature is
+                # forwarded; unsigned reasoning falls through to the content fold.
+                assistant_response["reasoningContent"] = {
+                    "reasoningText": {"text": msg.reasoning, "signature": msg.reasoning_signature}
+                }
+            elif msg.reasoning:
+                # Unsigned reasoning cannot use the nested field (Kiro rejects an
+                # empty signature), so it is folded into content as a fallback.
+                assistant_response["content"] = fold_reasoning_into_content(content, msg.reasoning)
 
             # Process tool_calls
             tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)

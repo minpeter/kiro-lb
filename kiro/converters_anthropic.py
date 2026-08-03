@@ -78,6 +78,29 @@ def extract_reasoning_from_anthropic_content(content: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def extract_reasoning_signature_from_anthropic_content(content: Any) -> Optional[str]:
+    """Return the first ``thinking`` block's signature, when the client sent one.
+
+    Forwarded so the nested reasoningContent field can carry it. The signature is
+    opaque to this gateway: it is neither parsed nor regenerated, only relayed.
+    """
+    if not isinstance(content, list):
+        return None
+
+    for block in content:
+        if isinstance(block, dict):
+            if block.get("type") == "thinking":
+                signature = block.get("signature")
+                if isinstance(signature, str) and signature:
+                    return signature
+        elif getattr(block, "type", None) == "thinking":
+            signature = getattr(block, "signature", None)
+            if isinstance(signature, str) and signature:
+                return signature
+
+    return None
+
+
 def extract_system_prompt(system: Any) -> str:
     """
     Extracts system prompt text from Anthropic system field.
@@ -293,6 +316,7 @@ def convert_anthropic_messages(
         tool_results = None
         images = None
         reasoning = None
+        reasoning_signature: Optional[str] = None
 
         if role == "assistant":
             # Assistant messages may contain tool_use blocks
@@ -301,6 +325,7 @@ def convert_anthropic_messages(
                 total_tool_calls += len(tool_calls)
 
             reasoning = extract_reasoning_from_anthropic_content(content) or None
+            reasoning_signature = extract_reasoning_signature_from_anthropic_content(content)
 
         elif role == "user":
             # User messages may contain tool_result blocks and images
@@ -330,6 +355,7 @@ def convert_anthropic_messages(
             tool_results=tool_results if tool_results else None,
             images=images if images else None,
             reasoning=reasoning,
+            reasoning_signature=reasoning_signature if role == "assistant" else None,
         )
         unified_messages.append(unified_msg)
 
