@@ -501,6 +501,12 @@ AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("t
 # Note: Native Anthropic server-side tools (Path A) work ALWAYS, regardless of this setting
 WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# Unsigned prior-turn reasoning (OpenAI path, which carries no thinking
+# signature) cannot use the nested reasoningContent field and would otherwise be
+# folded into content as <thinking> tags. That spends context on every turn for
+# reasoning that is only a summary. Default is to drop it; set to true to fold.
+KIRO_FOLD_UNSIGNED_REASONING: bool = os.getenv("KIRO_FOLD_UNSIGNED_REASONING", "false").lower() in ("true", "1", "yes")
+
 # ==================================================================================================
 # Account System Settings
 # ==================================================================================================

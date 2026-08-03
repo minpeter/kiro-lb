@@ -176,8 +176,8 @@ def test_redacted_thinking_block_is_not_forwarded_as_text():
     assert content == "Hello."
 
 
-def test_openai_reasoning_field_reaches_kiro_history():
-    """Parity: `reasoning` is the field the OpenAI serializer emits, so it must round-trip."""
+def test_openai_reasoning_field_is_dropped_by_default(monkeypatch):
+    """Parity: `reasoning` is the field the OpenAI serializer emits; it is dropped unless folding is opted in."""
     _, unified = convert_openai_messages_to_unified(
         [
             ChatMessage(role="user", content="Read probe.txt"),
@@ -188,13 +188,19 @@ def test_openai_reasoning_field_reaches_kiro_history():
     history = build_kiro_history(unified, "claude-opus-5")
     entry = next(e["assistantResponseMessage"] for e in history if "assistantResponseMessage" in e)
 
+    from kiro import config as _config
+
+    monkeypatch.setattr(_config, "KIRO_FOLD_UNSIGNED_REASONING", False, raising=False)
     assert "reasoningContent" not in entry
-    assert "<thinking>" in entry["content"]
-    assert REASONING in entry["content"]
+    assert "<thinking>" not in entry["content"]
+    assert entry["content"] == "Reading it now."
 
 
-def test_openai_legacy_reasoning_content_field_is_accepted():
+def test_openai_legacy_reasoning_content_field_is_accepted(monkeypatch):
     """Requests accept both spellings on input, so the legacy one must work too."""
+    from kiro import config as _config
+
+    monkeypatch.setattr(_config, "KIRO_FOLD_UNSIGNED_REASONING", False, raising=False)
     _, unified = convert_openai_messages_to_unified(
         [
             ChatMessage(role="user", content="Read probe.txt"),
@@ -206,7 +212,7 @@ def test_openai_legacy_reasoning_content_field_is_accepted():
     entry = next(e["assistantResponseMessage"] for e in history if "assistantResponseMessage" in e)
 
     assert "reasoningContent" not in entry
-    assert REASONING in entry["content"]
+    assert "<thinking>" not in entry["content"]
 
 
 def test_openai_message_without_reasoning_is_untouched():

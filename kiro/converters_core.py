@@ -104,6 +104,13 @@ def fold_reasoning_into_content(content: str, reasoning: Optional[str]) -> str:
     return f"<thinking>{reasoning}</thinking>\n{content}"
 
 
+def _fold_unsigned_reasoning_enabled() -> bool:
+    """Read the opt-in at call time so tests can toggle the config module."""
+    from kiro import config as _config
+
+    return bool(getattr(_config, "KIRO_FOLD_UNSIGNED_REASONING", False))
+
+
 def extract_text_content(content: Any) -> str:
     """
     Extracts text content from various formats.
@@ -1211,9 +1218,11 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
                 assistant_response["reasoningContent"] = {
                     "reasoningText": {"text": msg.reasoning, "signature": msg.reasoning_signature}
                 }
-            elif msg.reasoning:
+            elif msg.reasoning and _fold_unsigned_reasoning_enabled():
                 # Unsigned reasoning cannot use the nested field (Kiro rejects an
-                # empty signature), so it is folded into content as a fallback.
+                # empty signature). Folding it into content costs context on every
+                # turn for reasoning that is only a summary, so it is opt-in via
+                # KIRO_FOLD_UNSIGNED_REASONING; default drops the reasoning.
                 assistant_response["content"] = fold_reasoning_into_content(content, msg.reasoning)
 
             # Process tool_calls

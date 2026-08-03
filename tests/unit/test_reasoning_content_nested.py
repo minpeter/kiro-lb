@@ -63,13 +63,16 @@ def test_reasoning_with_signature_uses_nested_field_not_fold():
     assert "<thinking>" not in entry["content"]
 
 
-def test_reasoning_without_signature_folds_into_content():
-    """Kiro rejects an empty signature, so unsigned reasoning falls back to the content fold."""
+def test_reasoning_without_signature_is_dropped_by_default(monkeypatch):
+    """Kiro rejects an empty signature, and folding unsigned reasoning is opt-in, so it is dropped."""
+    from kiro import config as _config
+
+    monkeypatch.setattr(_config, "KIRO_FOLD_UNSIGNED_REASONING", False, raising=False)
     entry = _assistant_history_entry(_three_turn({"signature": ""}))
 
     assert "reasoningContent" not in entry
-    assert REASONING in entry["content"]
-    assert "<thinking>" in entry["content"]
+    assert "<thinking>" not in entry["content"]
+    assert entry["content"] == "Reading it now."
 
 
 def test_reasoning_reaches_full_upstream_payload():
@@ -135,11 +138,13 @@ def test_empty_thinking_produces_no_field():
     assert entry["content"] == "Hello."
 
 
-def test_openai_unsigned_reasoning_folds_into_content():
-    """OpenAI carries no thinking signature, so its reasoning uses the content-fold fallback."""
+def test_openai_unsigned_reasoning_is_dropped_by_default(monkeypatch):
+    """OpenAI carries no thinking signature, so its reasoning is dropped unless folding is opted in."""
+    from kiro import config as _config
     from kiro.converters_openai import convert_openai_messages_to_unified
     from kiro.models_openai import ChatMessage
 
+    monkeypatch.setattr(_config, "KIRO_FOLD_UNSIGNED_REASONING", False, raising=False)
     _, unified = convert_openai_messages_to_unified(
         [
             ChatMessage(role="user", content="Read probe.txt"),
@@ -151,5 +156,5 @@ def test_openai_unsigned_reasoning_folds_into_content():
     entry = next(e["assistantResponseMessage"] for e in history if "assistantResponseMessage" in e)
 
     assert "reasoningContent" not in entry
-    assert "<thinking>" in entry["content"]
-    assert REASONING in entry["content"]
+    assert "<thinking>" not in entry["content"]
+    assert entry["content"] == "Reading it now."
