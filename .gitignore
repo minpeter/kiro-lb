@@ -38,3 +38,10 @@ data/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# blue/green edge runtime cfg (rendered by deploy.sh)
+docker/haproxy-edge.generated.cfg
+
+# Which slot is live right now — per-host runtime state that changes on every
+# deploy; deploy.sh falls back to `blue` when it is absent.
+deploy/bluegreen/active_slot

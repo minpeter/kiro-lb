@@ -1,46 +1,91 @@
-# kiro-lb homelab deployment. Keep this service bound to the private lab IP.
+# kiro-lb homelab — blue/green behind a stable lab-IP edge.
+#
+# External contract (nginx / clients): ALWAYS 10.10.10.10:8000
+#   nginx kiro.minpeter.internal → 10.10.10.10:8000  (never change per deploy)
+#   edge HAProxy :8000 → kiro-blue|kiro-green
+#
+# Debug direct slots (host loopback only):
+#   blue  http://127.0.0.1:8001
+#   green http://127.0.0.1:8002
+#
+# Deploy: ./deploy/bluegreen/deploy.sh
+# Boot after reboot: ./deploy/bluegreen/deploy.sh --boot
+# Project name must stay `kiro-lb` (-p kiro-lb).
+
+name: kiro-lb
+
+x-kiro-app: &kiro-app
+  image: kiro-lb:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+    network: host
+  user: "1000:1000"
+  env_file:
+    - .env
+  environment:
+    SERVER_HOST: "0.0.0.0"
+    SERVER_PORT: "8000"
+    ACCOUNT_SYSTEM: "true"
+    ACCOUNTS_CONFIG_FILE: /app/data/credentials.json
+    ACCOUNTS_STATE_FILE: /app/data/state.json
+    DASHBOARD_DATA_DIR: /app/data
+    SQLITE_READONLY: ${SQLITE_READONLY:-true}
+    HOME: /tmp
+    DEBUG_MODE: ${DEBUG_MODE:-off}
+    DEBUG_CAPTURE_CONTENT: ${DEBUG_CAPTURE_CONTENT:-false}
+    DEBUG_CAPTURE_SUCCESS: ${DEBUG_CAPTURE_SUCCESS:-false}
+    DEBUG_CAPTURE_MAX_BYTES: ${DEBUG_CAPTURE_MAX_BYTES:-4194304}
+    DEBUG_CAPTURE_RETENTION: ${DEBUG_CAPTURE_RETENTION:-10}
+  volumes:
+    # Shared data: only the ACTIVE slot should receive traffic (see deploy.sh).
+    - ./data:/app/data
+    - ./debug_logs:/app/debug_logs
+    - /home/minpeter/.local/share/kiro-cli:/host/kiro-cli:ro
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+    interval: 5s
+    timeout: 5s
+    retries: 12
+    start_period: 15s
+  networks:
+    - kiro-lb-network
+
 services:
-  kiro-lb:
-    image: kiro-lb:local
-    build:
-      context: .
-      dockerfile: Dockerfile
-      network: host
-    container_name: kiro-lb
-    user: "1000:1000"
+  edge:
+    image: haproxy:3.2-alpine
+    container_name: kiro-lb-edge
     ports:
-      - "10.10.10.10:${KIRO_LB_PORT:-8001}:8000"
-    env_file:
-      - .env
-    environment:
-      SERVER_HOST: "0.0.0.0"
-      SERVER_PORT: "8000"
-      ACCOUNT_SYSTEM: "true"
-      ACCOUNTS_CONFIG_FILE: /app/data/credentials.json
-      ACCOUNTS_STATE_FILE: /app/data/state.json
-      DASHBOARD_DATA_DIR: /app/data
-      SQLITE_READONLY: ${SQLITE_READONLY:-true}
-      HOME: /tmp
-      DEBUG_MODE: ${DEBUG_MODE:-off}
-      DEBUG_CAPTURE_CONTENT: ${DEBUG_CAPTURE_CONTENT:-false}
-      DEBUG_CAPTURE_SUCCESS: ${DEBUG_CAPTURE_SUCCESS:-false}
-      DEBUG_CAPTURE_MAX_BYTES: ${DEBUG_CAPTURE_MAX_BYTES:-4194304}
-      DEBUG_CAPTURE_RETENTION: ${DEBUG_CAPTURE_RETENTION:-10}
+      - "10.10.10.10:8000:8000"
     volumes:
-      # Dashboard-managed credentials stay writable; the host CLI store is
-      # discovery-only and must never be modified by the gateway container.
-      - ./data:/app/data
-      - ./debug_logs:/app/debug_logs
-      - /home/minpeter/.local/share/kiro-cli:/host/kiro-cli:ro
+      - ./docker/haproxy-edge.generated.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+      # An HTTP probe, not `haproxy -c`: validating the config file spends ~10s
+      # resolving the idle slot's absent DNS name, overruns any sane timeout, and
+      # left the container permanently `unhealthy` while it served traffic fine.
+      # This asks the question that matters — is the edge answering — and stays
+      # fast whichever slot is idle. 127.0.0.1, not localhost: that resolves to
+      # ::1 first and HAProxy binds v4 only.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-T", "3", "http://127.0.0.1:8000/health"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
-      start_period: 15s
     networks:
       - kiro-lb-network
+
+  kiro-blue:
+    <<: *kiro-app
+    container_name: kiro-lb-blue
+    ports:
+      - "127.0.0.1:8001:8000"
+
+  kiro-green:
+    <<: *kiro-app
+    container_name: kiro-lb-green
+    ports:
+      - "127.0.0.1:8002:8000"
 
 networks:
   kiro-lb-network:

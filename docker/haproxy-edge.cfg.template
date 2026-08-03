@@ -1,0 +1,28 @@
+# kiro-lb lab edge template — deploy.sh renders docker/haproxy-edge.generated.cfg
+# Placeholders @@BLUE_STATE@@ / @@GREEN_STATE@@ become empty or "disabled".
+# init-addr last,libc,none: start even when the idle slot DNS name is absent.
+global
+  log stdout format raw local0
+
+defaults
+  log global
+  mode http
+  option httplog
+  option dontlognull
+  timeout connect 5s
+  timeout client 1h
+  timeout server 1h
+  timeout http-request 60s
+  timeout http-keep-alive 30s
+
+frontend kiro_in
+  bind *:8000
+  default_backend kiro_app
+  http-response set-header X-Kiro-Slot %[srv_name]
+
+backend kiro_app
+  option httpchk
+  http-check send meth GET uri /health
+  http-check expect status 200
+  server blue kiro-blue:8000 check inter 2s fall 2 rise 2 init-addr last,libc,none @@BLUE_STATE@@
+  server green kiro-green:8000 check inter 2s fall 2 rise 2 init-addr last,libc,none @@GREEN_STATE@@

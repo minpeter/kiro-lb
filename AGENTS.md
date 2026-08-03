@@ -26,7 +26,9 @@ kiro-lb-python/
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
 ├── pyproject.toml           # ruff + mypy config only; the project is not packaged
 ├── docker-compose.yml       # Upstream-style deployment (service kiro-gateway)
-├── docker-compose.homelab.yml  # This operator's live deployment (bound to 10.10.10.10)
+├── docker-compose.homelab.yml  # Live: edge HAProxy :8000 + kiro-blue/green slots
+├── docker/haproxy-edge.cfg.template  # rendered → haproxy-edge.generated.cfg
+├── deploy/bluegreen/        # zero-downtime deploy.sh (nginx-fixed lab IP)
 └── manual_api_test.py       # Manual live-API script, excluded from pytest
 ```
 
