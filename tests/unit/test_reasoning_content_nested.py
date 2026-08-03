@@ -65,9 +65,7 @@ def test_reasoning_with_signature_uses_nested_field_not_fold():
 
 def test_reasoning_without_signature_is_dropped_by_default(monkeypatch):
     """Kiro rejects an empty signature, and folding unsigned reasoning is opt-in, so it is dropped."""
-    from kiro import config as _config
 
-    monkeypatch.setattr(_config, "KIRO_FOLD_UNSIGNED_REASONING", False, raising=False)
     entry = _assistant_history_entry(_three_turn({"signature": ""}))
 
     assert "reasoningContent" not in entry
@@ -140,11 +138,9 @@ def test_empty_thinking_produces_no_field():
 
 def test_openai_unsigned_reasoning_is_dropped_by_default(monkeypatch):
     """OpenAI carries no thinking signature, so its reasoning is dropped unless folding is opted in."""
-    from kiro import config as _config
     from kiro.converters_openai import convert_openai_messages_to_unified
     from kiro.models_openai import ChatMessage
 
-    monkeypatch.setattr(_config, "KIRO_FOLD_UNSIGNED_REASONING", False, raising=False)
     _, unified = convert_openai_messages_to_unified(
         [
             ChatMessage(role="user", content="Read probe.txt"),

@@ -91,26 +91,6 @@ class KiroPayloadResult:
 # ==================================================================================================
 
 
-def fold_reasoning_into_content(content: str, reasoning: Optional[str]) -> str:
-    """Merge a prior assistant turn's reasoning into content.
-
-    Fallback for reasoning the client echoed back WITHOUT a signature. Signed
-    reasoning rides the official nested field instead (see build_kiro_history).
-    """
-    if not reasoning:
-        return content
-    if not content:
-        return f"<thinking>{reasoning}</thinking>"
-    return f"<thinking>{reasoning}</thinking>\n{content}"
-
-
-def _fold_unsigned_reasoning_enabled() -> bool:
-    """Read the opt-in at call time so tests can toggle the config module."""
-    from kiro import config as _config
-
-    return bool(getattr(_config, "KIRO_FOLD_UNSIGNED_REASONING", False))
-
-
 def extract_text_content(content: Any) -> str:
     """
     Extracts text content from various formats.
@@ -1218,12 +1198,9 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
                 assistant_response["reasoningContent"] = {
                     "reasoningText": {"text": msg.reasoning, "signature": msg.reasoning_signature}
                 }
-            elif msg.reasoning and _fold_unsigned_reasoning_enabled():
-                # Unsigned reasoning cannot use the nested field (Kiro rejects an
-                # empty signature). Folding it into content costs context on every
-                # turn for reasoning that is only a summary, so it is opt-in via
-                # KIRO_FOLD_UNSIGNED_REASONING; default drops the reasoning.
-                assistant_response["content"] = fold_reasoning_into_content(content, msg.reasoning)
+            # Unsigned reasoning cannot use the nested field (Kiro rejects an
+            # empty signature), and folding it into content costs context on every
+            # turn for reasoning that is only a summary. It is dropped.
 
             # Process tool_calls
             tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
