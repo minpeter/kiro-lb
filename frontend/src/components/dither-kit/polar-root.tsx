@@ -52,6 +52,10 @@ export type PolarRootProps<TData extends Row> = {
   bloomOnHover?: boolean
   defaultSelectedDataKey?: string | null
   onSelectionChange?: (key: string | null) => void
+  /** Controlled spotlight — overrides the internal legend-hover focus. */
+  focusDataKey?: string | null
+  /** Fires with the hovered slice/axis index as the pointer moves (null on leave). */
+  onHoverChange?: (index: number | null) => void
 }
 
 export function PolarRoot<TData extends Row>({
@@ -73,6 +77,8 @@ export function PolarRoot<TData extends Row>({
   bloomOnHover = false,
   defaultSelectedDataKey = null,
   onSelectionChange,
+  focusDataKey,
+  onHoverChange,
 }: PolarRootProps<TData>) {
   const { ref, size } = useChartDimensions<HTMLDivElement>()
   const margins = { ...DEFAULT_POLAR_MARGINS, ...marginsProp }
@@ -94,6 +100,7 @@ export function PolarRoot<TData extends Row>({
     bloomOnHover,
     defaultSelectedDataKey,
     onSelectionChange,
+    focusDataKey,
   })
 
   const backChildren: ReactNode[] = []
@@ -117,9 +124,13 @@ export function PolarRoot<TData extends Row>({
     if (chartType === "pie" && ctx.pie) {
       const inside = r <= ctx.outerRadius && r >= ctx.innerRadius
       const i = inside ? sliceAtAngle(ctx.pie, angle) : -1
-      ctx.setHoverIndex(i >= 0 ? i : null)
+      const index = i >= 0 ? i : null
+      ctx.setHoverIndex(index)
+      onHoverChange?.(index)
     } else if (ctx.radar) {
-      ctx.setHoverIndex(axisAtAngle(ctx.radar.axes, angle))
+      const index = axisAtAngle(ctx.radar.axes, angle)
+      ctx.setHoverIndex(index)
+      onHoverChange?.(index)
     }
     ctx.setCursor(clientX - rect.left, clientY - rect.top)
   }
@@ -135,6 +146,7 @@ export function PolarRoot<TData extends Row>({
           onPointerLeave={() => {
             ctx.setMouseInChart(false)
             ctx.setHoverIndex(null)
+            onHoverChange?.(null)
           }}
         >
           {ctx.ready && (

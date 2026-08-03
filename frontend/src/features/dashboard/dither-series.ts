@@ -107,6 +107,17 @@ export function tokenPieRows(slices: Slice[]): PieRow[] {
     .filter((row) => row.tokens > 0);
 }
 
+/**
+ * The config key of a hovered wedge. Zero-token slices draw no wedge and are
+ * filtered out of the chart data, so a wedge index is not its slice position -
+ * the row's own key has to be read back rather than recomputed from the index.
+ */
+export function sliceIdAt(rows: PieRow[], wedgeIndex: number | null): string | null {
+  if (wedgeIndex === null) return null;
+  return rows[wedgeIndex]?.slice ?? null;
+}
+
+
 export function tokenPieConfig(slices: Slice[], tailLabel = "other models"): DitherConfig {
   const config: DitherConfig = {};
   slices.forEach((slice, index) => {

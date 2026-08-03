@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Coins } from "lucide-react";
 import { Pie } from "@/components/dither-kit/pie";
 import { PieChart } from "@/components/dither-kit/pie-chart";
@@ -8,7 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { EmptyState } from "@/components/empty-state";
 import { ChartSkeleton } from "./skeletons";
 import { exactTokens, formatTokens, shareOf, summarizeUsage } from "../format";
-import { tokenPieConfig, tokenPieRows, type DitherConfig } from "../dither-series";
+import { sliceIdAt, tokenPieConfig, tokenPieRows, type DitherConfig } from "../dither-series";
 import { buildSlices, shareLabel, TAIL_LABEL, type Slice } from "../token-slices";
 import { PANEL_UPPER_MIN_HEIGHT } from "../panel-metrics";
 import type { KeyUsage } from "../types";
@@ -21,11 +21,15 @@ function Donut({
   config,
   total,
   slices,
+  focused,
+  onFocus,
 }: {
   rows: { slice: string; tokens: number }[];
   config: DitherConfig;
   total: number;
   slices: Slice[];
+  focused: string | null;
+  onFocus: (sliceId: string | null) => void;
 }) {
   return (
     <div
@@ -45,6 +49,11 @@ function Donut({
         bloomOnHover
         animate={false}
         margins={{ top: 4, right: 4, bottom: 4, left: 4 }}
+        // Hovering a wedge spotlights it and lifts its legend row. The engine
+        // reports the wedge index, which is not the slice position once
+        // zero-token slices are dropped, so the key is read back from the rows.
+        focusDataKey={focused}
+        onHoverChange={(index) => onFocus(sliceIdAt(rows, index))}
       >
         <Pie variant="gradient" />
         <Tooltip valueFormatter={(value) => formatTokens(value)} />
@@ -60,30 +69,54 @@ function Donut({
   );
 }
 
-function Legend({ slices, config }: { slices: Slice[]; config: DitherConfig }) {
+function Legend({
+  slices,
+  config,
+  focused,
+  onFocus,
+}: {
+  slices: Slice[];
+  config: DitherConfig;
+  focused: string | null;
+  onFocus: (sliceId: string | null) => void;
+}) {
   return (
     <ul className="min-w-0 flex-1 space-y-1.5">
-      {slices.map((slice, index) => (
-        <li key={slice.label} className="flex items-center gap-2 text-sm">
-          <span
-            aria-hidden
-            className="size-2.5 shrink-0 rounded-sm"
-            // The swatch reads the same dither seed the wedge is painted with, so
-            // the legend cannot drift from the ring.
-            style={{ backgroundColor: rgb(seedOfColor(config[`s${index}`].color).fill) }}
-          />
-          <span className={`truncate font-mono text-xs ${slice.label === TAIL_LABEL ? "text-muted-foreground" : ""}`}>
-            {slice.label}
-            {slice.models > 1 && <span className="text-muted-foreground"> ({slice.models})</span>}
-          </span>
-          <span className="ml-auto shrink-0 tabular-nums" title={exactTokens(slice.tokens)}>
-            {formatTokens(slice.tokens)}
-          </span>
-          <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-            {shareLabel(slice.share, slice.tokens)}
-          </span>
-        </li>
-      ))}
+      {slices.map((slice, index) => {
+        const sliceId = `s${index}`;
+        const dimmed = focused !== null && focused !== sliceId;
+        return (
+          <li
+            key={slice.label}
+            // Hovering a row spotlights its wedge, and a hovered wedge lifts this
+            // row: with 97% of the tokens in one model the runners-up draw arcs a
+            // pixel wide, so the ring alone cannot say which row is which.
+            onPointerEnter={() => onFocus(sliceId)}
+            onPointerLeave={() => onFocus(null)}
+            className={`flex items-center gap-2 rounded-sm text-sm transition-opacity ${
+              dimmed ? "opacity-40" : ""
+            } ${focused === sliceId ? "bg-muted/50" : ""}`}
+          >
+            <span
+              aria-hidden
+              className="size-2.5 shrink-0 rounded-sm"
+              // The swatch reads the same dither seed the wedge is painted with, so
+              // the legend cannot drift from the ring.
+              style={{ backgroundColor: rgb(seedOfColor(config[sliceId].color).fill) }}
+            />
+            <span className={`truncate font-mono text-xs ${slice.label === TAIL_LABEL ? "text-muted-foreground" : ""}`}>
+              {slice.label}
+              {slice.models > 1 && <span className="text-muted-foreground"> ({slice.models})</span>}
+            </span>
+            <span className="ml-auto shrink-0 tabular-nums" title={exactTokens(slice.tokens)}>
+              {formatTokens(slice.tokens)}
+            </span>
+            <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+              {shareLabel(slice.share, slice.tokens)}
+            </span>
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -96,6 +129,9 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
   );
   const rows = useMemo(() => tokenPieRows(slices), [slices]);
   const config = useMemo(() => tokenPieConfig(slices, TAIL_LABEL), [slices]);
+  // Shared hover so the ring and the legend spotlight the same slice, whichever
+  // one the pointer is over.
+  const [focused, setFocused] = useState<string | null>(null);
 
   const inputShare = shareOf(totals.promptTokens, totals.totalTokens);
 
@@ -128,8 +164,15 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
             <div
               className={`flex flex-col items-center justify-center gap-6 @sm/panel:flex-row @sm/panel:items-center ${PANEL_UPPER_MIN_HEIGHT}`}
             >
-              <Donut rows={rows} config={config} total={totals.totalTokens} slices={slices} />
-              <Legend slices={slices} config={config} />
+              <Donut
+                rows={rows}
+                config={config}
+                total={totals.totalTokens}
+                slices={slices}
+                focused={focused}
+                onFocus={setFocused}
+              />
+              <Legend slices={slices} config={config} focused={focused} onFocus={setFocused} />
             </div>
 
             <dl className="grid grid-cols-2 gap-3 border-t pt-4 @2xl/panel:grid-cols-4">

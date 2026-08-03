@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountRateSeries, ditherPalette, rateChartConfig, rateChartRows, tokenPieConfig, tokenPieRows } from "./dither-series";
+import { accountRateSeries, ditherPalette, rateChartConfig, rateChartRows, sliceIdAt, tokenPieConfig, tokenPieRows } from "./dither-series";
 import type { RateTotals } from "./request-rate-totals";
 import type { AccountRateSeries } from "./types";
 import type { Slice } from "./token-slices";
@@ -154,5 +154,28 @@ describe("tokenPieRows / tokenPieConfig", () => {
     const rows = tokenPieRows([...slices, slice("empty", 0, 0)]);
 
     expect(rows.map((row) => row.slice)).toEqual(["s0", "s1"]);
+  });
+});
+
+describe("sliceIdAt", () => {
+  it("maps a hovered wedge index to its config key", () => {
+    const rows = tokenPieRows([slice("a", 900, 90), slice("b", 100, 10)]);
+
+    expect(sliceIdAt(rows, 1)).toBe("s1");
+  });
+
+  it("reports nothing hovered as no key", () => {
+    expect(sliceIdAt(tokenPieRows([slice("a", 1, 100)]), null)).toBeNull();
+  });
+
+  it("accounts for dropped zero-token slices, so a key is not its wedge position", () => {
+    const rows = tokenPieRows([slice("a", 900, 90), slice("none", 0, 0), slice("c", 100, 10)]);
+
+    expect(rows).toHaveLength(2);
+    expect(sliceIdAt(rows, 1)).toBe("s2");
+  });
+
+  it("reports an out-of-range wedge index as no key", () => {
+    expect(sliceIdAt(tokenPieRows([slice("a", 1, 100)]), 5)).toBeNull();
   });
 });

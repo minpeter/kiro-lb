@@ -104,8 +104,12 @@ export function usePolarController({
   bloomOnHover = false,
   defaultSelectedDataKey = null,
   onSelectionChange,
+  focusDataKey: focusDataKeyProp,
 }: {
   chartType: "pie" | "radar"
+  /** Controlled spotlight: set from outside (e.g. an in-flow legend beside the
+   * chart) it overrides the internal legend-hover focus. */
+  focusDataKey?: string | null
   data: Row[]
   config: ChartConfig
   dataKey: string
@@ -135,7 +139,8 @@ export function usePolarController({
   const [selectedDataKey, setSelectedDataKey] = useState<string | null>(
     defaultSelectedDataKey
   )
-  const [focusDataKey, setFocusDataKey] = useState<string | null>(null)
+  const [internalFocusDataKey, setFocusDataKey] = useState<string | null>(null)
+  const focusDataKey = focusDataKeyProp ?? internalFocusDataKey
   const [hoverIndex, setHoverIndex] = useState<number | null>(null)
   const [cursorX, setCursorX] = useState(0)
   const [cursorY, setCursorY] = useState(0)
@@ -241,7 +246,11 @@ export function usePolarController({
         hoverIndex,
         ready,
         tooltipLeft,
-        heading: (i) => pie[i]?.name ?? null,
+        // No heading: the single row below already names the slice, and it
+        // carries the colour swatch that ties it to the hovered wedge. Charts
+        // whose slice keys are synthetic (positional ids) would otherwise head
+        // the tooltip with the raw key.
+        heading: () => null,
         itemsAt: (i) => {
           const s = pie[i]
           if (!s) return []

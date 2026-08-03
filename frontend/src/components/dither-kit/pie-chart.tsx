@@ -27,6 +27,10 @@ export type PieChartProps<TData extends Row> = {
   bloomOnHover?: boolean
   defaultSelectedDataKey?: string | null
   onSelectionChange?: (key: string | null) => void
+  /** Controlled spotlight — overrides the internal legend-hover focus. */
+  focusDataKey?: string | null
+  /** Fires with the hovered slice index as the pointer moves (null on leave). */
+  onHoverChange?: (index: number | null) => void
 }
 
 /** Composable dither **pie / donut** chart. Compose `<Pie>`, `<Legend>`, … inside. */
