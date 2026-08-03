@@ -52,6 +52,7 @@ class UnifiedMessage:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
     images: Optional[List[Dict[str, Any]]] = None
+    reasoning: Optional[str] = None
 
 
 @dataclass
@@ -87,6 +88,30 @@ class KiroPayloadResult:
 # ==================================================================================================
 # Text Content Extraction
 # ==================================================================================================
+
+
+def fold_reasoning_into_content(content: str, reasoning: Optional[str]) -> str:
+    """Merge a prior assistant turn's reasoning into the text Kiro will read.
+
+    Anthropic requires clients to pass ``thinking`` blocks back with the
+    ``tool_use`` they accompanied so the model can resume the reasoning it
+    paused. Kiro's history schema has no slot for them: measured against
+    ``q.us-east-1.amazonaws.com``, an extra ``thinking`` or ``reasoningContent``
+    key on ``assistantResponseMessage`` is accepted with HTTP 200 and then
+    silently discarded -- a passphrase placed only there was never recalled,
+    matching a control run that carried no reasoning at all. The same passphrase
+    inside ``content`` was recalled verbatim, so folding is the only channel the
+    upstream actually reads.
+
+    This forwards reasoning the model itself produced on an earlier turn. It is
+    not the removed prompt-tag path, which synthesized reasoning instructions the
+    client never sent (see tests/unit/test_native_reasoning.py).
+    """
+    if not reasoning:
+        return content
+    if not content:
+        return f"<thinking>{reasoning}</thinking>"
+    return f"<thinking>{reasoning}</thinking>\n{content}"
 
 
 def extract_text_content(content: Any) -> str:
@@ -770,7 +795,12 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
             # Create a copy of the message without tool content but with text representation
             # IMPORTANT: Preserve images from the original message (e.g., screenshots from MCP tools)
             cleaned_msg = UnifiedMessage(
-                role=msg.role, content=content, tool_calls=None, tool_results=None, images=msg.images
+                role=msg.role,
+                content=content,
+                tool_calls=None,
+                tool_results=None,
+                images=msg.images,
+                reasoning=msg.reasoning,
             )
             result.append(cleaned_msg)
         else:
@@ -850,6 +880,7 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     tool_calls=msg.tool_calls,
                     tool_results=None,  # Remove orphaned tool_results (now in text)
                     images=msg.images,
+                    reasoning=msg.reasoning,
                 )
                 result.append(cleaned_msg)
                 converted_any_tool_results = True
@@ -907,6 +938,12 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                     last.tool_calls = []
                 last.tool_calls = list(last.tool_calls) + list(msg.tool_calls)
                 total_tool_calls_merged += len(msg.tool_calls)
+
+            # Merge reasoning the same way as content: two merged assistant turns
+            # each carry their own thinking, and dropping the later one would lose
+            # the reasoning behind the tool calls just merged in above.
+            if msg.role == "assistant" and msg.reasoning:
+                last.reasoning = f"{last.reasoning}\n{msg.reasoning}" if last.reasoning else msg.reasoning
 
             # Merge tool_results for user messages
             if msg.role == "user" and msg.tool_results:
@@ -1033,6 +1070,7 @@ def normalize_message_roles(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 tool_calls=msg.tool_calls,
                 tool_results=msg.tool_results,
                 images=msg.images,
+                reasoning=msg.reasoning,
             )
             normalized.append(normalized_msg)
             converted_count += 1
@@ -1165,7 +1203,7 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         elif msg.role == "assistant":
             content = extract_text_content(msg.content)
 
-            assistant_response: Dict[str, Any] = {"content": content}
+            assistant_response: Dict[str, Any] = {"content": fold_reasoning_into_content(content, msg.reasoning)}
 
             # Process tool_calls
             tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
