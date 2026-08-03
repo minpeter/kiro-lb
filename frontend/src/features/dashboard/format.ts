@@ -27,3 +27,19 @@ export function formatUsage(usage?: AccountUsage | null): string {
 export function formatLatency(milliseconds?: number | null): string {
   return milliseconds == null ? "—" : `${milliseconds.toLocaleString()} ms`;
 }
+
+// Pinned to en-US on purpose: the K/M/B units are what operators read these
+// tables for, and the browser locale would substitute its own scale (ko-KR
+// renders 991,600,000 as 9.9억).
+const compactTokens = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+
+/** Token counts run to nine digits, which is unreadable in a table: 991.6M. */
+export function formatTokens(value?: number | null): string {
+  if (value == null) return "—";
+  return compactTokens.format(value);
+}
+
+/** Exact count for the cell's title, so the rounded figure stays verifiable. */
+export function exactTokens(value?: number | null): string | undefined {
+  return value == null ? undefined : `${value.toLocaleString()} tokens`;
+}
