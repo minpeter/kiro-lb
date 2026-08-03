@@ -114,7 +114,20 @@ def fold_reasoning_into_content(content: str, reasoning: Optional[str]) -> str:
     conversation state: replaying history under a reused id returns prior-turn
     content no matter what the client sends, which makes the control pass and the
     experiment meaningless. So the signature is not the obstacle -- a valid
-    matched pair behaves exactly like sending nothing. On this endpoint
+    matched pair behaves exactly like sending nothing.
+
+    The remaining variables are also closed, so this is not one probe's luck:
+    ``additionalModelRequestFields`` fails in all three placements the client
+    uses (top level, message level, both), the wire shape was matched byte-for-
+    byte against the binary's own serializer, and the user-side history message
+    has no reasoning slot at all -- ``ser_user_input_message`` emits only
+    ``content``, ``userInputMessageContext``, ``modelId``, ``cachePoint``,
+    ``type``, ``clientCacheConfig``, ``useClientCachingOnly``, ``userIntent``,
+    ``origin``, ``images``, ``documents``. Model variance is narrower than the
+    others: on ``claude-opus-4.8`` the model produced no reasoning to replay,
+    and on ``claude-opus-4.7`` it did not store the token in reasoning, so the
+    official field is untested there -- but it fails on ``claude-opus-5``, the
+    only allowlisted model that actually emits reasoning. On this endpoint
     ``reasoningContent`` never reaches generation, and ``content`` is the only
     channel that does.
 
