@@ -428,6 +428,21 @@ async def refresh_account_usage(account: Any) -> dict[str, Any]:
         return {"updatedAt": updated_at, "error": error}
 
 
+async def prime_registered_account_usage(manager: Any, result: dict[str, Any]) -> dict[str, Any]:
+    """Poll quota for a freshly registered account and drop the internal key.
+
+    `register_account` returns the raw account ID (a credential path or token
+    hash) so the caller can find the new pool entry. That key must never reach
+    the client, and every registration route has to poll usage here: the
+    periodic refresh is up to USAGE_REFRESH_INTERVAL_SECONDS away, so without
+    this the new account shows no email, tier, or usage until then.
+    """
+    account = manager._accounts.get(result.pop("accountKey", ""))
+    if account is not None and account.auth_manager is not None:
+        await refresh_account_usage(account)
+    return result
+
+
 async def refresh_all_account_usage(manager: Any) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for account_id, account in list(manager._accounts.items()):
@@ -581,12 +596,7 @@ async def dashboard_register_account(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Account registration failed: {exc}") from exc
-    # Populate quota immediately so the new account is not blank in the UI.
-    manager = request.app.state.account_manager
-    account = manager._accounts.get(result.pop("accountKey", ""))
-    if account is not None and account.auth_manager is not None:
-        await refresh_account_usage(account)
-    return result
+    return await prime_registered_account_usage(request.app.state.account_manager, result)
 
 
 @router.post("/api/dashboard/accounts/refresh-usage")
@@ -658,7 +668,7 @@ async def dashboard_register_device_login(flow_id: str, request: Request) -> dic
         discard_flow(flow_id)
 
     result["provider"] = flow.provider
-    return result
+    return await prime_registered_account_usage(request.app.state.account_manager, result)
 
 
 @router.delete("/api/dashboard/accounts/device-login/{flow_id}")

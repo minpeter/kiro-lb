@@ -142,6 +142,80 @@ class TestSuspensionQuarantine:
         assert account.failures == 0
         assert account.stats.failed_requests == 1
 
+    def test_legacy_host_suspension_quarantines_without_a_reason_code(self, manager):
+        """The q.* host sends reason=null and states the verdict in the message.
+
+        Matching on the reason code alone left these accounts in the rotation
+        answering 403 to every request, which is the exact failure the
+        quarantine exists to prevent.
+        """
+        import asyncio
+
+        account = _account()
+        manager._accounts[account.id] = account
+
+        asyncio.run(
+            manager.report_failure(
+                account.id, "claude-sonnet-4.5", ErrorType.RECOVERABLE, 403, None, _SUSPENDED_BODY["message"]
+            )
+        )
+
+        remaining = account.suspended_until - time.time()
+        assert remaining == pytest.approx(ACCOUNT_SUSPENSION_QUARANTINE, abs=5)
+        assert account.failures == 0
+
+    def test_runtime_host_suspension_quarantines_from_the_message_too(self, manager):
+        import asyncio
+
+        account = _account()
+        manager._accounts[account.id] = account
+
+        asyncio.run(
+            manager.report_failure(
+                account.id, "claude-sonnet-4.5", ErrorType.RECOVERABLE, 403, None, _SUSPENDED_BODY_RUNTIME["message"]
+            )
+        )
+
+        assert account.suspended_until > time.time()
+        assert account.failures == 0
+
+    def test_a_plain_403_still_drives_the_circuit_breaker(self, manager):
+        """Only a suspension verdict may quarantine; an ordinary 403 must not."""
+        import asyncio
+
+        account = _account()
+        manager._accounts[account.id] = account
+
+        asyncio.run(
+            manager.report_failure(
+                account.id,
+                "claude-sonnet-4.5",
+                ErrorType.RECOVERABLE,
+                403,
+                None,
+                "The security token included in the request is expired",
+            )
+        )
+
+        assert account.suspended_until == 0.0
+        assert account.failures == 1
+
+    def test_suspension_wording_in_a_non_403_is_not_a_verdict(self, manager):
+        """A 400 echoing the payload says nothing about the account itself."""
+        import asyncio
+
+        account = _account()
+        manager._accounts[account.id] = account
+
+        asyncio.run(
+            manager.report_failure(
+                account.id, "claude-sonnet-4.5", ErrorType.RECOVERABLE, 400, None, _SUSPENDED_BODY["message"]
+            )
+        )
+
+        assert account.suspended_until == 0.0
+        assert account.failures == 1
+
     def test_suspended_account_is_never_selected(self, manager):
         import asyncio
 
@@ -177,6 +251,196 @@ class TestSuspensionQuarantine:
         manager._accounts[account.id] = account
 
         asyncio.run(manager.report_success(account.id, "claude-sonnet-4.5"))
+
+        assert account.suspended_until == 0.0
+
+
+class TestSuspensionDetectedAtInitialization:
+    """A locked account must leave the pool before it costs a client request.
+
+    ListAvailableModels is the first upstream call an account makes. It answers
+    403 for a suspended account, and that non-200 used to be swallowed by the
+    FALLBACK_MODELS path: the account came up advertising all 19 models and
+    collected traffic it could only answer 403 to.
+    """
+
+    @staticmethod
+    def _manager_with_json_account(tmp_path):
+        import json as json_module
+
+        creds = tmp_path / "account.json"
+        # clientId/clientSecret select AWS SSO OIDC, which resolves to the legacy
+        # q.* host. The runtime host skips ListAvailableModels entirely
+        # (_is_runtime_endpoint), so it could never surface a suspension here.
+        creds.write_text(
+            json_module.dumps(
+                {
+                    "refreshToken": "t",
+                    "accessToken": "a",
+                    "expiresAt": "2099-01-01T00:00:00.000Z",
+                    "clientId": "client-id",
+                    "clientSecret": "client-secret",
+                    "region": "us-east-1",
+                }
+            )
+        )
+        pool = tmp_path / "credentials.json"
+        pool.write_text(json_module.dumps([{"type": "json", "path": str(creds)}]))
+        mgr = AccountManager(str(pool), str(tmp_path / "state.json"))
+        mgr._save_state = AsyncMock()
+        return mgr, str(creds.resolve())
+
+    def _initialize_with_response(self, tmp_path, status_code, body):
+        import asyncio
+        import json as json_module
+        from unittest.mock import patch
+
+        manager, account_id = self._manager_with_json_account(tmp_path)
+        asyncio.run(manager.load_credentials())
+
+        response = MagicMock()
+        response.status_code = status_code
+        response.text = json_module.dumps(body)
+        response.json.return_value = body
+
+        with patch("kiro.account_manager.KiroHttpClient") as http_class:
+            client = AsyncMock()
+            client.request_with_retry = AsyncMock(return_value=response)
+            client.close = AsyncMock()
+            http_class.return_value = client
+            ok = asyncio.run(manager._initialize_account(account_id))
+        return manager, account_id, ok
+
+    def test_legacy_host_403_quarantines_instead_of_falling_back(self, tmp_path):
+        manager, account_id, _ = self._initialize_with_response(tmp_path, 403, _SUSPENDED_BODY)
+
+        account = manager._accounts[account_id]
+        remaining = account.suspended_until - time.time()
+        assert remaining == pytest.approx(ACCOUNT_SUSPENSION_QUARANTINE, abs=5)
+
+    def test_runtime_host_403_quarantines_too(self, tmp_path):
+        manager, account_id, _ = self._initialize_with_response(tmp_path, 403, _SUSPENDED_BODY_RUNTIME)
+
+        assert manager._accounts[account_id].suspended_until > time.time()
+
+    def test_a_quarantined_account_advertises_no_models(self, tmp_path):
+        """Falling back to the static list is what made a locked account look healthy."""
+        manager, account_id, _ = self._initialize_with_response(tmp_path, 403, _SUSPENDED_BODY)
+
+        resolver = manager._accounts[account_id].model_resolver
+        advertised = set(resolver.get_available_models()) if resolver else set()
+        assert "claude-opus-5" not in advertised
+
+    def test_a_quarantined_account_is_not_a_routing_target(self, tmp_path):
+        """With a healthy peer present, the locked account must never be picked.
+
+        A second account is required for this assertion: the single-account path
+        deliberately bypasses every exclusion so the operator sees the real
+        upstream error instead of a generic "no account available".
+        """
+        import asyncio
+
+        manager, account_id, _ = self._initialize_with_response(tmp_path, 403, _SUSPENDED_BODY)
+        healthy = _account("/creds/healthy.json")
+        healthy.models_cached_at = time.time()
+        manager._accounts[healthy.id] = healthy
+
+        picks = {asyncio.run(manager.get_next_account("claude-sonnet-4.5")).id for _ in range(50)}
+
+        assert picks == {healthy.id}
+
+    def test_an_unrelated_failure_still_falls_back(self, tmp_path):
+        """Only a suspension may empty the model list; a network blip must not."""
+        import asyncio
+        from unittest.mock import patch
+
+        manager, account_id = self._manager_with_json_account(tmp_path)
+        asyncio.run(manager.load_credentials())
+
+        with patch("kiro.account_manager.KiroHttpClient") as http_class:
+            client = AsyncMock()
+            client.request_with_retry = AsyncMock(side_effect=Exception("Network error"))
+            client.close = AsyncMock()
+            http_class.return_value = client
+            ok = asyncio.run(manager._initialize_account(account_id))
+
+        assert ok is True
+        assert manager._accounts[account_id].suspended_until == 0.0
+
+
+class TestSuspensionDetectedOnTtlRefresh:
+    """A suspension can also arrive after an account is already healthy.
+
+    The model cache expires on ACCOUNT_CACHE_TTL and _refresh_account_models
+    re-lists. That call answers 403 once the account is locked, and treating any
+    non-200 as "keep the stale cache" left the account advertising every model
+    for as long as the process lived.
+    """
+
+    @staticmethod
+    def _healthy_account(account_id: str = "/creds/locked-later.json") -> Account:
+        from kiro.cache import ModelInfoCache
+        from kiro.model_resolver import ModelResolver
+
+        account = Account(id=account_id)
+        auth = MagicMock()
+        # A plain MagicMock q_host would make _is_runtime_endpoint short-circuit
+        # the refresh, so the legacy host is set explicitly.
+        auth.q_host = "https://q.us-east-1.amazonaws.com"
+        auth.profile_arn = None
+        account.auth_manager = auth
+        account.model_cache = ModelInfoCache()
+        account.model_resolver = ModelResolver(cache=account.model_cache, hidden_models={}, aliases={})
+        account.models_cached_at = time.time()
+        return account
+
+    def _refresh_with_response(self, manager, status_code, body):
+        import asyncio
+        import json as json_module
+        from unittest.mock import patch
+
+        response = MagicMock()
+        response.status_code = status_code
+        response.text = json_module.dumps(body)
+        response.json.return_value = body
+
+        with patch("kiro.account_manager.KiroHttpClient") as http_class:
+            client = AsyncMock()
+            client.request_with_retry = AsyncMock(return_value=response)
+            client.close = AsyncMock()
+            http_class.return_value = client
+            asyncio.run(manager._refresh_account_models(next(iter(manager._accounts))))
+
+    def test_refresh_403_quarantines_the_account(self, manager):
+        account = self._healthy_account()
+        manager._accounts[account.id] = account
+
+        self._refresh_with_response(manager, 403, _SUSPENDED_BODY)
+
+        remaining = account.suspended_until - time.time()
+        assert remaining == pytest.approx(ACCOUNT_SUSPENSION_QUARANTINE, abs=5)
+
+    def test_refresh_403_stops_the_account_being_routed_to(self, manager):
+        import asyncio
+
+        account = self._healthy_account()
+        manager._accounts[account.id] = account
+        self._refresh_with_response(manager, 403, _SUSPENDED_BODY)
+
+        healthy = _account("/creds/healthy.json")
+        healthy.models_cached_at = time.time()
+        manager._accounts[healthy.id] = healthy
+
+        picks = {asyncio.run(manager.get_next_account("claude-sonnet-4.5")).id for _ in range(50)}
+
+        assert picks == {healthy.id}
+
+    def test_an_unrelated_refresh_failure_is_not_a_suspension(self, manager):
+        """A 500 says nothing about the account; the stale cache stays usable."""
+        account = self._healthy_account()
+        manager._accounts[account.id] = account
+
+        self._refresh_with_response(manager, 500, {"message": "internal", "reason": None})
 
         assert account.suspended_until == 0.0
 

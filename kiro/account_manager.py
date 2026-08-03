@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import httpx
 from loguru import logger
 
 from kiro.account_errors import ErrorType
@@ -46,7 +47,7 @@ from kiro.config import (
     STATE_SAVE_INTERVAL_SECONDS,
 )
 from kiro.http_client import KiroHttpClient
-from kiro.kiro_errors import SUSPENSION_REASON
+from kiro.kiro_errors import is_suspension_error
 from kiro.model_resolver import ModelResolver, normalize_model_name
 
 
@@ -142,6 +143,21 @@ def account_routing_state(account: "Account", now: Optional[float] = None) -> Tu
         return ("uninitialized", 0)
 
     return ("available", 0)
+
+
+def _reason_of(body: str) -> Optional[str]:
+    """Pull the reason code out of an upstream error body, if it carries one.
+
+    The runtime host states the verdict in `reason`; the legacy q.* host sends
+    `reason: null` and words it in the message instead. Both callers pass the
+    result to is_suspension_error, which handles either shape.
+    """
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return None
+    reason = parsed.get("reason") if isinstance(parsed, dict) else None
+    return str(reason) if reason else None
 
 
 def _format_duration(seconds: float) -> str:
@@ -625,6 +641,11 @@ class AccountManager:
                     if response.status_code == 200:
                         data = response.json()
                         models_list = data.get("models", [])
+                    elif self._quarantine_if_suspended(account_id, account, response):
+                        # A locked account must not fall back to the static list:
+                        # that is what left it advertising every model and drawing
+                        # traffic it can only answer 403 to.
+                        models_list = []
                     else:
                         # Shouldn't happen (retry handles non-200), but keep for safety
                         raise Exception(f"HTTP {response.status_code}")
@@ -675,6 +696,25 @@ class AccountManager:
             logger.error(f"Failed to initialize account {account_id}: {e}")
             return False
 
+    def _quarantine_if_suspended(self, account_id: str, account: "Account", response: httpx.Response) -> bool:
+        """Park an account whose model listing came back as an upstream lock.
+
+        ListAvailableModels is the first upstream call an account makes, so a
+        suspension can be caught here before a client request is spent on it.
+        Returns whether the account was quarantined.
+        """
+        body = response.text
+        if not is_suspension_error(response.status_code, body, _reason_of(body)):
+            return False
+        account.suspended_until = time.time() + ACCOUNT_SUSPENSION_QUARANTINE
+        self._dirty = True
+        logger.error(
+            f"Account {account_id} is SUSPENDED upstream (detected while listing models); "
+            f"excluded from routing for {_format_duration(ACCOUNT_SUSPENSION_QUARANTINE)}. "
+            f"Kiro support must restore this account."
+        )
+        return True
+
     async def _refresh_account_models(self, account_id: str) -> None:
         """
         Refresh model cache for account (TTL refresh).
@@ -717,7 +757,12 @@ class AccountManager:
                 method="GET", url=list_models_url, json_data=None, params=params, stream=False
             )
 
-            if response.status_code == 200:
+            if response.status_code != 200:
+                # A TTL refresh is also an upstream verdict. Without this check a
+                # suspension arriving here was swallowed and the stale cache kept
+                # the locked account advertising models indefinitely.
+                self._quarantine_if_suspended(account_id, account, response)
+            else:
                 data = response.json()
                 models_list = data.get("models", [])
                 await account.model_cache.update(models_list)
@@ -939,7 +984,13 @@ class AccountManager:
                 pass
 
     async def report_failure(
-        self, account_id: str, model: str, error_type: ErrorType, status_code: int, reason: Optional[str]
+        self,
+        account_id: str,
+        model: str,
+        error_type: ErrorType,
+        status_code: int,
+        reason: Optional[str],
+        message: Optional[str] = None,
     ) -> None:
         """
         Report failed request (update failures, stats, failover).
@@ -950,6 +1001,9 @@ class AccountManager:
             error_type: Error classification (FATAL or RECOVERABLE)
             status_code: HTTP status code
             reason: Error reason from Kiro API
+            message: Original upstream message. Required to recognize a
+                suspension on the legacy q.* host, which sends reason=null and
+                states the verdict only in the message.
         """
         async with self._lock:
             account = self._accounts.get(account_id)
@@ -990,7 +1044,13 @@ class AccountManager:
             # quarantine and leave the Circuit Breaker alone - inflating failures
             # would only add an unrelated backoff to an account already fully
             # excluded.
-            if reason == SUSPENSION_REASON:
+            #
+            # The reason field alone is not the test: the runtime host sends
+            # reason=TEMPORARILY_SUSPENDED, but the legacy q.* host sends
+            # reason=null and states the verdict only in the message. Checking
+            # reason only left Builder ID accounts in the rotation, answering 403
+            # to every request forever.
+            if is_suspension_error(status_code, message, reason):
                 account.suspended_until = time.time() + ACCOUNT_SUSPENSION_QUARANTINE
                 account.stats.total_requests += 1
                 account.stats.failed_requests += 1
