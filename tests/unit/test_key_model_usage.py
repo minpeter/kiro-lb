@@ -8,6 +8,7 @@ survive a restart.
 
 import asyncio
 import importlib
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -251,3 +252,87 @@ async def test_anthropic_stream_records_usage_for_the_calling_key(dashboard, str
 
     assert row["model"] == "claude-opus-5"
     assert row["requests"] == 1
+
+
+def test_rows_stored_under_a_client_spelling_are_merged_on_startup(dashboard):
+    """Rows written before normalization must be folded, not left as duplicates.
+
+    A store that predates the normalization in record_token_usage holds
+    `claude-sonnet-4-5` beside `claude-sonnet-4.5`, splitting one model's totals
+    across two rows. The live store had exactly one such row, worth 34,658 tokens
+    over 560 requests.
+    """
+    now = int(time.time())
+    with dashboard._db() as conn:
+        conn.executemany(
+            "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            [
+                (ROOT_KEY_ID, "claude-sonnet-4.5", 1_000, 100, 10, now - 50),
+                (ROOT_KEY_ID, "claude-sonnet-4-5", 30_000, 4_658, 560, now),
+            ],
+        )
+
+    dashboard.initialize_dashboard_store()
+
+    rows = {row["model"]: row for row in dashboard.key_model_usage()[ROOT_KEY_ID]}
+    assert "claude-sonnet-4-5" not in rows
+    # Added, not replaced: dropping the old row would lose what it accounted for.
+    assert rows["claude-sonnet-4.5"]["promptTokens"] == 31_000
+    assert rows["claude-sonnet-4.5"]["completionTokens"] == 4_758
+    assert rows["claude-sonnet-4.5"]["requests"] == 570
+    assert rows["claude-sonnet-4.5"]["updatedAt"] == now
+
+
+def test_the_merge_creates_the_row_when_no_canonical_one_exists(dashboard):
+    now = int(time.time())
+    with dashboard._db() as conn:
+        conn.execute(
+            "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (ROOT_KEY_ID, "claude-haiku-4-5", 7, 3, 1, now),
+        )
+
+    dashboard.initialize_dashboard_store()
+
+    rows = {row["model"]: row for row in dashboard.key_model_usage()[ROOT_KEY_ID]}
+    assert set(rows) == {"claude-haiku-4.5"}
+    assert rows["claude-haiku-4.5"]["totalTokens"] == 10
+
+
+def test_the_merge_leaves_already_normalized_rows_alone(dashboard):
+    now = int(time.time())
+    with dashboard._db() as conn:
+        conn.executemany(
+            "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            [
+                (ROOT_KEY_ID, "claude-opus-5", 100, 50, 5, now),
+                (ROOT_KEY_ID, "some-unknown-model", 1, 1, 1, now),
+            ],
+        )
+
+    dashboard.initialize_dashboard_store()
+
+    rows = {row["model"]: row for row in dashboard.key_model_usage()[ROOT_KEY_ID]}
+    # An unfamiliar name is not a spelling variant; Kiro is the arbiter, so it stays.
+    assert rows["claude-opus-5"]["totalTokens"] == 150
+    assert rows["some-unknown-model"]["totalTokens"] == 2
+
+
+def test_the_merge_is_idempotent(dashboard):
+    now = int(time.time())
+    with dashboard._db() as conn:
+        conn.execute(
+            "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (ROOT_KEY_ID, "claude-sonnet-4-5", 10, 5, 2, now),
+        )
+
+    dashboard.initialize_dashboard_store()
+    dashboard.initialize_dashboard_store()
+
+    rows = {row["model"]: row for row in dashboard.key_model_usage()[ROOT_KEY_ID]}
+    # A second startup must not double the totals it already folded.
+    assert rows["claude-sonnet-4.5"]["totalTokens"] == 15
+    assert rows["claude-sonnet-4.5"]["requests"] == 2

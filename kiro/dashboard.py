@@ -20,6 +20,7 @@ from typing import Any, Iterator
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
+from loguru import logger
 
 from kiro.account_manager import account_label, account_routing_state
 from kiro.accounts_admin import register_account
@@ -41,6 +42,7 @@ from kiro.device_login import (
 )
 from kiro.metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from kiro.metrics import render_metrics
+from kiro.model_resolver import normalize_model_name
 from kiro.usage import fetch_account_usage
 from kiro.usage_tracking import ROOT_KEY_ID, drain_pending_usage
 
@@ -154,6 +156,52 @@ def initialize_dashboard_store() -> None:
         for column, ddl in (("overage_status", "TEXT"), ("overage_used", "REAL"), ("email", "TEXT")):
             if column not in existing:
                 conn.execute(f"ALTER TABLE account_usage ADD COLUMN {column} {ddl}")
+
+        _merge_unnormalized_usage_models(conn)
+
+
+def _merge_unnormalized_usage_models(conn: sqlite3.Connection) -> int:
+    """Fold rows stored under a client spelling into the normalized model.
+
+    `record_token_usage` normalizes before writing, but rows recorded before that
+    keep whatever the client sent: `claude-sonnet-4-5` sat beside
+    `claude-sonnet-4.5` as a separate model, so one model's totals were split
+    across two rows and it appeared twice in the dashboard.
+
+    Totals are added, not overwritten. Dropping the old row instead would lose
+    the tokens it accounted for, and taking the larger of the two would silently
+    understate consumption.
+    """
+    merged = 0
+    rows = conn.execute(
+        "SELECT key_id, model, prompt_tokens, completion_tokens, requests, updated_at FROM key_model_usage"
+    ).fetchall()
+    for row in rows:
+        canonical = normalize_model_name(row["model"]) or row["model"]
+        if canonical == row["model"]:
+            continue
+        conn.execute(
+            """INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key_id, model) DO UPDATE SET
+                prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                completion_tokens = completion_tokens + excluded.completion_tokens,
+                requests = requests + excluded.requests,
+                updated_at = MAX(updated_at, excluded.updated_at)""",
+            (
+                row["key_id"],
+                canonical,
+                row["prompt_tokens"],
+                row["completion_tokens"],
+                row["requests"],
+                row["updated_at"],
+            ),
+        )
+        conn.execute("DELETE FROM key_model_usage WHERE key_id = ? AND model = ?", (row["key_id"], row["model"]))
+        merged += 1
+    if merged:
+        logger.info("Merged {} usage row(s) stored under a non-normalized model name", merged)
+    return merged
 
 
 def prune_request_logs() -> int:
