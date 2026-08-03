@@ -95,13 +95,28 @@ def fold_reasoning_into_content(content: str, reasoning: Optional[str]) -> str:
 
     Anthropic requires clients to pass ``thinking`` blocks back with the
     ``tool_use`` they accompanied so the model can resume the reasoning it
-    paused. Kiro's history schema has no slot for them: measured against
-    ``q.us-east-1.amazonaws.com``, an extra ``thinking`` or ``reasoningContent``
-    key on ``assistantResponseMessage`` is accepted with HTTP 200 and then
-    silently discarded -- a passphrase placed only there was never recalled,
-    matching a control run that carried no reasoning at all. The same passphrase
-    inside ``content`` was recalled verbatim, so folding is the only channel the
-    upstream actually reads.
+    paused. Kiro accepts the official field but does not act on it.
+
+    ``kiro-cli`` itself sends prior-turn reasoning as a dedicated member:
+    disassembling ``ser_assistant_response_message`` in the shipped binary shows
+    it writing ``reasoningContent``, whose serializer emits ``text`` and
+    ``signature``. Replaying that exact shape from here does not work. Measured
+    against ``q.us-east-1.amazonaws.com`` with one token placed only in the
+    model's own reasoning on a prior turn, then asked for on the next:
+
+        reasoningContent {text, signature}  (its OWN signature, verbatim)  absent
+        reasoningContent {text}             (signature omitted)            absent
+        reasoningContent {text, signature}  (text mutated one char)        absent
+        <thinking>...</thinking> in content                                RECALLED
+        nothing at all                                                     absent
+
+    Every arm ran in a fresh ``conversationId``, because Kiro keeps server-side
+    conversation state: replaying history under a reused id returns prior-turn
+    content no matter what the client sends, which makes the control pass and the
+    experiment meaningless. So the signature is not the obstacle -- a valid
+    matched pair behaves exactly like sending nothing. On this endpoint
+    ``reasoningContent`` never reaches generation, and ``content`` is the only
+    channel that does.
 
     This forwards reasoning the model itself produced on an earlier turn. It is
     not the removed prompt-tag path, which synthesized reasoning instructions the
