@@ -45,7 +45,8 @@ they held are folded into this file; do not link to them.
 | Account failover / rotation | `kiro/account_manager.py` | Circuit breaker, global sticky, lazy init |
 | Credentials + host selection | `kiro/auth.py`, `kiro/config.py` | 4 sources; Builder ID routes to a different host |
 | Add an account by browser login | `kiro/device_login.py` | Social + Builder ID device flows |
-| Dashboard API / SQLite store | `kiro/dashboard.py` | 17 routes under `/api/dashboard`, plus `/` |
+| Dashboard API / SQLite store | `kiro/dashboard.py` | 18 routes under `/api/dashboard`, plus `/` and `/metrics` |
+| Prometheus exposition | `kiro/metrics.py` | Pure renderer; the route and its auth live in `dashboard.py` |
 | Per-key token accounting | `kiro/usage_tracking.py` | ContextVar identity, batched flush |
 | Token counting / encodings | `kiro/tokenizer.py` | Per-family encoding + CJK-only correction |
 | Model name handling | `kiro/model_resolver.py` | Never raises; unknown names pass through |
@@ -98,7 +99,9 @@ trusting a pin here.
   deepseek/qwen/minimax/glm. The correction is a property of the script, not the
   model — it scales by measured CJK ratio and is 1.0 for Latin text.
 - Control and data planes stay separate: dashboard cookie sessions cannot call
-  `/v1`, and `/v1` API keys cannot call `/api/dashboard`.
+  `/v1`, and `/v1` API keys cannot call `/api/dashboard`. `/metrics` is a third
+  plane: it takes a `/v1` bearer key (a scraper cannot hold a cookie) and refuses
+  dashboard sessions.
 - Dashboard SQLite stores metadata only — no prompts, completions, raw keys, or
   refresh tokens. New columns arrive via additive `PRAGMA table_info` +
   `ALTER TABLE` migration (`dashboard.py:96`, `:147`), never a destructive rewrite.
@@ -144,6 +147,11 @@ trusting a pin here.
 - Rejecting unknown model names. Kiro is the arbiter, not this gateway. The
   resolver also never suggests a model from another family
   (`model_resolver.py:405`).
+- Labelling a Prometheus series with a raw model name. The resolver forwards
+  unknown names to Kiro, so `model` is client-controlled: the live store holds 40
+  distinct names including probes like `claude-opus-99`. `kiro/metrics.py`
+  normalizes, then clamps to what the pool serves and collapses the rest into
+  `other`, re-aggregating in Python so no series is emitted twice.
 - Building the upstream host from region alone. A Builder ID account (SSO OIDC
   with no profile ARN) must go to `q.{region}.amazonaws.com`; everything else
   stays on the Kiro host (`kiro/config.py:613`). Absence of a profile alone is
@@ -183,6 +191,16 @@ multi-arch images on non-PR runs. Tool versions are pinned in
 
 ## NOTES
 
+- `/metrics` reads only what the gateway already stores (dashboard SQLite + live
+  pool), so a scrape cannot perturb routing or spend upstream quota. The homelab
+  does not scrape it directly: no job in `/opt/monitoring/prometheus.yml` carries
+  credentials, so a workstation timer fetches it with a bearer key and `PUT`s to
+  Pushgateway (`job=kiro-lb-usage`, `instance=ws`), which the existing
+  `pushgateway` job scrapes with `honor_labels: true`. `job` and `instance` are
+  therefore never set in the exposition itself. Units live in
+  `~/homelab/kiro-lb-probe/`.
+- `/metrics` is not recorded by the request-metrics middleware (`main.py:623`
+  filters to `/v1/`), so scraping does not inflate the counters it reports.
 - `main.py` refuses to start when `credentials.json` has no usable account, even
   with `ACCOUNT_SYSTEM=false`; set `KIRO_CLI_DB_FILE` for a standalone run.
   `validate_configuration` (`main.py:201`) skips legacy `.env` checks entirely
