@@ -68,7 +68,11 @@ export function Tooltip({
             mass: 0.6,
           }}
           className={cn(
-            "pointer-events-none absolute z-10 rounded-md border px-2 py-1 shadow-sm",
+            // `w-max` + nowrap: the tooltip is absolute inside the chart box, so
+            // shrink-to-fit caps it at that box's width and a long series name
+            // wraps mid-word. Sizing to content lets it overflow the plot, which
+            // is what a floating tooltip is for.
+            "pointer-events-none absolute z-10 w-max whitespace-nowrap rounded-md border px-2 py-1 shadow-sm",
             VARIANT[variant]
           )}
         >
