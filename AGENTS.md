@@ -20,8 +20,9 @@ kiro-lb-python/
 ├── kiro/                    # Gateway package: 39 modules, 16.5k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 1768 tests; network-blocked by conftest
+├── tests/                   # pytest, 1822 tests; network-blocked by conftest
 ├── data/                    # Runtime credentials/state/sqlite (gitignored)
+├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
 ├── pyproject.toml           # ruff + mypy config only; the project is not packaged
 ├── docker-compose.yml       # Upstream-style deployment (service kiro-gateway)
@@ -47,6 +48,7 @@ they held are folded into this file; do not link to them.
 | Add an account by browser login | `kiro/device_login.py` | Social + Builder ID device flows |
 | Dashboard API / SQLite store | `kiro/dashboard.py` | 18 routes under `/api/dashboard`, plus `/` and `/metrics` |
 | Prometheus exposition | `kiro/metrics.py` | Pure renderer; the route and its auth live in `dashboard.py` |
+| Grafana dashboard / metrics wiring | `deploy/` | Dashboard JSON is asserted against the exporter by `tests/unit/test_dashboard_provisioning.py` |
 | Per-key token accounting | `kiro/usage_tracking.py` | ContextVar identity, batched flush |
 | Token counting / encodings | `kiro/tokenizer.py` | Per-family encoding + CJK-only correction |
 | Model name handling | `kiro/model_resolver.py` | Never raises; unknown names pass through |
@@ -170,7 +172,7 @@ trusting a pin here.
 
 ```bash
 python main.py --host 127.0.0.1 --port 8000    # run gateway
-pytest -q                                      # full suite (1768 tests, ~6s, no network)
+pytest -q                                      # full suite (1822 tests, ~6s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
@@ -197,8 +199,19 @@ multi-arch images on non-PR runs. Tool versions are pinned in
   credentials, so a workstation timer fetches it with a bearer key and `PUT`s to
   Pushgateway (`job=kiro-lb-usage`, `instance=ws`), which the existing
   `pushgateway` job scrapes with `honor_labels: true`. `job` and `instance` are
-  therefore never set in the exposition itself. Units live in
-  `~/homelab/kiro-lb-probe/`.
+  therefore never set in the exposition itself. The tracked copies of those
+  units, and the Grafana dashboard, live in `deploy/`; the deployed units are
+  symlinked from `~/homelab/kiro-lb-probe/`.
+- The Grafana dashboard is checked in (`deploy/grafana/kiro-lb.json`, uid
+  `kiro-lb`) so a metric rename cannot silently empty a panel:
+  `tests/unit/test_dashboard_provisioning.py` asserts every metric and label it
+  queries against `_FAMILIES`, and pins the two constraints that are invisible in
+  the UI — rate windows must span several 30s pushes, and latency is a summary
+  without quantiles so no p95 panel may claim otherwise. Edit the JSON in the
+  repo and copy it out, never only on the monitoring host.
+- Grafana on `apps` serves 12 unrelated dashboards, so install with the
+  provisioning reload API (`POST /api/admin/provisioning/dashboards/reload`)
+  rather than restarting the container.
 - `/metrics` is not recorded by the request-metrics middleware (`main.py:623`
   filters to `/v1/`), so scraping does not inflate the counters it reports.
 - `main.py` refuses to start when `credentials.json` has no usable account, even
