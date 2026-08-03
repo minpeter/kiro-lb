@@ -113,13 +113,48 @@ def test_usage_is_attributed_to_the_calling_key(dashboard):
 def test_usage_is_split_per_model(dashboard):
     current_api_key_id.set(ROOT_KEY_ID)
     record_token_usage("claude-opus-5", 100, 50)
-    record_token_usage("claude-sonnet-4-5", 7, 3)
+    record_token_usage("claude-haiku-4.5", 7, 3)
 
     dashboard.flush_key_model_usage()
     rows = {row["model"]: row for row in dashboard.key_model_usage()[ROOT_KEY_ID]}
 
     assert rows["claude-opus-5"]["totalTokens"] == 150
-    assert rows["claude-sonnet-4-5"]["totalTokens"] == 10
+    assert rows["claude-haiku-4.5"]["totalTokens"] == 10
+
+
+def test_client_spellings_of_one_model_share_a_row(dashboard):
+    """Callers pass the name the client sent, which varies for the same model.
+
+    `claude-sonnet-4-5`, the dotted form and a dated form are one model. Storing
+    them separately split its totals across rows nothing could rejoin, which is
+    what made the same model appear twice in the dashboard.
+    """
+    current_api_key_id.set(ROOT_KEY_ID)
+    record_token_usage("claude-sonnet-4-5", 10, 1)
+    record_token_usage("claude-sonnet-4.5", 20, 2)
+    record_token_usage("claude-sonnet-4-5-20251001", 30, 3)
+
+    dashboard.flush_key_model_usage()
+    rows = {row["model"]: row for row in dashboard.key_model_usage()[ROOT_KEY_ID]}
+
+    assert set(rows) == {"claude-sonnet-4.5"}
+    assert rows["claude-sonnet-4.5"]["totalTokens"] == 66
+    assert rows["claude-sonnet-4.5"]["requests"] == 3
+
+
+def test_an_unknown_model_name_is_still_recorded(dashboard):
+    """Normalization must not drop a name it does not recognize.
+
+    Kiro is the arbiter of model names, so an unfamiliar one is still real
+    traffic that has to be attributed.
+    """
+    current_api_key_id.set(ROOT_KEY_ID)
+    record_token_usage("some-new-model-9", 5, 5)
+
+    dashboard.flush_key_model_usage()
+    rows = {row["model"]: row for row in dashboard.key_model_usage()[ROOT_KEY_ID]}
+
+    assert rows["some-new-model-9"]["totalTokens"] == 10
 
 
 def test_usage_without_a_key_is_not_recorded(dashboard):

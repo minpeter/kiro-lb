@@ -1,7 +1,8 @@
-import { Activity, Gauge, ServerCog, ShieldCheck } from "lucide-react";
+import { Activity, Coins, Gauge, ServerCog, ShieldCheck } from "lucide-react";
+import { useMemo } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { dashboardApi } from "@/features/dashboard/api";
-import { formatLatency } from "@/features/dashboard/format";
+import { exactTokens, formatLatency, formatTokens, summarizeUsage } from "@/features/dashboard/format";
 import { useDashboard } from "@/features/dashboard/use-dashboard";
 import { useTabHash } from "@/features/dashboard/use-tab-hash";
 import { AccountsPanel } from "@/features/dashboard/components/accounts-panel";
@@ -10,6 +11,7 @@ import { DeviceLoginCard } from "@/features/dashboard/components/device-login-ca
 import { LoginCard } from "@/features/dashboard/components/login-card";
 import { RequestLogTable } from "@/features/dashboard/components/request-log-table";
 import { RequestRateChart } from "@/features/dashboard/components/request-rate-chart";
+import { TokenUsagePanel } from "@/features/dashboard/components/token-usage-panel";
 import { AppHeader, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
 
@@ -17,6 +19,9 @@ export default function App() {
   const dashboard = useDashboard();
   const [tab, selectTab] = useTabHash();
   const { overview, isLoading, isMutating, runAction } = dashboard;
+  // Totals are derived from the same per-key usage the API keys tab shows, so
+  // the two views can never disagree.
+  const totals = useMemo(() => summarizeUsage(dashboard.keyUsage), [dashboard.keyUsage]);
 
   if (!dashboard.isAuthenticated && !isLoading) {
     return <LoginCard error={dashboard.error} onSignIn={dashboard.signIn} />;
@@ -53,11 +58,16 @@ export default function App() {
           </TabsList>
 
           <TabsContent value="overview" className="space-y-6">
-            <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
               {isLoading || !overview ? (
-                Array.from({ length: 4 }).map((_, index) => <StatCardSkeleton key={index} />)
+                Array.from({ length: 5 }).map((_, index) => <StatCardSkeleton key={index} />)
               ) : (
                 <>
+                  <StatCard
+                    label="Total tokens"
+                    value={<span title={exactTokens(totals.totalTokens)}>{formatTokens(totals.totalTokens)}</span>}
+                    icon={<Coins size={15} />}
+                  />
                   <StatCard label="24h requests" value={overview.requests24h.toLocaleString()} icon={<Activity size={15} />} />
                   <StatCard label="24h success" value={overview.successes24h.toLocaleString()} icon={<ShieldCheck size={15} />} />
                   <StatCard label="Average latency" value={formatLatency(overview.averageLatencyMs)} icon={<Gauge size={15} />} />
@@ -69,6 +79,8 @@ export default function App() {
                 </>
               )}
             </section>
+
+            <TokenUsagePanel keyUsage={dashboard.keyUsage} isLoading={isLoading} />
 
             <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
 
