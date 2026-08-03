@@ -1,13 +1,19 @@
 import { useMemo } from "react";
 import { Activity } from "lucide-react";
+import { Area } from "@/components/dither-kit/area";
+import { AreaChart } from "@/components/dither-kit/area-chart";
+import { Grid } from "@/components/dither-kit/grid";
+import { ReferenceLine } from "@/components/dither-kit/reference-line";
+import { Tooltip } from "@/components/dither-kit/tooltip";
+import { XAxis } from "@/components/dither-kit/x-axis";
+import { YAxis } from "@/components/dither-kit/y-axis";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
 import { ChartSkeleton } from "./skeletons";
+import { rateChartConfig, rateChartRows } from "../dither-series";
 import { summarizeRate, throttledAccounts } from "../request-rate-totals";
 import { PANEL_UPPER_MIN_HEIGHT } from "../panel-metrics";
 import type { RequestRate } from "../types";
-
-const CHART_HEIGHT = 100;
 
 function formatClock(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -34,22 +40,10 @@ function Figure({ label, value, hint, tone }: { label: string; value: string; hi
 export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoading: boolean }) {
   const totals = useMemo(() => summarizeRate(rate), [rate]);
   const throttled = useMemo(() => throttledAccounts(rate), [rate]);
+  const rows = useMemo(() => rateChartRows(totals), [totals]);
+  const config = useMemo(() => rateChartConfig(totals), [totals]);
 
   const hasTraffic = totals.requests > 0;
-  // Anchor the scale slightly above the peak so the busiest bucket does not sit
-  // flush against the top edge and read as clipped.
-  const scale = Math.max(totals.peakPerMinute * 1.15, 1);
-  const y = (value: number) => CHART_HEIGHT - (value / scale) * CHART_HEIGHT;
-  const lastIndex = Math.max(totals.perMinute.length - 1, 1);
-
-  const area = [
-    `M 0 ${CHART_HEIGHT}`,
-    ...totals.perMinute.map((value, index) => `L ${index} ${y(value)}`),
-    `L ${lastIndex} ${CHART_HEIGHT}`,
-    "Z",
-  ].join(" ");
-  const line = totals.perMinute.map((value, index) => `${index === 0 ? "M" : "L"} ${index} ${y(value)}`).join(" ");
-  const meanY = y(totals.meanPerMinute);
 
   return (
     <Card className="@container/panel flex flex-col">
@@ -77,57 +71,30 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
           <div className="space-y-4">
             {/* Floor the plot area so this card's divider lines up with the token
                 panel's when the two share a row. */}
-            <div className={`relative flex flex-col justify-center ${PANEL_UPPER_MIN_HEIGHT}`}>
-              <svg
-                viewBox={`0 0 ${lastIndex} ${CHART_HEIGHT}`}
-                preserveAspectRatio="none"
-                className="h-36 w-full"
+            <div className={`flex flex-col justify-center ${PANEL_UPPER_MIN_HEIGHT}`}>
+              <div
+                className="h-44 w-full"
                 role="img"
                 aria-label={`Total requests per minute across all accounts. Peak ${round(
                   totals.peakPerMinute,
                 )} per minute, average ${round(totals.meanPerMinute)} per minute, ${totals.requests} requests in the window.`}
               >
-                <path d={area} fill="var(--chart-1)" opacity={0.26} />
-                <path
-                  d={line}
-                  fill="none"
-                  stroke="var(--chart-1)"
-                  strokeWidth={1}
-                  vectorEffect="non-scaling-stroke"
-                />
-                {/* The mean makes a spike legible as a spike rather than as the
-                    normal level, which a bare area chart cannot convey. */}
-                <line
-                  x1={0}
-                  x2={lastIndex}
-                  y1={meanY}
-                  y2={meanY}
-                  stroke="var(--muted-foreground)"
-                  strokeWidth={1}
-                  strokeDasharray="4 3"
-                  opacity={0.7}
-                  vectorEffect="non-scaling-stroke"
-                />
-                {/* Rejections are drawn on top: they are rare and must not be
-                    lost inside the total they are part of. */}
-                {totals.rateLimitedPerMinute.some(Boolean) && (
-                  <path
-                    d={totals.rateLimitedPerMinute
-                      .map((value, index) => `${index === 0 ? "M" : "L"} ${index} ${y(value)}`)
-                      .join(" ")}
-                    fill="none"
-                    stroke="var(--destructive)"
-                    strokeWidth={1}
-                    vectorEffect="non-scaling-stroke"
-                  />
-                )}
-              </svg>
-              <span
-                className="pointer-events-none absolute left-0 -translate-y-1/2 rounded bg-background/80 px-1 text-[10px] tabular-nums text-muted-foreground"
-                style={{ top: `${(meanY / CHART_HEIGHT) * 100}%` }}
-              >
-                avg {round(totals.meanPerMinute)}/min
-              </span>
+                {/* No entrance sweep: live polling bumps the data revision every
+                    second, so the reveal would replay forever instead of playing once. */}
+                <AreaChart data={rows} config={config} bloom="low" bloomOnHover animate={false}>
+                  <Grid />
+                  <XAxis dataKey="at" maxTicks={6} />
+                  <YAxis tickCount={3} tickFormatter={round} />
+                  {/* The mean makes a spike legible as a spike rather than as the
+                      normal level, which a bare area chart cannot convey. */}
+                  <ReferenceLine y={totals.meanPerMinute} label={`avg ${round(totals.meanPerMinute)}/min`} />
+                  <Area dataKey="served" variant="gradient" />
+                  {/* Rejections are drawn on top: they are rare and must not be
+                      lost inside the total they are part of. */}
+                  {config.rejected && <Area dataKey="rejected" variant="hatched" />}
+                  <Tooltip labelKey="at" valueFormatter={(value) => `${round(value)}/min`} />
+                </AreaChart>
+              </div>
             </div>
 
             {/* Container queries, not viewport ones: this panel sits full-width on

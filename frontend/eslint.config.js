@@ -33,7 +33,10 @@ export default defineConfig([
     },
   },
   {
-    files: ["src/components/ui/**/*.{ts,tsx}"],
+    // Vendored component packs (shadcn primitives, the dither-kit chart engine):
+    // their context modules export hooks beside components by design, and the
+    // registry is the upstream, so the rule is off for them as it is for ui/.
+    files: ["src/components/ui/**/*.{ts,tsx}", "src/components/dither-kit/**/*.{ts,tsx}"],
     rules: {
       "react-refresh/only-export-components": "off",
     },

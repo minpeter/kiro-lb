@@ -1,59 +1,55 @@
 import { useMemo } from "react";
 import { Coins } from "lucide-react";
+import { Pie } from "@/components/dither-kit/pie";
+import { PieChart } from "@/components/dither-kit/pie-chart";
+import { Tooltip } from "@/components/dither-kit/tooltip";
+import { rgb, seedOfColor } from "@/components/dither-kit/palette";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
 import { ChartSkeleton } from "./skeletons";
 import { exactTokens, formatTokens, shareOf, summarizeUsage } from "../format";
+import { tokenPieConfig, tokenPieRows, type DitherConfig } from "../dither-series";
 import { buildSlices, shareLabel, TAIL_LABEL, type Slice } from "../token-slices";
 import { PANEL_UPPER_MIN_HEIGHT } from "../panel-metrics";
 import type { KeyUsage } from "../types";
 
-// Donut geometry. The ring is drawn as one circle per slice, so every segment
-// shares these dimensions.
-const RADIUS = 60;
-const STROKE = 26;
-const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
+/** Donut hole as a fraction of the outer radius, leaving room for the total. */
+const INNER_RADIUS = 0.62;
 
-function Donut({ slices, total }: { slices: Slice[]; total: number }) {
-  // Drawn with stroke-dasharray on concentric circles rather than arc paths:
-  // one segment per slice, no trigonometry, and no seams between segments.
-  // Offsets are the running sum of preceding lengths, computed without mutating
-  // anything during render.
-  const segments = slices.map((slice, index) => {
-    const length = (slice.tokens / total) * CIRCUMFERENCE;
-    const offset = slices
-      .slice(0, index)
-      .reduce((sum, previous) => sum + (previous.tokens / total) * CIRCUMFERENCE, 0);
-    return { ...slice, length, offset };
-  });
-
+function Donut({
+  rows,
+  config,
+  total,
+  slices,
+}: {
+  rows: { slice: string; tokens: number }[];
+  config: DitherConfig;
+  total: number;
+  slices: Slice[];
+}) {
   return (
-    <div className="relative shrink-0">
-      <svg
-        viewBox="0 0 160 160"
-        className="h-40 w-40 -rotate-90"
-        role="img"
-        aria-label={`Token share by model. ${slices
-          .map((slice) => `${slice.label}: ${slice.share.toFixed(1)}%`)
-          .join(", ")}.`}
+    <div
+      className="relative size-44 shrink-0"
+      role="img"
+      aria-label={`Token share by model. ${slices
+        .map((slice) => `${slice.label}: ${slice.share.toFixed(1)}%`)
+        .join(", ")}.`}
+    >
+      <PieChart
+        data={rows}
+        config={config}
+        dataKey="tokens"
+        nameKey="slice"
+        innerRadius={INNER_RADIUS}
+        bloom="low"
+        bloomOnHover
+        animate={false}
+        margins={{ top: 4, right: 4, bottom: 4, left: 4 }}
       >
-        <circle cx={80} cy={80} r={RADIUS} fill="none" stroke="var(--muted)" strokeWidth={STROKE} opacity={0.35} />
-        {segments.map((segment) => (
-          <circle
-            key={segment.label}
-            cx={80}
-            cy={80}
-            r={RADIUS}
-            fill="none"
-            stroke={segment.color}
-            strokeWidth={STROKE}
-            strokeDasharray={`${segment.length} ${CIRCUMFERENCE - segment.length}`}
-            strokeDashoffset={-segment.offset}
-          >
-            <title>{`${segment.label}: ${formatTokens(segment.tokens)} (${segment.share.toFixed(1)}%)`}</title>
-          </circle>
-        ))}
-      </svg>
+        <Pie variant="gradient" />
+        <Tooltip valueFormatter={(value) => formatTokens(value)} />
+      </PieChart>
+      {/* Pointer-events off so the ring underneath keeps its hover slices. */}
       <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
         <span className="text-xl font-semibold tabular-nums" title={exactTokens(total)}>
           {formatTokens(total)}
@@ -64,12 +60,18 @@ function Donut({ slices, total }: { slices: Slice[]; total: number }) {
   );
 }
 
-function Legend({ slices }: { slices: Slice[] }) {
+function Legend({ slices, config }: { slices: Slice[]; config: DitherConfig }) {
   return (
     <ul className="min-w-0 flex-1 space-y-1.5">
-      {slices.map((slice) => (
+      {slices.map((slice, index) => (
         <li key={slice.label} className="flex items-center gap-2 text-sm">
-          <span aria-hidden className="size-2.5 shrink-0 rounded-sm" style={{ backgroundColor: slice.color }} />
+          <span
+            aria-hidden
+            className="size-2.5 shrink-0 rounded-sm"
+            // The swatch reads the same dither seed the wedge is painted with, so
+            // the legend cannot drift from the ring.
+            style={{ backgroundColor: rgb(seedOfColor(config[`s${index}`].color).fill) }}
+          />
           <span className={`truncate font-mono text-xs ${slice.label === TAIL_LABEL ? "text-muted-foreground" : ""}`}>
             {slice.label}
             {slice.models > 1 && <span className="text-muted-foreground"> ({slice.models})</span>}
@@ -92,6 +94,8 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
     () => buildSlices(totals.models, totals.totalTokens),
     [totals.models, totals.totalTokens],
   );
+  const rows = useMemo(() => tokenPieRows(slices), [slices]);
+  const config = useMemo(() => tokenPieConfig(slices, TAIL_LABEL), [slices]);
 
   const inputShare = shareOf(totals.promptTokens, totals.totalTokens);
 
@@ -124,8 +128,8 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
             <div
               className={`flex flex-col items-center justify-center gap-6 @sm/panel:flex-row @sm/panel:items-center ${PANEL_UPPER_MIN_HEIGHT}`}
             >
-              <Donut slices={slices} total={totals.totalTokens} />
-              <Legend slices={slices} />
+              <Donut rows={rows} config={config} total={totals.totalTokens} slices={slices} />
+              <Legend slices={slices} config={config} />
             </div>
 
             <dl className="grid grid-cols-2 gap-3 border-t pt-4 @2xl/panel:grid-cols-4">
