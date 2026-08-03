@@ -4,6 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { EmptyState } from "@/components/empty-state";
 import { ChartSkeleton } from "./skeletons";
 import { summarizeRate, throttledAccounts } from "../request-rate-totals";
+import { PANEL_UPPER_MIN_HEIGHT } from "../panel-metrics";
 import type { RequestRate } from "../types";
 
 const CHART_HEIGHT = 100;
@@ -74,7 +75,9 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
           />
         ) : (
           <div className="space-y-4">
-            <div className="relative">
+            {/* Floor the plot area so this card's divider lines up with the token
+                panel's when the two share a row. */}
+            <div className={`relative flex flex-col justify-center ${PANEL_UPPER_MIN_HEIGHT}`}>
               <svg
                 viewBox={`0 0 ${lastIndex} ${CHART_HEIGHT}`}
                 preserveAspectRatio="none"

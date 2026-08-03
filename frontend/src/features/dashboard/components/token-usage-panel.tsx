@@ -5,6 +5,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ChartSkeleton } from "./skeletons";
 import { exactTokens, formatTokens, shareOf, summarizeUsage } from "../format";
 import { buildSlices, shareLabel, TAIL_LABEL, type Slice } from "../token-slices";
+import { PANEL_UPPER_MIN_HEIGHT } from "../panel-metrics";
 import type { KeyUsage } from "../types";
 
 // Donut geometry. The ring is drawn as one circle per slice, so every segment
@@ -117,7 +118,12 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
             {/* The donut and legend sit side by side once the card is wide enough,
                 and stack below that. Keyed to the container, not the viewport,
                 because this panel is half-width on a large screen. */}
-            <div className="flex flex-col items-center gap-6 @sm/panel:flex-row @sm/panel:items-center">
+            {/* Same floor as the rate chart's plot area, so both dividers land on
+                the same line when the panels share a row. A short legend pads;
+                a full one already fills this height. */}
+            <div
+              className={`flex flex-col items-center justify-center gap-6 @sm/panel:flex-row @sm/panel:items-center ${PANEL_UPPER_MIN_HEIGHT}`}
+            >
               <Donut slices={slices} total={totals.totalTokens} />
               <Legend slices={slices} />
             </div>
