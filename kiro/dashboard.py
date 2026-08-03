@@ -24,7 +24,10 @@ from fastapi.responses import FileResponse
 from kiro.account_manager import account_label, account_routing_state
 from kiro.accounts_admin import register_account
 from kiro.config import (
+    APP_VERSION,
     FALLBACK_MODELS,
+    HIDDEN_MODELS,
+    MODEL_ALIASES,
     RATE_OBSERVATION_RETENTION_DAYS,
     REQUEST_LOG_RETENTION_DAYS,
 )
@@ -36,6 +39,8 @@ from kiro.device_login import (
     start_device_login,
     write_builder_id_credentials,
 )
+from kiro.metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
+from kiro.metrics import render_metrics
 from kiro.usage import fetch_account_usage
 from kiro.usage_tracking import ROOT_KEY_ID, drain_pending_usage
 
@@ -718,6 +723,65 @@ async def dashboard_request_logs(request: Request, limit: int = 25, offset: int 
         "offset": offset,
         "hasMore": offset + len(rows) < total,
     }
+
+
+@router.get("/metrics", include_in_schema=False)
+async def metrics_endpoint(request: Request) -> Response:
+    """Prometheus exposition, authenticated with a data-plane API key.
+
+    This is a third plane: not a dashboard cookie session, and not a `/v1` chat
+    route. It authenticates with the same bearer key `/v1` uses because that is
+    the convention the homelab's other AI gateway already follows, and because a
+    scraper cannot hold a cookie. It is still read-only and must never be
+    reachable unauthenticated: the exposition carries account quota figures and
+    per-key token totals.
+
+    Nothing here is recorded for the scrape's benefit. The numbers come from the
+    dashboard's existing SQLite store and the live pool, so the endpoint cannot
+    perturb routing or spend upstream quota.
+    """
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""
+    if not token or not verify_data_api_key(token):
+        # WWW-Authenticate keeps this a well-formed 401 for the scraper rather
+        # than an opaque refusal.
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API Key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    manager = request.app.state.account_manager
+    # Flush first: token counters batch in memory, so an unflushed scrape would
+    # report totals that lag the traffic by up to one flush interval.
+    await asyncio.to_thread(flush_key_model_usage)
+    key_names = {ROOT_KEY_ID: "root"}
+    try:
+        key_names.update({key["id"]: key["name"] for key in list_data_api_keys()})
+    except Exception:
+        pass
+
+    # The allowlist that bounds the `model` label. Aliases and hidden models are
+    # included because they are genuinely served: `auto-kiro` is the alias every
+    # Cursor client uses, and leaving it out would file real traffic under
+    # `other`.
+    models = set(manager.get_all_available_models() or ())
+    if not models:
+        models = {item["modelId"] if isinstance(item, dict) else item for item in FALLBACK_MODELS}
+    models.update(MODEL_ALIASES)
+    models.update(HIDDEN_MODELS)
+    body = render_metrics(
+        started_at=request.app.state.started_at,
+        version=APP_VERSION,
+        accounts=list(manager._accounts.values()),
+        models=models,
+        connection_factory=_db,
+        usage_for=_cached_usage,
+        label_for=account_label,
+        state_for=account_routing_state,
+        key_names=key_names,
+    )
+    return Response(content=body, media_type=METRICS_CONTENT_TYPE)
 
 
 @router.get("/")
