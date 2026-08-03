@@ -51,7 +51,7 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
   const meanY = y(totals.meanPerMinute);
 
   return (
-    <Card>
+    <Card className="@container/panel flex flex-col">
       <CardHeader>
         <CardTitle>Total request rate</CardTitle>
         <CardDescription>
@@ -63,7 +63,7 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
             : "Requests per minute across the whole pool."}
         </CardDescription>
       </CardHeader>
-      <CardContent>
+      <CardContent className="flex-1">
         {isLoading || !rate ? (
           <ChartSkeleton rows={1} />
         ) : !hasTraffic ? (
@@ -127,7 +127,10 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
               </span>
             </div>
 
-            <dl className="grid grid-cols-2 gap-3 border-t pt-4 sm:grid-cols-5">
+            {/* Container queries, not viewport ones: this panel sits full-width on
+                its own and half-width beside the token chart, so the column count
+                has to follow the card rather than the screen. */}
+            <dl className="grid grid-cols-2 gap-3 border-t pt-4 @md/panel:grid-cols-3 @2xl/panel:grid-cols-5">
               <Figure
                 label="Peak"
                 value={`${round(totals.peakPerMinute)}/min`}

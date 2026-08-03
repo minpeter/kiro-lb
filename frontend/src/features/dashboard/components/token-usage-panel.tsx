@@ -95,7 +95,7 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
   const inputShare = shareOf(totals.promptTokens, totals.totalTokens);
 
   return (
-    <Card>
+    <Card className="@container/panel flex flex-col">
       <CardHeader>
         <CardTitle>Token usage by model</CardTitle>
         <CardDescription>
@@ -103,7 +103,7 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
           this gateway has consumed.
         </CardDescription>
       </CardHeader>
-      <CardContent>
+      <CardContent className="flex-1">
         {isLoading ? (
           <ChartSkeleton rows={1} />
         ) : totals.totalTokens === 0 ? (
@@ -114,12 +114,15 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
           />
         ) : (
           <div className="space-y-4">
-            <div className="flex flex-wrap items-center gap-6">
+            {/* The donut and legend sit side by side once the card is wide enough,
+                and stack below that. Keyed to the container, not the viewport,
+                because this panel is half-width on a large screen. */}
+            <div className="flex flex-col items-center gap-6 @sm/panel:flex-row @sm/panel:items-center">
               <Donut slices={slices} total={totals.totalTokens} />
               <Legend slices={slices} />
             </div>
 
-            <dl className="grid grid-cols-2 gap-3 border-t pt-4 sm:grid-cols-4">
+            <dl className="grid grid-cols-2 gap-3 border-t pt-4 @2xl/panel:grid-cols-4">
               <div>
                 <dt className="text-xs text-muted-foreground">Input</dt>
                 <dd className="tabular-nums" title={exactTokens(totals.promptTokens)}>

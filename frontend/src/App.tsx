@@ -81,12 +81,16 @@ export default function App() {
               )}
             </section>
 
-            {/* Overview is the pool-wide view: the per-account breakdown and its
-                inferred rate limits live on the Accounts tab, where a limit
-                actually applies. */}
-            <TotalRateChart rate={dashboard.rate} isLoading={isLoading} />
-
-            <TokenUsagePanel keyUsage={dashboard.keyUsage} isLoading={isLoading} />
+            {/* Side by side once there is room for both: the rate chart answers
+                what the pool is doing now, the donut what it has spent, and
+                reading them together is the point of this tab. They stack below
+                xl, where half a screen is too narrow for the donut and legend.
+                Overview stays pool-wide; the per-account breakdown and its
+                inferred limits live on the Accounts tab, where a limit applies. */}
+            <section className="grid items-stretch gap-6 xl:grid-cols-2">
+              <TotalRateChart rate={dashboard.rate} isLoading={isLoading} />
+              <TokenUsagePanel keyUsage={dashboard.keyUsage} isLoading={isLoading} />
+            </section>
 
             <RequestLogTable
               page={dashboard.logs}
