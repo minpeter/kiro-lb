@@ -39,6 +39,7 @@ from kiro.device_login import (
     resolve_provider,
     start_device_login,
     write_builder_id_credentials,
+    write_social_credentials,
 )
 from kiro.metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from kiro.metrics import render_metrics
@@ -727,17 +728,19 @@ async def dashboard_register_device_login(flow_id: str, request: Request) -> dic
     if not refresh_token:
         raise HTTPException(status_code=502, detail="Kiro approved the login without a refresh token")
 
+    # Both providers rotate the refresh token on every refresh, so both need a
+    # file the auth manager can write the rotated token back to. An inline
+    # refresh_token entry has none: the account survived one token lifetime and
+    # then answered 401 "Bad credentials" on the next cold init.
     if flow.provider == "BuilderId":
-        # Builder ID refresh needs the client registration, so it is stored as a
-        # JSON credential file next to the pool config rather than inline.
         credential_path = write_builder_id_credentials(flow, _DATA_DIR / "logins")
-        registration = {"type": "json", "path": str(credential_path)}
+        registration: dict[str, Any] = {"type": "json", "path": str(credential_path)}
     else:
-        registration = {
-            "type": "refresh_token",
-            "refreshToken": refresh_token,
-            "profileArn": flow.token.get("profileArn") or "",
-        }
+        credential_path = write_social_credentials(flow, _DATA_DIR / "logins")
+        registration = {"type": "json", "path": str(credential_path)}
+        profile_arn = flow.token.get("profileArn")
+        if profile_arn:
+            registration["profileArn"] = profile_arn
 
     try:
         result = await register_account(request.app.state.account_manager, registration)

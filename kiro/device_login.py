@@ -11,6 +11,8 @@ the polling logic is deliberately not shared:
 - Social (Google / GitHub) on ``prod.us-east-1.auth.desktop.kiro.dev``. Pending
   is HTTP 200 with a ``status`` field, timings are milliseconds, and the response
   carries ``profileArn``, which routes the account to ``runtime.kiro.dev``.
+  Refreshing rotates the refresh token, so the credentials must live in a file
+  the auth manager can write back to.
 - Builder ID (AWS SSO OIDC) on ``oidc.{region}.amazonaws.com``. Pending is HTTP
   400 with an ``authorization_pending`` code, timings are seconds, and refreshing
   needs the client registration, so the client id and secret are stored with the
@@ -35,6 +37,8 @@ from loguru import logger
 
 AUTH_HOST = "https://prod.us-east-1.auth.desktop.kiro.dev"
 CLIENT_ID = "kiro-cli"
+# The social auth host is pinned to us-east-1, so refreshes resolve there too.
+SOCIAL_REGION = "us-east-1"
 
 BUILDER_ID_START_URL = "https://view.awsapps.com/start"
 BUILDER_ID_REGION = "us-east-1"
@@ -332,29 +336,65 @@ async def await_approval(flow_id: str, timeout_seconds: float) -> DeviceFlow:
     return flow
 
 
+def _write_credential_file(path: Path, document: Dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
+
+
+def _expires_at(expires_in: Any) -> str:
+    seconds = float(expires_in or 3600)
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+
+
 def write_builder_id_credentials(flow: DeviceFlow, directory: Path) -> Path:
     """Persist a Builder ID login as a JSON credential file and return its path.
 
-    Builder ID refresh needs the client registration, not just the refresh token,
-    so it cannot use the inline refresh_token entry the social flow uses. The
-    field names are the ones auth.py reads, and clientId/clientSecret are what
+    Builder ID refresh needs the client registration, not just the refresh token.
+    The field names are the ones auth.py reads, and clientId/clientSecret are what
     make it detect AWS SSO OIDC rather than the Kiro Desktop endpoint.
     """
     if not flow.token or not flow.registration:
         raise ValueError("Builder ID login is not approved")
 
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"builder-id-{flow.id}.json"
-    expires_in = float(flow.token.get("expiresIn") or 3600)
     document = {
         "refreshToken": flow.token.get("refreshToken"),
         "accessToken": flow.token.get("accessToken"),
-        "expiresAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + expires_in)),
+        "expiresAt": _expires_at(flow.token.get("expiresIn")),
         "region": flow.registration["region"],
         "clientId": flow.registration["clientId"],
         "clientSecret": flow.registration["clientSecret"],
         "startUrl": BUILDER_ID_START_URL,
     }
-    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    os.chmod(path, 0o600)
-    return path
+    return _write_credential_file(directory / f"builder-id-{flow.id}.json", document)
+
+
+def write_social_credentials(flow: DeviceFlow, directory: Path) -> Path:
+    """Persist a social login as a JSON credential file and return its path.
+
+    The Kiro Desktop refresh endpoint rotates the refresh token and rejects the
+    previous one with 401 "Bad credentials". An inline ``refresh_token`` pool
+    entry has no file to write the rotation back to, so the account worked for one
+    token lifetime and then died on the next cold init. A JSON file gives
+    ``_save_credentials_to_file`` somewhere to persist the rotated token.
+
+    No clientId/clientSecret is written: their absence is what makes auth.py keep
+    using the Kiro Desktop endpoint instead of AWS SSO OIDC.
+    """
+    if not flow.token:
+        raise ValueError(f"{flow.provider} login is not approved")
+
+    document: Dict[str, Any] = {
+        "refreshToken": flow.token.get("refreshToken"),
+        "accessToken": flow.token.get("accessToken"),
+        "expiresAt": _expires_at(flow.token.get("expiresIn")),
+        "region": SOCIAL_REGION,
+    }
+    profile_arn = flow.token.get("profileArn")
+    if profile_arn:
+        document["profileArn"] = profile_arn
+    identity_provider = flow.token.get("identityProvider")
+    if identity_provider:
+        document["identityProvider"] = identity_provider
+    return _write_credential_file(directory / f"social-{flow.provider.lower()}-{flow.id}.json", document)
