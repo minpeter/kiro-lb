@@ -20,7 +20,7 @@ kiro-lb-python/
 ├── kiro/                    # Gateway package: 39 modules, 16.5k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 1725 tests; network-blocked by conftest
+├── tests/                   # pytest, 1768 tests; network-blocked by conftest
 ├── data/                    # Runtime credentials/state/sqlite (gitignored)
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
 ├── pyproject.toml           # ruff + mypy config only; the project is not packaged
@@ -104,6 +104,10 @@ trusting a pin here.
   `ALTER TABLE` migration (`dashboard.py:96`, `:147`), never a destructive rewrite.
 - Proxy env vars are set before any httpx client exists (`main.py:181`); creating
   a client earlier silently ignores the VPN/proxy config.
+- `web_search` auto-injection (Path B) is opt-in and off by default
+  (`config.py:498`): injecting a tool the caller never asked for changes the
+  shape of every request. Native server-side `web_search` (Path A) is driven by
+  the client and works regardless of the flag (`routes_anthropic.py:173`).
 - `pytest.ini`, `kiro/__init__.py`, and legacy comments in `kiro/http_client.py`,
   `kiro/mcp_tools.py` and 5 test modules are Russian; new code, comments, and
   docstrings are English only.
@@ -158,14 +162,18 @@ trusting a pin here.
 
 ```bash
 python main.py --host 127.0.0.1 --port 8000    # run gateway
-pytest -q                                      # full suite (1725 tests, ~6s, no network)
+pytest -q                                      # full suite (1768 tests, ~6s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
 mypy                                           # config in pyproject.toml (kiro + main.py)
 cd frontend && bun run lint && bun run typecheck && bun run build
-docker compose -f docker-compose.homelab.yml up -d --build
+docker compose -p kiro-lb -f docker-compose.homelab.yml up -d --build
 ```
+
+The `-p kiro-lb` is required: the live container was created under that project
+name, so letting compose derive it from the directory (`kiro-lb-python`) fails on
+a `container_name` conflict instead of recreating.
 
 CI (`.github/workflows/docker.yml`) has three jobs: `quality` (ruff format check,
 ruff check, mypy, frontend eslint + tsc), `test` (pytest, then coverage), and

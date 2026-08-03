@@ -818,10 +818,11 @@ class TestFallbackModelsIntegration:
 class TestWebSearchConfig:
     """Tests for WebSearch configuration (WEB_SEARCH_ENABLED)."""
 
-    def test_web_search_enabled_default_true(self, monkeypatch):
+    def test_web_search_enabled_defaults_to_false(self, monkeypatch):
         """
-        What it does: Verifies WEB_SEARCH_ENABLED defaults to true.
-        Purpose: Ensure auto-injection is enabled by default.
+        What it does: Verifies WEB_SEARCH_ENABLED defaults to false.
+        Purpose: Auto-injection is opt-in; a caller that never asked for a search
+            tool must not have one added to its request.
         """
         print("Setup: Removing WEB_SEARCH_ENABLED from environment...")
         monkeypatch.delenv("WEB_SEARCH_ENABLED", raising=False)
@@ -839,8 +840,8 @@ class TestWebSearchConfig:
         monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
         reload(config_module)
 
-        print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
-        assert config_module.WEB_SEARCH_ENABLED is True
+        print(f"Comparing WEB_SEARCH_ENABLED: Expected False, Got {config_module.WEB_SEARCH_ENABLED}")
+        assert config_module.WEB_SEARCH_ENABLED is False
 
     def test_web_search_enabled_false(self, monkeypatch):
         """
