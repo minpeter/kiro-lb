@@ -336,3 +336,125 @@ def test_the_merge_is_idempotent(dashboard):
     # A second startup must not double the totals it already folded.
     assert rows["claude-sonnet-4.5"]["totalTokens"] == 15
     assert rows["claude-sonnet-4.5"]["requests"] == 2
+
+
+def test_generation_time_is_recorded_alongside_the_tokens(dashboard):
+    """Throughput is only meaningful if both halves cover the same requests.
+
+    The request log cannot supply the denominator: its latency stops when the
+    handler returns, which for a streaming response is first-byte time. One
+    Kiro model averaged 17ms there while actually generating for seconds.
+    """
+    current_api_key_id.set(ROOT_KEY_ID)
+    record_token_usage("claude-opus-5", 100, 50, 2.5)
+    record_token_usage("claude-opus-5", 100, 30, 1.5)
+
+    dashboard.flush_key_model_usage()
+    row = {r["model"]: r for r in dashboard.key_model_usage()[ROOT_KEY_ID]}["claude-opus-5"]
+
+    assert row["generationSeconds"] == 4.0
+    # 80 output tokens over 4s of generation.
+    assert row["tokensPerSecond"] == 20.0
+
+
+def test_throughput_is_absent_rather_than_zero_without_timing(dashboard):
+    """A row predating the timing column must not claim the model produces nothing."""
+    current_api_key_id.set(ROOT_KEY_ID)
+    record_token_usage("claude-opus-5", 100, 50)
+
+    dashboard.flush_key_model_usage()
+    row = {r["model"]: r for r in dashboard.key_model_usage()[ROOT_KEY_ID]}["claude-opus-5"]
+
+    assert row["generationSeconds"] == 0.0
+    assert row["tokensPerSecond"] is None
+
+
+def test_a_nonpositive_duration_is_ignored(dashboard):
+    """A clock that did not advance is not a measurement of instant generation."""
+    current_api_key_id.set(ROOT_KEY_ID)
+    record_token_usage("claude-opus-5", 10, 5, 0.0)
+    record_token_usage("claude-opus-5", 10, 5, -1.0)
+
+    dashboard.flush_key_model_usage()
+    row = {r["model"]: r for r in dashboard.key_model_usage()[ROOT_KEY_ID]}["claude-opus-5"]
+
+    assert row["generationSeconds"] == 0.0
+    assert row["tokensPerSecond"] is None
+    # The requests themselves still count.
+    assert row["requests"] == 2
+
+
+def test_generation_time_survives_the_normalization_merge(dashboard):
+    """The merge adds every column, so a folded row keeps its timing."""
+    now = int(time.time())
+    with dashboard._db() as conn:
+        conn.executemany(
+            "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests,"
+            " generation_ms, timed_completion_tokens, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            [
+                (ROOT_KEY_ID, "claude-sonnet-4.5", 100, 40, 4, 2_000, 40, now - 10),
+                (ROOT_KEY_ID, "claude-sonnet-4-5", 100, 60, 6, 3_000, 60, now),
+            ],
+        )
+
+    dashboard.initialize_dashboard_store()
+
+    rows = {r["model"]: r for r in dashboard.key_model_usage()[ROOT_KEY_ID]}
+    assert "claude-sonnet-4-5" not in rows
+    assert rows["claude-sonnet-4.5"]["generationSeconds"] == 5.0
+    # 100 timed output tokens over the combined 5s.
+    assert rows["claude-sonnet-4.5"]["tokensPerSecond"] == 20.0
+
+
+def test_an_existing_store_gains_the_column_without_losing_rows(dashboard):
+    """The additive migration must not rewrite what is already there."""
+    now = int(time.time())
+    with dashboard._db() as conn:
+        conn.execute("DROP TABLE key_model_usage")
+        # Recreate the pre-timing schema, then seed it.
+        conn.execute(
+            """CREATE TABLE key_model_usage (
+                key_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                requests INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (key_id, model)
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (ROOT_KEY_ID, "claude-opus-5", 500, 100, 7, now),
+        )
+
+    dashboard.initialize_dashboard_store()
+
+    row = {r["model"]: r for r in dashboard.key_model_usage()[ROOT_KEY_ID]}["claude-opus-5"]
+    assert row["totalTokens"] == 600
+    assert row["requests"] == 7
+    # Backfilled to 0, which reads as "not measured" rather than as instant.
+    assert row["tokensPerSecond"] is None
+
+
+def test_untimed_tokens_do_not_inflate_throughput(dashboard):
+    """Only timed requests may divide the duration.
+
+    On the live store, 126,943 output tokens accumulated over 960 requests while
+    the timing column held just 1.5s from two freshly measured ones. Dividing the
+    full total by that partial duration reported 82,752 tok/s.
+    """
+    current_api_key_id.set(ROOT_KEY_ID)
+    # Untimed history, as a store predating the column would hold.
+    record_token_usage("claude-opus-5", 50_000, 40_000)
+    # One measured request: 100 tokens in 4s.
+    record_token_usage("claude-opus-5", 100, 100, 4.0)
+
+    dashboard.flush_key_model_usage()
+    row = {r["model"]: r for r in dashboard.key_model_usage()[ROOT_KEY_ID]}["claude-opus-5"]
+
+    # The real totals still include everything.
+    assert row["completionTokens"] == 40_100
+    # But throughput sees only the measured request.
+    assert row["tokensPerSecond"] == 25.0

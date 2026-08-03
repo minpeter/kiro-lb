@@ -20,7 +20,7 @@ kiro-lb-python/
 ├── kiro/                    # Gateway package: 39 modules, 16.5k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 1824 tests; network-blocked by conftest
+├── tests/                   # pytest, 1837 tests; network-blocked by conftest
 ├── data/                    # Runtime credentials/state/sqlite (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
@@ -104,6 +104,17 @@ trusting a pin here.
   (`usage_tracking.py:33`). Callers pass whatever the client sent, so
   `claude-sonnet-4-5`, the dotted form and a dated form are one model; storing
   them raw split a single model's totals across rows nothing could rejoin.
+- Generation throughput divides `timed_completion_tokens` by `generation_ms`,
+  never the full `completion_tokens`. The two counters must cover the same
+  requests: rows predating the timing column hold tokens with no duration, and
+  dividing the full total by a partial duration reported 82,752 tok/s on the live
+  store. The exporter pairs them as `kiro_lb_timed_output_tokens_total` and
+  `kiro_lb_generation_seconds_total`, both keyed by model only.
+- Generation time is measured inside the streaming generators
+  (`streaming_openai.py`, `streaming_anthropic.py`), not by the request-log
+  middleware. The middleware stops when the handler returns, which for a stream
+  is first-byte time: one model averaged 17ms there while generating for seconds,
+  so that latency can never be a throughput denominator.
 - Frontend logic that a panel derives (totals, chart slices) lives in a plain
   module beside the component, not exported from the `.tsx`: eslint's
   `react-refresh/only-export-components` rejects mixed exports, and it is what
@@ -180,7 +191,7 @@ trusting a pin here.
 
 ```bash
 python main.py --host 127.0.0.1 --port 8000    # run gateway
-pytest -q                                      # full suite (1824 tests, ~6s, no network)
+pytest -q                                      # full suite (1837 tests, ~6s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half

@@ -978,6 +978,226 @@
         "x": 0,
         "y": 24
       },
+      "id": 28,
+      "panels": [],
+      "title": "Throughput",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Generation throughput: timed output tokens divided by the upstream generation time that produced them. Both counters cover the same requests - dividing kiro_lb_tokens_total instead would mix in requests that were never timed. This is not the request latency on the Traffic row: that stops at first byte for a stream.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "tok / s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none",
+          "min": 0,
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "id": 29,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model) (rate(kiro_lb_timed_output_tokens_total{job=\"kiro-lb-usage\"}[5m])) / clamp_min(sum by (model) (rate(kiro_lb_generation_seconds_total{job=\"kiro-lb-usage\"}[5m])), 0.001)",
+          "legendFormat": "{{model}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Output tokens per second by model",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "One line is pool-wide throughput. The other is generation-seconds accrued per second, which is how many upstream responses were being produced at once: 2 means two streams were generating in parallel on average.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "tok/s  \u00b7  streams",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none",
+          "min": 0,
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(kiro_lb_timed_output_tokens_total{job=\"kiro-lb-usage\"}[5m])) / clamp_min(sum(rate(kiro_lb_generation_seconds_total{job=\"kiro-lb-usage\"}[5m])), 0.001)",
+          "legendFormat": "tok/s (all models)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(kiro_lb_generation_seconds_total{job=\"kiro-lb-usage\"}[5m]))",
+          "legendFormat": "concurrent generations",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Pool throughput and concurrency",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
       "id": 15,
       "panels": [],
       "title": "Tokens",
@@ -1044,7 +1264,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 25
+        "y": 35
       },
       "id": 16,
       "options": {
@@ -1140,7 +1360,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 25
+        "y": 35
       },
       "id": 17,
       "options": {
@@ -1202,7 +1422,7 @@
         "h": 9,
         "w": 8,
         "x": 0,
-        "y": 34
+        "y": 44
       },
       "id": 18,
       "options": {
@@ -1274,7 +1494,7 @@
         "h": 9,
         "w": 8,
         "x": 8,
-        "y": 34
+        "y": 44
       },
       "id": 19,
       "options": {
@@ -1380,7 +1600,7 @@
         "h": 9,
         "w": 8,
         "x": 16,
-        "y": 34
+        "y": 44
       },
       "id": 20,
       "options": {
@@ -1473,7 +1693,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 53
       },
       "id": 21,
       "options": {
@@ -1593,7 +1813,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 62
       },
       "id": 22,
       "panels": [],
@@ -1662,7 +1882,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 53
+        "y": 63
       },
       "id": 23,
       "options": {
@@ -1760,7 +1980,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 53
+        "y": 63
       },
       "id": 24,
       "options": {
@@ -1909,7 +2129,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 62
+        "y": 72
       },
       "id": 25,
       "options": {
@@ -2149,7 +2369,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 81
       },
       "id": 26,
       "options": {
@@ -2247,7 +2467,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 81
       },
       "id": 27,
       "options": {

@@ -128,10 +128,20 @@ def initialize_dashboard_store() -> None:
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 requests INTEGER NOT NULL DEFAULT 0,
+                generation_ms INTEGER NOT NULL DEFAULT 0,
+                timed_completion_tokens INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (key_id, model)
             )"""
         )
+        # Additive migration for stores created before generation time was tracked.
+        # Existing rows keep 0, which reads as "no timing yet" rather than as an
+        # instant response: a throughput consumer has to divide by it, so the
+        # zero must be skipped, not treated as a measurement.
+        usage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(key_model_usage)")}
+        for column in ("generation_ms", "timed_completion_tokens"):
+            if column not in usage_columns:
+                conn.execute(f"ALTER TABLE key_model_usage ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS account_usage (
                 account_id TEXT PRIMARY KEY,
@@ -174,19 +184,22 @@ def _merge_unnormalized_usage_models(conn: sqlite3.Connection) -> int:
     """
     merged = 0
     rows = conn.execute(
-        "SELECT key_id, model, prompt_tokens, completion_tokens, requests, updated_at FROM key_model_usage"
+        "SELECT key_id, model, prompt_tokens, completion_tokens, requests, generation_ms,"
+        " timed_completion_tokens, updated_at FROM key_model_usage"
     ).fetchall()
     for row in rows:
         canonical = normalize_model_name(row["model"]) or row["model"]
         if canonical == row["model"]:
             continue
         conn.execute(
-            """INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, generation_ms, timed_completion_tokens, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key_id, model) DO UPDATE SET
                 prompt_tokens = prompt_tokens + excluded.prompt_tokens,
                 completion_tokens = completion_tokens + excluded.completion_tokens,
                 requests = requests + excluded.requests,
+                generation_ms = generation_ms + excluded.generation_ms,
+                timed_completion_tokens = timed_completion_tokens + excluded.timed_completion_tokens,
                 updated_at = MAX(updated_at, excluded.updated_at)""",
             (
                 row["key_id"],
@@ -194,6 +207,8 @@ def _merge_unnormalized_usage_models(conn: sqlite3.Connection) -> int:
                 row["prompt_tokens"],
                 row["completion_tokens"],
                 row["requests"],
+                row["generation_ms"],
+                row["timed_completion_tokens"],
                 row["updated_at"],
             ),
         )
@@ -266,16 +281,18 @@ def flush_key_model_usage() -> int:
     try:
         with _db() as conn:
             conn.executemany(
-                """INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                """INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests, generation_ms, timed_completion_tokens, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(key_id, model) DO UPDATE SET
                     prompt_tokens = prompt_tokens + excluded.prompt_tokens,
                     completion_tokens = completion_tokens + excluded.completion_tokens,
                     requests = requests + excluded.requests,
+                    generation_ms = generation_ms + excluded.generation_ms,
+                    timed_completion_tokens = timed_completion_tokens + excluded.timed_completion_tokens,
                     updated_at = excluded.updated_at""",
                 [
-                    (key_id, model, prompt, completion, requests, now)
-                    for key_id, model, prompt, completion, requests in pending
+                    (key_id, model, prompt, completion, requests, generation_ms, timed, now)
+                    for key_id, model, prompt, completion, requests, generation_ms, timed in pending
                 ],
             )
         return len(pending)
@@ -287,20 +304,30 @@ def key_model_usage() -> dict[str, list[dict[str, Any]]]:
     try:
         with _db() as conn:
             rows = conn.execute(
-                "SELECT key_id, model, prompt_tokens, completion_tokens, requests, updated_at"
+                "SELECT key_id, model, prompt_tokens, completion_tokens, requests, generation_ms,"
+                " timed_completion_tokens, updated_at"
                 " FROM key_model_usage ORDER BY prompt_tokens + completion_tokens DESC"
             ).fetchall()
     except Exception:
         return {}
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
+        generation_ms = row["generation_ms"] or 0
+        completion = row["completion_tokens"]
+        timed_completion = row["timed_completion_tokens"] or 0
         grouped.setdefault(row["key_id"], []).append(
             {
                 "model": row["model"],
                 "promptTokens": row["prompt_tokens"],
-                "completionTokens": row["completion_tokens"],
-                "totalTokens": row["prompt_tokens"] + row["completion_tokens"],
+                "completionTokens": completion,
+                "totalTokens": row["prompt_tokens"] + completion,
                 "requests": row["requests"],
+                "generationSeconds": generation_ms / 1000,
+                # Only the tokens that were also timed may divide the duration.
+                # Using the full total mixes in rows recorded before timing
+                # existed and reported 82,752 tok/s on the live store. Absent
+                # rather than 0 when nothing has been timed yet.
+                "tokensPerSecond": (timed_completion / (generation_ms / 1000)) if generation_ms > 0 else None,
                 "updatedAt": row["updated_at"],
             }
         )

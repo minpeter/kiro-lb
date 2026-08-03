@@ -37,7 +37,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
-from kiro.usage_tracking import record_token_usage
+from kiro.usage_tracking import GenerationTimer, record_token_usage
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -151,6 +151,9 @@ async def stream_kiro_to_anthropic(
     output_tokens = 0
     full_content = ""
     full_thinking_content = ""
+    # Timed from inside the generator: the middleware's latency stops when the
+    # handler returns, which for a stream is first-byte time.
+    generation = GenerationTimer()
 
     # NOTE: Anthropic streaming spec requires input_tokens in message_start (beginning),
     # but Kiro API provides accurate context_usage at the end of stream.
@@ -704,7 +707,7 @@ async def stream_kiro_to_anthropic(
             f"tool_blocks={len(tool_blocks)}, stop_reason={stop_reason}"
         )
 
-        record_token_usage(model, input_tokens, output_tokens)
+        record_token_usage(model, input_tokens, output_tokens, generation.elapsed)
 
     except FirstTokenTimeoutError:
         raise
@@ -756,6 +759,9 @@ async def collect_anthropic_response(
         Dictionary with full response in Anthropic Messages format
     """
     message_id = generate_message_id()
+    # The non-streaming path drains the upstream stream before returning, so the
+    # whole call is generation time.
+    generation = GenerationTimer()
 
     # Non-streaming uses the same full-request estimation as streaming
     input_tokens = 0
@@ -873,7 +879,7 @@ async def collect_anthropic_response(
         f"tool_calls={len(result.tool_calls)}, stop_reason={stop_reason}"
     )
 
-    record_token_usage(model, input_tokens, output_tokens)
+    record_token_usage(model, input_tokens, output_tokens, generation.elapsed)
 
     usage_payload: Dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
     usage_payload.update(upstream_cache_usage)

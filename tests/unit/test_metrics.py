@@ -399,6 +399,70 @@ class TestTokenMetrics:
         assert series[f'kiro_lb_tokens_total{{{labels},direction="output"}}'] == 250
         assert series[f"kiro_lb_key_requests_total{{{labels}}}"] == 5
 
+    def test_generation_time_is_exposed_per_model(self, dashboard):
+        """The denominator for tokens/sec, keyed by model only.
+
+        Throughput is a property of the model and the upstream, not of who asked,
+        and keying it per model keeps it divisible by the token counters without a
+        many-to-one vector match in PromQL.
+        """
+        with dashboard._db() as conn:
+            conn.executemany(
+                "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests,"
+                " generation_ms, timed_completion_tokens, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                [
+                    ("root", "claude-opus-5", 100, 400, 4, 20_000, 400, int(time.time())),
+                    (_KEY_ID, "claude-opus-5", 100, 100, 1, 5_000, 100, int(time.time())),
+                ],
+            )
+
+        series = _series(_render(dashboard))
+
+        # Summed across keys: 25s of generation for this model.
+        assert series['kiro_lb_generation_seconds_total{model="claude-opus-5"}'] == 25.0
+        # The numerator is the timed subset, not kiro_lb_tokens_total: 500 tokens
+        # over 25s is 20 tok/s.
+        assert series['kiro_lb_timed_output_tokens_total{model="claude-opus-5"}'] == 500
+        assert (
+            series['kiro_lb_timed_output_tokens_total{model="claude-opus-5"}']
+            / series['kiro_lb_generation_seconds_total{model="claude-opus-5"}']
+        ) == 20.0
+
+    def test_the_throughput_numerator_excludes_untimed_requests(self, dashboard):
+        """kiro_lb_tokens_total counts every request; the ratio must not use it.
+
+        Dividing the full output total by a partial duration reported 82,752 tok/s
+        on the live store, where most tokens predate the timing column.
+        """
+        with dashboard._db() as conn:
+            conn.executemany(
+                "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests,"
+                " generation_ms, timed_completion_tokens, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                [
+                    # Untimed history plus one measured request worth 100 tokens in 4s.
+                    ("root", "claude-opus-5", 50_000, 40_000, 900, 4_000, 100, int(time.time())),
+                ],
+            )
+
+        series = _series(_render(dashboard))
+
+        assert series['kiro_lb_timed_output_tokens_total{model="claude-opus-5"}'] == 100
+        assert series['kiro_lb_generation_seconds_total{model="claude-opus-5"}'] == 4.0
+        # 25 tok/s, not 40,000/4 = 10,000.
+        assert 100 / 4.0 == 25.0
+
+    def test_generation_time_carries_no_key_label(self, dashboard):
+        with dashboard._db() as conn:
+            conn.execute(
+                "INSERT INTO key_model_usage(key_id, model, prompt_tokens, completion_tokens, requests,"
+                " generation_ms, timed_completion_tokens, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (_KEY_ID, "claude-opus-5", 1, 1, 1, 1_000, 1, int(time.time())),
+            )
+
+        for line in _render(dashboard).splitlines():
+            if line.startswith("kiro_lb_generation_seconds_total"):
+                assert "key_id" not in line and "key_name" not in line
+
     def test_an_unnamed_key_falls_back_to_its_id(self, dashboard):
         with dashboard._db() as conn:
             conn.execute(
