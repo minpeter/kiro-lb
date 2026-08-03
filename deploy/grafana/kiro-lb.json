@@ -653,14 +653,18 @@
             "mean",
             "max"
           ],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 260
         },
         "tooltip": {
-          "hideZeros": false,
+          "hideZeros": true,
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "maxHeight": 320
         }
       },
       "targets": [
@@ -846,14 +850,18 @@
             "mean",
             "max"
           ],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 260
         },
         "tooltip": {
-          "hideZeros": false,
+          "hideZeros": true,
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "maxHeight": 320
         }
       },
       "targets": [
@@ -988,7 +996,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Generation throughput: timed output tokens divided by the upstream generation time that produced them. Both counters cover the same requests - dividing kiro_lb_tokens_total instead would mix in requests that were never timed. This is not the request latency on the Traffic row: that stops at first byte for a stream.",
+      "description": "Generation throughput: timed output tokens divided by the upstream generation time that produced them. Both counters cover the same requests - dividing kiro_lb_tokens_total instead would mix in requests that were never timed. This is not the request latency on the Traffic row: that stops at first byte for a stream. Models that have never been measured are filtered out; one with timing in its history keeps its line while idle, so a quiet spell reads as quiet rather than as the model disappearing.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1055,14 +1063,18 @@
             "mean",
             "max"
           ],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 260
         },
         "tooltip": {
-          "hideZeros": false,
+          "hideZeros": true,
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "maxHeight": 320
         }
       },
       "targets": [
@@ -1072,7 +1084,7 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "sum by (model) (rate(kiro_lb_timed_output_tokens_total{job=\"kiro-lb-usage\"}[5m])) / clamp_min(sum by (model) (rate(kiro_lb_generation_seconds_total{job=\"kiro-lb-usage\"}[5m])), 0.001)",
+          "expr": "(sum by (model) (rate(kiro_lb_timed_output_tokens_total{job=\"kiro-lb-usage\"}[5m])) / clamp_min(sum by (model) (rate(kiro_lb_generation_seconds_total{job=\"kiro-lb-usage\"}[5m])), 0.001))\n  and on (model) (sum by (model) (kiro_lb_generation_seconds_total{job=\"kiro-lb-usage\"}) > 0)",
           "legendFormat": "{{model}}",
           "range": true,
           "refId": "A"
@@ -1369,14 +1381,18 @@
             "mean",
             "max"
           ],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true,
+          "width": 260
         },
         "tooltip": {
-          "hideZeros": false,
+          "hideZeros": true,
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "maxHeight": 320
         }
       },
       "targets": [
