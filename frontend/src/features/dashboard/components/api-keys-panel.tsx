@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { formatTimestamp } from "../format";
+import { exactTokens, formatTimestamp, formatTokens } from "../format";
 import type { ApiKey, KeyModelUsage, KeyUsage } from "../types";
 import { TableSkeleton } from "./skeletons";
 
@@ -17,8 +17,6 @@ export type ApiKeysPanelProps = {
   onCreate: () => void;
   onRevoke: (id: string) => void;
 };
-
-const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
 
 function totals(rows: KeyModelUsage[]) {
   return rows.reduce(
@@ -52,9 +50,15 @@ function UsageBreakdown({ rows }: { rows: KeyModelUsage[] }) {
             <TableRow key={row.model}>
               <TableCell className="font-mono text-xs">{row.model}</TableCell>
               <TableCell className="text-right tabular-nums">{row.requests.toLocaleString()}</TableCell>
-              <TableCell className="text-right tabular-nums">{row.promptTokens.toLocaleString()}</TableCell>
-              <TableCell className="text-right tabular-nums">{row.completionTokens.toLocaleString()}</TableCell>
-              <TableCell className="text-right font-medium tabular-nums">{row.totalTokens.toLocaleString()}</TableCell>
+              <TableCell className="text-right tabular-nums" title={exactTokens(row.promptTokens)}>
+                {formatTokens(row.promptTokens)}
+              </TableCell>
+              <TableCell className="text-right tabular-nums" title={exactTokens(row.completionTokens)}>
+                {formatTokens(row.completionTokens)}
+              </TableCell>
+              <TableCell className="text-right font-medium tabular-nums" title={exactTokens(row.totalTokens)}>
+                {formatTokens(row.totalTokens)}
+              </TableCell>
               <TableCell className="text-xs text-muted-foreground">{formatTimestamp(row.updatedAt)}</TableCell>
             </TableRow>
           ))}
@@ -129,7 +133,9 @@ export function ApiKeysPanel({ apiKeys, keyUsage, isLoading, isMutating, onCreat
                       </Badge>
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{requests ? requests.toLocaleString() : "—"}</TableCell>
-                    <TableCell className="text-right tabular-nums">{tokens ? compact.format(tokens) : "—"}</TableCell>
+                    <TableCell className="text-right tabular-nums" title={tokens ? exactTokens(tokens) : undefined}>
+                      {tokens ? formatTokens(tokens) : "—"}
+                    </TableCell>
                     <TableCell className="text-xs text-muted-foreground">
                       {key.readOnly ? "environment" : formatTimestamp(key.createdAt)}
                     </TableCell>
