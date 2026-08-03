@@ -52,6 +52,16 @@ _FAMILIES: tuple[tuple[str, str, str], ...] = (
     # are emitted, which is valid and keeps the series count flat.
     ("kiro_lb_request_latency_seconds", "summary", "Latency of successful requests by model and protocol."),
     ("kiro_lb_tokens_total", "counter", "Tokens attributed to an API key, by model and direction."),
+    (
+        "kiro_lb_generation_seconds_total",
+        "counter",
+        "Upstream generation time, by model. Denominator for tokens/sec.",
+    ),
+    (
+        "kiro_lb_timed_output_tokens_total",
+        "counter",
+        "Output tokens from requests that were also timed. Numerator for tokens/sec.",
+    ),
     ("kiro_lb_key_requests_total", "counter", "Requests attributed to an API key, by model."),
     ("kiro_lb_accounts", "gauge", "Accounts in the pool by routing state."),
     ("kiro_lb_account_requests_total", "counter", "Upstream requests per account by outcome."),
@@ -166,22 +176,39 @@ def _request_metrics(conn: Any, known: frozenset[str]) -> Iterator[str]:
 
 def _token_metrics(conn: Any, key_names: dict[str, str], known: frozenset[str]) -> Iterator[str]:
     rows = conn.execute(
-        "SELECT key_id, model, prompt_tokens, completion_tokens, requests FROM key_model_usage"
+        "SELECT key_id, model, prompt_tokens, completion_tokens, requests, generation_ms,"
+        " timed_completion_tokens FROM key_model_usage"
     ).fetchall()
     totals: dict[tuple[str, str], tuple[int, int, int]] = {}
+    # Generation time carries no key dimension: throughput is a property of the
+    # model and the upstream, not of who asked. Keying it per model also keeps it
+    # divisible by the token counters without a many-to-one vector match.
+    generation: dict[str, int] = {}
+    timed_output: dict[str, int] = {}
     for row in rows:
-        usage_key = (row["key_id"], _model(row["model"], known))
+        model = _model(row["model"], known)
+        usage_key = (row["key_id"], model)
         previous_usage = totals.get(usage_key, (0, 0, 0))
         totals[usage_key] = (
             previous_usage[0] + row["prompt_tokens"],
             previous_usage[1] + row["completion_tokens"],
             previous_usage[2] + row["requests"],
         )
+        generation[model] = generation.get(model, 0) + (row["generation_ms"] or 0)
+        timed_output[model] = timed_output.get(model, 0) + (row["timed_completion_tokens"] or 0)
     for (key_id, model), (prompt, completion, requests) in totals.items():
         labels = {"key_id": key_id, "key_name": key_names.get(key_id, key_id), "model": model}
         yield _line("kiro_lb_tokens_total", {**labels, "direction": "input"}, prompt)
         yield _line("kiro_lb_tokens_total", {**labels, "direction": "output"}, completion)
         yield _line("kiro_lb_key_requests_total", labels, requests)
+    for model, generation_ms in generation.items():
+        # Emitted even at zero so the series exists from the first scrape; a
+        # consumer has to clamp the denominator anyway.
+        yield _line("kiro_lb_generation_seconds_total", {"model": model}, generation_ms / 1000.0)
+        # Paired with the duration above so tokens/sec divides two counters that
+        # cover the same requests. kiro_lb_tokens_total also includes untimed
+        # requests, so dividing that instead overstates throughput.
+        yield _line("kiro_lb_timed_output_tokens_total", {"model": model}, timed_output.get(model, 0))
 
 
 def _account_metrics(accounts: Iterable[Any], usage_for: Any, label_for: Any, state_for: Any) -> Iterator[str]:

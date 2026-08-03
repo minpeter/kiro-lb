@@ -93,6 +93,21 @@ Lands at `/d/kiro-lb/kiro-lb-gateway`.
 summary without quantiles, so `_sum / _count` is all there is. There is
 deliberately no p95 panel implying otherwise.
 
+**Latency is not throughput.** That summary is recorded by the request-log
+middleware, which stops when the handler returns — first-byte time for a stream.
+Throughput has its own pair, measured inside the streaming generators:
+
+```promql
+sum by (model) (rate(kiro_lb_timed_output_tokens_total[5m]))
+  / clamp_min(sum by (model) (rate(kiro_lb_generation_seconds_total[5m])), 0.001)
+```
+
+The numerator is deliberately not `kiro_lb_tokens_total`: that counts every
+request, including ones with no timing, and dividing it by a partial duration
+reported 82,752 tok/s on the live store. `kiro_lb_generation_seconds_total` on its
+own is also useful — as a rate it reads as concurrent generations, since 2 means
+two upstream responses were being produced at once.
+
 Token counts use Grafana's native `short` unit (`1.06 Bil`, `3.88 Mil`). Request
 counts are left unscaled: at four or five digits, `23.1 K` loses more than it
 saves.

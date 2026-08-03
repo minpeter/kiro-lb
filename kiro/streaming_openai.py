@@ -41,7 +41,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 from kiro.tokenizer import count_message_tokens, count_tokens, count_tools_tokens
-from kiro.usage_tracking import record_token_usage
+from kiro.usage_tracking import GenerationTimer, record_token_usage
 from kiro.utils import generate_completion_id
 
 if TYPE_CHECKING:
@@ -142,6 +142,10 @@ async def stream_kiro_to_openai_internal(
     completion_id = generate_completion_id()
     created_time = int(time.time())
     first_chunk = False
+    # Timed from inside the generator: the middleware's latency stops when the
+    # handler returns, which for a stream is first-byte time, so it cannot
+    # measure generation.
+    generation = GenerationTimer()
 
     metering_data = None
     context_usage_percentage = None
@@ -408,7 +412,7 @@ async def stream_kiro_to_openai_internal(
             f"total_tokens={total_tokens} ({total_source})"
         )
 
-        record_token_usage(model, prompt_tokens, completion_tokens)
+        record_token_usage(model, prompt_tokens, completion_tokens, generation.elapsed)
 
         yield _openai_sse(final_chunk)
         yield _openai_done()

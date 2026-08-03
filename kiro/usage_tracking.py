@@ -11,6 +11,7 @@ write per request while still surviving a restart.
 from __future__ import annotations
 
 import threading
+import time
 from contextvars import ContextVar
 from typing import Dict, List, Tuple
 
@@ -24,36 +25,82 @@ ROOT_KEY_ID = "root"
 
 current_api_key_id: ContextVar[str | None] = ContextVar("current_api_key_id", default=None)
 
-# (key_id, model) -> [prompt_tokens, completion_tokens, requests]
+# (key_id, model) -> [prompt_tokens, completion_tokens, requests, generation_ms,
+#                     timed_completion_tokens]
 _pending: Dict[Tuple[str, str], List[int]] = {}
 _lock = threading.Lock()
 
 
-def record_token_usage(model: str, prompt_tokens: int, completion_tokens: int) -> None:
+def record_token_usage(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    generation_seconds: float | None = None,
+) -> None:
     """Attribute a finished request's tokens to the key that made it.
 
     The model name is normalized first. Callers pass whatever the client sent,
     and `claude-sonnet-4-5`, `claude-sonnet-4.5` and
     `claude-sonnet-4-5-20251001` are one model: storing them separately splits a
     single model's totals across rows that no consumer can rejoin.
+
+    `generation_seconds` is how long the upstream took to produce this response,
+    measured by the caller because only it knows when the stream actually
+    finished. The request log cannot supply it: its latency is recorded when the
+    handler returns, which for a streaming response is first-byte time, not
+    generation time.
+
+    Output tokens are counted twice: once as the real total, and once restricted
+    to requests that were also timed. Throughput has to divide the second by the
+    duration, because the two are otherwise gathered over different request sets -
+    rows predating this column hold tokens with no time at all, and dividing the
+    full total by a partial duration produced 82,752 tok/s on the live store.
     """
     key_id = current_api_key_id.get()
     if key_id is None or not model:
         return
     model = normalize_model_name(model) or model
+    completion = max(0, int(completion_tokens or 0))
+    timed = generation_seconds is not None and generation_seconds > 0
     try:
         with _lock:
-            entry = _pending.setdefault((key_id, model), [0, 0, 0])
+            entry = _pending.setdefault((key_id, model), [0, 0, 0, 0, 0])
             entry[0] += max(0, int(prompt_tokens or 0))
-            entry[1] += max(0, int(completion_tokens or 0))
+            entry[1] += completion
             entry[2] += 1
+            if timed:
+                # Milliseconds keep the accumulator an int, matching the token
+                # counters and the SQLite columns.
+                entry[3] += int((generation_seconds or 0) * 1000)
+                entry[4] += completion
     except Exception as exc:
         # Accounting must never break the proxy data plane.
         logger.debug("Token usage accounting skipped: {}", exc)
 
 
-def drain_pending_usage() -> List[Tuple[str, str, int, int, int]]:
+class GenerationTimer:
+    """Measure how long an upstream response took to produce.
+
+    A plain `time.perf_counter()` pair would do, except that a streaming
+    generator can be abandoned mid-flight; keeping the start in an object makes
+    the elapsed value available wherever the finally-block ends up.
+    """
+
+    __slots__ = ("_started",)
+
+    def __init__(self) -> None:
+        self._started = time.perf_counter()
+
+    @property
+    def elapsed(self) -> float:
+        return max(0.0, time.perf_counter() - self._started)
+
+
+def drain_pending_usage() -> List[Tuple[str, str, int, int, int, int, int]]:
     with _lock:
-        drained = [(key_id, model, counts[0], counts[1], counts[2]) for (key_id, model), counts in _pending.items()]
+        drained = [
+            (key_id, model, counts[0], counts[1], counts[2], counts[3], counts[4])
+            for (key_id, model), counts in _pending.items()
+        ]
         _pending.clear()
     return drained
