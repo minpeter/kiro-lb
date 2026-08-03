@@ -401,12 +401,18 @@ async def messages(
 
                     # Extract error reason and save for final return
                     error_reason = None
+                    # The upstream message is kept verbatim: on the legacy q.*
+                    # host a suspension arrives with reason=null and the verdict
+                    # only in the message, so report_failure needs the raw text
+                    # to quarantine the account instead of retrying it forever.
+                    upstream_message = error_text
                     try:
                         error_json = json.loads(error_text)
                         from kiro.kiro_errors import enhance_kiro_error
 
                         error_info = enhance_kiro_error(error_json)
                         error_reason = error_info.reason
+                        upstream_message = error_info.original_message or error_text
                         last_error_message = error_info.user_message
                         last_error_status = response.status_code
                         logger.debug(
@@ -422,7 +428,12 @@ async def messages(
                     if error_type == ErrorType.FATAL:
                         # FATAL - return to client immediately
                         await account_manager.report_failure(
-                            account.id, request_data.model, error_type, response.status_code, error_reason
+                            account.id,
+                            request_data.model,
+                            error_type,
+                            response.status_code,
+                            error_reason,
+                            upstream_message,
                         )
 
                         logger.warning(f"HTTP {response.status_code} - POST /v1/messages - {last_error_message[:100]}")
@@ -438,7 +449,12 @@ async def messages(
                     else:  # ErrorType.RECOVERABLE
                         # RECOVERABLE - try next account
                         await account_manager.report_failure(
-                            account.id, request_data.model, error_type, response.status_code, error_reason
+                            account.id,
+                            request_data.model,
+                            error_type,
+                            response.status_code,
+                            error_reason,
+                            upstream_message,
                         )
 
                         # Single account - no point in failover, break immediately
