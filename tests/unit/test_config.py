@@ -829,8 +829,14 @@ class TestWebSearchConfig:
         print("Action: Reloading config module...")
         from importlib import reload
 
+        import dotenv
+
         import kiro.config as config_module
 
+        # reload() re-runs load_dotenv(), so an operator .env that sets
+        # WEB_SEARCH_ENABLED would decide this assertion. Patch dotenv itself,
+        # not the config attribute: reload re-imports the name.
+        monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
         reload(config_module)
 
         print(f"Comparing WEB_SEARCH_ENABLED: Expected True, Got {config_module.WEB_SEARCH_ENABLED}")
