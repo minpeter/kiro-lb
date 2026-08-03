@@ -56,6 +56,10 @@ jobs:
         working-directory: frontend
         run: bun run typecheck
 
+      - name: Test frontend (vitest)
+        working-directory: frontend
+        run: bun run test
+
   test:
     name: Run Tests
     runs-on: ubuntu-latest

@@ -20,7 +20,7 @@ kiro-lb-python/
 ├── kiro/                    # Gateway package: 39 modules, 16.5k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 1822 tests; network-blocked by conftest
+├── tests/                   # pytest, 1824 tests; network-blocked by conftest
 ├── data/                    # Runtime credentials/state/sqlite (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
@@ -100,6 +100,14 @@ trusting a pin here.
   `cl100k_base` for Claude and unknown names, `o200k_base` for GPT/o1/o3 and for
   deepseek/qwen/minimax/glm. The correction is a property of the script, not the
   model — it scales by measured CJK ratio and is 1.0 for Latin text.
+- Per-key token rows are keyed by the **normalized** model name
+  (`usage_tracking.py:33`). Callers pass whatever the client sent, so
+  `claude-sonnet-4-5`, the dotted form and a dated form are one model; storing
+  them raw split a single model's totals across rows nothing could rejoin.
+- Frontend logic that a panel derives (totals, chart slices) lives in a plain
+  module beside the component, not exported from the `.tsx`: eslint's
+  `react-refresh/only-export-components` rejects mixed exports, and it is what
+  makes the logic unit-testable (`token-slices.ts`, `format.ts`).
 - Control and data planes stay separate: dashboard cookie sessions cannot call
   `/v1`, and `/v1` API keys cannot call `/api/dashboard`. `/metrics` is a third
   plane: it takes a `/v1` bearer key (a scraper cannot hold a cookie) and refuses
@@ -172,12 +180,12 @@ trusting a pin here.
 
 ```bash
 python main.py --host 127.0.0.1 --port 8000    # run gateway
-pytest -q                                      # full suite (1822 tests, ~6s, no network)
+pytest -q                                      # full suite (1824 tests, ~6s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
 mypy                                           # config in pyproject.toml (kiro + main.py)
-cd frontend && bun run lint && bun run typecheck && bun run build
+cd frontend && bun run lint && bun run typecheck && bun run test && bun run build
 docker compose -p kiro-lb -f docker-compose.homelab.yml up -d --build
 ```
 
@@ -186,7 +194,7 @@ name, so letting compose derive it from the directory (`kiro-lb-python`) fails o
 a `container_name` conflict instead of recreating.
 
 CI (`.github/workflows/docker.yml`) has three jobs: `quality` (ruff format check,
-ruff check, mypy, frontend eslint + tsc), `test` (pytest, then coverage), and
+ruff check, mypy, frontend eslint + tsc + vitest), `test` (pytest, then coverage), and
 `build`, which needs both. The build job Trivy-scans (report-only) and pushes
 multi-arch images on non-PR runs. Tool versions are pinned in
 `requirements-dev.txt` so a tool release cannot turn CI red on its own.

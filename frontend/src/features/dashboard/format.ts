@@ -1,4 +1,4 @@
-import type { AccountUsage } from "./types";
+import type { AccountUsage, KeyUsage } from "./types";
 
 /** Format a unix timestamp for operator-facing tables. */
 export function formatTimestamp(value?: number | null): string {
@@ -42,4 +42,70 @@ export function formatTokens(value?: number | null): string {
 /** Exact count for the cell's title, so the rounded figure stays verifiable. */
 export function exactTokens(value?: number | null): string | undefined {
   return value == null ? undefined : `${value.toLocaleString()} tokens`;
+}
+
+export type ModelTotal = {
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  requests: number;
+};
+
+export type UsageTotals = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  requests: number;
+  /** Descending by total tokens, so the caller can take a meaningful head. */
+  models: ModelTotal[];
+};
+
+/**
+ * Collapse the per-key breakdown into grand totals plus a per-model ranking.
+ *
+ * The API returns usage keyed by API key, because that is how it is attributed.
+ * The overview asks the other question: what has this gateway spent in total,
+ * regardless of who spent it. Summing across keys here keeps that view honest
+ * when keys are added or revoked, since a revoked key's history still counts
+ * toward what was consumed.
+ */
+export function summarizeUsage(usage: KeyUsage): UsageTotals {
+  const byModel = new Map<string, ModelTotal>();
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let requests = 0;
+
+  for (const rows of Object.values(usage)) {
+    for (const row of rows) {
+      promptTokens += row.promptTokens;
+      completionTokens += row.completionTokens;
+      requests += row.requests;
+      const entry = byModel.get(row.model) ?? {
+        model: row.model,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        requests: 0,
+      };
+      entry.promptTokens += row.promptTokens;
+      entry.completionTokens += row.completionTokens;
+      entry.totalTokens += row.totalTokens;
+      entry.requests += row.requests;
+      byModel.set(row.model, entry);
+    }
+  }
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    requests,
+    models: [...byModel.values()].sort((a, b) => b.totalTokens - a.totalTokens),
+  };
+}
+
+/** Share of a total as a percentage, guarding the empty case. */
+export function shareOf(value: number, total: number): number {
+  return total > 0 ? (value / total) * 100 : 0;
 }

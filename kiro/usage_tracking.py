@@ -16,6 +16,8 @@ from typing import Dict, List, Tuple
 
 from loguru import logger
 
+from kiro.model_resolver import normalize_model_name
+
 # Identity of the key that authenticated the current request. ROOT_KEY_ID marks
 # the legacy environment key, which has no dashboard-managed row.
 ROOT_KEY_ID = "root"
@@ -28,10 +30,17 @@ _lock = threading.Lock()
 
 
 def record_token_usage(model: str, prompt_tokens: int, completion_tokens: int) -> None:
-    """Attribute a finished request's tokens to the key that made it."""
+    """Attribute a finished request's tokens to the key that made it.
+
+    The model name is normalized first. Callers pass whatever the client sent,
+    and `claude-sonnet-4-5`, `claude-sonnet-4.5` and
+    `claude-sonnet-4-5-20251001` are one model: storing them separately splits a
+    single model's totals across rows that no consumer can rejoin.
+    """
     key_id = current_api_key_id.get()
     if key_id is None or not model:
         return
+    model = normalize_model_name(model) or model
     try:
         with _lock:
             entry = _pending.setdefault((key_id, model), [0, 0, 0])
