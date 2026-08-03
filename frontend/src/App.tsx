@@ -12,6 +12,7 @@ import { LoginCard } from "@/features/dashboard/components/login-card";
 import { RequestLogTable } from "@/features/dashboard/components/request-log-table";
 import { RequestRateChart } from "@/features/dashboard/components/request-rate-chart";
 import { TokenUsagePanel } from "@/features/dashboard/components/token-usage-panel";
+import { TotalRateChart } from "@/features/dashboard/components/total-rate-chart";
 import { AppHeader, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
 
@@ -80,9 +81,12 @@ export default function App() {
               )}
             </section>
 
-            <TokenUsagePanel keyUsage={dashboard.keyUsage} isLoading={isLoading} />
+            {/* Overview is the pool-wide view: the per-account breakdown and its
+                inferred rate limits live on the Accounts tab, where a limit
+                actually applies. */}
+            <TotalRateChart rate={dashboard.rate} isLoading={isLoading} />
 
-            <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
+            <TokenUsagePanel keyUsage={dashboard.keyUsage} isLoading={isLoading} />
 
             <RequestLogTable
               page={dashboard.logs}
