@@ -101,7 +101,12 @@ export default function App() {
           </TabsContent>
 
           <TabsContent value="accounts" className="space-y-6">
-            <AccountsPanel accounts={dashboard.accounts} isLoading={isLoading} />
+            <AccountsPanel
+              accounts={dashboard.accounts}
+              isLoading={isLoading}
+              isMutating={isMutating}
+              onDeleteAccount={(id) => void runAction(() => dashboardApi.deleteAccount(id))}
+            />
             <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
             <DeviceLoginCard onRegistered={dashboard.reload} />
           </TabsContent>

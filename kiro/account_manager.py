@@ -330,12 +330,20 @@ class AccountManager:
         self._unsaved_rate_observations: List[RateObservation] = []
 
     async def load_credentials(self) -> None:
+        """Load credentials while serializing durable rollback recovery."""
+        from kiro.accounts_admin import recover_pending_account_deletion_files
+
+        async with self._lock:
+            recover_pending_account_deletion_files(self)
+            await self._load_credentials_unlocked()
+
+    async def _load_credentials_unlocked(self) -> None:
         """
         Load credentials from credentials.json.
 
-        Validates each entry and creates Account objects.
-        Invalid entries are skipped with warnings.
-        Folders are scanned for credential files.
+        The caller must hold ``_lock``. Validates each entry and creates
+        Account objects; invalid entries are skipped with warnings and folders
+        are scanned for credential files.
         """
         creds_path = Path(self._credentials_file).expanduser()
 
@@ -489,11 +497,13 @@ class AccountManager:
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
 
-    async def _save_state(self) -> None:
+    async def _save_state(self, *, raise_errors: bool = False) -> bool:
         """
         Save runtime state to state.json atomically.
 
-        Uses tmp file + rename for atomic write.
+        Uses tmp file + rename for atomic write. Background callers keep the
+        best-effort default; destructive operations can require an observable
+        failure with ``raise_errors=True``.
         """
         state_data = {
             "current_account_index": self._current_account_index,
@@ -525,11 +535,55 @@ class AccountManager:
             # Atomic rename
             tmp_path.replace(state_path)
             logger.debug("State saved successfully")
+            return True
 
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
-            if tmp_path.exists():
-                tmp_path.unlink()
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError as cleanup_error:
+                logger.error(f"Failed to clean up state temp file: {cleanup_error}")
+            if raise_errors:
+                raise
+            return False
+
+    def _remove_account_state(self, account_id: str) -> None:
+        """Remove one account from live routing and all persisted runtime state.
+
+        The caller must hold ``_lock`` so account selection cannot observe a
+        partially updated pool.
+        """
+        account_ids = list(self._accounts)
+        removed_index = account_ids.index(account_id) if account_id in self._accounts else None
+        current_index = self._current_account_index % len(account_ids) if account_ids else 0
+
+        self._accounts.pop(account_id, None)
+
+        for model in list(self._model_to_accounts):
+            model_accounts = self._model_to_accounts[model]
+            model_accounts.accounts = [known_id for known_id in model_accounts.accounts if known_id != account_id]
+            if not model_accounts.accounts:
+                del self._model_to_accounts[model]
+
+        self._rate_observations = [item for item in self._rate_observations if item.account_id != account_id]
+        self._unsaved_rate_observations = [
+            item for item in self._unsaved_rate_observations if item.account_id != account_id
+        ]
+
+        remaining_count = len(self._accounts)
+        if not remaining_count:
+            self._current_account_index = 0
+        elif removed_index is None:
+            self._current_account_index = current_index % remaining_count
+        elif removed_index < current_index:
+            self._current_account_index = current_index - 1
+        elif removed_index == current_index:
+            self._current_account_index = min(current_index, remaining_count - 1)
+        else:
+            self._current_account_index = current_index
+
+        self._dirty = True
 
     async def save_state_periodically(self) -> None:
         """
@@ -542,8 +596,8 @@ class AccountManager:
 
             if self._dirty:
                 async with self._lock:
-                    await self._save_state()
-                    self._dirty = False
+                    if await self._save_state():
+                        self._dirty = False
 
     async def _initialize_account(self, account_id: str) -> bool:
         """

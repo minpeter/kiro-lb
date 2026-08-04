@@ -39,6 +39,7 @@ export type Account = {
   requests: number;
   failures: number;
   cooldownSeconds: number;
+  deletable: boolean;
   usage?: AccountUsage | null;
 };
 
