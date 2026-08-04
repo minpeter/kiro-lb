@@ -39,6 +39,8 @@ export const dashboardApi = {
   logout: () => request<{ ok: boolean }>("/api/dashboard/logout", { method: "POST" }),
   overview: () => request<Overview>("/api/dashboard/overview"),
   accounts: () => request<{ accounts: Account[] }>("/api/dashboard/accounts"),
+  deleteAccount: (id: string) =>
+    request<{ ok: boolean }>(`/api/dashboard/accounts/${encodeURIComponent(id)}`, { method: "DELETE" }),
   requestLogs: (limit: number, offset: number) =>
     request<RequestLogPage>(`/api/dashboard/request-logs?limit=${limit}&offset=${offset}`),
   requestRate: (windowSeconds: number, bucketSeconds: number) =>

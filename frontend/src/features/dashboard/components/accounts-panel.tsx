@@ -1,5 +1,7 @@
-import { AtSign, Ban, ServerCog } from "lucide-react";
+import { useState } from "react";
+import { AtSign, Ban, ServerCog, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
 import { Progress } from "@/components/ui/progress";
@@ -73,7 +75,15 @@ function UsageCell({ account }: { account: Account }) {
   );
 }
 
-export function AccountsPanel({ accounts, isLoading }: { accounts: Account[]; isLoading: boolean }) {
+export type AccountsPanelProps = {
+  accounts: Account[];
+  isLoading: boolean;
+  isMutating?: boolean;
+  onDeleteAccount?: (id: string) => void;
+};
+
+export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount }: AccountsPanelProps) {
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
   return (
     <Card>
       <CardHeader>
@@ -84,7 +94,7 @@ export function AccountsPanel({ accounts, isLoading }: { accounts: Account[]; is
       </CardHeader>
       <CardContent>
         {isLoading ? (
-          <TableSkeleton rows={2} columns={6} />
+          <TableSkeleton rows={2} columns={10} />
         ) : accounts.length === 0 ? (
           <EmptyState icon={ServerCog} title="No accounts registered" description="Add a credential source below." />
         ) : (
@@ -100,6 +110,7 @@ export function AccountsPanel({ accounts, isLoading }: { accounts: Account[]; is
                 <TableHead className="text-right">Requests</TableHead>
                 <TableHead className="text-right">Failures</TableHead>
                 <TableHead>Updated</TableHead>
+                <TableHead className="w-12" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -131,6 +142,46 @@ export function AccountsPanel({ accounts, isLoading }: { accounts: Account[]; is
                   <TableCell className="text-right tabular-nums">{account.requests}</TableCell>
                   <TableCell className="text-right tabular-nums">{account.failures}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{formatTimestamp(account.usage?.updatedAt)}</TableCell>
+                  <TableCell className="text-right">
+                    {account.deletable ? (
+                      confirmingId === account.id ? (
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            disabled={isMutating}
+                            aria-label={`Cancel deleting account ${account.id}`}
+                            onClick={() => setConfirmingId(null)}
+                          >
+                            Cancel
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="destructive"
+                            disabled={isMutating}
+                            aria-label={`Confirm delete account ${account.id}`}
+                            onClick={() => {
+                              setConfirmingId(null);
+                              onDeleteAccount?.(account.id);
+                            }}
+                          >
+                            Delete
+                          </Button>
+                        </div>
+                      ) : (
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          className="text-muted-foreground hover:text-destructive"
+                          disabled={isMutating}
+                          aria-label={`Delete account ${account.id}`}
+                          onClick={() => setConfirmingId(account.id)}
+                        >
+                          <Trash2 size={14} />
+                        </Button>
+                      )
+                    ) : null}
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>

@@ -51,6 +51,8 @@ export function useDashboard(): DashboardState {
   const [error, setError] = useState("");
   // Pagination reads must not resurrect a stale page after a newer request.
   const logRequestId = useRef(0);
+  // Reloads and live polls share this generation so stale responses cannot overwrite current dashboard state.
+  const dashboardRequestId = useRef(0);
 
   const handleFailure = useCallback((cause: unknown) => {
     const message = (cause as Error).message;
@@ -83,6 +85,7 @@ export function useDashboard(): DashboardState {
   }, []);
 
   const reload = useCallback(async () => {
+    const requestId = ++dashboardRequestId.current;
     try {
       const [nextOverview, nextAccounts, nextKeys, nextRate, nextKeyUsage] = await Promise.all([
         dashboardApi.overview(),
@@ -91,6 +94,7 @@ export function useDashboard(): DashboardState {
         dashboardApi.requestRate(RATE_WINDOW_SECONDS, RATE_BUCKET_SECONDS),
         dashboardApi.keyUsage(),
       ]);
+      if (requestId !== dashboardRequestId.current) return;
       setOverview(nextOverview);
       setAccounts(nextAccounts.accounts);
       setApiKeys(nextKeys.apiKeys);
@@ -101,9 +105,9 @@ export function useDashboard(): DashboardState {
       setError("");
       await loadLogs(limit, offset);
     } catch (cause) {
-      handleFailure(cause);
+      if (requestId === dashboardRequestId.current) handleFailure(cause);
     } finally {
-      setIsLoading(false);
+      if (requestId === dashboardRequestId.current) setIsLoading(false);
     }
   }, [handleFailure, limit, loadLogs, offset]);
 
@@ -111,6 +115,7 @@ export function useDashboard(): DashboardState {
   // change on their own, and refetching the log page every second would fight
   // the operator's pagination.
   const refreshLive = useCallback(async () => {
+    const requestId = ++dashboardRequestId.current;
     try {
       const [nextOverview, nextAccounts, nextRate, nextKeyUsage] = await Promise.all([
         dashboardApi.overview(),
@@ -118,13 +123,14 @@ export function useDashboard(): DashboardState {
         dashboardApi.requestRate(RATE_WINDOW_SECONDS, RATE_BUCKET_SECONDS),
         dashboardApi.keyUsage(),
       ]);
+      if (requestId !== dashboardRequestId.current) return;
       setOverview(nextOverview);
       setAccounts(nextAccounts.accounts);
       setRate(nextRate);
       setKeyUsage(nextKeyUsage.usage);
       setLastUpdatedAt(Date.now());
     } catch (cause) {
-      handleFailure(cause);
+      if (requestId === dashboardRequestId.current) handleFailure(cause);
     }
   }, [handleFailure]);
 
