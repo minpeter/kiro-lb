@@ -1,5 +1,4 @@
 import { useMemo } from "react";
-import { Activity } from "lucide-react";
 import { Area } from "@/components/dither-kit/area";
 import { AreaChart } from "@/components/dither-kit/area-chart";
 import { Grid } from "@/components/dither-kit/grid";
@@ -8,7 +7,6 @@ import { Tooltip } from "@/components/dither-kit/tooltip";
 import { XAxis } from "@/components/dither-kit/x-axis";
 import { YAxis } from "@/components/dither-kit/y-axis";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { EmptyState } from "@/components/empty-state";
 import { ChartSkeleton } from "./skeletons";
 import { rateChartConfig, rateChartRows } from "../dither-series";
 import { summarizeRate, throttledAccounts } from "../request-rate-totals";
@@ -43,8 +41,6 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
   const rows = useMemo(() => rateChartRows(totals), [totals]);
   const config = useMemo(() => rateChartConfig(totals), [totals]);
 
-  const hasTraffic = totals.requests > 0;
-
   return (
     <Card className="@container/panel flex flex-col">
       <CardHeader>
@@ -61,12 +57,6 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
       <CardContent className="flex-1">
         {isLoading || !rate ? (
           <ChartSkeleton rows={1} />
-        ) : !hasTraffic ? (
-          <EmptyState
-            icon={Activity}
-            title="No traffic in this window"
-            description="The chart fills in as requests reach /v1."
-          />
         ) : (
           <div className="space-y-4">
             {/* Floor the plot area so this card's divider lines up with the token
