@@ -23,7 +23,13 @@ from fastapi.responses import FileResponse
 from loguru import logger
 
 from kiro.account_manager import account_label, account_routing_state
-from kiro.accounts_admin import register_account
+from kiro.accounts_admin import (
+    AccountConflictError,
+    AccountNotFoundError,
+    is_account_deletable,
+    register_account,
+    remove_account,
+)
 from kiro.config import (
     APP_VERSION,
     FALLBACK_MODELS,
@@ -537,7 +543,7 @@ async def refresh_all_account_usage(manager: Any) -> list[dict[str, Any]]:
     return results
 
 
-def _account_view(account: Any) -> dict[str, Any]:
+def _account_view(account: Any, *, deletable: bool = False) -> dict[str, Any]:
     now = time.time()
     cooldown_seconds = max(0, int(account.last_failure_time - now)) if account.last_failure_time else 0
     # The failure counter no longer covers every exclusion: rate limits and
@@ -546,6 +552,7 @@ def _account_view(account: Any) -> dict[str, Any]:
     routing_state, eligible_in = account_routing_state(account, now)
     return {
         "id": account_label(account.id),
+        "deletable": deletable,
         "initialized": account.auth_manager is not None,
         "routingState": routing_state,
         "eligibleInSeconds": eligible_in,
@@ -764,7 +771,32 @@ async def dashboard_cancel_device_login(flow_id: str, request: Request) -> dict[
 @router.get("/api/dashboard/accounts")
 async def dashboard_accounts(request: Request) -> dict[str, list[dict[str, Any]]]:
     _require_auth(request)
-    return {"accounts": [_account_view(account) for account in request.app.state.account_manager._accounts.values()]}
+    manager = request.app.state.account_manager
+    return {
+        "accounts": [
+            _account_view(account, deletable=is_account_deletable(manager, account.id))
+            for account in manager._accounts.values()
+        ]
+    }
+
+
+@router.delete("/api/dashboard/accounts/{account_label}")
+async def dashboard_delete_account(account_label: str, request: Request) -> dict[str, bool]:
+    _require_auth(request)
+
+    def delete_metadata(account_id: str) -> None:
+        with _db() as conn:
+            conn.execute("DELETE FROM account_usage WHERE account_id = ?", (account_id,))
+            conn.execute("DELETE FROM rate_observations WHERE account_id = ?", (account_id,))
+
+    try:
+        await remove_account(request.app.state.account_manager, account_label, finalize=delete_metadata)
+    except AccountNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AccountConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {"ok": True}
 
 
 @router.get("/api/dashboard/request-rate")
