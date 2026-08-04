@@ -10,6 +10,7 @@ Reference: https://docs.anthropic.com/en/api/messages
 import json
 from typing import TYPE_CHECKING, Any, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -20,10 +21,12 @@ from kiro.config import PROFILE_ARN, WEB_SEARCH_ENABLED
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.dashboard import identify_data_api_key
 from kiro.http_client import KiroHttpClient
-from kiro.mcp_tools import handle_native_web_search
 from kiro.models_anthropic import (
     AnthropicCountTokensRequest,
+    AnthropicMessage,
     AnthropicMessagesRequest,
+    ToolResultContentBlock,
+    ToolUseContentBlock,
 )
 from kiro.payload_guards import PayloadTooLargeError
 from kiro.streaming_anthropic import (
@@ -52,6 +55,33 @@ else:
 anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 # Also support Authorization: Bearer for compatibility
 auth_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+
+WEB_SEARCH_DESCRIPTION = "Search the web for current information. Use when you need up-to-date data from the internet."
+WEB_SEARCH_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"query": {"type": "string", "description": "Search query"}},
+    "required": ["query"],
+}
+
+
+def normalize_native_web_search_tools(tools: Optional[list]) -> None:
+    """Give native server-side ``web_search`` tools a schema Kiro can act on.
+
+    An Anthropic native tool (``type="web_search_20250305"``) carries no
+    ``input_schema`` because Anthropic supplies it server-side. This gateway instead
+    advertises the tool to Kiro and intercepts the call mid-stream, so without a schema
+    the model is handed a tool with no ``query`` parameter to populate.
+    """
+    for tool in tools or []:
+        tool_type = getattr(tool, "type", None)
+        if not (tool_type and tool_type.startswith("web_search")):
+            continue
+        if not getattr(tool, "input_schema", None):
+            tool.input_schema = dict(WEB_SEARCH_INPUT_SCHEMA)
+        if not (getattr(tool, "description", None) or "").strip():
+            tool.description = WEB_SEARCH_DESCRIPTION
+        logger.debug("Normalized native web_search tool for mid-stream interception (Path A)")
 
 
 async def verify_anthropic_api_key(
@@ -155,42 +185,13 @@ async def messages(
 
             web_search_tool = AnthropicTool(
                 name="web_search",
-                description="Search the web for current information. Use when you need up-to-date data from the internet.",
-                input_schema={
-                    "type": "object",
-                    "properties": {"query": {"type": "string", "description": "Search query"}},
-                    "required": ["query"],
-                },
+                description=WEB_SEARCH_DESCRIPTION,
+                input_schema=dict(WEB_SEARCH_INPUT_SCHEMA),
             )
             request_data.tools.append(web_search_tool)
             logger.debug("Auto-injected web_search tool for MCP emulation (Path B)")
 
-    # ==============================================================================
-    # WebSearch Support - Path A: Native Anthropic (Early Return)
-    # ==============================================================================
-
-    # Check for native Anthropic server-side tool (Path A)
-    # This works ALWAYS, regardless of WEB_SEARCH_ENABLED setting
-    if request_data.tools:
-        for tool in request_data.tools:
-            tool_type = getattr(tool, "type", None)
-            if tool_type and tool_type.startswith("web_search"):
-                # Path A: Early return, direct MCP call
-                # Get auth_manager from first available account (no failover needed for early return)
-                account = request.app.state.account_manager.get_first_account()
-                if not account.auth_manager:
-                    logger.error("No initialized accounts available for native web_search")
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "type": "error",
-                            "error": {"type": "api_error", "message": "No initialized accounts available"},
-                        },
-                    )
-                auth_manager = account.auth_manager
-
-                logger.info("Detected native Anthropic web_search (Path A), routing to MCP API")
-                return await handle_native_web_search(request, request_data, auth_manager, api_format="anthropic")
+    normalize_native_web_search_tools(request_data.tools)
 
     # ==============================================================================
     # Account System: Account System Failover or Legacy Mode
@@ -604,6 +605,23 @@ async def messages(
     else:
         system_for_tokenizer = request_data.system
 
+    async def make_search_request(tool_use_id: str, query: str, result_content: str) -> httpx.Response:
+        followup_request = request_data.model_copy(deep=True)
+        followup_request.messages.extend(
+            [
+                AnthropicMessage(
+                    role="assistant",
+                    content=[ToolUseContentBlock(id=tool_use_id, name="web_search", input={"query": query})],
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content=[ToolResultContentBlock(tool_use_id=tool_use_id, content=result_content)],
+                ),
+            ]
+        )
+        followup_payload = anthropic_to_kiro(followup_request, conversation_id, profile_arn_for_payload)
+        return await http_client.request_with_retry("POST", url, followup_payload, stream=True, retry_rate_limits=False)
+
     try:
         # Make request to Kiro API (for both streaming and non-streaming modes)
         # Important: we wait for Kiro response BEFORE returning StreamingResponse,
@@ -668,6 +686,7 @@ async def messages(
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
+                        make_search_request=make_search_request,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -717,6 +736,7 @@ async def messages(
                 request_messages=messages_for_tokenizer,
                 request_tools=tools_for_tokenizer,
                 request_system=system_for_tokenizer,
+                make_search_request=make_search_request,
             )
 
             await http_client.close()

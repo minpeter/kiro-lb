@@ -46,6 +46,20 @@ class ThinkingContentBlock(BaseModel):
     signature: str = ""
 
 
+class RedactedThinkingContentBlock(BaseModel):
+    """
+    Safety-redacted reasoning block in Anthropic format.
+
+    Anthropic tells clients to pass ``redacted_thinking`` back unchanged during
+    tool use, so the block must parse even though ``data`` is opaque ciphertext
+    this gateway can neither read nor forward as prose. Rejecting it would fail
+    the whole request for a client that followed the documented protocol.
+    """
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str = ""
+
+
 class ToolUseContentBlock(BaseModel):
     """
     Tool use content block in Anthropic format.
@@ -147,6 +161,7 @@ class ImageContentBlock(BaseModel):
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
+    RedactedThinkingContentBlock,
     ImageContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,

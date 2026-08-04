@@ -52,6 +52,8 @@ class UnifiedMessage:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
     images: Optional[List[Dict[str, Any]]] = None
+    reasoning: Optional[str] = None
+    reasoning_signature: Optional[str] = None
 
 
 @dataclass
@@ -770,7 +772,13 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
             # Create a copy of the message without tool content but with text representation
             # IMPORTANT: Preserve images from the original message (e.g., screenshots from MCP tools)
             cleaned_msg = UnifiedMessage(
-                role=msg.role, content=content, tool_calls=None, tool_results=None, images=msg.images
+                role=msg.role,
+                content=content,
+                tool_calls=None,
+                tool_results=None,
+                images=msg.images,
+                reasoning=msg.reasoning,
+                reasoning_signature=msg.reasoning_signature,
             )
             result.append(cleaned_msg)
         else:
@@ -850,6 +858,8 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     tool_calls=msg.tool_calls,
                     tool_results=None,  # Remove orphaned tool_results (now in text)
                     images=msg.images,
+                    reasoning=msg.reasoning,
+                    reasoning_signature=msg.reasoning_signature,
                 )
                 result.append(cleaned_msg)
                 converted_any_tool_results = True
@@ -907,6 +917,16 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                     last.tool_calls = []
                 last.tool_calls = list(last.tool_calls) + list(msg.tool_calls)
                 total_tool_calls_merged += len(msg.tool_calls)
+
+            # Merge reasoning the same way as content: two merged assistant turns
+            # each carry their own thinking, and dropping the later one would lose
+            # the reasoning behind the tool calls just merged in above. Keep the
+            # latest turn's (reasoning, signature) pair intact rather than
+            # concatenating texts under a single signature, which would pair a
+            # signature with reasoning it did not seal.
+            if msg.role == "assistant" and msg.reasoning:
+                last.reasoning = msg.reasoning
+                last.reasoning_signature = msg.reasoning_signature
 
             # Merge tool_results for user messages
             if msg.role == "user" and msg.tool_results:
@@ -1033,6 +1053,8 @@ def normalize_message_roles(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 tool_calls=msg.tool_calls,
                 tool_results=msg.tool_results,
                 images=msg.images,
+                reasoning=msg.reasoning,
+                reasoning_signature=msg.reasoning_signature,
             )
             normalized.append(normalized_msg)
             converted_count += 1
@@ -1166,6 +1188,19 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             content = extract_text_content(msg.content)
 
             assistant_response: Dict[str, Any] = {"content": content}
+
+            if msg.reasoning and msg.reasoning_signature:
+                # Signed prior-turn reasoning rides the official nested field, the
+                # only reasoning form that reaches generation on this endpoint.
+                # Kiro enforces the signature (THINKING_SIGNATURE_INVALID on empty
+                # or fabricated values), so only a client-supplied signature is
+                # forwarded; unsigned reasoning falls through to the content fold.
+                assistant_response["reasoningContent"] = {
+                    "reasoningText": {"text": msg.reasoning, "signature": msg.reasoning_signature}
+                }
+            # Unsigned reasoning cannot use the nested field (Kiro rejects an
+            # empty signature), and folding it into content costs context on every
+            # turn for reasoning that is only a summary. It is dropped.
 
             # Process tool_calls
             tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)

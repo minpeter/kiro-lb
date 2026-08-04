@@ -214,6 +214,9 @@ def convert_openai_messages_to_unified(messages: List[ChatMessage]) -> Tuple[str
                 tool_calls=tool_calls,
                 tool_results=tool_results,
                 images=images,
+                # Requests accept both spellings on input, so a client echoing
+                # either one back gets its prior reasoning preserved.
+                reasoning=(msg.reasoning or msg.reasoning_content) if msg.role == "assistant" else None,
             )
             processed.append(unified_msg)
 
