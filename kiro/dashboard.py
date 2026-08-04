@@ -8,15 +8,15 @@ keys, refresh tokens, or OAuth credentials are written to its SQLite database.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import os
 import secrets
 import sqlite3
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
@@ -41,46 +41,33 @@ from kiro.config import (
 from kiro.device_login import (
     DeviceLoginError,
     discard_flow,
+    internal_credentials,
     poll_device_login,
     resolve_provider,
     start_device_login,
-    write_builder_id_credentials,
-    write_social_credentials,
 )
 from kiro.metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from kiro.metrics import render_metrics
 from kiro.model_resolver import normalize_model_name
+from kiro.store import connection as _db
+from kiro.store import initialize as initialize_shared_store
 from kiro.usage import fetch_account_usage
-from kiro.usage_tracking import ROOT_KEY_ID, drain_pending_usage
+from kiro.usage_tracking import ROOT_KEY_ID, drain_pending_usage, restore_pending_usage
 
 router = APIRouter(tags=["dashboard"])
 
-_DATA_DIR = Path(os.getenv("DASHBOARD_DATA_DIR", "data"))
-_DB_PATH = _DATA_DIR / "dashboard.sqlite3"
 _STATIC_DIR = Path(__file__).parent / "static"
 _COOKIE = "kiro_lb_session"
 _SESSION_TTL_SECONDS = 12 * 60 * 60
-_sessions: dict[str, float] = {}
 
 
-@contextmanager
-def _db() -> Iterator[sqlite3.Connection]:
-    """Yield a dashboard-store connection, committing then closing it.
-
-    sqlite3's own context manager commits but leaves the connection open, which
-    leaks a handle per call. Every store access goes through here.
-    """
-    _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+def _proxy_api_key() -> str:
+    """Return the legacy root key without caching environment state."""
+    return os.getenv("PROXY_API_KEY", "")
 
 
 def initialize_dashboard_store() -> None:
+    initialize_shared_store()
     with _db() as conn:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS request_logs (
@@ -93,6 +80,45 @@ def initialize_dashboard_store() -> None:
             )"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at)")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS request_metric_rollups (
+                route TEXT NOT NULL, model TEXT NOT NULL, status_code INTEGER NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(route, model, status_code)
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS request_latency_rollups (
+                route TEXT NOT NULL, model TEXT NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(route, model)
+            )"""
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS dashboard_migrations (name TEXT PRIMARY KEY)")
+        if not conn.execute("SELECT 1 FROM dashboard_migrations WHERE name = 'request_rollups_v1'").fetchone():
+            conn.execute(
+                "INSERT INTO request_metric_rollups(route, model, status_code, requests)"
+                " SELECT route, COALESCE(model, ''), status_code, COUNT(*)"
+                " FROM request_logs GROUP BY route, COALESCE(model, ''), status_code"
+            )
+            conn.execute(
+                "INSERT INTO request_latency_rollups(route, model, requests, latency_ms)"
+                " SELECT route, COALESCE(model, ''), COUNT(*), COALESCE(SUM(latency_ms), 0) FROM request_logs"
+                " WHERE status_code BETWEEN 200 AND 399 GROUP BY route, COALESCE(model, '')"
+            )
+            conn.execute("INSERT INTO dashboard_migrations(name) VALUES ('request_rollups_v1')")
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS rollup_request_log AFTER INSERT ON request_logs BEGIN
+                INSERT INTO request_metric_rollups(route, model, status_code, requests)
+                VALUES (NEW.route, COALESCE(NEW.model, ''), NEW.status_code, 1)
+                ON CONFLICT(route, model, status_code) DO UPDATE SET requests = requests + 1;
+                INSERT INTO request_latency_rollups(route, model, requests, latency_ms)
+                SELECT NEW.route, COALESCE(NEW.model, ''), 1, NEW.latency_ms
+                WHERE NEW.status_code BETWEEN 200 AND 399
+                ON CONFLICT(route, model) DO UPDATE SET requests = requests + 1,
+                    latency_ms = latency_ms + excluded.latency_ms;
+            END"""
+        )
         # Rate observations back the inferred rate limit shown on the dashboard.
         # Only the RPM at each upstream verdict is kept, which is what the
         # estimate needs; the high-resolution chart ring stays in memory.
@@ -241,18 +267,20 @@ def prune_request_logs() -> int:
         return 0
 
 
-def record_rate_observations(rows: list[tuple[str, float, int, int, str]]) -> None:
+def record_rate_observations(rows: list[tuple[str, float, int, int, str]]) -> bool:
     """Persist (account_id, observed_at, rpm, rejected, outcome) rate samples."""
     if not rows:
-        return
+        return True
     try:
         with _db() as conn:
             conn.executemany(
                 "INSERT INTO rate_observations(account_id, observed_at, rpm, rejected, outcome) VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
-    except Exception:
-        pass
+        return True
+    except Exception as exc:
+        logger.error("Failed to persist rate observations: {}", exc)
+        return False
 
 
 def load_rate_observations(since: float) -> list[tuple[str, float, int, int, str]]:
@@ -303,7 +331,9 @@ def flush_key_model_usage() -> int:
                 ],
             )
         return len(pending)
-    except Exception:
+    except Exception as exc:
+        restore_pending_usage(pending)
+        logger.error("Failed to flush key-model usage; restored pending batch: {}", exc)
         return 0
 
 
@@ -358,6 +388,20 @@ def _password() -> str:
     return os.getenv("DASHBOARD_PASSWORD", "")
 
 
+def _session_token(expires_at: int) -> str:
+    payload = str(expires_at)
+    signature = hmac.new(_password().encode(), payload.encode(), hashlib.sha256).digest()
+    return f"{payload}.{base64.urlsafe_b64encode(signature).decode().rstrip('=')}"
+
+
+def _secure_cookie(request: Request) -> bool:
+    configured = os.getenv("DASHBOARD_SECURE_COOKIE")
+    if configured is not None:
+        return configured.lower() in ("true", "1", "yes")
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    return request.url.scheme == "https" or forwarded == "https"
+
+
 def _hash_api_key(value: str, salt: bytes) -> bytes:
     return hashlib.scrypt(value.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
 
@@ -389,7 +433,7 @@ def identify_data_api_key(value: str) -> str | None:
     The legacy environment key answers as ROOT_KEY_ID: it has no row of its own
     but still needs to be attributable in per-key usage.
     """
-    legacy = os.getenv("PROXY_API_KEY", "")
+    legacy = _proxy_api_key()
     if legacy and hmac.compare_digest(value, legacy):
         return ROOT_KEY_ID
     if not value.startswith("klb_"):
@@ -441,9 +485,12 @@ def _authenticated(request: Request) -> bool:
     token = request.cookies.get(_COOKIE)
     if not token:
         return False
-    expires_at = _sessions.get(token, 0)
-    if expires_at <= time.time():
-        _sessions.pop(token, None)
+    try:
+        raw_expiry, supplied = token.split(".", 1)
+        expected = _session_token(int(raw_expiry)).split(".", 1)[1]
+        if int(raw_expiry) <= time.time() or not hmac.compare_digest(supplied, expected):
+            return False
+    except (TypeError, ValueError):
         return False
     return True
 
@@ -578,14 +625,13 @@ async def dashboard_login(request: Request, response: Response) -> dict[str, boo
     candidate = str(payload.get("password", ""))
     if not hmac.compare_digest(candidate, password):
         raise HTTPException(status_code=401, detail="Invalid password")
-    token = secrets.token_urlsafe(32)
-    _sessions[token] = time.time() + _SESSION_TTL_SECONDS
+    token = _session_token(int(time.time()) + _SESSION_TTL_SECONDS)
     response.set_cookie(
         _COOKIE,
         token,
         httponly=True,
         samesite="strict",
-        secure=request.url.scheme == "https",
+        secure=_secure_cookie(request),
         max_age=_SESSION_TTL_SECONDS,
     )
     return {"ok": True}
@@ -593,8 +639,7 @@ async def dashboard_login(request: Request, response: Response) -> dict[str, boo
 
 @router.post("/api/dashboard/logout")
 async def dashboard_logout(request: Request, response: Response) -> dict[str, bool]:
-    _sessions.pop(request.cookies.get(_COOKIE, ""), None)
-    response.delete_cookie(_COOKIE)
+    response.delete_cookie(_COOKIE, httponly=True, samesite="strict", secure=_secure_cookie(request))
     return {"ok": True}
 
 
@@ -605,7 +650,7 @@ async def dashboard_list_keys(request: Request) -> dict[str, list[dict[str, Any]
     # The legacy environment key authenticates real traffic but has no row, so
     # it is listed as a read-only root entry: usage must be attributable to it,
     # and it cannot be revoked from here because it lives in the environment.
-    legacy = os.getenv("PROXY_API_KEY", "")
+    legacy = _proxy_api_key()
     if legacy:
         keys.append(
             {
@@ -735,19 +780,11 @@ async def dashboard_register_device_login(flow_id: str, request: Request) -> dic
     if not refresh_token:
         raise HTTPException(status_code=502, detail="Kiro approved the login without a refresh token")
 
-    # Both providers rotate the refresh token on every refresh, so both need a
-    # file the auth manager can write the rotated token back to. An inline
-    # refresh_token entry has none: the account survived one token lifetime and
-    # then answered 401 "Bad credentials" on the next cold init.
-    if flow.provider == "BuilderId":
-        credential_path = write_builder_id_credentials(flow, _DATA_DIR / "logins")
-        registration: dict[str, Any] = {"type": "json", "path": str(credential_path)}
-    else:
-        credential_path = write_social_credentials(flow, _DATA_DIR / "logins")
-        registration = {"type": "json", "path": str(credential_path)}
-        profile_arn = flow.token.get("profileArn")
-        if profile_arn:
-            registration["profileArn"] = profile_arn
+    registration = {
+        "type": "internal",
+        "id": f"device-{flow.provider.lower()}-{flow.id}",
+        "credential": internal_credentials(flow),
+    }
 
     try:
         result = await register_account(request.app.state.account_manager, registration)
@@ -784,13 +821,8 @@ async def dashboard_accounts(request: Request) -> dict[str, list[dict[str, Any]]
 async def dashboard_delete_account(label: str, request: Request) -> dict[str, bool]:
     _require_auth(request)
 
-    def delete_metadata(account_id: str) -> None:
-        with _db() as conn:
-            conn.execute("DELETE FROM account_usage WHERE account_id = ?", (account_id,))
-            conn.execute("DELETE FROM rate_observations WHERE account_id = ?", (account_id,))
-
     try:
-        await remove_account(request.app.state.account_manager, label, finalize=delete_metadata)
+        await remove_account(request.app.state.account_manager, label)
     except AccountNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except AccountConflictError as exc:

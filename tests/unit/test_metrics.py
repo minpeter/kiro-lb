@@ -24,6 +24,7 @@ _KEY_ID = "6f1c2d3e4a5b"
 @pytest.fixture
 def dashboard(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "dashboard-password")
     module = importlib.reload(importlib.import_module("kiro.dashboard"))
     module.initialize_dashboard_store()
     return module
@@ -550,9 +551,9 @@ class TestEndpoint:
     def test_a_dashboard_cookie_cannot_scrape(self, dashboard, monkeypatch):
         """Control-plane sessions stay out of the metrics plane."""
         client = self._client(dashboard, monkeypatch)
-        token = "session-token"
-        dashboard._sessions[token] = time.time() + 3600
-        client.cookies.set(dashboard._COOKIE, token)
+        login = client.post("/api/dashboard/login", json={"password": "dashboard-password"})
+        assert login.status_code == 200
+        assert dashboard._COOKIE in client.cookies
 
         response = client.get("/metrics")
 

@@ -29,6 +29,7 @@ from kiro.parsers import (
     deduplicate_tool_calls,
     parse_bracket_tool_calls,
 )
+from kiro.sse_validation import StreamProtocolError
 
 if TYPE_CHECKING:
     from kiro.cache import ModelInfoCache
@@ -126,6 +127,7 @@ async def parse_kiro_stream(
     prompt tags or response text.  Content is passed through verbatim.
     """
     parser = AwsEventStreamParser()
+    received_event = False
     try:
         byte_iterator = response.aiter_bytes()
         try:
@@ -133,11 +135,12 @@ async def parse_kiro_stream(
         except asyncio.TimeoutError:
             raise FirstTokenTimeoutError(f"No response within {first_token_timeout} seconds")
         except StopAsyncIteration:
-            return
+            raise StreamProtocolError("Upstream stream ended before any events were received")
 
         if debug_logger:
             debug_logger.log_raw_chunk(first_chunk)
         async for event in _process_chunk(parser, first_chunk):
+            received_event = True
             if debug_logger:
                 debug_logger.log_parsed_event(asdict(event))
             yield event
@@ -153,6 +156,7 @@ async def parse_kiro_stream(
             if debug_logger:
                 debug_logger.log_raw_chunk(chunk)
             async for event in _process_chunk(parser, chunk):
+                received_event = True
                 if debug_logger:
                     debug_logger.log_parsed_event(asdict(event))
                 yield event
@@ -168,9 +172,12 @@ async def parse_kiro_stream(
             if tool_call.get("_parse_error"):
                 raise MalformedToolInputError("Malformed upstream tool input")
             event = KiroEvent(type="tool_use", tool_use=tool_call)
+            received_event = True
             if debug_logger:
                 debug_logger.log_parsed_event(asdict(event))
             yield event
+        if not received_event:
+            raise StreamProtocolError("Upstream stream ended before any events were received")
     except FirstTokenTimeoutError:
         raise
     except GeneratorExit:
@@ -234,8 +241,10 @@ async def collect_stream_to_result(
     """
     result = StreamResult()
     full_content_for_bracket_tools = ""
+    received_event = False
 
     async for event in parse_kiro_stream(response, first_token_timeout):
+        received_event = True
         if event.type == "content" and event.content:
             result.content += event.content
             full_content_for_bracket_tools += event.content
@@ -250,7 +259,6 @@ async def collect_stream_to_result(
                 )
         elif event.type == "thinking" and event.thinking_content:
             result.thinking_content += event.thinking_content
-            full_content_for_bracket_tools += event.thinking_content
             if result.content_blocks and result.content_blocks[-1]["type"] == "thinking":
                 result.content_blocks[-1]["thinking"] += event.thinking_content
             else:
@@ -282,7 +290,13 @@ async def collect_stream_to_result(
         elif event.type == "stop_reason" and event.stop_reason:
             result.stop_reason = event.stop_reason
 
-    # Check for bracket-style tool calls in full content
+    # Keep this guard at the collector boundary as well: tests and alternate
+    # transports may replace the parser with another KiroEvent iterator.
+    if not received_event:
+        raise StreamProtocolError("Upstream stream ended before any events were received")
+
+    # Recovery is intentionally limited to client-visible text. Reasoning can
+    # discuss bracket syntax without actually invoking a tool.
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)

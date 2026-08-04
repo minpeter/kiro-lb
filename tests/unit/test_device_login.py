@@ -8,7 +8,6 @@ milliseconds, and the poll response carries the profileArn directly.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -257,14 +256,12 @@ async def test_registering_an_approved_login_adds_the_account(dashboard, tmp_pat
     assert result["initialized"] is True
     assert result["provider"] == "Google"
 
-    entries = __import__("json").loads((tmp_path / "credentials.json").read_text())
-    # The Kiro Desktop endpoint rotates the refresh token and answers 401 "Bad
-    # credentials" for the previous one, so a social login must be stored as a
-    # JSON file that _save_credentials_to_file can write the rotation back to.
-    assert entries[0]["type"] == "json"
-    assert entries[0]["profile_arn"] == APPROVED["profileArn"]
+    from kiro.store import load_account_sources, load_internal_credential
 
-    document = __import__("json").loads(Path(entries[0]["path"]).read_text())
+    entries = load_account_sources()
+    assert entries[0]["type"] == "internal"
+    document = load_internal_credential(entries[0]["id"])
+    assert document is not None
     assert document["refreshToken"] == APPROVED["refreshToken"]
     assert document["accessToken"] == APPROVED["accessToken"]
     assert document["profileArn"] == APPROVED["profileArn"]
@@ -272,30 +269,6 @@ async def test_registering_an_approved_login_adds_the_account(dashboard, tmp_pat
     # refresh endpoint instead of AWS SSO OIDC.
     assert "clientId" not in document
     assert "clientSecret" not in document
-
-
-@pytest.mark.asyncio
-async def test_a_social_account_persists_its_rotated_refresh_token(dashboard, tmp_path):
-    """The rotation must reach disk, or the account dies on the next cold init."""
-    with patch("kiro.device_login.httpx.AsyncClient", return_value=_client(_Response(AUTHORIZATION))):
-        flow = await start_device_login("Google")
-    with patch("kiro.device_login.httpx.AsyncClient", return_value=_client(_Response(APPROVED))):
-        await poll_device_login(flow.id)
-
-    path = device_login.write_social_credentials(flow, tmp_path / "logins")
-
-    from kiro.auth import AuthType, KiroAuthManager
-
-    manager = KiroAuthManager(creds_file=str(path))
-    assert manager.auth_type is AuthType.KIRO_DESKTOP
-
-    manager._refresh_token = "rotated-refresh-token"
-    manager._access_token = "rotated-access-token"
-    manager._save_credentials_to_file()
-
-    document = __import__("json").loads(path.read_text())
-    assert document["refreshToken"] == "rotated-refresh-token"
-    assert document["accessToken"] == "rotated-access-token"
 
 
 @pytest.mark.asyncio
@@ -447,26 +420,6 @@ async def test_builder_id_approval_carries_no_profile_arn():
 
 
 @pytest.mark.asyncio
-async def test_builder_id_credentials_file_carries_the_client_registration(tmp_path):
-    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
-    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
-        flow = await start_device_login("BuilderId")
-    with patch("kiro.device_login.httpx.AsyncClient", return_value=_client(_Response(OIDC_TOKEN))):
-        await poll_device_login(flow.id)
-
-    path = device_login.write_builder_id_credentials(flow, tmp_path / "logins")
-    document = __import__("json").loads(path.read_text())
-
-    # clientId/clientSecret are what make auth.py pick the OIDC refresh endpoint.
-    assert document["clientId"] == "client-id-value"
-    assert document["clientSecret"] == "client-secret-value"
-    assert document["refreshToken"] == OIDC_TOKEN["refreshToken"]
-    assert document["region"] == "us-east-1"
-    assert "profileArn" not in document
-    assert oct(path.stat().st_mode)[-3:] == "600"
-
-
-@pytest.mark.asyncio
 async def test_registering_builder_id_adds_a_json_account(dashboard, tmp_path):
     client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
     with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
@@ -479,19 +432,15 @@ async def test_registering_builder_id_adds_a_json_account(dashboard, tmp_path):
         result = await dashboard.dashboard_register_device_login(flow.id, request)
 
     assert result["provider"] == "BuilderId"
-    entries = __import__("json").loads((tmp_path / "credentials.json").read_text())
-    assert entries[0]["type"] == "json"
+    from kiro.store import load_account_sources, load_internal_credential
+
+    entries = load_account_sources()
+    assert entries[0]["type"] == "internal"
     assert "profile_arn" not in entries[0]
-
-
-@pytest.mark.asyncio
-async def test_writing_credentials_for_an_unapproved_flow_is_refused(tmp_path):
-    client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
-    with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
-        flow = await start_device_login("BuilderId")
-
-    with pytest.raises(ValueError):
-        device_login.write_builder_id_credentials(flow, tmp_path / "logins")
+    document = load_internal_credential(entries[0]["id"])
+    assert document is not None
+    assert document["clientSecret"] == "client-secret-value"
+    assert document["refreshToken"] == OIDC_TOKEN["refreshToken"]
 
 
 # =============================================================================

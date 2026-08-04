@@ -318,28 +318,33 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     # Account System: Account System Failover or Legacy Mode
     # ==============================================================================
 
-    if request.app.state.account_system:
-        # ==============================================================================
-        # ACCOUNT SYSTEM ENABLED: Failover Loop
-        # ==============================================================================
+    account_system = request.app.state.account_system
+    while True:
         from kiro.account_errors import ErrorType, classify_error
 
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
-        MAX_ATTEMPTS = len(all_accounts) * 2  # Full circle with margin
+        single_attempt = not account_system or len(all_accounts) == 1
+        max_attempts = 1 if not account_system else max(1, len(all_accounts) * 2)
 
         last_error_message = None
         last_error_status = None
         tried_accounts: set[str] = set()  # Track tried accounts in current failover loop
 
-        for attempt in range(MAX_ATTEMPTS):
-            # Get next available account (excluding already tried)
-            account = await account_manager.get_next_account(request_data.model, exclude_accounts=tried_accounts)
+        for _attempt in range(max_attempts):
+            account = (
+                await account_manager.get_next_account(request_data.model, exclude_accounts=tried_accounts)
+                if account_system
+                else account_manager.get_first_account()
+            )
 
-            if account is None:
+            if account is None or not account.auth_manager:
                 # All accounts unavailable
-                if len(all_accounts) == 1:
+                if single_attempt:
                     # Single account - return original error with original status code
+                    if not account_system:
+                        logger.error("No initialized accounts available (legacy mode)")
+                        raise HTTPException(503, "No initialized accounts available")
                     raise HTTPException(
                         status_code=last_error_status or 503, detail=last_error_message or "Account unavailable"
                     )
@@ -404,9 +409,6 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 )
 
                 if response.status_code == 200:
-                    # SUCCESS - report and return
-                    await account_manager.report_success(account.id, request_data.model)
-
                     # Prepare data for token counting
                     messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
                     tools_for_tokenizer = (
@@ -438,15 +440,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     parallel_tool_calls=request_data.parallel_tool_calls is not False,
                                 ):
                                     yield chunk
+                                if account_system:
+                                    await account_manager.report_success(account.id, request_data.model)
                             except GeneratorExit:
                                 client_disconnected = True
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                             except Exception as e:
                                 streaming_error = e
-                                try:
-                                    yield "data: [DONE]\n\n"
-                                except Exception:
-                                    pass
                                 raise
                             finally:
                                 await http_client.close()
@@ -485,6 +485,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             include_reasoning=request_data.include_reasoning,
                             parallel_tool_calls=request_data.parallel_tool_calls is not False,
                         )
+                        if account_system:
+                            await account_manager.report_success(account.id, request_data.model)
 
                         await http_client.close()
                         logger.info("HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
@@ -532,14 +534,15 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
                     if error_type == ErrorType.FATAL:
                         # FATAL - return to client immediately
-                        await account_manager.report_failure(
-                            account.id,
-                            request_data.model,
-                            error_type,
-                            response.status_code,
-                            error_reason,
-                            upstream_message,
-                        )
+                        if account_system:
+                            await account_manager.report_failure(
+                                account.id,
+                                request_data.model,
+                                error_type,
+                                response.status_code,
+                                error_reason,
+                                upstream_message,
+                            )
 
                         logger.warning(
                             f"HTTP {response.status_code} - POST /v1/chat/completions - {last_error_message[:100]}"
@@ -561,17 +564,28 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
                     else:  # ErrorType.RECOVERABLE
                         # RECOVERABLE - try next account
-                        await account_manager.report_failure(
-                            account.id,
-                            request_data.model,
-                            error_type,
-                            response.status_code,
-                            error_reason,
-                            upstream_message,
-                        )
+                        if account_system:
+                            await account_manager.report_failure(
+                                account.id,
+                                request_data.model,
+                                error_type,
+                                response.status_code,
+                                error_reason,
+                                upstream_message,
+                            )
 
-                        # Single account - no point in failover, break immediately
-                        if len(all_accounts) == 1:
+                        if single_attempt:
+                            if not account_system:
+                                return JSONResponse(
+                                    status_code=response.status_code,
+                                    content={
+                                        "error": {
+                                            "message": last_error_message,
+                                            "type": "kiro_api_error",
+                                            "code": response.status_code,
+                                        }
+                                    },
+                                )
                             break
 
                         continue  # Next iteration
@@ -584,15 +598,21 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 # NOT for HTTP-level errors (which are returned as response objects)
                 if e.status_code in (502, 504):
                     # Network error → try next account
-                    await account_manager.report_failure(
-                        account.id, request_data.model, ErrorType.RECOVERABLE, e.status_code, None
-                    )
+                    if account_system:
+                        await account_manager.report_failure(
+                            account.id, request_data.model, ErrorType.RECOVERABLE, e.status_code, None
+                        )
 
                     last_error_message = str(e.detail)
                     last_error_status = e.status_code
 
                     # Single account - no point in failover, break immediately
-                    if len(all_accounts) == 1:
+                    if single_attempt:
+                        if not account_system:
+                            logger.warning("Network error (legacy mode, no failover available)")
+                            if debug_logger:
+                                debug_logger.flush_on_error(e.status_code, str(e.detail))
+                            raise
                         break
 
                     logger.warning(f"Network error on account {account.id}, trying next account")
@@ -613,7 +633,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
         # All attempts exhausted
-        if len(all_accounts) == 1:
+        if single_attempt:
             # Single account - return its original error
             # last_error_status and last_error_message are guaranteed to be set
             assert last_error_status is not None
@@ -627,212 +647,3 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             if last_error_message:
                 detail += f" Error from last account: {last_error_message}"
             raise HTTPException(status_code=503, detail=detail)
-
-    else:
-        # ==============================================================================
-        # LEGACY MODE: Single Account (no failover)
-        # ==============================================================================
-        account = request.app.state.account_manager.get_first_account()
-        if not account.auth_manager:
-            logger.error("No initialized accounts available (legacy mode)")
-            raise HTTPException(503, "No initialized accounts available")
-        auth_manager = account.auth_manager
-        model_cache = account.model_cache
-
-    # Generate conversation ID for Kiro API (random UUID, not used for tracking)
-    conversation_id = generate_conversation_id()
-
-    # Build payload for Kiro
-    # A Builder ID account has no profile and must not be given one: the global
-    # fallback would send a foreign ARN and fail the request.
-    profile_arn_for_payload = auth_manager.profile_arn or (
-        "" if auth_manager.auth_type == AuthType.AWS_SSO_OIDC else PROFILE_ARN or ""
-    )
-
-    try:
-        kiro_payload = build_kiro_payload(request_data, conversation_id, profile_arn_for_payload)
-    except PayloadTooLargeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # Log Kiro payload
-    try:
-        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode("utf-8")
-        if debug_logger:
-            debug_logger.log_kiro_request_body(kiro_request_body)
-    except Exception as e:
-        logger.warning(f"Failed to log Kiro request: {e}")
-
-    # Create HTTP client with retry logic
-    # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)
-    # For non-streaming: use shared client for connection pooling
-    url = f"{auth_manager.api_host}/generateAssistantResponse"
-    logger.debug(f"Kiro API URL: {url}")
-
-    if request_data.stream:
-        # Streaming mode: per-request client prevents orphaned connections
-        # when network interface changes (VPN disconnect/reconnect)
-        http_client = KiroHttpClient(auth_manager, shared_client=None)
-    else:
-        # Non-streaming mode: shared client for efficient connection reuse
-        shared_client = request.app.state.http_client
-        http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
-    try:
-        # Make request to Kiro API (for both streaming and non-streaming modes)
-        # Important: we wait for Kiro response BEFORE returning StreamingResponse,
-        # so that 200 OK means Kiro accepted the request and started responding
-        response = await http_client.request_with_retry("POST", url, kiro_payload, stream=True, retry_rate_limits=False)
-
-        if response.status_code != 200:
-            try:
-                error_content = await response.aread()
-            except Exception:
-                error_content = b"Unknown error"
-
-            await http_client.close()
-            error_text = error_content.decode("utf-8", errors="replace")
-
-            # Try to parse JSON response from Kiro to extract error message
-            error_message = error_text
-            try:
-                error_json = json.loads(error_text)
-                # Enhance Kiro API errors with user-friendly messages
-                from kiro.kiro_errors import enhance_kiro_error
-
-                error_info = enhance_kiro_error(error_json)
-                error_message = error_info.user_message
-                # Log original error for debugging
-                logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-            # Log access log for error (before flush, so it gets into app_logs)
-            logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}")
-
-            # Flush debug logs on error ("errors" mode)
-            if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
-
-            # Return error in OpenAI API format
-            return JSONResponse(
-                status_code=response.status_code,
-                content={"error": {"message": error_message, "type": "kiro_api_error", "code": response.status_code}},
-            )
-
-        # Prepare data for fallback token counting
-        # Convert Pydantic models to dicts for tokenizer
-        messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-        tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
-
-        if request_data.stream:
-            # Streaming mode with first token retry
-            async def stream_wrapper():
-                streaming_error = None
-                client_disconnected = False
-                try:
-                    # Create retry request function for retries
-                    async def make_retry_request():
-                        return await http_client.request_with_retry(
-                            "POST", url, kiro_payload, stream=True, retry_rate_limits=False
-                        )
-
-                    # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry(
-                        make_request=make_retry_request,
-                        client=http_client.client,
-                        model=request_data.model,
-                        model_cache=model_cache,
-                        auth_manager=auth_manager,
-                        initial_response=response,
-                        request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer,
-                        include_reasoning=request_data.include_reasoning,
-                        parallel_tool_calls=request_data.parallel_tool_calls is not False,
-                    ):
-                        yield chunk
-                except GeneratorExit:
-                    # Client disconnected - this is normal
-                    client_disconnected = True
-                    logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
-                except Exception as e:
-                    streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
-                    try:
-                        yield "data: [DONE]\n\n"
-                    except Exception:
-                        pass  # Client already disconnected
-                    raise
-                finally:
-                    await http_client.close()
-                    # Log access log for streaming (success or error)
-                    if streaming_error:
-                        error_type = type(streaming_error).__name__
-                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                        logger.error(
-                            f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}"
-                        )
-                    elif client_disconnected:
-                        logger.info("HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
-                    else:
-                        logger.info("HTTP 200 - POST /v1/chat/completions (streaming) - completed")
-                    # Write debug logs AFTER streaming completes
-                    if debug_logger:
-                        if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
-                        else:
-                            debug_logger.discard_buffers()
-
-            return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
-
-        else:
-            # Non-streaming mode - collect entire response
-            client = http_client.client
-            assert client is not None
-            openai_response = await collect_stream_response(
-                client,
-                response,
-                request_data.model,
-                model_cache,
-                auth_manager,
-                request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer,
-                include_reasoning=request_data.include_reasoning,
-                parallel_tool_calls=request_data.parallel_tool_calls is not False,
-            )
-
-            await http_client.close()
-
-            # Log access log for non-streaming success
-            logger.info("HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
-
-            # Write debug logs after non-streaming request completes
-            if debug_logger:
-                debug_logger.discard_buffers()
-
-            return JSONResponse(content=openai_response)
-
-    except HTTPException as e:
-        await http_client.close()
-
-        # Network errors (502/504 from request_with_retry) = RECOVERABLE
-        # In legacy mode, we still log them but re-raise (no failover available)
-        if e.status_code in (502, 504):
-            logger.warning("Network error (legacy mode, no failover available)")
-
-        # Log access log for HTTP error
-        logger.error(f"HTTP {e.status_code} - POST /v1/chat/completions - {e.detail}")
-        # Flush debug logs on HTTP error ("errors" mode)
-        if debug_logger:
-            debug_logger.flush_on_error(e.status_code, str(e.detail))
-        raise
-    except Exception as e:
-        await http_client.close()
-        logger.error(f"Internal error: {e}", exc_info=True)
-        # Log access log for internal error
-        logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
-        # Flush debug logs on internal error ("errors" mode)
-        if debug_logger:
-            debug_logger.flush_on_error(500, str(e))
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")

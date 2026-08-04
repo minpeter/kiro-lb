@@ -142,10 +142,7 @@ def _preamble() -> Iterator[str]:
 
 
 def _request_metrics(conn: Any, known: frozenset[str]) -> Iterator[str]:
-    rows = conn.execute(
-        "SELECT route, model, status_code, COUNT(*) AS requests, COALESCE(SUM(latency_ms), 0) AS latency_ms"
-        " FROM request_logs GROUP BY route, model, status_code"
-    ).fetchall()
+    rows = conn.execute("SELECT route, model, status_code, requests FROM request_metric_rollups").fetchall()
     # Re-aggregated in Python rather than SQL: several raw model names collapse
     # into the same label, and emitting one line per raw name would repeat a
     # series, which Prometheus rejects as a duplicate.
@@ -159,10 +156,7 @@ def _request_metrics(conn: Any, known: frozenset[str]) -> Iterator[str]:
 
     # Latency is summed separately: it has no status_class dimension, because a
     # rejected request's latency says nothing about generation speed.
-    latency = conn.execute(
-        "SELECT route, model, COUNT(*) AS requests, COALESCE(SUM(latency_ms), 0) AS latency_ms"
-        " FROM request_logs WHERE status_code BETWEEN 200 AND 399 GROUP BY route, model"
-    ).fetchall()
+    latency = conn.execute("SELECT route, model, requests, latency_ms FROM request_latency_rollups").fetchall()
     timed: dict[tuple[str, str], tuple[int, int]] = {}
     for row in latency:
         timed_key = (_model(row["model"], known), _protocol(row["route"]))

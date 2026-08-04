@@ -126,6 +126,18 @@ def setup_test_environment(tmp_path_factory):
     print("🧹 Test environment cleaned up")
 
 
+@pytest.fixture(autouse=True)
+def isolate_gateway_store(setup_test_environment):
+    """Give each test a clean gateway partition in the shared dashboard DB."""
+    from kiro.store import connection, initialize
+
+    initialize()
+    with connection() as conn:
+        conn.execute("DELETE FROM account_sources")
+        conn.execute("DELETE FROM account_runtime")
+        conn.execute("DELETE FROM store_migrations")
+
+
 @pytest.fixture
 def mock_env_vars(monkeypatch):
     """

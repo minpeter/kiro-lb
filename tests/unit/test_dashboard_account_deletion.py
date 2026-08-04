@@ -6,16 +6,17 @@ import asyncio
 import importlib
 import json
 import sqlite3
-from contextlib import contextmanager
 from pathlib import Path
-from typing import ContextManager, Iterator, Protocol
+from typing import Iterator, Protocol
 
 import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
 import kiro.dashboard as dashboard_module
+import kiro.store as store
 from kiro.account_manager import AccountManager, account_label
+from kiro.store import connection, load_account_sources, load_runtime_state, replace_account_sources
 
 JSONValue = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
 Metadata = dict[str, list[tuple[object, ...]]]
@@ -23,9 +24,6 @@ Metadata = dict[str, list[tuple[object, ...]]]
 
 class DashboardModule(Protocol):
     router: APIRouter
-    _sessions: dict[str, float]
-
-    def _db(self) -> ContextManager[sqlite3.Connection]: ...
 
     def initialize_dashboard_store(self) -> None: ...
 
@@ -37,7 +35,6 @@ def dashboard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Dashb
     importlib.reload(dashboard_module)
     dashboard_module.initialize_dashboard_store()
     yield dashboard_module
-    dashboard_module._sessions.clear()
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -53,6 +50,8 @@ def _manager_for_entries(
     state_file = tmp_path / "state.json"
     _write_json(credentials_file, entries)
     monkeypatch.setenv("ACCOUNTS_CONFIG_FILE", str(credentials_file))
+    with connection() as conn:
+        replace_account_sources(entries, conn)
     manager = AccountManager(str(credentials_file), str(state_file))
     asyncio.run(manager.load_credentials())
     return manager, credentials_file, state_file
@@ -135,9 +134,9 @@ def _metadata(dashboard: DashboardModule) -> Metadata:
 
 
 def _mutation_snapshot(
-    dashboard: DashboardModule, manager: AccountManager, credentials_file: Path
-) -> tuple[JSONValue, tuple[str, ...], Metadata]:
-    return (_parsed(credentials_file), tuple(manager._accounts), _metadata(dashboard))
+    dashboard: DashboardModule, manager: AccountManager
+) -> tuple[object, object, tuple[str, ...], Metadata]:
+    return load_account_sources(), load_runtime_state(), tuple(manager._accounts), _metadata(dashboard)
 
 
 def test_account_listing_requires_dashboard_auth(
@@ -172,7 +171,7 @@ def test_delete_requires_dashboard_session_not_data_plane_bearer(
 ) -> None:
     manager, credentials_file, _, sources = _direct_manager(tmp_path, monkeypatch, ("target", "survivor"))
     target_id = str(sources["target"].resolve())
-    before = _mutation_snapshot(dashboard, manager, credentials_file)
+    before = _mutation_snapshot(dashboard, manager)
 
     with _client(dashboard, manager) as client:
         response = client.delete(
@@ -181,7 +180,7 @@ def test_delete_requires_dashboard_session_not_data_plane_bearer(
         )
 
     assert response.status_code == 401
-    assert _mutation_snapshot(dashboard, manager, credentials_file) == before
+    assert _mutation_snapshot(dashboard, manager) == before
 
 
 def test_metadata_deletion_failure_rolls_back_pool_and_allows_retry(
@@ -194,13 +193,13 @@ def test_metadata_deletion_failure_rolls_back_pool_and_allows_retry(
     asyncio.run(manager._save_state())
     manager._dirty = False
     before = (
-        _parsed(credentials_file),
-        _parsed(state_file),
+        load_account_sources(),
+        load_runtime_state(),
         tuple(manager._accounts),
         manager._dirty,
         _metadata(dashboard),
     )
-    original_db = dashboard._db
+    original_connection = store.connection
 
     class FailingDeleteConnection:
         def __init__(self, conn: sqlite3.Connection):
@@ -211,12 +210,14 @@ def test_metadata_deletion_failure_rolls_back_pool_and_allows_retry(
                 raise sqlite3.OperationalError("injected metadata deletion failure")
             return self._conn.execute(sql, parameters)
 
+    from contextlib import contextmanager
+
     @contextmanager
-    def failing_db() -> Iterator[FailingDeleteConnection]:
-        with original_db() as conn:
+    def failing_connection() -> Iterator[FailingDeleteConnection]:
+        with original_connection() as conn:
             yield FailingDeleteConnection(conn)
 
-    monkeypatch.setattr(dashboard, "_db", failing_db)
+    monkeypatch.setattr(store, "connection", failing_connection)
 
     with _client(dashboard, manager) as client:
         _login(client)
@@ -224,21 +225,21 @@ def test_metadata_deletion_failure_rolls_back_pool_and_allows_retry(
             client.delete(f"/api/dashboard/accounts/{account_label(target_id)}")
 
         assert (
-            _parsed(credentials_file),
-            _parsed(state_file),
+            load_account_sources(),
+            load_runtime_state(),
             tuple(manager._accounts),
             manager._dirty,
             _metadata(dashboard),
         ) == before
 
-        monkeypatch.setattr(dashboard, "_db", original_db)
+        monkeypatch.setattr(store, "connection", original_connection)
         retry = client.delete(f"/api/dashboard/accounts/{account_label(target_id)}")
 
     assert retry.status_code == 200
     assert retry.json() == {"ok": True}
-    assert _parsed(credentials_file) == [{"type": "json", "path": str(sources["survivor"])}]
+    assert load_account_sources() == [{"type": "json", "path": str(sources["survivor"])}]
     assert tuple(manager._accounts) == (survivor_id,)
-    state = _parsed(state_file)
+    state = load_runtime_state()
     assert isinstance(state, dict)
     accounts = state["accounts"]
     assert isinstance(accounts, dict)
@@ -265,7 +266,7 @@ def test_authenticated_delete_returns_only_ok_and_clears_target_metadata(
     assert set(response.json()) == {"ok"}
     assert target_id not in response.text
     assert str(sources["target"]) not in response.text
-    assert _parsed(credentials_file) == [{"type": "json", "path": str(sources["survivor"])}]
+    assert load_account_sources() == [{"type": "json", "path": str(sources["survivor"])}]
     assert tuple(manager._accounts) == (survivor_id,)
     assert sources["target"].is_file()
 
@@ -287,14 +288,14 @@ def test_unknown_or_malformed_label_is_404_without_mutation(
 ) -> None:
     manager, credentials_file, _, sources = _direct_manager(tmp_path, monkeypatch, ("target", "survivor"))
     _seed_metadata(dashboard, str(sources["target"].resolve()), str(sources["survivor"].resolve()))
-    before = _mutation_snapshot(dashboard, manager, credentials_file)
+    before = _mutation_snapshot(dashboard, manager)
 
     with _client(dashboard, manager) as client:
         _login(client)
         response = client.delete(f"/api/dashboard/accounts/{opaque_label}")
 
     assert response.status_code == 404
-    assert _mutation_snapshot(dashboard, manager, credentials_file) == before
+    assert _mutation_snapshot(dashboard, manager) == before
 
 
 def test_repeated_delete_is_404_and_does_not_mutate_survivor(
@@ -308,12 +309,12 @@ def test_repeated_delete_is_404_and_does_not_mutate_survivor(
     with _client(dashboard, manager) as client:
         _login(client)
         first = client.delete(f"/api/dashboard/accounts/{account_label(target_id)}")
-        after_first = _mutation_snapshot(dashboard, manager, credentials_file)
+        after_first = _mutation_snapshot(dashboard, manager)
         second = client.delete(f"/api/dashboard/accounts/{account_label(target_id)}")
 
     assert first.status_code == 200
     assert second.status_code == 404
-    assert _mutation_snapshot(dashboard, manager, credentials_file) == after_first
+    assert _mutation_snapshot(dashboard, manager) == after_first
 
 
 def test_last_direct_account_is_not_deletable_and_delete_is_409_without_mutation(
@@ -322,7 +323,7 @@ def test_last_direct_account_is_not_deletable_and_delete_is_409_without_mutation
     manager, credentials_file, _, sources = _direct_manager(tmp_path, monkeypatch, ("only",))
     only_id = str(sources["only"].resolve())
     _seed_metadata(dashboard, only_id)
-    before = _mutation_snapshot(dashboard, manager, credentials_file)
+    before = _mutation_snapshot(dashboard, manager)
 
     with _client(dashboard, manager) as client:
         _login(client)
@@ -332,7 +333,7 @@ def test_last_direct_account_is_not_deletable_and_delete_is_409_without_mutation
     assert listing.status_code == 200
     assert listing.json()["accounts"][0]["deletable"] is False
     assert response.status_code == 409
-    assert _mutation_snapshot(dashboard, manager, credentials_file) == before
+    assert _mutation_snapshot(dashboard, manager) == before
     assert sources["only"].is_file()
 
 
@@ -356,7 +357,7 @@ def test_directory_scanned_account_is_not_deletable_and_delete_is_409_without_mu
     scanned_id = str(scanned_source.resolve())
     direct_id = str(direct_source.resolve())
     _seed_metadata(dashboard, scanned_id, direct_id)
-    before = _mutation_snapshot(dashboard, manager, credentials_file)
+    before = _mutation_snapshot(dashboard, manager)
 
     with _client(dashboard, manager) as client:
         _login(client)
@@ -368,7 +369,7 @@ def test_directory_scanned_account_is_not_deletable_and_delete_is_409_without_mu
     assert accounts[account_label(scanned_id)]["deletable"] is False
     assert accounts[account_label(direct_id)]["deletable"] is True
     assert response.status_code == 409
-    assert _mutation_snapshot(dashboard, manager, credentials_file) == before
+    assert _mutation_snapshot(dashboard, manager) == before
     assert scanned_source.is_file()
     assert direct_source.is_file()
 

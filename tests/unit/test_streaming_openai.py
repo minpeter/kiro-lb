@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro.sse_validation import StreamProtocolError
 from kiro.streaming_core import KiroEvent
 from kiro.streaming_openai import (
     FirstTokenTimeoutError,
@@ -66,6 +67,24 @@ def mock_response():
 
 class TestStreamKiroToOpenai:
     """Tests for stream_kiro_to_openai() generator."""
+
+    @pytest.mark.asyncio
+    async def test_immediate_eof_has_no_done_marker(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            return
+            yield  # Make it an async generator.
+
+        chunks = []
+        with patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream):
+            with pytest.raises(StreamProtocolError, match="before any events"):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        assert "data: [DONE]\n\n" not in chunks
 
     @pytest.mark.asyncio
     async def test_yields_content_chunks(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
@@ -966,12 +985,12 @@ class TestStreamingOpenaiErrorHandling:
         print("✓ FirstTokenTimeoutError propagated correctly")
 
     @pytest.mark.asyncio
-    async def test_handles_generator_exit_gracefully(
+    async def test_propagates_generator_exit(
         self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
     ):
         """
-        What it does: Handles GeneratorExit gracefully without re-raising.
-        Goal: Verify client disconnect is handled without error.
+        What it does: Propagates GeneratorExit after cleanup.
+        Goal: Prevent an incomplete stream from being reported as successful.
         """
         print("Setup: Mock stream that raises GeneratorExit...")
 
@@ -980,21 +999,17 @@ class TestStreamingOpenaiErrorHandling:
             raise GeneratorExit()
 
         print("Action: Streaming to OpenAI format with GeneratorExit...")
-        chunks = []
-
         with patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream):
             with patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=[]):
-                # GeneratorExit is caught internally and not re-raised
-                # This is correct behavior - client disconnect should be handled gracefully
-                async for chunk in stream_kiro_to_openai(
-                    mock_http_client, mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
-                ):
-                    chunks.append(chunk)
+                with pytest.raises(GeneratorExit):
+                    async for _chunk in stream_kiro_to_openai(
+                        mock_http_client, mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        pass
 
-        print(f"Received {len(chunks)} chunks before disconnect")
         # Response should be closed
-        mock_response.aclose.assert_called()
-        print("✓ GeneratorExit handled gracefully")
+        mock_response.aclose.assert_awaited_once()
+        print("✓ GeneratorExit propagated after cleanup")
 
     @pytest.mark.asyncio
     async def test_propagates_other_exceptions(

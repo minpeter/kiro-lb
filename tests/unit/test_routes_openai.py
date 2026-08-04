@@ -1374,6 +1374,30 @@ class TestChatCompletionsLegacyMode:
     """Tests for legacy mode (ACCOUNT_SYSTEM=false) in /v1/chat/completions."""
 
     @pytest.mark.asyncio
+    async def test_legacy_uninitialized_account_is_selected_once_without_failover(self):
+        from kiro.models_openai import ChatCompletionRequest
+        from kiro.routes_openai import chat_completions
+
+        account = Mock(auth_manager=None)
+        manager = Mock()
+        manager._accounts = {"legacy": account}
+        manager.get_first_account.return_value = account
+        request = Mock()
+        request.app.state.account_system = False
+        request.app.state.account_manager = manager
+        request_data = ChatCompletionRequest(
+            model="claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}], stream=False
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await chat_completions(request, request_data)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == "No initialized accounts available"
+        manager.get_first_account.assert_called_once_with()
+        manager.get_next_account.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_chat_completions_legacy_get_first_account(self):
         """
         What it does: Verifies legacy mode uses get_first_account().
