@@ -1078,6 +1078,41 @@ class TestWebSearchAutoInjection:
 class TestWebSearchNativeDetection:
     """Tests for native Anthropic server-side tools detection (Path A)."""
 
+    def test_native_tool_gets_query_schema(self):
+        """
+        What it does: Verifies a native server-side web_search tool is given a query schema.
+        Purpose: Kiro receives the tool like any other tool, so an empty schema leaves the
+        model with no query parameter to fill and nothing to intercept mid-stream.
+        """
+        from kiro.models_anthropic import AnthropicTool
+        from kiro.routes_anthropic import normalize_native_web_search_tools
+
+        tools = [AnthropicTool(type="web_search_20250305", name="web_search", max_uses=8)]
+
+        normalize_native_web_search_tools(tools)
+
+        assert tools[0].input_schema == {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Search query"}},
+            "required": ["query"],
+        }
+        assert tools[0].description
+
+    def test_user_defined_tool_is_left_alone(self):
+        """
+        What it does: Verifies normalization does not touch user-defined tools.
+        Purpose: Only tools carrying a web_search type are server-side tools.
+        """
+        from kiro.models_anthropic import AnthropicTool
+        from kiro.routes_anthropic import normalize_native_web_search_tools
+
+        tools = [AnthropicTool(name="get_weather", description="Weather", input_schema={"type": "object"})]
+
+        normalize_native_web_search_tools(tools)
+
+        assert tools[0].input_schema == {"type": "object"}
+        assert tools[0].description == "Weather"
+
     def test_native_tool_type_detection(self):
         """
         What it does: Verifies detection of native server-side tools by type field.

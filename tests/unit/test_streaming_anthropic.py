@@ -473,6 +473,67 @@ class TestStreamKiroToAnthropic:
         print("✓ tool_use block yielded for tool calls")
 
     @pytest.mark.asyncio
+    async def test_web_search_continues_with_followup_model_response(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        followup_response = AsyncMock()
+
+        async def mock_parse_kiro_stream(response, *args, **kwargs):
+            if response is mock_response:
+                yield KiroEvent(type="thinking", thinking_content="I should search")
+                yield KiroEvent(type="thinking_signature", thinking_signature="signature-1")
+                yield KiroEvent(
+                    type="tool_use",
+                    tool_use={
+                        "id": "toolu_search",
+                        "function": {"name": "web_search", "arguments": '{"query":"latest news"}'},
+                    },
+                )
+            else:
+                yield KiroEvent(type="content", content="Final answer after search")
+                yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        search_request = AsyncMock(return_value=followup_response)
+        mcp_call = AsyncMock(
+            return_value=(
+                "srvtoolu_search",
+                {"results": [{"title": "A result", "url": "https://example.test", "snippet": "A snippet"}]},
+            )
+        )
+
+        chunks: list[str] = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
+                with patch("kiro.mcp_tools.call_kiro_mcp_api", mcp_call):
+                    async for chunk in stream_kiro_to_anthropic(
+                        mock_response,
+                        "claude-opus-5",
+                        mock_model_cache,
+                        mock_auth_manager,
+                        make_search_request=search_request,
+                    ):
+                        chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        starts = [event["content_block"] for event in events if event["type"] == "content_block_start"]
+        assert [block["type"] for block in starts] == [
+            "thinking",
+            "server_tool_use",
+            "web_search_tool_result",
+            "text",
+        ]
+        assert [event["delta"]["text"] for event in events if event.get("delta", {}).get("type") == "text_delta"] == [
+            "Final answer after search"
+        ]
+        message_delta = next(event for event in events if event["type"] == "message_delta")
+        assert message_delta["delta"]["stop_reason"] == "end_turn"
+        assert all("<web_search>" not in event["delta"].get("text", "") for event in events if "delta" in event)
+        search_request.assert_awaited_once()
+        assert search_request.await_args.args[:2] == ("toolu_search", "latest news")
+        assert mcp_call.await_count == 1
+        assert_valid_content_event_order(events)
+
+    @pytest.mark.asyncio
     async def test_yields_message_delta_with_stop_reason(self, mock_response, mock_model_cache, mock_auth_manager):
         """
         What it does: Yields message_delta with stop_reason.
@@ -678,6 +739,73 @@ class TestCollectAnthropicResponse:
         assert result["content"][0]["type"] == "text"
         assert result["content"][0]["text"] == "Hello, world!"
         print("✓ Text content collected correctly")
+
+    @pytest.mark.asyncio
+    async def test_collects_web_search_followup_response(self, mock_response, mock_model_cache, mock_auth_manager):
+        followup_response = AsyncMock()
+        first_result = StreamResult(
+            content="Before search",
+            thinking_content="",
+            tool_calls=[
+                {
+                    "id": "toolu_search",
+                    "function": {"name": "web_search", "arguments": '{"query":"latest news"}'},
+                }
+            ],
+            usage=None,
+            context_usage_percentage=2.0,
+            stop_reason="TOOL_USE",
+            content_blocks=[
+                {"type": "text", "text": "Before search"},
+                {
+                    "type": "tool_use",
+                    "tool": {
+                        "id": "toolu_search",
+                        "function": {"name": "web_search", "arguments": '{"query":"latest news"}'},
+                    },
+                },
+            ],
+        )
+        second_result = StreamResult(
+            content="Final answer after search",
+            thinking_content="",
+            tool_calls=[],
+            usage=None,
+            context_usage_percentage=5.0,
+            stop_reason="END_TURN",
+            content_blocks=[{"type": "text", "text": "Final answer after search"}],
+        )
+        search_request = AsyncMock(return_value=followup_response)
+        mcp_call = AsyncMock(
+            return_value=(
+                "srvtoolu_search",
+                {"results": [{"title": "A result", "url": "https://example.test", "snippet": "A snippet"}]},
+            )
+        )
+
+        with patch("kiro.streaming_anthropic.collect_stream_to_result", side_effect=[first_result, second_result]):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", mcp_call):
+                result = await collect_anthropic_response(
+                    mock_response,
+                    "claude-sonnet-4",
+                    mock_model_cache,
+                    mock_auth_manager,
+                    make_search_request=search_request,
+                )
+
+        assert [block["type"] for block in result["content"]] == [
+            "text",
+            "server_tool_use",
+            "web_search_tool_result",
+            "text",
+        ]
+        assert [block["text"] for block in result["content"] if block["type"] == "text"] == [
+            "Before search",
+            "Final answer after search",
+        ]
+        assert result["stop_reason"] == "end_turn"
+        assert search_request.await_args.args[:2] == ("toolu_search", "latest news")
+        assert mcp_call.await_count == 1
 
     @pytest.mark.asyncio
     async def test_collects_native_thinking_signature(self, mock_response, mock_model_cache, mock_auth_manager):

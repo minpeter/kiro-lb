@@ -15,7 +15,7 @@ Reference: https://docs.anthropic.com/en/api/messages-streaming
 
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 from loguru import logger
@@ -122,6 +122,7 @@ async def stream_kiro_to_anthropic(
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
     conversation_id: Optional[str] = None,
+    make_search_request: Optional[Callable[[str, str, str], Awaitable[httpx.Response]]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -187,6 +188,23 @@ async def stream_kiro_to_anthropic(
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
     upstream_cache_usage: Dict[str, int] = {}
+    current_response = response
+    pending_response: Optional[httpx.Response] = None
+
+    async def iter_events() -> AsyncGenerator[Any, None]:
+        nonlocal current_response, pending_response
+
+        while True:
+            async for next_event in parse_kiro_stream(current_response, first_token_timeout):
+                yield next_event
+                if pending_response is not None:
+                    previous_response = current_response
+                    current_response = pending_response
+                    pending_response = None
+                    await previous_response.aclose()
+                    break
+            else:
+                break
 
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
@@ -249,7 +267,7 @@ async def stream_kiro_to_anthropic(
 
     begin_anthropic_stream()
     try:
-        async for event in parse_kiro_stream(response, first_token_timeout):
+        async for event in iter_events():
             if not message_started:
                 yield format_sse_event("message_start", message_start_data)
                 message_started = True
@@ -407,18 +425,18 @@ async def stream_kiro_to_anthropic(
                     query = tool_input.get("query", "")
                     if not query:
                         logger.warning("web_search called without query, skipping MCP call")
-                        continue
+                        mcp_tool_use_id, results = None, None
+                    elif make_search_request is None:
+                        logger.debug("web_search interception is unavailable; forwarding the tool call")
+                        mcp_tool_use_id, results = None, None
+                    else:
+                        logger.debug(f"WebSearch query (Path B): {query}")
+                        mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
 
-                    logger.debug(f"WebSearch query (Path B): {query}")
-
-                    # Call MCP API
-                    mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
-
-                    if results is None:
+                    if results is None or make_search_request is None:
                         logger.error("MCP API call failed for web_search")
                         # Continue with normal tool_use processing (will show error to user)
                     else:
-                        # Emit server_tool_use + web_search_tool_result + text summary
                         # (full SSE sequence as in mcp_tools.py)
 
                         # Event: content_block_start (server_tool_use)
@@ -484,37 +502,11 @@ async def stream_kiro_to_anthropic(
                         )
                         current_block_index += 1
 
-                        # Event: content_block_start (text)
-                        yield format_sse_event(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": current_block_index,
-                                "content_block": {"type": "text", "text": ""},
-                            },
-                        )
-
-                        # Events: content_block_delta (text_delta) - stream summary
                         summary = generate_search_summary(query, results)
-                        chunk_size = 100
-                        for i in range(0, len(summary), chunk_size):
-                            chunk = summary[i : i + chunk_size]
-                            yield format_sse_event(
-                                "content_block_delta",
-                                {
-                                    "type": "content_block_delta",
-                                    "index": current_block_index,
-                                    "delta": {"type": "text_delta", "text": chunk},
-                                },
-                            )
-
-                        # Event: content_block_stop (text)
-                        yield format_sse_event(
-                            "content_block_stop", {"type": "content_block_stop", "index": current_block_index}
-                        )
-                        current_block_index += 1
-
-                        # Skip normal tool_use processing
+                        pending_response = await make_search_request(tool_id, query, summary)
+                        upstream_stop_reason = None
+                        context_usage_percentage = None
+                        upstream_cache_usage = {}
                         continue
 
                 # Check if this tool was truncated
@@ -727,7 +719,7 @@ async def stream_kiro_to_anthropic(
     finally:
         end_anthropic_stream()
         try:
-            await response.aclose()
+            await current_response.aclose()
         except Exception as close_error:
             logger.debug(f"Error closing response: {close_error}")
 
@@ -740,6 +732,7 @@ async def collect_anthropic_response(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
+    make_search_request: Optional[Callable[[str, str, str], Awaitable[httpx.Response]]] = None,
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -775,28 +768,97 @@ async def collect_anthropic_response(
         )
         input_tokens = request_token_stats["total_tokens"]
 
-    # Collect stream result
     result = await collect_stream_to_result(response)
-    upstream_cache_usage = _extract_cache_usage_fields(result.usage)
+    native_blocks: List[Dict[str, Any]] = []
+    accumulated_content = ""
+    accumulated_thinking = ""
 
-    native_blocks = list(result.content_blocks)
-    if not native_blocks:
-        if result.thinking_content:
-            native_blocks.append(
+    while True:
+        accumulated_content += result.content
+        accumulated_thinking += result.thinking_content
+        result_blocks = list(result.content_blocks)
+        if not result_blocks:
+            if result.thinking_content:
+                result_blocks.append(
+                    {
+                        "type": "thinking",
+                        "thinking": result.thinking_content,
+                        "signature": result.thinking_signature,
+                    }
+                )
+            if result.content:
+                result_blocks.append(
+                    {
+                        "type": "text",
+                        "text": result.content,
+                    }
+                )
+            result_blocks.extend({"type": "tool_use", "tool": tool_call} for tool_call in result.tool_calls)
+
+        search_index = next(
+            (
+                index
+                for index, block in enumerate(result_blocks)
+                if block.get("type") == "tool_use"
+                and (block.get("tool", {}).get("function", {}).get("name", "") or block.get("tool", {}).get("name", ""))
+                == "web_search"
+            ),
+            None,
+        )
+        if make_search_request is None or search_index is None:
+            native_blocks.extend(result_blocks)
+            break
+
+        search_tool = result_blocks[search_index]["tool"]
+        tool_id = search_tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+        tool_input = search_tool.get("function", {}).get("arguments", {}) or search_tool.get("input", {})
+        if isinstance(tool_input, str):
+            try:
+                tool_input = json.loads(tool_input)
+            except json.JSONDecodeError:
+                raise StreamProtocolError("Malformed upstream tool input")
+        query = tool_input.get("query", "") if isinstance(tool_input, dict) else ""
+        if not query:
+            native_blocks.extend(result_blocks)
+            break
+
+        from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
+
+        mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
+        if results is None:
+            native_blocks.extend(result_blocks)
+            break
+
+        native_blocks.extend(block for index, block in enumerate(result_blocks) if index != search_index)
+        search_content = [
+            {
+                "type": "web_search_result",
+                "title": search_result.get("title", ""),
+                "url": search_result.get("url", ""),
+                "encrypted_content": search_result.get("snippet", ""),
+                "page_age": None,
+            }
+            for search_result in results.get("results", [])
+        ]
+        native_blocks.extend(
+            [
                 {
-                    "type": "thinking",
-                    "thinking": result.thinking_content,
-                    "signature": result.thinking_signature,
-                }
-            )
-        if result.content:
-            native_blocks.append(
+                    "type": "server_tool_use",
+                    "id": mcp_tool_use_id,
+                    "name": "web_search",
+                    "input": {"query": query},
+                },
                 {
-                    "type": "text",
-                    "text": result.content,
-                }
-            )
-        native_blocks.extend({"type": "tool_use", "tool": tool_call} for tool_call in result.tool_calls)
+                    "type": "web_search_tool_result",
+                    "tool_use_id": mcp_tool_use_id,
+                    "content": search_content,
+                },
+            ]
+        )
+        followup_response = await make_search_request(tool_id, query, generate_search_summary(query, results))
+        result = await collect_stream_to_result(followup_response)
+
+    upstream_cache_usage = _extract_cache_usage_fields(result.usage)
 
     content_blocks = []
     for native_block in native_blocks:
@@ -816,6 +878,9 @@ async def collect_anthropic_response(
                     "text": native_block["text"],
                 }
             )
+            continue
+        if native_block["type"] in {"server_tool_use", "web_search_tool_result"}:
+            content_blocks.append(native_block)
             continue
 
         tool_call = native_block["tool"]
@@ -837,7 +902,7 @@ async def collect_anthropic_response(
         )
 
     # Calculate output tokens
-    output_tokens = count_tokens(result.content + result.thinking_content, model=model)
+    output_tokens = count_tokens(accumulated_content + accumulated_thinking, model=model)
 
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:
@@ -864,9 +929,10 @@ async def collect_anthropic_response(
 
     # Prefer the reason the upstream actually reported.
     upstream_mapped = to_anthropic_stop_reason(result.stop_reason)
+    has_tool_blocks = any(block.get("type") == "tool_use" for block in native_blocks)
     if content_was_truncated or is_truncated(result.stop_reason):
         stop_reason = "max_tokens"
-    elif upstream_mapped == "tool_use" or result.tool_calls:
+    elif upstream_mapped == "tool_use" or result.tool_calls or has_tool_blocks:
         stop_reason = "tool_use"
     elif upstream_mapped:
         stop_reason = upstream_mapped
@@ -907,6 +973,7 @@ async def stream_with_first_token_retry_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
+    make_search_request: Optional[Callable[[str, str, str], Awaitable[httpx.Response]]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -970,6 +1037,7 @@ async def stream_with_first_token_retry_anthropic(
             request_messages=request_messages,
             request_tools=request_tools,
             request_system=request_system,
+            make_search_request=make_search_request,
         ):
             yield chunk
 
