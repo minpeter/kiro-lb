@@ -293,11 +293,11 @@ class AccountManager:
     Manages multiple Kiro accounts with intelligent failover.
 
     Responsibilities:
-    - Load credentials from credentials.json
+    - Load account sources from the private SQLite store
     - Lazy initialization of accounts
     - Select next available account (Circuit Breaker + Sticky)
     - Track statistics and failures
-    - Persist state to state.json
+    - Persist runtime state to the private SQLite store
 
     Example:
         >>> manager = AccountManager("credentials.json", "state.json")
@@ -311,15 +311,36 @@ class AccountManager:
         """
         Initialize AccountManager.
 
+        Direct construction remains backwards compatible with the legacy JSON
+        files. The one-time import also checks the account-deletion recovery
+        record before completing its marker, so an interrupted deletion cannot
+        be mistaken for the source of truth.
+
         Args:
-            credentials_file: Path to credentials.json
-            state_file: Path to state.json
+            credentials_file: Legacy credentials.json import path
+            state_file: Legacy state.json import path
         """
+        from kiro.store import import_legacy_files
+
+        credentials_path = Path(credentials_file).expanduser()
+        recovery_file = str(credentials_path.with_name(f"{credentials_path.name}.account-deletion-recovery"))
+        try:
+            import_legacy_files(credentials_file, state_file, recovery_file)
+        except Exception as e:
+            # Preserve the old manager contract for malformed optional files.
+            # The import transaction rolls back, leaving its marker incomplete
+            # so corrected files (or a recovery record) can be retried later.
+            logger.error(f"Failed to import legacy account files: {e}")
+
         self._credentials_file = credentials_file
         self._state_file = state_file
         self._accounts: Dict[str, Account] = {}
         self._model_to_accounts: Dict[str, ModelAccountList] = {}
         self._lock = asyncio.Lock()
+        # Slow credential/model I/O must never hold the routing lock.  Tasks are
+        # per account so concurrent selectors share one initialization/refresh.
+        self._initializations: Dict[str, asyncio.Task[bool]] = {}
+        self._model_refreshes: Dict[str, asyncio.Task[None]] = {}
         self._dirty = False
         self._credentials_config: List[Dict] = []
         self._current_account_index: int = 0  # GLOBAL sticky index for all models
@@ -331,29 +352,21 @@ class AccountManager:
 
     async def load_credentials(self) -> None:
         """Load credentials while serializing durable rollback recovery."""
-        from kiro.accounts_admin import recover_pending_account_deletion_files
-
         async with self._lock:
-            recover_pending_account_deletion_files(self)
             await self._load_credentials_unlocked()
 
     async def _load_credentials_unlocked(self) -> None:
         """
-        Load credentials from credentials.json.
+        Load account sources from the private SQLite store.
 
         The caller must hold ``_lock``. Validates each entry and creates
         Account objects; invalid entries are skipped with warnings and folders
         are scanned for credential files.
         """
-        creds_path = Path(self._credentials_file).expanduser()
-
-        if not creds_path.exists():
-            logger.warning(f"Credentials file not found: {self._credentials_file}")
-            return
-
         try:
-            with open(creds_path, "r", encoding="utf-8") as f:
-                self._credentials_config = json.load(f)
+            from kiro.store import load_account_sources
+
+            self._credentials_config = load_account_sources()
         except Exception as e:
             logger.error(f"Failed to load credentials: {e}")
             return
@@ -391,6 +404,12 @@ class AccountManager:
                 self._accounts[account_id] = Account(id=account_id)
                 logger.debug(f"Added account: {account_id}")
                 continue  # Skip path processing for refresh_token
+
+            if cred_type == "internal":
+                account_id = str(entry.get("id", ""))
+                if account_id:
+                    self._accounts[account_id] = Account(id=account_id)
+                continue
 
             # Handle folder scanning for json/sqlite types
             assert path is not None
@@ -454,20 +473,18 @@ class AccountManager:
 
     async def load_state(self) -> None:
         """
-        Load runtime state from state.json.
+        Load runtime state from the private SQLite store.
 
         Restores model_to_accounts mapping and account runtime state.
         Creates empty state if file doesn't exist.
         """
-        state_path = Path(self._state_file)
-
-        if not state_path.exists():
-            logger.debug("State file not found, starting with empty state")
-            return
-
         try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                state_data = json.load(f)
+            from kiro.store import load_runtime_state
+
+            state_data = load_runtime_state()
+            if state_data is None:
+                logger.debug("No persisted account runtime state")
+                return
             # Restore global current_account_index
             self._current_account_index = state_data.get("current_account_index", 0)
 
@@ -497,15 +514,54 @@ class AccountManager:
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
 
+    async def reload_durable_state(self) -> None:
+        """Replace the live pool with the latest durable handoff snapshot."""
+        async with self._lock:
+            self._accounts.clear()
+            self._model_to_accounts.clear()
+            self._current_account_index = 0
+            await self._load_credentials_unlocked()
+            await self.load_state()
+
+    async def flush_for_handoff(self) -> None:
+        """Persist a final routing snapshot while account selection is stopped."""
+        async with self._lock:
+            await self._save_state(raise_errors=True)
+
     async def _save_state(self, *, raise_errors: bool = False) -> bool:
         """
-        Save runtime state to state.json atomically.
+        Save runtime state transactionally in SQLite.
 
         Uses tmp file + rename for atomic write. Background callers keep the
         best-effort default; destructive operations can require an observable
         failure with ``raise_errors=True``.
         """
-        state_data = {
+        state_data = self._state_document()
+
+        try:
+            from kiro.store import save_runtime_state
+
+            written = save_runtime_state(state_data)
+            # Older store implementations returned None after writing. False is
+            # the explicit signal that this process does not own runtime writes.
+            if written is False:
+                message = "Runtime state write skipped: this process is not the active writer"
+                logger.debug(message)
+                if raise_errors:
+                    raise RuntimeError(message)
+                return False
+            logger.debug("State saved successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+            if raise_errors:
+                raise
+            return False
+
+    def _state_document(self) -> Dict:
+        """Return the complete durable runtime state document."""
+        return {
             "current_account_index": self._current_account_index,
             "accounts": {
                 account_id: {
@@ -524,29 +580,6 @@ class AccountManager:
             },
             "model_to_accounts": {model: {"accounts": mal.accounts} for model, mal in self._model_to_accounts.items()},
         }
-
-        state_path = Path(self._state_file)
-        tmp_path = state_path.with_suffix(".json.tmp")
-
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(state_data, f, indent=2, ensure_ascii=False)
-
-            # Atomic rename
-            tmp_path.replace(state_path)
-            logger.debug("State saved successfully")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except OSError as cleanup_error:
-                logger.error(f"Failed to clean up state temp file: {cleanup_error}")
-            if raise_errors:
-                raise
-            return False
 
     def _remove_account_state(self, account_id: str) -> None:
         """Remove one account from live routing and all persisted runtime state.
@@ -611,30 +644,13 @@ class AccountManager:
         Returns:
             True if successful, False otherwise
         """
-        account = self._accounts.get(account_id)
+        async with self._lock:
+            account = self._accounts.get(account_id)
+            creds_config = self._credentials_for_account(account_id)
         if not account:
             return False
 
         try:
-            # Find credentials config for this account
-            creds_config = None
-            for entry in self._credentials_config:
-                path = entry.get("path", "")
-                expanded_path = Path(path).expanduser()
-
-                if entry.get("type") == "refresh_token":
-                    # Match by deterministic hash for refresh_token type
-                    token = entry.get("refresh_token", "")
-                    token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
-                    if account_id == f"refresh_token_{token_hash}":
-                        creds_config = entry
-                        break
-                elif str(expanded_path.resolve()) == account_id or (
-                    expanded_path.is_dir() and account_id.startswith(str(expanded_path.resolve()) + os.sep)
-                ):
-                    creds_config = entry
-                    break
-
             if not creds_config:
                 logger.error(f"No credentials config found for account: {account_id}")
                 return False
@@ -662,12 +678,19 @@ class AccountManager:
                     region=creds_config.get("region", "us-east-1"),
                     api_region=creds_config.get("api_region"),
                 )
+            elif cred_type == "internal":
+                auth_manager = KiroAuthManager(
+                    internal_account_id=account_id,
+                    profile_arn=creds_config.get("profile_arn"),
+                    region=creds_config.get("region", "us-east-1"),
+                    api_region=creds_config.get("api_region"),
+                )
             else:
                 logger.error(f"Unknown credential type: {cred_type}")
                 return False
 
             # Get token to verify credentials
-            token = await auth_manager.get_access_token()
+            await auth_manager.get_access_token()
 
             # Determine if we should fetch models or use static list
             if _is_runtime_endpoint(auth_manager):
@@ -728,27 +751,94 @@ class AccountManager:
                 cache=model_cache, hidden_models=HIDDEN_MODELS, aliases=MODEL_ALIASES, hidden_from_list=HIDDEN_FROM_LIST
             )
 
-            # Update account
-            account.auth_manager = auth_manager
-            account.model_cache = model_cache
-            account.model_resolver = model_resolver
-            account.models_cached_at = time.time()
-
-            # Update model_to_accounts mapping
             available_models = model_resolver.get_available_models()
-            for model in available_models:
-                if model not in self._model_to_accounts:
-                    self._model_to_accounts[model] = ModelAccountList()
-                if account_id not in self._model_to_accounts[model].accounts:
-                    self._model_to_accounts[model].accounts.append(account_id)
+            async with self._lock:
+                # Deletion or source replacement may happen while token/model I/O
+                # is in flight. Never resurrect or initialize the wrong source.
+                if (
+                    self._accounts.get(account_id) is not account
+                    or self._credentials_for_account(account_id) is not creds_config
+                ):
+                    return False
+                account.auth_manager = auth_manager
+                account.model_cache = model_cache
+                account.model_resolver = model_resolver
+                account.models_cached_at = time.time()
+                for model in available_models:
+                    if model not in self._model_to_accounts:
+                        self._model_to_accounts[model] = ModelAccountList()
+                    if account_id not in self._model_to_accounts[model].accounts:
+                        self._model_to_accounts[model].accounts.append(account_id)
+                self._dirty = True
 
             logger.info(f"Initialized account: {account_id} ({len(available_models)} models)")
-            self._dirty = True
             return True
 
         except Exception as e:
             logger.error(f"Failed to initialize account {account_id}: {e}")
             return False
+
+    def _credentials_for_account(self, account_id: str) -> Optional[Dict]:
+        """Find the source that explicitly owns ``account_id``.
+
+        Only file-backed source types participate in path matching; this avoids
+        an internal source with no path resolving to the current directory and
+        accidentally claiming unrelated accounts.
+        """
+        for entry in self._credentials_config:
+            cred_type = entry.get("type")
+            if cred_type == "internal":
+                if str(entry.get("id", "")) == account_id:
+                    return entry
+                continue
+            if cred_type == "refresh_token":
+                token = entry.get("refresh_token")
+                if not isinstance(token, str) or not token:
+                    continue
+                token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
+                if account_id == f"refresh_token_{token_hash}":
+                    return entry
+                continue
+            if cred_type not in ("json", "sqlite") or not entry.get("path"):
+                continue
+            expanded_path = Path(str(entry["path"])).expanduser()
+            resolved = str(expanded_path.resolve())
+            if resolved == account_id or (expanded_path.is_dir() and account_id.startswith(resolved + os.sep)):
+                return entry
+        return None
+
+    async def initialize_account(self, account_id: str) -> bool:
+        """Initialize an account outside the global lock with per-account single-flight."""
+        async with self._lock:
+            account = self._accounts.get(account_id)
+            if account is None:
+                return False
+            if account.auth_manager is not None:
+                return True
+            task = self._initializations.get(account_id)
+            if task is None:
+                task = asyncio.create_task(self._initialize_account(account_id))
+                self._initializations[account_id] = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            async with self._lock:
+                if self._initializations.get(account_id) is task and task.done():
+                    self._initializations.pop(account_id, None)
+
+    async def _refresh_account_models_singleflight(self, account_id: str) -> None:
+        """Refresh one account outside the routing lock, sharing concurrent work."""
+        async with self._lock:
+            task = self._model_refreshes.get(account_id)
+            if task is None:
+                task = asyncio.create_task(self._refresh_account_models(account_id))
+                self._model_refreshes[account_id] = task
+        try:
+            await asyncio.shield(task)
+        finally:
+            async with self._lock:
+                if self._model_refreshes.get(account_id) is task and task.done():
+                    self._model_refreshes.pop(account_id, None)
 
     def _quarantine_if_suspended(self, account_id: str, account: "Account", response: httpx.Response) -> bool:
         """Park an account whose model listing came back as an upstream lock.
@@ -776,36 +866,41 @@ class AccountManager:
         Args:
             account_id: Account ID to refresh
         """
-        account = self._accounts.get(account_id)
-        if not account or not account.auth_manager:
-            return
-
-        # These dependencies are initialized atomically with the auth manager.
-        assert account.model_cache is not None
-        assert account.model_resolver is not None
+        async with self._lock:
+            account = self._accounts.get(account_id)
+            if not account or not account.auth_manager:
+                return
+            auth_manager = account.auth_manager
+            model_cache = account.model_cache
+            model_resolver = account.model_resolver
+        assert model_cache is not None
+        assert model_resolver is not None
 
         # Check if using runtime endpoint (no dynamic model list available)
-        if _is_runtime_endpoint(account.auth_manager):
+        if _is_runtime_endpoint(auth_manager):
             # Runtime endpoint does not provide /ListAvailableModels
             # Use static list and update cache timestamp
             logger.debug(
                 f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)"
             )
-            await account.model_cache.update(FALLBACK_MODELS)
-            account.models_cached_at = time.time()
-            self._dirty = True
+            async with self._lock:
+                if self._accounts.get(account_id) is not account or account.auth_manager is not auth_manager:
+                    return
+                await model_cache.update(FALLBACK_MODELS)
+                account.models_cached_at = time.time()
+                self._dirty = True
             return
 
         # Old endpoint - attempt to fetch dynamic model list
         # Use KiroHttpClient for retry logic
-        http_client = KiroHttpClient(account.auth_manager, shared_client=None)
+        http_client = KiroHttpClient(auth_manager, shared_client=None)
 
         try:
             params = {"origin": "AI_EDITOR"}
-            if account.auth_manager.auth_type == AuthType.KIRO_DESKTOP and account.auth_manager.profile_arn:
-                params["profileArn"] = account.auth_manager.profile_arn
+            if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+                params["profileArn"] = auth_manager.profile_arn
 
-            list_models_url = f"{account.auth_manager.q_host}/ListAvailableModels"
+            list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
 
             response = await http_client.request_with_retry(
                 method="GET", url=list_models_url, json_data=None, params=params, stream=False
@@ -815,23 +910,24 @@ class AccountManager:
                 # A TTL refresh is also an upstream verdict. Without this check a
                 # suspension arriving here was swallowed and the stale cache kept
                 # the locked account advertising models indefinitely.
-                self._quarantine_if_suspended(account_id, account, response)
+                async with self._lock:
+                    if self._accounts.get(account_id) is account and account.auth_manager is auth_manager:
+                        self._quarantine_if_suspended(account_id, account, response)
             else:
                 data = response.json()
                 models_list = data.get("models", [])
-                await account.model_cache.update(models_list)
-                account.models_cached_at = time.time()
-
-                # Update model_to_accounts mapping (new models may have appeared)
-                available_models = account.model_resolver.get_available_models()
-                for model in available_models:
-                    if model not in self._model_to_accounts:
-                        self._model_to_accounts[model] = ModelAccountList()
-                    if account_id not in self._model_to_accounts[model].accounts:
-                        self._model_to_accounts[model].accounts.append(account_id)
-
-                logger.debug(f"Refreshed models for {account_id}")
-                self._dirty = True
+                async with self._lock:
+                    if self._accounts.get(account_id) is not account or account.auth_manager is not auth_manager:
+                        return
+                    await model_cache.update(models_list)
+                    account.models_cached_at = time.time()
+                    for model in model_resolver.get_available_models():
+                        if model not in self._model_to_accounts:
+                            self._model_to_accounts[model] = ModelAccountList()
+                        if account_id not in self._model_to_accounts[model].accounts:
+                            self._model_to_accounts[model].accounts.append(account_id)
+                    self._dirty = True
+                    logger.debug(f"Refreshed models for {account_id}")
 
         except Exception as e:
             # All retries exhausted - keep using stale cache
@@ -861,126 +957,95 @@ class AccountManager:
             Account object or None if no accounts available
         """
         async with self._lock:
-            # Special case: single account - bypass Circuit Breaker
-            # Circuit Breaker is meaningless for single account - user should see real Kiro API errors
-            # instead of generic "Account unavailable" after cooldown kicks in
-            if len(self._accounts) == 1:
-                account_id = list(self._accounts.keys())[0]
-                account = self._accounts[account_id]
-
-                # Skip if already tried in current failover loop
-                if exclude_accounts and account_id in exclude_accounts:
-                    return None
-
-                # Lazy initialization if needed
-                if account.auth_manager is None:
-                    success = await self._initialize_account(account_id)
-                    if not success:
-                        return None
-
-                # Check TTL and refresh if needed
-                if account.models_cached_at > 0:
-                    age = time.time() - account.models_cached_at
-                    if age > ACCOUNT_CACHE_TTL:
-                        try:
-                            await self._refresh_account_models(account_id)
-                        except Exception as e:
-                            logger.warning(f"Failed to refresh models for {account_id}: {e}")
-                # # Validate model availability
-                # if account.model_resolver:
-                #     normalized_model = normalize_model_name(model)
-                #     available_models = account.model_resolver.get_available_models()
-                #     if normalized_model not in available_models:
-                #         return None
-
-                # Always return single account (ignore cooldown/failures)
-                # No model validation - let Kiro API decide (gateway, not gatekeeper)
-                return account
-
-            # Multi-account logic: GLOBAL sticky
-            # ALWAYS start from GLOBAL index (one current account for ALL models)
+            all_account_ids = list(self._accounts)
             start_index = self._current_account_index
+            single_account = len(all_account_ids) == 1
 
-            # ALWAYS iterate over ALL accounts
-            all_account_ids = list(self._accounts.keys())
-
-            for i in range(len(all_account_ids)):
-                current_index = (start_index + i) % len(all_account_ids)
-                account_id = all_account_ids[current_index]
-                account = self._accounts[account_id]
+        for i in range(len(all_account_ids)):
+            account_id = all_account_ids[(start_index + i) % len(all_account_ids)]
+            async with self._lock:
+                account = self._accounts.get(account_id)
+                if account is None:
+                    continue
 
                 # Skip accounts already tried in current failover loop
                 if exclude_accounts and account_id in exclude_accounts:
                     continue
 
-                # An upstream suspension takes the account out of the rotation
-                # completely. No probabilistic retry: the lock is lifted by Kiro
-                # support, never by another request, and each attempt still costs
-                # a full retry storm plus a user-visible failure.
-                if account.suspended_until > time.time():
-                    continue
-
-                # Skip accounts that cannot serve any request. A quota-exhausted
-                # account is out of the rotation entirely until its quarantine
-                # expires: no probabilistic retry, because there is nothing to
-                # discover before the quota resets.
-                if account.quota_exhausted_until > time.time():
-                    continue
-
-                # Skip accounts inside their rate-limit window. This is checked
-                # before the Circuit Breaker and has no probabilistic retry:
-                # retrying a rate-limited account only earns another 429.
-                if account.rate_limited_until > time.time():
-                    continue
-
-                # Check Circuit Breaker (Half-Open state with exponential backoff)
-                if account.failures > 0:
-                    time_since_failure = time.time() - account.last_failure_time
-
-                    # Exponential backoff: base * 2^(failures - 1), capped at MAX_MULTIPLIER
-                    # 1 failure: 60s, 2: 120s, 3: 240s, ..., 12+: 86400s (1 day cap)
-                    backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
-                    effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
-
-                    if time_since_failure < effective_timeout:
-                        # Probabilistic retry (10% chance)
-                        if random.random() > ACCOUNT_PROBABILISTIC_RETRY_CHANCE:
-                            continue
-                        else:
-                            logger.info(f"Probabilistic retry for broken account {account_id}")
-                    else:
-                        # Half-Open: recovery timeout passed
-                        logger.info(
-                            f"Half-Open state for {account_id} (recovery timeout passed, effective={effective_timeout}s)"
-                        )
-
-                # Lazy initialization
-                if account.auth_manager is None:
-                    success = await self._initialize_account(account_id)
-                    if not success:
-                        account.failures += 1
-                        self._dirty = True
+                # A sole account bypasses health policy so callers see the real
+                # upstream error rather than a generic unavailable response.
+                if not single_account:
+                    # An upstream suspension takes the account out of the rotation
+                    # completely. No probabilistic retry: the lock is lifted by Kiro
+                    # support, never by another request, and each attempt still costs
+                    # a full retry storm plus a user-visible failure.
+                    if account.suspended_until > time.time():
                         continue
 
-                # Check TTL and refresh if needed
-                if account.models_cached_at > 0:
-                    age = time.time() - account.models_cached_at
-                    if age > ACCOUNT_CACHE_TTL:
-                        try:
-                            await self._refresh_account_models(account_id)
-                        except Exception as e:
-                            logger.warning(f"Failed to refresh models for {account_id}: {e}")
-                # # Check if model is available on this account
-                # available_models = account.model_resolver.get_available_models()
-                # if normalized_model not in available_models:
-                #     continue
+                    # Skip accounts that cannot serve any request. A quota-exhausted
+                    # account is out of the rotation entirely until its quarantine
+                    # expires: no probabilistic retry, because there is nothing to
+                    # discover before the quota resets.
+                    if account.quota_exhausted_until > time.time():
+                        continue
 
-                # No model validation - let Kiro API decide (gateway, not gatekeeper)
-                # Account is suitable!
-                return account
+                    # Skip accounts inside their rate-limit window. This is checked
+                    # before the Circuit Breaker and has no probabilistic retry:
+                    # retrying a rate-limited account only earns another 429.
+                    if account.rate_limited_until > time.time():
+                        continue
 
-            # All accounts unavailable
-            return None
+                    # Check Circuit Breaker (Half-Open state with exponential backoff)
+                    if account.failures > 0:
+                        time_since_failure = time.time() - account.last_failure_time
+
+                        # Exponential backoff: base * 2^(failures - 1), capped at MAX_MULTIPLIER
+                        # 1 failure: 60s, 2: 120s, 3: 240s, ..., 12+: 86400s (1 day cap)
+                        backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
+                        effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
+
+                        if time_since_failure < effective_timeout:
+                            # Probabilistic retry (10% chance)
+                            if random.random() > ACCOUNT_PROBABILISTIC_RETRY_CHANCE:
+                                continue
+                            logger.info(f"Probabilistic retry for broken account {account_id}")
+                        else:
+                            # Half-Open: recovery timeout passed
+                            logger.info(
+                                f"Half-Open state for {account_id} (recovery timeout passed, effective={effective_timeout}s)"
+                            )
+
+                needs_initialization = account.auth_manager is None
+                needs_refresh = (
+                    not needs_initialization
+                    and account.models_cached_at > 0
+                    and time.time() - account.models_cached_at > ACCOUNT_CACHE_TTL
+                )
+
+            if needs_initialization:
+                if not await self.initialize_account(account_id):
+                    async with self._lock:
+                        current = self._accounts.get(account_id)
+                        if current is account:
+                            current.failures += 1
+                            self._dirty = True
+                    continue
+
+            if needs_refresh:
+                try:
+                    await self._refresh_account_models_singleflight(account_id)
+                except Exception as e:
+                    logger.warning(f"Failed to refresh models for {account_id}: {e}")
+
+            # Any await above allowed deletion or replacement. Revalidate the
+            # exact object before exposing it to a route.
+            async with self._lock:
+                current = self._accounts.get(account_id)
+                if current is not account or current.auth_manager is None:
+                    continue
+                return current
+
+        return None
 
     async def report_success(self, account_id: str, model: str) -> None:
         """
@@ -1190,6 +1255,14 @@ class AccountManager:
         pending = self._unsaved_rate_observations
         self._unsaved_rate_observations = []
         return [(item.account_id, item.at, item.rpm, int(item.rejected), item.outcome) for item in pending]
+
+    def restore_unsaved_rate_observations(self, rows: List[Tuple[str, float, int, int, str]]) -> None:
+        """Restore a failed persistence batch ahead of newer observations."""
+        restored = [
+            RateObservation(account_id=account_id, at=at, rpm=rpm, rejected=bool(rejected), outcome=outcome)
+            for account_id, at, rpm, rejected, outcome in rows
+        ]
+        self._unsaved_rate_observations = restored + self._unsaved_rate_observations
 
     def load_rate_observations(self, rows: List[Tuple[str, float, int, int, str]]) -> None:
         """Restore persisted rate observations after a restart."""

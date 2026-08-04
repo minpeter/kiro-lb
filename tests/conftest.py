@@ -19,6 +19,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+# Authentication intentionally has no production default. Set the test-only
+# key before pytest imports application modules during collection.
+os.environ.setdefault("PROXY_API_KEY", "test_proxy_key_12345")
+
 # =============================================================================
 # Event Loop Fixtures
 # =============================================================================
@@ -83,9 +87,11 @@ def setup_test_environment(tmp_path_factory):
 
     original_creds_file = kiro.config.ACCOUNTS_CONFIG_FILE
     original_state_file = kiro.config.ACCOUNTS_STATE_FILE
+    original_proxy_api_key = kiro.config.PROXY_API_KEY
 
     kiro.config.ACCOUNTS_CONFIG_FILE = str(creds_file)
     kiro.config.ACCOUNTS_STATE_FILE = str(tmp_dir / "state.json")
+    kiro.config.PROXY_API_KEY = "test_proxy_key_12345"
 
     # main.py binds these at import time, and .env may point at deployment-only
     # container paths, so the environment must be isolated too.
@@ -96,10 +102,8 @@ def setup_test_environment(tmp_path_factory):
     os.environ["ACCOUNTS_CONFIG_FILE"] = str(creds_file)
     os.environ["ACCOUNTS_STATE_FILE"] = str(tmp_dir / "state.json")
     os.environ["DASHBOARD_DATA_DIR"] = str(tmp_dir / "dashboard")
-    # config.PROXY_API_KEY falls back to a built-in default, but the data-plane
-    # authenticator reads PROXY_API_KEY straight from the environment. Without a
-    # local .env (as in CI) the two disagree and every authenticated route
-    # answers 401, so pin the environment to whatever config actually resolved.
+    # Authentication has no insecure production default. Pin an explicit test
+    # key in both the imported config and request-time environment.
     os.environ["PROXY_API_KEY"] = kiro.config.PROXY_API_KEY
 
     import main
@@ -115,6 +119,7 @@ def setup_test_environment(tmp_path_factory):
     # Restore original paths
     kiro.config.ACCOUNTS_CONFIG_FILE = original_creds_file
     kiro.config.ACCOUNTS_STATE_FILE = original_state_file
+    kiro.config.PROXY_API_KEY = original_proxy_api_key
     main.ACCOUNTS_CONFIG_FILE = original_creds_file
     main.ACCOUNTS_STATE_FILE = original_state_file
     for key, value in original_environ.items():
@@ -124,6 +129,18 @@ def setup_test_environment(tmp_path_factory):
             os.environ[key] = value
 
     print("🧹 Test environment cleaned up")
+
+
+@pytest.fixture(autouse=True)
+def isolate_gateway_store(setup_test_environment):
+    """Give each test a clean gateway partition in the shared dashboard DB."""
+    from kiro.store import connection, initialize
+
+    initialize()
+    with connection() as conn:
+        conn.execute("DELETE FROM account_sources")
+        conn.execute("DELETE FROM account_runtime")
+        conn.execute("DELETE FROM store_migrations")
 
 
 @pytest.fixture

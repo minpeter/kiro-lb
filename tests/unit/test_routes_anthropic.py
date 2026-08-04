@@ -9,6 +9,7 @@ Tests the following endpoint:
 For OpenAI API tests, see test_routes_openai.py.
 """
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1432,6 +1433,29 @@ class TestMessagesFailoverLoop:
 
 class TestMessagesLegacyMode:
     """Tests for legacy mode (ACCOUNT_SYSTEM=false) in /v1/messages endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_legacy_uninitialized_account_is_selected_once_without_failover(self):
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        from kiro.routes_anthropic import messages
+
+        account = MagicMock(auth_manager=None)
+        manager = MagicMock()
+        manager._accounts = {"legacy": account}
+        manager.get_first_account.return_value = account
+        request = MagicMock()
+        request.app.state.account_system = False
+        request.app.state.account_manager = manager
+        request_data = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5", max_tokens=64, messages=[{"role": "user", "content": "hi"}], stream=False
+        )
+
+        response = await messages(request, request_data)
+
+        assert response.status_code == 503
+        assert json.loads(response.body)["error"]["message"] == "No initialized accounts available"
+        manager.get_first_account.assert_called_once_with()
+        manager.get_next_account.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_messages_legacy_get_first_account(self):

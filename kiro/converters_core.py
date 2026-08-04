@@ -826,21 +826,33 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
     for msg in messages:
         # Check if this message has tool_results
         if msg.tool_results:
-            # Check if the previous message is an assistant with tool_calls
-            has_preceding_assistant = result and result[-1].role == "assistant" and result[-1].tool_calls
+            # Adjacent assistant turns are merged later because Kiro requires
+            # alternating roles. Validate against that whole pending assistant
+            # run rather than only its final element.
+            preceding_calls = []
+            for previous in reversed(result):
+                if previous.role != "assistant":
+                    break
+                preceding_calls.extend(previous.tool_calls or [])
+            valid_ids = {
+                call.get("id") or call.get("toolUseId")
+                for call in preceding_calls
+                if call.get("id") or call.get("toolUseId")
+            }
+            matching = [tr for tr in msg.tool_results if tr.get("tool_use_id") in valid_ids]
+            unmatched = [tr for tr in msg.tool_results if tr.get("tool_use_id") not in valid_ids]
 
-            if not has_preceding_assistant:
+            if unmatched:
                 # We cannot create a valid synthetic assistant message because we don't know
                 # the original tool name and arguments. Kiro API validates tool names.
                 # Convert tool_results to text to preserve context for the model.
                 logger.debug(
-                    f"Converting {len(msg.tool_results)} orphaned tool_results to text "
-                    f"(no preceding assistant message with tool_calls). "
-                    f"Tool IDs: {[tr.get('tool_use_id', 'unknown') for tr in msg.tool_results]}"
+                    f"Converting {len(unmatched)} unmatched tool_results to text. "
+                    f"Tool IDs: {[tr.get('tool_use_id', 'unknown') for tr in unmatched]}"
                 )
 
                 # Convert tool_results to text representation
-                tool_results_text = tool_results_to_text(msg.tool_results)
+                tool_results_text = tool_results_to_text(unmatched)
 
                 # Append to existing content
                 original_content = extract_text_content(msg.content) or ""
@@ -856,7 +868,7 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     role=msg.role,
                     content=new_content,
                     tool_calls=msg.tool_calls,
-                    tool_results=None,  # Remove orphaned tool_results (now in text)
+                    tool_results=matching or None,
                     images=msg.images,
                     reasoning=msg.reasoning,
                     reasoning_signature=msg.reasoning_signature,
@@ -1310,7 +1322,10 @@ def build_kiro_payload(
     # If current message is assistant, need to add it to history
     # and create user message placeholder
     if current_message.role == "assistant":
-        history.append({"assistantResponseMessage": {"content": current_content}})
+        # Preserve signed reasoning and native tool calls on a final assistant
+        # continuation exactly as for any prior assistant turn. Dropping toolUses
+        # here can leave the following tool result structurally orphaned.
+        history.extend(build_kiro_history([current_message], model_id))
         # No filler text: the assistant turn above is the prompt to continue.
         current_content = ""
 
@@ -1388,6 +1403,8 @@ def build_kiro_payload(
                 f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
                 f"({stats.original_bytes} -> {stats.final_bytes} bytes)"
             )
+            if stats.final_bytes > KIRO_MAX_PAYLOAD_BYTES:
+                raise PayloadTooLargeError(stats.final_bytes, KIRO_MAX_PAYLOAD_BYTES)
         else:
             logger.warning(
                 f"Payload {payload_size} bytes exceeds the {KIRO_MAX_PAYLOAD_BYTES} byte limit "

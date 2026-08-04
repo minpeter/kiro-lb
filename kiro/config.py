@@ -80,7 +80,7 @@ SERVER_PORT: int = int(os.getenv("SERVER_PORT", str(DEFAULT_SERVER_PORT)))
 # ==================================================================================================
 
 # API key for proxy access (clients must pass it in Authorization header)
-PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
+PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "")
 
 # ==================================================================================================
 # VPN/Proxy Settings for Kiro API Access
@@ -510,10 +510,10 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "false").lower() in (
 # When true: enables full failover loop with Circuit Breaker
 ACCOUNT_SYSTEM: bool = os.getenv("ACCOUNT_SYSTEM", "false").lower() in ("true", "1", "yes")
 
-# Path to credentials configuration file
+# Legacy gateway JSON import paths. SQLite is authoritative after first import;
+# these files are never written or deleted by the gateway.
 ACCOUNTS_CONFIG_FILE: str = os.getenv("ACCOUNTS_CONFIG_FILE", "credentials.json")
 
-# Path to runtime state file
 ACCOUNTS_STATE_FILE: str = os.getenv("ACCOUNTS_STATE_FILE", "state.json")
 
 # ==================================================================================================
@@ -593,7 +593,7 @@ ACCOUNT_CACHE_TTL: int = int(os.getenv("ACCOUNT_CACHE_TTL", "43200"))
 # State Persistence Settings
 # ==================================================================================================
 
-# Interval for periodic state.json saving in seconds
+# Interval for periodic runtime-state saving in seconds
 STATE_SAVE_INTERVAL_SECONDS: int = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", "10"))
 
 # Dashboard live usage polling interval. A value of 0 disables background refresh;

@@ -21,7 +21,7 @@ kiro-lb-python/
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
 ├── tests/                   # pytest, 1837 tests; network-blocked by conftest
-├── data/                    # Runtime credentials/state/sqlite (gitignored)
+├── data/                    # Unified private dashboard.sqlite3 store (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
 ├── pyproject.toml           # ruff + mypy config only; the project is not packaged
@@ -48,7 +48,8 @@ they held are folded into this file; do not link to them.
 | Account failover / rotation | `kiro/account_manager.py` | Circuit breaker, global sticky, lazy init |
 | Credentials + host selection | `kiro/auth.py`, `kiro/config.py` | 4 sources; Builder ID routes to a different host |
 | Add an account by browser login | `kiro/device_login.py` | Social + Builder ID device flows |
-| Dashboard API / SQLite store | `kiro/dashboard.py` | 18 routes under `/api/dashboard`, plus `/` and `/metrics` |
+| Shared SQLite persistence | `kiro/store.py` | Accounts, runtime state, internal login credentials; mode 0600/WAL |
+| Dashboard API | `kiro/dashboard.py` | 18 routes under `/api/dashboard`, plus `/` and `/metrics` |
 | Prometheus exposition | `kiro/metrics.py` | Pure renderer; the route and its auth live in `dashboard.py` |
 | Grafana dashboard / metrics wiring | `deploy/` | Dashboard JSON is asserted against the exporter by `tests/unit/test_dashboard_provisioning.py` |
 | Per-key token accounting | `kiro/usage_tracking.py` | ContextVar identity, batched flush |
@@ -125,8 +126,9 @@ trusting a pin here.
   `/v1`, and `/v1` API keys cannot call `/api/dashboard`. `/metrics` is a third
   plane: it takes a `/v1` bearer key (a scraper cannot hold a cookie) and refuses
   dashboard sessions.
-- Dashboard SQLite stores metadata only — no prompts, completions, raw keys, or
-  refresh tokens. New columns arrive via additive `PRAGMA table_info` +
+- The private SQLite store contains dashboard metadata plus account policy,
+  runtime state, and upstream refresh credentials for internal device logins;
+  it never stores prompts, completions, or raw client API keys. New columns arrive via additive `PRAGMA table_info` +
   `ALTER TABLE` migration (`dashboard.py:96`, `:147`), never a destructive rewrite.
 - Proxy env vars are set before any httpx client exists (`main.py:181`); creating
   a client earlier silently ignores the VPN/proxy config.
@@ -235,11 +237,11 @@ multi-arch images on non-PR runs. Tool versions are pinned in
   rather than restarting the container.
 - `/metrics` is not recorded by the request-metrics middleware (`main.py:623`
   filters to `/v1/`), so scraping does not inflate the counters it reports.
-- `main.py` refuses to start when `credentials.json` has no usable account, even
+- `main.py` refuses to start when the unified store has no usable account, even
   with `ACCOUNT_SYSTEM=false`; set `KIRO_CLI_DB_FILE` for a standalone run.
   `validate_configuration` (`main.py:201`) skips legacy `.env` checks entirely
-  once `credentials.json` exists. Legacy mode always recreates
-  `credentials.json` from `.env` (`main.py:401`).
+  once legacy credentials have been imported. Legacy mode replaces its SQLite
+  account policy from `.env` without writing gateway-owned JSON.
 - The OpenAI `developer` role must be folded into the system prompt
   (`converters_openai.py:149`); dropping it makes Kiro answer `REQUEST_BODY_INVALID`.
 - The oversize rejection is `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, which names

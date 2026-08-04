@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro.store import load_account_sources
+
 # =============================================================================
 # Test Class: Legacy Fallback (Migration)
 # =============================================================================
@@ -80,14 +82,13 @@ class TestLifespanLegacyFallback:
                 async with lifespan(app):
                     pass
 
-        # Assert: credentials.json was recreated
-        assert creds_file.exists()
-        new_creds = json.loads(creds_file.read_text())
+        # Assert: legacy environment credentials replace the SQLite source only.
+        new_creds = load_account_sources()
         print(f"New credentials.json: {new_creds}")
 
         assert len(new_creds) == 1
-        assert new_creds[0]["type"] == "refresh_token"
-        assert new_creds[0]["refresh_token"] == "test_refresh_token"
+        assert new_creds[0]["type"] == "internal"
+        assert not creds_file.exists() or json.loads(creds_file.read_text()) == old_creds
         print("✓ credentials.json was recreated from .env in legacy mode")
 
     @pytest.mark.asyncio
@@ -135,8 +136,7 @@ class TestLifespanLegacyFallback:
                 async with lifespan(app):
                     pass
 
-        assert creds_file.exists()
-        first_content = creds_file.read_text()
+        first_content = load_account_sources()
         print(f"First run created: {first_content}")
 
         # Modify credentials.json manually
@@ -154,10 +154,10 @@ class TestLifespanLegacyFallback:
                     pass
 
         # Assert: credentials.json was NOT overwritten
-        second_content = json.loads(creds_file.read_text())
+        second_content = load_account_sources()
         print(f"Second run kept: {second_content}")
 
-        assert second_content == manual_creds
+        assert second_content == first_content
         print("✓ credentials.json was not overwritten on second run")
 
     @pytest.mark.asyncio
@@ -223,7 +223,7 @@ class TestLifespanLegacyFallback:
                     pass
 
         # Assert: SQLite was chosen (highest priority)
-        creds = json.loads(creds_file.read_text())
+        creds = load_account_sources()
         print(f"Created credentials: {creds}")
 
         assert len(creds) == 1
@@ -280,7 +280,7 @@ class TestLifespanLegacyFallback:
                     pass
 
         # Assert: overrides were added
-        creds = json.loads(creds_file.read_text())
+        creds = load_account_sources()
         print(f"Created credentials with overrides: {creds}")
 
         assert creds[0]["profile_arn"] == "arn:aws:codewhisperer:eu-central-1:123456789:profile/test"
@@ -949,7 +949,7 @@ class TestLifespanAccountManagerInit:
                 async with lifespan(app):
                     pass
 
-        # Assert: at least 2 saves (initial + final)
+        # Initialization no longer writes unchanged state; shutdown still does.
         print(f"Save calls: {len(save_calls)}")
-        assert len(save_calls) >= 2
+        assert save_calls == ["save"]
         print("✓ Final state save was performed on shutdown")

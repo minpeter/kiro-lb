@@ -23,7 +23,6 @@ import httpx
 from loguru import logger
 
 from kiro.config import (
-    SQLITE_READONLY,
     TOKEN_REFRESH_THRESHOLD,
     get_aws_sso_oidc_url,
     get_kiro_api_host,
@@ -108,6 +107,7 @@ class KiroAuthManager:
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
         api_region: Optional[str] = None,
+        internal_account_id: Optional[str] = None,
     ):
         """
         Initializes the authentication manager.
@@ -129,6 +129,7 @@ class KiroAuthManager:
         self._region = region
         self._creds_file = creds_file
         self._sqlite_db = sqlite_db
+        self._internal_account_id = internal_account_id
 
         # AWS SSO OIDC specific fields
         self._client_id: Optional[str] = client_id
@@ -158,11 +159,21 @@ class KiroAuthManager:
         self._fingerprint = get_machine_fingerprint()
 
         # Load credentials from SQLite if specified (takes priority over JSON)
-        if sqlite_db:
+        if internal_account_id:
+            from kiro.store import load_internal_credential
+
+            self._load_credentials_document(load_internal_credential(internal_account_id) or {})
+        elif sqlite_db:
             self._load_credentials_from_sqlite(sqlite_db)
         # Load credentials from JSON file if specified
         elif creds_file:
             self._load_credentials_from_file(creds_file)
+
+        # External credential stores are immutable inputs.  A token rotated by
+        # this gateway is kept in its private database and takes precedence on
+        # subsequent process starts.
+        if creds_file or sqlite_db:
+            self._load_gateway_overlay()
 
         # Determine auth type based on available credentials
         self._detect_auth_type()
@@ -234,7 +245,7 @@ class KiroAuthManager:
             self._auth_type = AuthType.KIRO_DESKTOP
             logger.info("Detected auth type: Kiro Desktop")
 
-    def _load_credentials_from_sqlite(self, db_path: str) -> None:
+    def _load_credentials_from_sqlite(self, db_path: str, *, apply_overlay: bool = True) -> None:
         """
         Loads credentials from kiro-cli SQLite database.
 
@@ -262,7 +273,7 @@ class KiroAuthManager:
                 logger.warning(f"SQLite database not found: {db_path}")
                 return
 
-            conn = sqlite3.connect(str(path))
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             cursor = conn.cursor()
 
             # Try all possible token keys in priority order
@@ -361,6 +372,8 @@ class KiroAuthManager:
                 logger.debug(f"Failed to auto-detect API region from profile ARN: {e}")
 
             conn.close()
+            if apply_overlay:
+                self._load_gateway_overlay()
             logger.info(f"Credentials loaded from SQLite database: {db_path}")
 
         except sqlite3.Error as e:
@@ -370,7 +383,7 @@ class KiroAuthManager:
         except Exception as e:
             logger.error(f"Error loading credentials from SQLite: {e}")
 
-    def _load_credentials_from_file(self, file_path: str) -> None:
+    def _load_credentials_from_file(self, file_path: str, *, apply_overlay: bool = True) -> None:
         """
         Loads credentials from a JSON file.
 
@@ -402,47 +415,52 @@ class KiroAuthManager:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            # Load common data from file
-            if "refreshToken" in data:
-                self._refresh_token = data["refreshToken"]
-            if "accessToken" in data:
-                self._access_token = data["accessToken"]
-            if "profileArn" in data:
-                self._profile_arn = data["profileArn"]
-            if "region" in data:
-                # Store as SSO region for OIDC token refresh
-                self._sso_region = data["region"]
-                # Also use as detected API region (can be overridden by KIRO_API_REGION env var)
-                self._detected_api_region = data["region"]
-                logger.debug(f"Region from JSON credentials: {data['region']}")
-
-            # Load clientIdHash and device registration for Enterprise Kiro IDE
-            if "clientIdHash" in data:
-                self._client_id_hash = data["clientIdHash"]
-                self._load_enterprise_device_registration(self._client_id_hash)
-
-            # Load AWS SSO OIDC specific fields (if directly in credentials file)
-            if "clientId" in data:
-                self._client_id = data["clientId"]
-            if "clientSecret" in data:
-                self._client_secret = data["clientSecret"]
-
-            # Parse expiresAt
-            if "expiresAt" in data:
-                try:
-                    expires_str = data["expiresAt"]
-                    # Support for different date formats
-                    if expires_str.endswith("Z"):
-                        self._expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
-                    else:
-                        self._expires_at = datetime.fromisoformat(expires_str)
-                except Exception as e:
-                    logger.warning(f"Failed to parse expiresAt: {e}")
+            self._load_credentials_document(data)
+            if apply_overlay:
+                self._load_gateway_overlay()
 
             logger.info(f"Credentials loaded from {file_path}")
 
         except Exception as e:
             logger.error(f"Error loading credentials from file: {e}")
+
+    def _load_credentials_document(self, data: dict) -> None:
+        # Load common credential fields from JSON or the internal store.
+        if "refreshToken" in data:
+            self._refresh_token = data["refreshToken"]
+        if "accessToken" in data:
+            self._access_token = data["accessToken"]
+        if "profileArn" in data:
+            self._profile_arn = data["profileArn"]
+        if "region" in data:
+            # Store as SSO region for OIDC token refresh
+            self._sso_region = data["region"]
+            # Also use as detected API region (can be overridden by KIRO_API_REGION env var)
+            self._detected_api_region = data["region"]
+            logger.debug(f"Region from JSON credentials: {data['region']}")
+
+        # Load clientIdHash and device registration for Enterprise Kiro IDE
+        if "clientIdHash" in data:
+            self._client_id_hash = data["clientIdHash"]
+            self._load_enterprise_device_registration(self._client_id_hash)
+
+        # Load AWS SSO OIDC specific fields (if directly in credentials file)
+        if "clientId" in data:
+            self._client_id = data["clientId"]
+        if "clientSecret" in data:
+            self._client_secret = data["clientSecret"]
+
+        # Parse expiresAt
+        if "expiresAt" in data:
+            try:
+                expires_str = data["expiresAt"]
+                # Support for different date formats
+                if expires_str.endswith("Z"):
+                    self._expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+                else:
+                    self._expires_at = datetime.fromisoformat(expires_str)
+            except Exception as e:
+                logger.warning(f"Failed to parse expiresAt: {e}")
 
     def _load_enterprise_device_registration(self, client_id_hash: str) -> None:
         """
@@ -476,146 +494,103 @@ class KiroAuthManager:
             logger.error(f"Error loading enterprise device registration: {e}")
 
     def _save_credentials_to_file(self) -> None:
-        """
-        Saves updated credentials to a JSON file.
+        """Persist a rotation without modifying the external JSON input."""
+        self._save_gateway_overlay()
 
-        Updates the existing file while preserving other fields.
-        """
-        if not self._creds_file:
+    def _external_account_id(self) -> str | None:
+        source = self._sqlite_db or self._creds_file
+        return str(Path(source).expanduser().resolve()) if source else None
+
+    def _load_gateway_overlay(self) -> None:
+        account_id = self._external_account_id()
+        if not account_id:
             return
-
         try:
-            path = Path(self._creds_file).expanduser()
+            from kiro.store import load_internal_credential
 
-            # Read existing data
-            existing_data = {}
-            if path.exists():
-                with open(path, "r", encoding="utf-8") as f:
-                    existing_data = json.load(f)
+            overlay = load_internal_credential(account_id)
+            if overlay and self._overlay_is_fresher(overlay):
+                self._load_credentials_document(overlay)
+                logger.debug("Loaded gateway credential overlay for {}", account_id)
+        except Exception as exc:
+            logger.debug("No gateway credential overlay for {}: {}", account_id, exc)
 
-            # Update data
-            existing_data["accessToken"] = self._access_token
-            existing_data["refreshToken"] = self._refresh_token
-            if self._expires_at:
-                existing_data["expiresAt"] = self._expires_at.isoformat()
-            if self._profile_arn:
-                existing_data["profileArn"] = self._profile_arn
+    def _overlay_is_fresher(self, overlay: dict) -> bool:
+        """Prefer an overlay only when it is demonstrably at least as fresh."""
+        overlay_refresh = overlay.get("refreshToken")
+        if not overlay_refresh:
+            return False
+        if overlay_refresh == self._refresh_token:
+            return True
+        overlay_expiry = self._parse_expiry(overlay.get("expiresAt"))
+        if not overlay_expiry or not self._expires_at:
+            return False
+        return overlay_expiry > self._expires_at
 
-            # Save
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(existing_data, f, indent=2, ensure_ascii=False)
+    @staticmethod
+    def _parse_expiry(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except ValueError:
+            return None
 
-            logger.debug(f"Credentials saved to {self._creds_file}")
+    def _reload_raw_external_credentials(self) -> bool:
+        """Reload the immutable source, deliberately bypassing its overlay."""
+        if self._sqlite_db:
+            self._load_credentials_from_sqlite(self._sqlite_db, apply_overlay=False)
+            return True
+        if self._creds_file:
+            self._load_credentials_from_file(self._creds_file, apply_overlay=False)
+            return True
+        return False
 
-        except Exception as e:
-            logger.error(f"Error saving credentials: {e}")
+    def _save_gateway_overlay(self) -> None:
+        account_id = self._external_account_id()
+        if not account_id:
+            return
+        document = {
+            "accessToken": self._access_token,
+            "refreshToken": self._refresh_token,
+            "expiresAt": self._expires_at.isoformat() if self._expires_at else None,
+        }
+        if self._profile_arn:
+            document["profileArn"] = self._profile_arn
+        from kiro.store import connection, require_runtime_writer
+
+        with connection() as conn:
+            require_runtime_writer(conn)
+            updated = conn.execute(
+                "UPDATE account_sources SET credential_json = ? WHERE account_id = ?",
+                (json.dumps(document), account_id),
+            ).rowcount
+        if not updated:
+            # Standalone auth-manager consumers have no gateway-owned source row.
+            # Writer rejection above remains fatal for managed accounts.
+            logger.warning("Could not persist credential overlay for unregistered account {}", account_id)
+
+    def _save_credentials_to_internal_store(self) -> None:
+        if not self._internal_account_id:
+            return
+        from kiro.store import load_internal_credential, save_internal_credential
+
+        document = load_internal_credential(self._internal_account_id) or {}
+        document.update(
+            accessToken=self._access_token,
+            refreshToken=self._refresh_token,
+            expiresAt=self._expires_at.isoformat() if self._expires_at else None,
+        )
+        if self._profile_arn:
+            document["profileArn"] = self._profile_arn
+        save_internal_credential(self._internal_account_id, document)
 
     def _save_credentials_to_sqlite(self) -> None:
-        """
-        Saves updated credentials back to SQLite database.
-
-        Strategy: Read-Merge-Write (Issue #131 fix)
-        1. Read existing JSON from SQLite
-        2. Merge only updated fields (access_token, refresh_token, expires_at)
-        3. Preserve all unknown fields (startUrl, provider, registrationExpiresAt, etc.)
-        4. Write back merged JSON
-
-        This ensures compatibility with kiro-cli and future schema changes.
-        Unknown fields from kiro-cli are preserved, preventing data loss.
-
-        Respects SQLITE_READONLY flag - when enabled, skips write-back entirely.
-        """
-        if not self._sqlite_db:
-            return
-
-        # Check read-only mode
-        if SQLITE_READONLY:
-            logger.debug("SQLite write-back disabled (SQLITE_READONLY=true)")
-            return
-
-        try:
-            path = Path(self._sqlite_db).expanduser()
-            if not path.exists():
-                logger.warning(f"SQLite database not found for writing: {self._sqlite_db}")
-                return
-
-            # Use timeout to avoid blocking if database is locked
-            conn = sqlite3.connect(str(path), timeout=5.0)
-            cursor = conn.cursor()
-
-            # Try to save to the known key first (if we have it)
-            if self._sqlite_token_key:
-                if self._try_save_to_key(cursor, self._sqlite_token_key):
-                    conn.commit()
-                    conn.close()
-                    logger.debug(f"Credentials saved to SQLite key: {self._sqlite_token_key} (merged)")
-                    return
-                else:
-                    logger.warning(f"Failed to save to primary key: {self._sqlite_token_key}, trying fallback")
-
-            # Fallback: try all keys (for edge cases where source key is unknown or deleted)
-            for key in SQLITE_TOKEN_KEYS:
-                if self._try_save_to_key(cursor, key):
-                    conn.commit()
-                    conn.close()
-                    logger.debug(f"Credentials saved to SQLite key: {key} (fallback, merged)")
-                    return
-
-            # If we get here, no keys were updated
-            conn.close()
-            logger.warning("Failed to save credentials to SQLite: no matching keys found")
-
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error saving credentials: {e}")
-        except Exception as e:
-            logger.error(f"Error saving credentials to SQLite: {e}")
-
-    def _try_save_to_key(self, cursor: sqlite3.Cursor, key: str) -> bool:
-        """
-        Attempts to save credentials to a specific SQLite key using read-merge-write.
-
-        Args:
-            cursor: SQLite cursor
-            key: SQLite key to save to
-
-        Returns:
-            True if save was successful, False otherwise
-        """
-        try:
-            # Read existing data
-            cursor.execute("SELECT value FROM auth_kv WHERE key = ?", (key,))
-            row = cursor.fetchone()
-
-            if not row:
-                return False
-
-            # Parse existing JSON
-            try:
-                existing_data = json.loads(row[0])
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON for key {key}, skipping: {e}")
-                return False
-
-            # Merge: update ONLY our fields, preserve EVERYTHING else
-            existing_data["access_token"] = self._access_token
-            existing_data["refresh_token"] = self._refresh_token
-            existing_data["expires_at"] = self._expires_at.isoformat() if self._expires_at else None
-            existing_data["region"] = self._sso_region or self._region
-
-            # Update scopes if we have them
-            if self._scopes:
-                existing_data["scopes"] = self._scopes
-
-            token_json = json.dumps(existing_data)
-
-            # Write back merged data
-            cursor.execute("UPDATE auth_kv SET value = ? WHERE key = ?", (token_json, key))
-
-            return cursor.rowcount > 0
-
-        except Exception as e:
-            logger.debug(f"Failed to save to key {key}: {e}")
-            return False
+        """Persist a rotation without modifying the external Kiro CLI database."""
+        self._save_gateway_overlay()
 
     def is_token_expiring_soon(self) -> bool:
         """
@@ -662,12 +637,26 @@ class KiroAuthManager:
             ValueError: If refresh token is not set or response doesn't contain accessToken
             httpx.HTTPError: On HTTP request error
         """
+        if self._internal_account_id:
+            from kiro.store import refresh_internal_credential
+
+            self._load_credentials_document(refresh_internal_credential(self._internal_account_id))
         if self._auth_type == AuthType.AWS_SSO_OIDC:
             await self._refresh_token_aws_sso_oidc()
         else:
             await self._refresh_token_kiro_desktop()
 
     async def _refresh_token_kiro_desktop(self) -> None:
+        try:
+            await self._do_kiro_desktop_refresh()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400 and self._reload_raw_external_credentials():
+                logger.warning("Token refresh failed with 400; retrying with raw external credentials")
+                await self._do_kiro_desktop_refresh()
+            else:
+                raise
+
+    async def _do_kiro_desktop_refresh(self) -> None:
         """
         Refreshes token using Kiro Desktop Auth endpoint.
 
@@ -718,7 +707,9 @@ class KiroAuthManager:
         logger.info(f"Token refreshed via Kiro Desktop Auth, expires: {self._expires_at.isoformat()}")
 
         # Save to file or SQLite depending on configuration
-        if self._sqlite_db:
+        if self._internal_account_id:
+            self._save_credentials_to_internal_store()
+        elif self._sqlite_db:
             self._save_credentials_to_sqlite()
         else:
             self._save_credentials_to_file()
@@ -750,9 +741,8 @@ class KiroAuthManager:
             await self._do_aws_sso_oidc_refresh()
         except httpx.HTTPStatusError as e:
             # 400 = invalid_request, likely stale token after kiro-cli re-login
-            if e.response.status_code == 400 and self._sqlite_db:
-                logger.warning("Token refresh failed with 400, reloading credentials from SQLite and retrying...")
-                self._load_credentials_from_sqlite(self._sqlite_db)
+            if e.response.status_code == 400 and self._reload_raw_external_credentials():
+                logger.warning("Token refresh failed with 400; retrying with raw external credentials")
                 await self._do_aws_sso_oidc_refresh()
             else:
                 raise
@@ -845,7 +835,9 @@ class KiroAuthManager:
         logger.info(f"Token refreshed via AWS SSO OIDC, expires: {self._expires_at.isoformat()}")
 
         # Save to file or SQLite depending on configuration
-        if self._sqlite_db:
+        if self._internal_account_id:
+            self._save_credentials_to_internal_store()
+        elif self._sqlite_db:
             self._save_credentials_to_sqlite()
         else:
             self._save_credentials_to_file()
@@ -884,7 +876,7 @@ class KiroAuthManager:
 
             # Try to refresh the token
             try:
-                await self._refresh_token_request()
+                await self._refresh_with_store_lease()
             except httpx.HTTPStatusError as e:
                 # Graceful degradation for SQLite mode when refresh fails twice
                 # This happens when kiro-cli refreshed tokens in memory without persisting
@@ -925,9 +917,39 @@ class KiroAuthManager:
             New access token
         """
         async with self._lock:
-            await self._refresh_token_request()
+            await self._refresh_with_store_lease(force=True)
             assert self._access_token is not None
             return self._access_token
+
+    async def _refresh_with_store_lease(self, *, force: bool = False) -> None:
+        """Serialize gateway-owned refreshes across blue/green processes."""
+        account_id = self._internal_account_id or self._external_account_id()
+        if not account_id:
+            await self._refresh_token_request()
+            return
+
+        from kiro.store import (
+            load_internal_credential,
+            release_refresh_lease,
+            try_acquire_refresh_lease,
+        )
+
+        previous_token = self._access_token
+        owner = None
+        while owner is None:
+            owner = try_acquire_refresh_lease(account_id)
+            if owner is None:
+                await asyncio.sleep(0.05)
+        try:
+            latest = load_internal_credential(account_id)
+            if latest:
+                self._load_credentials_document(latest)
+            renewed_elsewhere = self._access_token != previous_token
+            if self._access_token and not self.is_token_expiring_soon() and (not force or renewed_elsewhere):
+                return
+            await self._refresh_token_request()
+        finally:
+            release_refresh_lease(account_id, owner)
 
     @property
     def profile_arn(self) -> Optional[str]:

@@ -11,6 +11,7 @@ Tests the AccountManager class that manages multiple Kiro accounts with:
 - State persistence
 """
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -624,6 +625,43 @@ class TestAccountManagerInitializeAccount:
     """
     Tests for AccountManager._initialize_account() method.
     """
+
+    def test_internal_source_matches_only_its_explicit_id(self, tmp_path):
+        manager = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+        internal = {"type": "internal", "id": "internal-1"}
+        file_source = {"type": "json", "path": str(tmp_path / "account.json")}
+        manager._credentials_config = [internal, file_source]
+
+        assert manager._credentials_for_account("internal-1") is internal
+        assert manager._credentials_for_account(str((tmp_path / "account.json").resolve())) is file_source
+        assert manager._credentials_for_account(str(tmp_path.resolve())) is None
+
+    @pytest.mark.asyncio
+    async def test_deleted_account_is_not_committed_after_initialization(self, tmp_path):
+        manager = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+        account_id = "internal-1"
+        source = {"type": "internal", "id": account_id}
+        manager._credentials_config = [source]
+        manager._accounts[account_id] = Account(id=account_id)
+        token_started = asyncio.Event()
+        allow_token = asyncio.Event()
+
+        async def delayed_token(_auth):
+            token_started.set()
+            await allow_token.wait()
+            return "token"
+
+        with patch("kiro.account_manager.KiroAuthManager.get_access_token", delayed_token):
+            task = asyncio.create_task(manager.initialize_account(account_id))
+            await token_started.wait()
+            async with manager._lock:
+                manager._remove_account_state(account_id)
+                manager._credentials_config.clear()
+            allow_token.set()
+            assert await task is False
+
+        assert account_id not in manager._accounts
+        assert all(account_id not in mapping.accounts for mapping in manager._model_to_accounts.values())
 
     @pytest.mark.asyncio
     async def test_initialize_account_json_success(self, tmp_path, mock_list_models_response):
@@ -1427,6 +1465,17 @@ class TestAccountManagerSaveState:
     """
 
     @pytest.mark.asyncio
+    async def test_non_writer_skip_reports_false_and_preserves_dirty(self, tmp_path):
+        manager = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+        manager._dirty = True
+
+        with patch("kiro.store.save_runtime_state", return_value=False):
+            assert await manager._save_state() is False
+            assert manager._dirty is True
+            with pytest.raises(RuntimeError, match="not the active writer"):
+                await manager._save_state(raise_errors=True)
+
+    @pytest.mark.asyncio
     async def test_save_state_atomic_write(self, tmp_path):
         """
         Test atomic state saving via tmp file.
@@ -1443,14 +1492,14 @@ class TestAccountManagerSaveState:
         # Act
         await manager._save_state()
 
-        # Assert
-        print(f"State file exists: {state_file.exists()}")
-        assert state_file.exists()
+        # Assert: the unified store transaction publishes the complete document.
+        from kiro.store import load_runtime_state
 
-        # Verify tmp file was cleaned up
-        tmp_file = tmp_path / "state.json.tmp"
-        print(f"Tmp file exists: {tmp_file.exists()}")
-        assert not tmp_file.exists()
+        saved = load_runtime_state()
+        assert saved is not None
+        assert saved["current_account_index"] == 0
+        assert saved["accounts"] == {}
+        assert not state_file.exists()
 
 
 class TestAccountManagerGetFirstAccount:

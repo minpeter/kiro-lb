@@ -250,22 +250,41 @@ class TestOversizedPayloadWithoutAutoTrim:
         assert str(error.payload_bytes) in str(error)
         assert str(error.limit_bytes) in str(error)
 
-    def test_trims_instead_of_raising_when_trim_enabled(self, monkeypatch):
+    def test_irreducibly_large_current_message_raises_when_trim_enabled(self, monkeypatch):
         import kiro.converters_core as cc
+        from kiro.payload_guards import PayloadTooLargeError
 
         monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", True)
         monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1000)
 
-        result = cc.build_kiro_payload(
-            messages=self._oversized_request(),
-            system_prompt="",
-            model_id="auto",
-            tools=None,
-            conversation_id="conv-oversized",
-            profile_arn=None,
-        )
+        with pytest.raises(PayloadTooLargeError):
+            cc.build_kiro_payload(
+                messages=self._oversized_request(),
+                system_prompt="",
+                model_id="auto",
+                tools=None,
+                conversation_id="conv-oversized",
+                profile_arn=None,
+            )
 
-        assert result.payload["conversationState"]["conversationId"] == "conv-oversized"
+    def test_reducible_history_is_trimmed_successfully(self, monkeypatch):
+        import kiro.converters_core as cc
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", True)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1400)
+        messages = [
+            cc.UnifiedMessage(role="user", content="old " + "x" * 2000),
+            cc.UnifiedMessage(role="assistant", content="old answer"),
+            cc.UnifiedMessage(role="user", content="recent question"),
+            cc.UnifiedMessage(role="assistant", content="recent answer"),
+            cc.UnifiedMessage(role="user", content="current"),
+        ]
+        result = cc.build_kiro_payload(messages, "", "auto", None, "conv-trim", None)
+
+        history = result.payload["conversationState"]["history"]
+        assert len(history) == 2
+        assert history[0]["userInputMessage"]["content"] == "recent question"
+        assert result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"] == "current"
 
     def test_under_limit_payload_is_untouched_when_trim_disabled(self, monkeypatch):
         import kiro.converters_core as cc

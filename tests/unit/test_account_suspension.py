@@ -448,7 +448,8 @@ class TestSuspensionDetectedOnTtlRefresh:
 class TestSuspensionPersistence:
     def test_suspension_survives_a_restart(self, tmp_path):
         import asyncio
-        import json
+
+        from kiro.store import load_runtime_state
 
         state_file = tmp_path / "state.json"
         mgr = AccountManager(str(tmp_path / "credentials.json"), str(state_file))
@@ -457,7 +458,8 @@ class TestSuspensionPersistence:
         mgr._accounts[account.id] = account
         asyncio.run(mgr._save_state())
 
-        saved = json.loads(state_file.read_text())
+        saved = load_runtime_state()
+        assert saved is not None
         assert saved["accounts"][account.id]["suspended_until"] == pytest.approx(account.suspended_until)
 
         reloaded = AccountManager(str(tmp_path / "credentials.json"), str(state_file))

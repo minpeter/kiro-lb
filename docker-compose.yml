@@ -15,7 +15,7 @@ services:
       
       # Required: Set your proxy API key
       # You can also use .env file (see env_file below)
-      - PROXY_API_KEY=${PROXY_API_KEY:-my-super-secret-password-123}
+      - PROXY_API_KEY=${PROXY_API_KEY:?Set PROXY_API_KEY in .env}
       
       # Authentication (choose one method)
       # Option 1: Refresh token
@@ -53,6 +53,8 @@ services:
       
       # Mount debug logs directory (optional, for debugging)
       - ./debug_logs:/app/debug_logs
+      # Unified private SQLite store (dashboard.sqlite3, mode 0600).
+      - ./data:/app/data
     
     restart: unless-stopped
     

@@ -104,3 +104,12 @@ def drain_pending_usage() -> List[Tuple[str, str, int, int, int, int, int]]:
         ]
         _pending.clear()
     return drained
+
+
+def restore_pending_usage(rows: List[Tuple[str, str, int, int, int, int, int]]) -> None:
+    """Add a failed durable flush back without overwriting concurrent usage."""
+    with _lock:
+        for key_id, model, prompt, completion, requests, generation_ms, timed in rows:
+            entry = _pending.setdefault((key_id, model), [0, 0, 0, 0, 0])
+            for index, value in enumerate((prompt, completion, requests, generation_ms, timed)):
+                entry[index] += value

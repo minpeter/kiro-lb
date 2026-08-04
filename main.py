@@ -32,9 +32,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
@@ -203,27 +204,23 @@ def validate_configuration() -> None:
     Validates that required configuration is present.
 
     Priority:
-    1. credentials.json (Account System) - if exists, skip legacy validation
-    2. Legacy .env variables (REFRESH_TOKEN, KIRO_CREDS_FILE, KIRO_CLI_DB_FILE)
+    1. Existing SQLite account sources or legacy credentials.json import
+    2. Environment sources (REFRESH_TOKEN, KIRO_CREDS_FILE, KIRO_CLI_DB_FILE)
 
     Checks:
-    - Either credentials.json exists OR legacy variables are configured
+    - Either a stored/importable account exists or an environment source is configured
     - Supports both .env file (local) and environment variables (Docker)
 
     Raises:
         SystemExit: If critical configuration is missing
     """
-    # Priority 1: Check if credentials.json exists (Account System)
-    # If it exists, legacy .env validation is skipped
-    from kiro.config import ACCOUNTS_CONFIG_FILE
+    from kiro.store import initialize, load_account_sources
 
-    creds_json_path = Path(ACCOUNTS_CONFIG_FILE)
-
-    if creds_json_path.exists():
-        logger.debug(f"Found {ACCOUNTS_CONFIG_FILE}, skipping legacy .env validation")
+    initialize()
+    if load_account_sources() or Path(ACCOUNTS_CONFIG_FILE).exists():
         return
 
-    # Priority 2: credentials.json doesn't exist - validate legacy .env variables
+    # Priority 2: no stored/importable account - validate environment sources
     errors = []
 
     # Check if .env file exists (optional - can use environment variables)
@@ -310,6 +307,40 @@ def validate_configuration() -> None:
 
 
 # --- Lifespan Manager ---
+class HandoffGateMiddleware:
+    """Drain data-plane and account mutations during a blue/green handoff."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        app = scope.get("app")
+        path = scope.get("path", "")
+        method = scope.get("method", "GET")
+        guarded = path.startswith("/v1/") or (
+            path.startswith("/api/dashboard/accounts") and method not in {"GET", "HEAD", "OPTIONS"}
+        )
+        if not guarded or app is None or not hasattr(app.state, "handoff_condition"):
+            await self.app(scope, receive, send)
+            return
+        condition = app.state.handoff_condition
+        async with condition:
+            if app.state.handoff_quiesced:
+                response = JSONResponse({"detail": "slot is quiesced for deployment"}, status_code=503)
+                await response(scope, receive, send)
+                return
+            app.state.handoff_inflight += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            async with condition:
+                app.state.handoff_inflight -= 1
+                condition.notify_all()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -327,6 +358,11 @@ async def lifespan(app: FastAPI):
     logger.info("Starting application... Creating state managers.")
     app.state.started_at = time.time()
     initialize_dashboard_store()
+    app.state.handoff_condition = asyncio.Condition()
+    app.state.handoff_inflight = 0
+    from kiro.store import can_write_runtime_state
+
+    app.state.handoff_quiesced = not can_write_runtime_state()
 
     # Create shared HTTP client with connection pooling
     # This reduces memory usage and enables connection reuse across requests
@@ -346,10 +382,22 @@ async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
     logger.info("Shared HTTP client created with connection pooling")
 
-    # ==============================================================================
-    # Legacy Fallback: .env → credentials.json
-    # ==============================================================================
-    creds_path = Path(ACCOUNTS_CONFIG_FILE)
+    # Import old gateway JSON once, then apply the legacy environment policy in
+    # SQLite. External JSON and kiro-cli SQLite paths remain source adapters.
+    from kiro.store import (
+        canonicalize_account_sources,
+        connection,
+        import_legacy_files,
+        load_account_sources,
+        replace_account_sources,
+    )
+
+    recovery_file = str(
+        Path(ACCOUNTS_CONFIG_FILE)
+        .expanduser()
+        .with_name(f"{Path(ACCOUNTS_CONFIG_FILE).name}.account-deletion-recovery")
+    )
+    import_legacy_files(ACCOUNTS_CONFIG_FILE, ACCOUNTS_STATE_FILE, recovery_file)
 
     # Check if we have legacy .env credentials
     has_refresh_token = bool(REFRESH_TOKEN)
@@ -371,57 +419,19 @@ async def lifespan(app: FastAPI):
         if api_region:
             entry["api_region"] = api_region
 
-    if ACCOUNT_SYSTEM:
-        # Account system enabled: create credentials.json ONCE (migration)
-        if not creds_path.exists():
-            if has_refresh_token or has_creds_file or has_cli_db:
-                logger.info("credentials.json not found, creating from .env (one-time migration)")
-                credentials = []
-
-                # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
-                if has_cli_db:
-                    entry = {"type": "sqlite", "path": KIRO_CLI_DB_FILE}
-                    _add_env_overrides(entry)
-                    credentials.append(entry)
-                elif has_creds_file:
-                    entry = {"type": "json", "path": KIRO_CREDS_FILE}
-                    _add_env_overrides(entry)
-                    credentials.append(entry)
-                elif has_refresh_token:
-                    entry = {"type": "refresh_token", "refresh_token": REFRESH_TOKEN}
-                    _add_env_overrides(entry)
-                    credentials.append(entry)
-
-                # Save credentials.json
-                with open(creds_path, "w", encoding="utf-8") as f:
-                    json.dump(credentials, f, indent=2, ensure_ascii=False)
-
-                logger.info("Created credentials.json from .env (one-time migration)")
-    else:
-        # Legacy mode: ALWAYS recreate credentials.json from .env
-        if has_refresh_token or has_creds_file or has_cli_db:
-            logger.debug("Legacy mode: recreating credentials.json from .env")
-            credentials = []
-
-            # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
-            if has_cli_db:
-                entry = {"type": "sqlite", "path": KIRO_CLI_DB_FILE}
-                _add_env_overrides(entry)
-                credentials.append(entry)
-            elif has_creds_file:
-                entry = {"type": "json", "path": KIRO_CREDS_FILE}
-                _add_env_overrides(entry)
-                credentials.append(entry)
-            elif has_refresh_token:
-                entry = {"type": "refresh_token", "refresh_token": REFRESH_TOKEN}
-                _add_env_overrides(entry)
-                credentials.append(entry)
-
-            # Save credentials.json (overwrite if exists)
-            with open(creds_path, "w", encoding="utf-8") as f:
-                json.dump(credentials, f, indent=2, ensure_ascii=False)
-
-            logger.debug("credentials.json recreated from .env (legacy mode)")
+    env_entry = None
+    if has_cli_db:
+        env_entry = {"type": "sqlite", "path": KIRO_CLI_DB_FILE}
+    elif has_creds_file:
+        env_entry = {"type": "json", "path": KIRO_CREDS_FILE}
+    elif has_refresh_token:
+        env_entry = {"type": "refresh_token", "refresh_token": REFRESH_TOKEN}
+    if env_entry:
+        _add_env_overrides(env_entry)
+        env_entry = canonicalize_account_sources([env_entry])[0]
+        if not ACCOUNT_SYSTEM or not load_account_sources():
+            with connection() as conn:
+                replace_account_sources([env_entry], conn)
 
     # ==============================================================================
     # Create AccountManager
@@ -441,10 +451,10 @@ async def lifespan(app: FastAPI):
     all_accounts = list(app.state.account_manager._accounts.keys())
 
     if not all_accounts:
-        logger.error("No accounts configured in credentials.json")
-        raise RuntimeError("No accounts configured in credentials.json")
+        logger.error("No accounts configured in the private store")
+        raise RuntimeError("No accounts configured in the private store")
 
-    # Determine start index from state.json
+    # Determine start index from persisted runtime state
     start_index = app.state.account_manager._current_account_index
 
     # Try to initialize accounts (full circle)
@@ -469,9 +479,6 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to initialize any account. Check your credentials.")
         raise RuntimeError("Failed to initialize any account")
 
-    # Save initial state
-    await app.state.account_manager._save_state()
-
     # Start background task for periodic state saving.
     save_task = asyncio.create_task(app.state.account_manager.save_state_periodically())
 
@@ -480,16 +487,18 @@ async def lifespan(app: FastAPI):
         # startup or impact the proxy data plane on endpoint/auth failures.
         while True:
             try:
-                await refresh_all_account_usage(app.state.account_manager)
+                if not app.state.handoff_quiesced:
+                    await refresh_all_account_usage(app.state.account_manager)
             except Exception as exc:
                 logger.warning("Background Kiro usage refresh failed: {}", exc)
             await asyncio.sleep(max(USAGE_REFRESH_INTERVAL_SECONDS, 60))
 
     # Populate the dashboard promptly, then keep a bounded periodic cache.
-    try:
-        await refresh_all_account_usage(app.state.account_manager)
-    except Exception as exc:
-        logger.warning("Initial Kiro usage refresh failed: {}", exc)
+    if not app.state.handoff_quiesced:
+        try:
+            await refresh_all_account_usage(app.state.account_manager)
+        except Exception as exc:
+            logger.warning("Initial Kiro usage refresh failed: {}", exc)
     usage_task = asyncio.create_task(refresh_usage_periodically())
 
     async def prune_request_logs_periodically() -> None:
@@ -512,8 +521,8 @@ async def lifespan(app: FastAPI):
 
     async def flush_rate_observations() -> None:
         pending = app.state.account_manager.drain_unsaved_rate_observations()
-        if pending:
-            await asyncio.to_thread(record_rate_observations, pending)
+        if pending and not await asyncio.to_thread(record_rate_observations, pending):
+            app.state.account_manager.restore_unsaved_rate_observations(pending)
 
     async def persist_rate_observations_periodically() -> None:
         while True:
@@ -564,6 +573,49 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI Application ---
 app = FastAPI(title=APP_TITLE, description=APP_DESCRIPTION, version=APP_VERSION, lifespan=lifespan)
+app.add_middleware(HandoffGateMiddleware)
+
+
+def _authorize_handoff(request: Request, secret: str | None) -> None:
+    expected = os.getenv("HANDOFF_SECRET", "")
+    host = request.headers.get("host", "").split(":", 1)[0]
+    if not expected or host not in {"127.0.0.1", "localhost", "::1"} or secret != expected:
+        raise HTTPException(status_code=403, detail="handoff control is direct-slot only")
+
+
+@app.post("/_internal/handoff/quiesce", include_in_schema=False)
+async def handoff_quiesce(request: Request, x_handoff_secret: str | None = Header(default=None)):
+    """Stop new work, drain existing streams, and persist the writer snapshot."""
+    _authorize_handoff(request, x_handoff_secret)
+    condition = request.app.state.handoff_condition
+    async with condition:
+        request.app.state.handoff_quiesced = True
+        await condition.wait_for(lambda: request.app.state.handoff_inflight == 0)
+    await request.app.state.account_manager.flush_for_handoff()
+    return {"ready": True, "state": "quiesced"}
+
+
+@app.post("/_internal/handoff/activate", include_in_schema=False)
+async def handoff_activate(request: Request, x_handoff_secret: str | None = Header(default=None)):
+    """Reload the final writer snapshot and permit this slot to serve traffic."""
+    _authorize_handoff(request, x_handoff_secret)
+    from kiro.store import can_write_runtime_state
+
+    if not can_write_runtime_state():
+        raise HTTPException(status_code=409, detail="slot does not own runtime state")
+    await request.app.state.account_manager.reload_durable_state()
+    request.app.state.handoff_quiesced = False
+    return {"ready": True, "state": "active"}
+
+
+@app.get("/_internal/handoff/ready", include_in_schema=False)
+async def handoff_ready(request: Request, x_handoff_secret: str | None = Header(default=None)):
+    """Authenticated direct-slot readiness used by the deploy script."""
+    _authorize_handoff(request, x_handoff_secret)
+    ready = not request.app.state.handoff_quiesced and bool(request.app.state.account_manager._accounts)
+    if not ready:
+        raise HTTPException(status_code=503, detail="slot is not active")
+    return {"ready": True, "state": "active"}
 
 
 # --- CORS Middleware ---

@@ -182,6 +182,7 @@ async def stream_kiro_to_anthropic(
     pending_content: List[str] = []
     tool_blocks: List[Dict[str, Any]] = []
     upstream_stop_reason: Optional[str] = None
+    received_upstream_event = False
 
     # Native reasoning blocks carry their own upstream signature events, so no
     # placeholder signature is generated here.
@@ -190,6 +191,16 @@ async def stream_kiro_to_anthropic(
     upstream_cache_usage: Dict[str, int] = {}
     current_response = response
     pending_response: Optional[httpx.Response] = None
+    closed_response_ids: set[int] = set()
+
+    async def close_response_once(response_to_close: Optional[httpx.Response]) -> None:
+        if response_to_close is None or id(response_to_close) in closed_response_ids:
+            return
+        closed_response_ids.add(id(response_to_close))
+        try:
+            await response_to_close.aclose()
+        except Exception as close_error:
+            logger.debug(f"Error closing response: {close_error}")
 
     async def iter_events() -> AsyncGenerator[Any, None]:
         nonlocal current_response, pending_response
@@ -201,7 +212,7 @@ async def stream_kiro_to_anthropic(
                     previous_response = current_response
                     current_response = pending_response
                     pending_response = None
-                    await previous_response.aclose()
+                    await close_response_once(previous_response)
                     break
             else:
                 break
@@ -268,6 +279,7 @@ async def stream_kiro_to_anthropic(
     begin_anthropic_stream()
     try:
         async for event in iter_events():
+            received_upstream_event = True
             if not message_started:
                 yield format_sse_event("message_start", message_start_data)
                 message_started = True
@@ -419,7 +431,7 @@ async def stream_kiro_to_anthropic(
                         try:
                             tool_input = json.loads(tool_input)
                         except json.JSONDecodeError:
-                            tool_input = {}
+                            raise StreamProtocolError("Malformed upstream tool input")
 
                     # Extract query
                     query = tool_input.get("query", "")
@@ -520,7 +532,7 @@ async def stream_kiro_to_anthropic(
                     try:
                         tool_input = json.loads(tool_input)
                     except json.JSONDecodeError:
-                        tool_input = {}
+                        raise StreamProtocolError("Malformed upstream tool input")
 
                 # Send tool_use block start
                 yield format_sse_event(
@@ -559,6 +571,9 @@ async def stream_kiro_to_anthropic(
             elif event.type == "stop_reason" and event.stop_reason:
                 upstream_stop_reason = event.stop_reason
 
+        if not received_upstream_event:
+            raise StreamProtocolError("Upstream stream ended before any events were received")
+
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
 
@@ -592,7 +607,7 @@ async def stream_kiro_to_anthropic(
                     try:
                         tool_input = json.loads(tool_input)
                     except json.JSONDecodeError:
-                        tool_input = {}
+                        raise StreamProtocolError("Malformed upstream tool input")
 
                 yield format_sse_event(
                     "content_block_start",
@@ -711,17 +726,15 @@ async def stream_kiro_to_anthropic(
         error_msg = str(e) if str(e) else "(empty message)"
         logger.error(f"Error during Anthropic streaming: [{error_type}] {error_msg}", exc_info=True)
 
-        # Send error event
-        yield format_sse_event(
-            "error", {"type": "error", "error": {"type": "api_error", "message": f"Internal error: {error_msg}"}}
-        )
         raise
     finally:
         end_anthropic_stream()
-        try:
-            await current_response.aclose()
-        except Exception as close_error:
-            logger.debug(f"Error closing response: {close_error}")
+        # A disconnect can happen after the follow-up response is opened but
+        # before iter_events promotes it to current_response. Close both slots;
+        # identity tracking also protects against closing an already-promoted
+        # or previously consumed response twice.
+        await close_response_once(current_response)
+        await close_response_once(pending_response)
 
 
 async def collect_anthropic_response(
@@ -768,7 +781,15 @@ async def collect_anthropic_response(
         )
         input_tokens = request_token_stats["total_tokens"]
 
-    result = await collect_stream_to_result(response)
+    async def collect_and_close(response_to_collect: httpx.Response) -> Any:
+        try:
+            return await collect_stream_to_result(response_to_collect)
+        finally:
+            # Shared-client close is intentionally a no-op, but response bodies
+            # still need explicit lifecycle management after they are drained.
+            await response_to_collect.aclose()
+
+    result = await collect_and_close(response)
     native_blocks: List[Dict[str, Any]] = []
     accumulated_content = ""
     accumulated_thinking = ""
@@ -856,7 +877,7 @@ async def collect_anthropic_response(
             ]
         )
         followup_response = await make_search_request(tool_id, query, generate_search_summary(query, results))
-        result = await collect_stream_to_result(followup_response)
+        result = await collect_and_close(followup_response)
 
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
 

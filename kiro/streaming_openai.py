@@ -154,6 +154,7 @@ async def stream_kiro_to_openai_internal(
     upstream_stop_reason = None
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    received_upstream_event = False
 
     begin_openai_stream()
     try:
@@ -176,6 +177,7 @@ async def stream_kiro_to_openai_internal(
         # Use streaming_core.parse_kiro_stream for unified event parsing
         # This handles AWS SSE parsing, first token timeout, and thinking parser
         async for event in parse_kiro_stream(response, first_token_timeout):
+            received_upstream_event = True
             if event.type == "content" and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
@@ -294,6 +296,9 @@ async def stream_kiro_to_openai_internal(
 
             elif event.type == "stop_reason" and event.stop_reason:
                 upstream_stop_reason = event.stop_reason
+
+        if not received_upstream_event:
+            raise StreamProtocolError("Upstream stream ended before any events were received")
 
         # Track completion signals for truncation detection
         received_usage = metering_data is not None
@@ -421,9 +426,11 @@ async def stream_kiro_to_openai_internal(
         # Propagate timeout up for retry
         raise
     except GeneratorExit:
-        # Client disconnected - this is normal, don't log as error
+        # Propagate disconnect so wrappers cannot mistake an incomplete stream
+        # for a successful completion and report account success.
         logger.debug("Client disconnected (GeneratorExit)")
         streaming_error_occurred = True
+        raise
     except Exception as e:
         streaming_error_occurred = True
         # Log exception type and message for better diagnostics

@@ -242,32 +242,25 @@ class TestStreamKiroToAnthropic:
     """Tests for stream_kiro_to_anthropic() generator."""
 
     @pytest.mark.asyncio
-    async def test_yields_message_start_event(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_immediate_eof_has_no_clean_terminal_event(self, mock_response, mock_model_cache, mock_auth_manager):
         """
-        What it does: Yields message_start event at beginning.
-        Goal: Verify Anthropic streaming protocol.
+        What it does: Rejects an upstream stream that ends before any event.
+        Goal: Never report immediate EOF as a clean empty response.
         """
-        print("Setup: Mock empty stream...")
 
         async def mock_parse_kiro_stream(*args, **kwargs):
             return
             yield  # Make it a generator
 
-        print("Action: Streaming to Anthropic format...")
         events = []
-
         with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
-            async for event in stream_kiro_to_anthropic(
-                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
-            ):
-                events.append(event)
+            with pytest.raises(StreamProtocolError, match="before any events"):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
 
-        print(f"Received {len(events)} events")
-
-        # First event should be message_start
-        assert len(events) > 0
-        assert "event: message_start" in events[0]
-        print("✓ message_start event yielded first")
+        assert not any("event: message_stop" in event for event in events)
 
     @pytest.mark.asyncio
     async def test_yields_content_block_start_on_first_content(
@@ -1160,7 +1153,9 @@ class TestStreamingAnthropicErrorHandling:
         print("✓ GeneratorExit propagated correctly")
 
     @pytest.mark.asyncio
-    async def test_yields_error_event_on_exception(self, mock_response, mock_model_cache, mock_auth_manager):
+    async def test_serializer_exception_raises_without_error_event(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
         """
         What it does: Yields error event on exception.
         Goal: Verify error event is sent to client.
@@ -1174,23 +1169,18 @@ class TestStreamingAnthropicErrorHandling:
         print("Action: Streaming to Anthropic format with error...")
         events = []
 
-        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
-            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
-                try:
+        with pytest.raises(RuntimeError, match="Test error"):
+            with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+                with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
                     async for event in stream_kiro_to_anthropic(
                         mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
                     ):
                         events.append(event)
-                except RuntimeError:
-                    pass
 
         print(f"Received {len(events)} events")
 
-        # Should have error event
         error_events = [e for e in events if "event: error" in e]
-        assert len(error_events) >= 1
-        assert "Test error" in error_events[0]
-        print("✓ Error event yielded on exception")
+        assert error_events == []
 
     @pytest.mark.asyncio
     async def test_closes_response_in_finally(self, mock_response, mock_model_cache, mock_auth_manager):

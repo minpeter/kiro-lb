@@ -100,6 +100,8 @@ export type KeyModelUsage = {
   completionTokens: number;
   totalTokens: number;
   requests: number;
+  generationSeconds: number;
+  tokensPerSecond: number | null;
   updatedAt: number;
 };
 

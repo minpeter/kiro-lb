@@ -7,6 +7,7 @@ Tests token management logic for Kiro without real network requests.
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -15,6 +16,7 @@ import pytest
 
 from kiro.auth import AuthType, KiroAuthManager
 from kiro.config import TOKEN_REFRESH_THRESHOLD
+from kiro.store import connection, initialize, replace_account_sources
 
 
 class TestKiroAuthManagerInitialization:
@@ -1935,288 +1937,149 @@ class TestKiroAuthManagerGracefulDegradation:
             assert exc_info.value.response.status_code == 400
 
 
-# =============================================================================
-# Tests for _save_credentials_to_sqlite() - NEW FUNCTIONALITY
-# =============================================================================
+class TestExternalCredentialOverlayPersistence:
+    """Rotations persist in the gateway store without mutating source credentials."""
 
+    @staticmethod
+    def _register_source(source_type: str, path: str) -> str:
+        initialize()
+        with connection() as conn:
+            replace_account_sources([{"type": source_type, "path": path}], conn)
+            return conn.execute("SELECT account_id FROM account_sources").fetchone()[0]
 
-class TestKiroAuthManagerSaveCredentialsToSqlite:
-    """Tests for _save_credentials_to_sqlite() method (Issue #43 fix).
+    @staticmethod
+    def _overlay(account_id: str) -> dict:
+        with connection() as conn:
+            row = conn.execute(
+                "SELECT credential_json FROM account_sources WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        assert row is not None and row[0] is not None
+        return json.loads(row[0])
 
-    Background: Gateway was not persisting refreshed tokens back to SQLite,
-    causing stale tokens to be reloaded after 1-2 hours.
-    """
+    def test_save_from_external_sqlite_uses_overlay_and_survives_restart(self, temp_sqlite_db_social):
+        account_id = self._register_source("kiro_cli", temp_sqlite_db_social)
+        source_before = open(temp_sqlite_db_social, "rb").read()
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
+        manager._access_token = "rotated_access"
+        manager._refresh_token = "rotated_refresh"
+        manager._expires_at = datetime(2099, 2, 3, tzinfo=timezone.utc)
 
-    def test_save_credentials_to_sqlite_writes_token_data(self, tmp_path):
-        """
-        What it does: Verifies that _save_credentials_to_sqlite writes token data.
-        Purpose: Ensure tokens are persisted to SQLite after refresh.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite database...")
-        db_file = tmp_path / "data.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        # Initial token data
-        initial_token_data = {
-            "access_token": "old_access_token",
-            "refresh_token": "old_refresh_token",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
-            ("codewhisperer:odic:token", json.dumps(initial_token_data)),
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with SQLite...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Action: Updating tokens in memory...")
-        manager._access_token = "new_access_token"
-        manager._refresh_token = "new_refresh_token"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-
-        print("Action: Calling _save_credentials_to_sqlite()...")
         manager._save_credentials_to_sqlite()
 
-        print("Verification: Reading SQLite to check saved data...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("codewhisperer:odic:token",))
-        row = cursor.fetchone()
-        conn.close()
+        assert open(temp_sqlite_db_social, "rb").read() == source_before
+        assert self._overlay(account_id) == {
+            "accessToken": "rotated_access",
+            "refreshToken": "rotated_refresh",
+            "expiresAt": "2099-02-03T00:00:00+00:00",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789:profile/social",
+        }
+        restarted = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
+        assert restarted._access_token == "rotated_access"
+        assert restarted._refresh_token == "rotated_refresh"
+        assert restarted._expires_at == datetime(2099, 2, 3, tzinfo=timezone.utc)
 
-        assert row is not None
-        saved_data = json.loads(row[0])
+    def test_save_from_external_json_uses_overlay_and_survives_restart(self, temp_creds_file):
+        account_id = self._register_source("json", temp_creds_file)
+        source_before = open(temp_creds_file, "rb").read()
+        manager = KiroAuthManager(creds_file=temp_creds_file)
+        manager._access_token = "json_rotated_access"
+        manager._refresh_token = "json_rotated_refresh"
+        manager._expires_at = datetime(2099, 4, 5, tzinfo=timezone.utc)
 
-        print(f"Comparing access_token: Expected 'new_access_token', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "new_access_token"
+        manager._save_credentials_to_file()
 
-        print(f"Comparing refresh_token: Expected 'new_refresh_token', Got '{saved_data['refresh_token']}'")
-        assert saved_data["refresh_token"] == "new_refresh_token"
+        assert open(temp_creds_file, "rb").read() == source_before
+        overlay = self._overlay(account_id)
+        assert overlay["accessToken"] == "json_rotated_access"
+        assert overlay["refreshToken"] == "json_rotated_refresh"
+        assert overlay["expiresAt"] == "2099-04-05T00:00:00+00:00"
+        restarted = KiroAuthManager(creds_file=temp_creds_file)
+        assert restarted._access_token == "json_rotated_access"
+        assert restarted._refresh_token == "json_rotated_refresh"
 
-    def test_save_credentials_to_sqlite_handles_missing_database(self, tmp_path):
-        """
-        What it does: Verifies handling of missing SQLite file.
-        Purpose: Ensure application doesn't crash when database is missing.
-        """
-        print("Setup: Creating KiroAuthManager with non-existent SQLite...")
-        non_existent_db = str(tmp_path / "non_existent.sqlite3")
-
-        manager = KiroAuthManager(refresh_token="test_token", sqlite_db=non_existent_db)
-        manager._access_token = "new_token"
-
-        print("Action: Calling _save_credentials_to_sqlite() with missing database...")
-        # Should not raise exception
+    def test_newer_external_sqlite_login_supersedes_stale_overlay(self, temp_sqlite_db_social):
+        self._register_source("kiro_cli", temp_sqlite_db_social)
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
+        manager._access_token = "stale_overlay_access"
+        manager._refresh_token = "stale_overlay_refresh"
+        manager._expires_at = datetime(2099, 2, 3, tzinfo=timezone.utc)
         manager._save_credentials_to_sqlite()
 
-        print("Verification: No exception raised...")
-        assert True
-
-    def test_save_credentials_to_sqlite_returns_early_when_no_sqlite_db(self):
-        """
-        What it does: Verifies early return when sqlite_db is None.
-        Purpose: Ensure method is no-op when SQLite is not configured.
-        """
-        print("Setup: Creating KiroAuthManager without sqlite_db...")
-        manager = KiroAuthManager(refresh_token="test_token")
-        manager._sqlite_db = None
-        manager._access_token = "new_token"
-
-        print("Action: Calling _save_credentials_to_sqlite()...")
-        # Should return early without doing anything
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: No exception raised...")
-        assert True
-
-
-# =============================================================================
-# Tests for token persistence after refresh (Issue #43 fix)
-# =============================================================================
-
-
-class TestKiroAuthManagerTokenPersistence:
-    """Tests for token persistence after refresh.
-
-    Background: After refresh, tokens must be saved to SQLite so they're
-    available after gateway restart or when reloaded.
-    """
-
-    @pytest.mark.asyncio
-    async def test_refresh_token_aws_sso_oidc_saves_to_sqlite(self, tmp_path, mock_aws_sso_oidc_token_response):
-        """
-        What it does: Verifies tokens are saved to SQLite after AWS SSO OIDC refresh.
-        Purpose: Ensure refreshed tokens are persisted (Issue #43 fix).
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite database...")
-        db_file = tmp_path / "data.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        initial_token_data = {
-            "access_token": "old_access_token",
-            "refresh_token": "old_refresh_token",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
-            ("codewhisperer:odic:token", json.dumps(initial_token_data)),
-        )
-
-        registration_data = {
-            "client_id": "test_client_id",
-            "client_secret": "test_client_secret",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
-            ("codewhisperer:odic:device-registration", json.dumps(registration_data)),
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with SQLite...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Setup: Mocking HTTP client for successful refresh...")
-        mock_response = AsyncMock()
-        mock_response.status_code = 200
-        mock_response.json = Mock(return_value=mock_aws_sso_oidc_token_response())
-        mock_response.raise_for_status = Mock()
-
-        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_class.return_value = mock_client
-
-            print("Action: Calling _do_aws_sso_oidc_refresh()...")
-            await manager._do_aws_sso_oidc_refresh()
-
-            print("Verification: Tokens updated in memory...")
-            assert manager._access_token == "new_aws_sso_access_token"
-            assert manager._refresh_token == "new_aws_sso_refresh_token"
-
-            print("Verification: Reading SQLite to check persistence...")
-            conn = sqlite3.connect(str(db_file))
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("codewhisperer:odic:token",))
-            row = cursor.fetchone()
-            conn.close()
-
+        with sqlite3.connect(temp_sqlite_db_social) as conn:
+            row = conn.execute("SELECT value FROM auth_kv WHERE key = 'kirocli:social:token'").fetchone()
             assert row is not None
-            saved_data = json.loads(row[0])
-
-            print(
-                f"Comparing saved access_token: Expected 'new_aws_sso_access_token', Got '{saved_data['access_token']}'"
+            external = json.loads(row[0])
+            external.update(
+                access_token="new_login_access",
+                refresh_token="new_login_refresh",
+                expires_at="2099-03-04T00:00:00Z",
             )
-            assert saved_data["access_token"] == "new_aws_sso_access_token"
-
-            print(
-                f"Comparing saved refresh_token: Expected 'new_aws_sso_refresh_token', Got '{saved_data['refresh_token']}'"
+            conn.execute(
+                "UPDATE auth_kv SET value = ? WHERE key = 'kirocli:social:token'",
+                (json.dumps(external),),
             )
-            assert saved_data["refresh_token"] == "new_aws_sso_refresh_token"
+
+        restarted = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
+        assert restarted._access_token == "new_login_access"
+        assert restarted._refresh_token == "new_login_refresh"
+        assert restarted._expires_at == datetime(2099, 3, 4, tzinfo=timezone.utc)
+
+    def test_newer_external_json_login_supersedes_stale_overlay(self, temp_creds_file):
+        self._register_source("json", temp_creds_file)
+        manager = KiroAuthManager(creds_file=temp_creds_file)
+        manager._access_token = "stale_json_overlay_access"
+        manager._refresh_token = "stale_json_overlay_refresh"
+        manager._expires_at = datetime(2099, 2, 3, tzinfo=timezone.utc)
+        manager._save_credentials_to_file()
+
+        with open(temp_creds_file, encoding="utf-8") as source:
+            external = json.load(source)
+        external.update(
+            accessToken="new_json_login_access",
+            refreshToken="new_json_login_refresh",
+            expiresAt="2099-03-04T00:00:00Z",
+        )
+        with open(temp_creds_file, "w", encoding="utf-8") as source:
+            json.dump(external, source)
+
+        restarted = KiroAuthManager(creds_file=temp_creds_file)
+        assert restarted._access_token == "new_json_login_access"
+        assert restarted._refresh_token == "new_json_login_refresh"
+        assert restarted._expires_at == datetime(2099, 3, 4, tzinfo=timezone.utc)
 
     @pytest.mark.asyncio
-    async def test_refresh_token_kiro_desktop_saves_to_sqlite(self, tmp_path, mock_kiro_token_response):
-        """
-        What it does: Verifies tokens are saved to SQLite after Kiro Desktop refresh.
-        Purpose: Ensure consistency between both refresh methods.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite database...")
-        db_file = tmp_path / "data.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        initial_token_data = {
-            "access_token": "old_access_token",
-            "refresh_token": "old_refresh_token",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
-            ("codewhisperer:odic:token", json.dumps(initial_token_data)),
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with SQLite and Kiro Desktop auth...")
-        manager = KiroAuthManager(refresh_token="test_refresh", sqlite_db=str(db_file))
-
-        print("Setup: Mocking HTTP client for successful refresh...")
-        mock_response = AsyncMock()
-        mock_response.status_code = 200
-        mock_response.json = Mock(return_value=mock_kiro_token_response())
+    async def test_refresh_from_external_sqlite_updates_only_overlay(
+        self, temp_sqlite_db_social, mock_kiro_token_response, valid_kiro_token
+    ):
+        account_id = self._register_source("kiro_cli", temp_sqlite_db_social)
+        source_before = open(temp_sqlite_db_social, "rb").read()
+        manager = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
+        mock_response = AsyncMock(status_code=200)
+        refreshed = mock_kiro_token_response()
+        refreshed["expiresIn"] = 4_000_000_000
+        mock_response.json = Mock(return_value=refreshed)
         mock_response.raise_for_status = Mock()
 
-        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_class.return_value = mock_client
-
-            print("Action: Calling _refresh_token_kiro_desktop()...")
+        with patch("kiro.auth.httpx.AsyncClient") as client_class:
+            client = AsyncMock()
+            client.post = AsyncMock(return_value=mock_response)
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
+            client_class.return_value = client
             await manager._refresh_token_kiro_desktop()
 
-            print("Verification: Reading SQLite to check persistence...")
-            conn = sqlite3.connect(str(db_file))
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("codewhisperer:odic:token",))
-            row = cursor.fetchone()
-            conn.close()
-
-            assert row is not None
-            saved_data = json.loads(row[0])
-
-            print(
-                f"Comparing saved refresh_token: Expected 'new_refresh_token_xyz', Got '{saved_data['refresh_token']}'"
-            )
-            assert saved_data["refresh_token"] == "new_refresh_token_xyz"
+        assert open(temp_sqlite_db_social, "rb").read() == source_before
+        overlay = self._overlay(account_id)
+        assert overlay["accessToken"] == valid_kiro_token
+        assert overlay["refreshToken"] == "new_refresh_token_xyz"
+        restarted = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
+        assert restarted._access_token == valid_kiro_token
+        assert restarted._refresh_token == "new_refresh_token_xyz"
 
 
 # =============================================================================
-# Tests for Social Login Support (kirocli:social:token)
+# Legacy SQLite write-back tests (superseded by immutable source overlays)
 # =============================================================================
-
-
 class TestKiroAuthManagerSocialLogin:
     """Tests for social login support (Google, GitHub, etc.).
 
@@ -2306,147 +2169,6 @@ class TestKiroAuthManagerSocialLogin:
         print(f"Comparing _sqlite_token_key: Expected 'codewhisperer:odic:token', Got '{manager._sqlite_token_key}'")
         assert manager._sqlite_token_key == "codewhisperer:odic:token"
 
-    def test_save_credentials_to_sqlite_uses_source_key(self, temp_sqlite_db_social):
-        """
-        What it does: Verifies tokens are saved back to the same key they were loaded from.
-        Purpose: Ensure social login tokens go to kirocli:social:token, not OIDC keys.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating KiroAuthManager with social login SQLite...")
-        manager = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
-
-        print("Verification: Loaded from kirocli:social:token...")
-        assert manager._sqlite_token_key == "kirocli:social:token"
-
-        print("Action: Updating tokens in memory...")
-        manager._access_token = "updated_social_access"
-        manager._refresh_token = "updated_social_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-
-        print("Action: Calling _save_credentials_to_sqlite()...")
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Reading SQLite to check saved data...")
-        conn = sqlite3.connect(temp_sqlite_db_social)
-        cursor = conn.cursor()
-
-        # Check that kirocli:social:token was updated
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        assert row is not None
-        saved_data = json.loads(row[0])
-
-        print(f"Comparing saved access_token: Expected 'updated_social_access', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "updated_social_access"
-
-        print(f"Comparing saved refresh_token: Expected 'updated_social_refresh', Got '{saved_data['refresh_token']}'")
-        assert saved_data["refresh_token"] == "updated_social_refresh"
-
-    @pytest.mark.asyncio
-    async def test_refresh_token_kiro_desktop_saves_to_social_key(
-        self, temp_sqlite_db_social, mock_kiro_token_response
-    ):
-        """
-        What it does: Verifies tokens are saved to kirocli:social:token after Kiro Desktop refresh.
-        Purpose: Ensure social login tokens persist correctly after refresh.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating KiroAuthManager with social login SQLite...")
-        manager = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
-
-        print("Verification: Loaded from kirocli:social:token...")
-        assert manager._sqlite_token_key == "kirocli:social:token"
-        assert manager.auth_type == AuthType.KIRO_DESKTOP
-
-        print("Setup: Mocking HTTP client for successful refresh...")
-        mock_response = AsyncMock()
-        mock_response.status_code = 200
-        mock_response.json = Mock(return_value=mock_kiro_token_response())
-        mock_response.raise_for_status = Mock()
-
-        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_class.return_value = mock_client
-
-            print("Action: Calling _refresh_token_kiro_desktop()...")
-            await manager._refresh_token_kiro_desktop()
-
-            print("Verification: Reading SQLite to check persistence...")
-            conn = sqlite3.connect(temp_sqlite_db_social)
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-            row = cursor.fetchone()
-            conn.close()
-
-            assert row is not None
-            saved_data = json.loads(row[0])
-
-            print(
-                f"Comparing saved refresh_token: Expected 'new_refresh_token_xyz', Got '{saved_data['refresh_token']}'"
-            )
-            assert saved_data["refresh_token"] == "new_refresh_token_xyz"
-
-    def test_save_credentials_fallback_when_source_key_unknown(self, tmp_path):
-        """
-        What it does: Verifies fallback behavior when _sqlite_token_key is None.
-        Purpose: Ensure robustness when source key is not tracked.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite database with kirocli:social:token...")
-        db_file = tmp_path / "data_fallback.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        token_data = {"access_token": "old_token", "refresh_token": "old_refresh", "expires_at": "2099-01-01T00:00:00Z"}
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with direct credentials (not from SQLite)...")
-        manager = KiroAuthManager(refresh_token="test_refresh", sqlite_db=str(db_file))
-
-        # Simulate scenario where _sqlite_token_key is None (edge case)
-        manager._sqlite_token_key = None
-        manager._access_token = "new_fallback_token"
-        manager._refresh_token = "new_fallback_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-
-        print("Action: Calling _save_credentials_to_sqlite() with unknown source key...")
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Fallback should try all keys and update first match...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        assert row is not None
-        saved_data = json.loads(row[0])
-
-        print(f"Comparing saved access_token: Expected 'new_fallback_token', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "new_fallback_token"
-
     def test_social_login_no_device_registration_key(self, temp_sqlite_db_social):
         """
         What it does: Verifies social login works without device-registration key.
@@ -2471,39 +2193,6 @@ class TestKiroAuthManagerSocialLogin:
         assert manager._access_token == "social_access_token"
         assert manager._client_id is None
         assert manager._client_secret is None
-
-    def test_provider_field_preserved_in_social_token(self, temp_sqlite_db_social):
-        """
-        What it does: Verifies provider field is preserved when saving social tokens.
-        Purpose: Ensure metadata like 'provider: google' is not lost.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating KiroAuthManager with social login SQLite...")
-        manager = KiroAuthManager(sqlite_db=temp_sqlite_db_social)
-
-        print("Action: Updating tokens and saving...")
-        manager._access_token = "new_social_token"
-        manager._refresh_token = "new_social_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Reading SQLite to check provider field...")
-        conn = sqlite3.connect(temp_sqlite_db_social)
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        saved_data = json.loads(row[0])
-
-        # Note: provider field is NOT explicitly saved by gateway (it's metadata from kiro-cli)
-        # Gateway only saves: access_token, refresh_token, expires_at, region, scopes
-        # This is acceptable because provider is not needed for token refresh
-        print("Verification: Core token fields saved correctly...")
-        assert saved_data["access_token"] == "new_social_token"
-        assert saved_data["refresh_token"] == "new_social_refresh"
 
 
 # =============================================================================
@@ -2865,888 +2554,6 @@ class TestKiroAuthManagerEnterpriseIDE:
 # =============================================================================
 # Tests for SQLite write-back preserving unknown fields (Issue #131)
 # =============================================================================
-
-
-class TestKiroAuthManagerSqliteWriteBackPreservation:
-    """Tests for _save_credentials_to_sqlite() preserving unknown fields (Issue #131).
-
-    Background: kiro-cli stores additional fields in SQLite (startUrl, provider,
-    registrationExpiresAt for social login). Gateway must preserve these fields
-    when saving refreshed tokens, using Read-Merge-Write strategy.
-    """
-
-    def test_save_preserves_unknown_fields_social_login(self, tmp_path):
-        """
-        What it does: Verifies unknown fields are preserved for social login.
-        Purpose: Ensure startUrl, provider, registrationExpiresAt are not lost (Issue #131 fix).
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with social login + extra fields...")
-        db_file = tmp_path / "data_social_extra.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        # Social login with extra fields that kiro-cli uses
-        token_data = {
-            "access_token": "old_social_access",
-            "refresh_token": "old_social_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-            "startUrl": "https://example.awsapps.com/start",
-            "provider": "google",
-            "registrationExpiresAt": "2099-12-31T23:59:59Z",
-            "customField": "custom_value",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with SQLite...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Action: Updating tokens in memory...")
-        manager._access_token = "new_social_access"
-        manager._refresh_token = "new_social_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-
-        print("Action: Calling _save_credentials_to_sqlite()...")
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Reading SQLite to check preserved fields...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        assert row is not None
-        saved_data = json.loads(row[0])
-
-        print("Verification: Tokens updated...")
-        print(f"Comparing access_token: Expected 'new_social_access', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "new_social_access"
-
-        print(f"Comparing refresh_token: Expected 'new_social_refresh', Got '{saved_data['refresh_token']}'")
-        assert saved_data["refresh_token"] == "new_social_refresh"
-
-        print("Verification: Extra fields preserved...")
-        print(f"Comparing startUrl: Expected 'https://example.awsapps.com/start', Got '{saved_data.get('startUrl')}'")
-        assert saved_data.get("startUrl") == "https://example.awsapps.com/start"
-
-        print(f"Comparing provider: Expected 'google', Got '{saved_data.get('provider')}'")
-        assert saved_data.get("provider") == "google"
-
-        print(
-            f"Comparing registrationExpiresAt: Expected '2099-12-31T23:59:59Z', Got '{saved_data.get('registrationExpiresAt')}'"
-        )
-        assert saved_data.get("registrationExpiresAt") == "2099-12-31T23:59:59Z"
-
-        print(f"Comparing customField: Expected 'custom_value', Got '{saved_data.get('customField')}'")
-        assert saved_data.get("customField") == "custom_value"
-
-    def test_save_preserves_unknown_fields_oidc(self, tmp_path):
-        """
-        What it does: Verifies unknown fields are preserved for AWS SSO OIDC.
-        Purpose: Ensure future kiro-cli fields are not lost.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with OIDC + extra fields...")
-        db_file = tmp_path / "data_oidc_extra.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        # OIDC with unknown fields
-        token_data = {
-            "access_token": "old_oidc_access",
-            "refresh_token": "old_oidc_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "eu-west-1",
-            "unknownField1": "value1",
-            "unknownField2": "value2",
-        }
-        cursor.execute("INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:odic:token", json.dumps(token_data)))
-
-        registration_data = {
-            "client_id": "test_client_id",
-            "client_secret": "test_client_secret",
-            "region": "eu-west-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
-            ("kirocli:odic:device-registration", json.dumps(registration_data)),
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with SQLite...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Action: Updating tokens and saving...")
-        manager._access_token = "new_oidc_access"
-        manager._refresh_token = "new_oidc_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Reading SQLite to check preserved fields...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:odic:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        saved_data = json.loads(row[0])
-
-        print("Verification: Unknown fields preserved...")
-        print(f"Comparing unknownField1: Expected 'value1', Got '{saved_data.get('unknownField1')}'")
-        assert saved_data.get("unknownField1") == "value1"
-
-        print(f"Comparing unknownField2: Expected 'value2', Got '{saved_data.get('unknownField2')}'")
-        assert saved_data.get("unknownField2") == "value2"
-
-    def test_save_updates_only_our_fields(self, tmp_path):
-        """
-        What it does: Verifies only gateway-managed fields are updated.
-        Purpose: Ensure Read-Merge-Write updates only necessary fields.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with mixed fields...")
-        db_file = tmp_path / "data_mixed.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        token_data = {
-            "access_token": "old_token",
-            "refresh_token": "old_refresh",
-            "expires_at": "2020-01-01T00:00:00Z",
-            "region": "us-west-2",
-            "customField": "original_value",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Action: Updating tokens to new values...")
-        manager._access_token = "new_token"
-        manager._refresh_token = "new_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
-        manager._sso_region = "eu-central-1"
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Reading SQLite...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        saved_data = json.loads(row[0])
-
-        print("Verification: Our fields updated...")
-        print(f"Comparing access_token: Expected 'new_token', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "new_token"
-
-        print(f"Comparing refresh_token: Expected 'new_refresh', Got '{saved_data['refresh_token']}'")
-        assert saved_data["refresh_token"] == "new_refresh"
-
-        print(f"Comparing region: Expected 'eu-central-1', Got '{saved_data['region']}'")
-        assert saved_data["region"] == "eu-central-1"
-
-        print("Verification: Custom field unchanged...")
-        print(f"Comparing customField: Expected 'original_value', Got '{saved_data.get('customField')}'")
-        assert saved_data.get("customField") == "original_value"
-
-    def test_save_with_sqlite_readonly_flag(self, tmp_path, monkeypatch):
-        """
-        What it does: Verifies SQLITE_READONLY flag prevents write-back.
-        Purpose: Ensure read-only mode works correctly (Issue #131 feature).
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite database...")
-        db_file = tmp_path / "data_readonly.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        token_data = {
-            "access_token": "original_access",
-            "refresh_token": "original_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Enabling SQLITE_READONLY flag...")
-        monkeypatch.setattr("kiro.auth.SQLITE_READONLY", True)
-
-        print("Setup: Creating KiroAuthManager...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Action: Updating tokens in memory...")
-        manager._access_token = "new_access"
-        manager._refresh_token = "new_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-
-        print("Action: Calling _save_credentials_to_sqlite() with READONLY=True...")
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Reading SQLite to check data NOT changed...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        saved_data = json.loads(row[0])
-
-        print("Verification: Tokens NOT updated (read-only mode)...")
-        print(f"Comparing access_token: Expected 'original_access', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "original_access"
-
-        print(f"Comparing refresh_token: Expected 'original_refresh', Got '{saved_data['refresh_token']}'")
-        assert saved_data["refresh_token"] == "original_refresh"
-
-    def test_save_fallback_when_primary_key_deleted(self, tmp_path):
-        """
-        What it does: Verifies fallback mechanism when primary key is deleted.
-        Purpose: Ensure tokens are saved to alternative key if primary is missing.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with kirocli:social:token...")
-        db_file = tmp_path / "data_fallback.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        # Create initial token in social key
-        token_data = {
-            "access_token": "social_access",
-            "refresh_token": "social_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Loading credentials from kirocli:social:token...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Verification: Primary key tracked...")
-        assert manager._sqlite_token_key == "kirocli:social:token"
-
-        print("Action: Deleting primary key and creating alternative key...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        # Delete social token
-        cursor.execute("DELETE FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-
-        # Create alternative key (kirocli:odic:token)
-        odic_data = {
-            "access_token": "odic_access",
-            "refresh_token": "odic_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute("INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:odic:token", json.dumps(odic_data)))
-        conn.commit()
-        conn.close()
-
-        print("Action: Updating tokens and saving...")
-        manager._access_token = "fallback_access"
-        manager._refresh_token = "fallback_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Tokens saved to fallback key (kirocli:odic:token)...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:odic:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        assert row is not None
-        saved_data = json.loads(row[0])
-
-        print(f"Comparing access_token: Expected 'fallback_access', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "fallback_access"
-
-        print(f"Comparing refresh_token: Expected 'fallback_refresh', Got '{saved_data['refresh_token']}'")
-        assert saved_data["refresh_token"] == "fallback_refresh"
-
-    def test_save_fallback_when_primary_key_is_none(self, tmp_path):
-        """
-        What it does: Verifies fallback when _sqlite_token_key is None.
-        Purpose: Ensure robustness when source key is not tracked.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with kirocli:social:token...")
-        db_file = tmp_path / "data_none_key.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        token_data = {
-            "access_token": "existing_access",
-            "refresh_token": "existing_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with direct credentials...")
-        manager = KiroAuthManager(refresh_token="test_refresh", sqlite_db=str(db_file))
-
-        print("Action: Manually setting _sqlite_token_key to None...")
-        manager._sqlite_token_key = None
-
-        print("Action: Updating tokens and saving...")
-        manager._access_token = "none_key_access"
-        manager._refresh_token = "none_key_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Fallback found and updated kirocli:social:token...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        assert row is not None
-        saved_data = json.loads(row[0])
-
-        print(f"Comparing access_token: Expected 'none_key_access', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "none_key_access"
-
-        print(f"Comparing refresh_token: Expected 'none_key_refresh', Got '{saved_data['refresh_token']}'")
-        assert saved_data["refresh_token"] == "none_key_refresh"
-
-    def test_save_handles_corrupted_json_gracefully(self, tmp_path):
-        """
-        What it does: Verifies graceful handling of corrupted JSON during save.
-        Purpose: Ensure _try_save_to_key skips corrupted key and fallback is used.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with valid key...")
-        db_file = tmp_path / "data_corrupted.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        # Valid JSON in social key (will be loaded)
-        social_data = {
-            "access_token": "social_access",
-            "refresh_token": "social_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(social_data))
-        )
-
-        # Valid JSON in odic key (fallback)
-        odic_data = {
-            "access_token": "odic_access",
-            "refresh_token": "odic_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute("INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:odic:token", json.dumps(odic_data)))
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager (loads from social)...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Verification: Loaded from social key...")
-        assert manager._access_token == "social_access"
-        assert manager._sqlite_token_key == "kirocli:social:token"
-
-        print("Action: Corrupting primary key in database...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("UPDATE auth_kv SET value = ? WHERE key = ?", ("not a valid json {{{", "kirocli:social:token"))
-        conn.commit()
-        conn.close()
-
-        print("Action: Updating tokens and saving (primary key now corrupted)...")
-        manager._access_token = "corrupted_test_access"
-        manager._refresh_token = "corrupted_test_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Tokens saved to fallback key (skipped corrupted primary)...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:odic:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        assert row is not None
-        saved_data = json.loads(row[0])
-
-        print(f"Comparing access_token: Expected 'corrupted_test_access', Got '{saved_data['access_token']}'")
-        assert saved_data["access_token"] == "corrupted_test_access"
-
-    def test_save_preserves_scopes_when_present(self, tmp_path):
-        """
-        What it does: Verifies scopes field is updated when present.
-        Purpose: Ensure scopes are saved correctly for AWS SSO OIDC.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with scopes...")
-        db_file = tmp_path / "data_scopes.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        token_data = {
-            "access_token": "old_access",
-            "refresh_token": "old_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-            "scopes": ["old_scope_1", "old_scope_2"],
-        }
-        cursor.execute("INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:odic:token", json.dumps(token_data)))
-
-        registration_data = {
-            "client_id": "test_client_id",
-            "client_secret": "test_client_secret",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
-            ("kirocli:odic:device-registration", json.dumps(registration_data)),
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Action: Updating scopes and saving...")
-        manager._access_token = "new_access"
-        manager._refresh_token = "new_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        manager._scopes = ["new_scope_1", "new_scope_2", "new_scope_3"]
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Reading SQLite...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:odic:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        saved_data = json.loads(row[0])
-
-        print("Verification: Scopes updated...")
-        print(
-            f"Comparing scopes: Expected ['new_scope_1', 'new_scope_2', 'new_scope_3'], Got {saved_data.get('scopes')}"
-        )
-        assert saved_data.get("scopes") == ["new_scope_1", "new_scope_2", "new_scope_3"]
-
-    def test_save_updates_region_always(self, tmp_path):
-        """
-        What it does: Verifies region field is always updated.
-        Purpose: Ensure region reflects current SSO region.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with old region...")
-        db_file = tmp_path / "data_region.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        token_data = {
-            "access_token": "access",
-            "refresh_token": "refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Action: Updating region and saving...")
-        manager._access_token = "new_access"
-        manager._refresh_token = "new_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-        manager._sso_region = "eu-west-1"
-        manager._save_credentials_to_sqlite()
-
-        print("Verification: Reading SQLite...")
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-        row = cursor.fetchone()
-        conn.close()
-
-        saved_data = json.loads(row[0])
-
-        print("Verification: Region updated...")
-        print(f"Comparing region: Expected 'eu-west-1', Got '{saved_data['region']}'")
-        assert saved_data["region"] == "eu-west-1"
-
-    def test_try_save_to_key_returns_false_when_key_not_found(self, tmp_path):
-        """
-        What it does: Verifies _try_save_to_key returns False when key doesn't exist.
-        Purpose: Ensure helper method correctly reports failure.
-        """
-        import sqlite3
-
-        print("Setup: Creating empty SQLite database...")
-        db_file = tmp_path / "data_empty.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        conn.commit()
-
-        print("Setup: Creating KiroAuthManager...")
-        manager = KiroAuthManager(refresh_token="test_refresh", sqlite_db=str(db_file))
-        manager._access_token = "test_access"
-        manager._refresh_token = "test_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-
-        print("Action: Calling _try_save_to_key with nonexistent key...")
-        result = manager._try_save_to_key(cursor, "nonexistent_key")
-
-        conn.close()
-
-        print("Verification: Returns False...")
-        print(f"Comparing result: Expected False, Got {result}")
-        assert result is False
-
-    def test_try_save_to_key_returns_true_on_success(self, tmp_path):
-        """
-        What it does: Verifies _try_save_to_key returns True on successful save.
-        Purpose: Ensure helper method correctly reports success.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with valid key...")
-        db_file = tmp_path / "data_valid.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        token_data = {
-            "access_token": "old_access",
-            "refresh_token": "old_refresh",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "region": "us-east-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-
-        print("Setup: Creating KiroAuthManager...")
-        manager = KiroAuthManager(refresh_token="test_refresh", sqlite_db=str(db_file))
-        manager._access_token = "new_access"
-        manager._refresh_token = "new_refresh"
-        manager._expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-
-        print("Action: Calling _try_save_to_key with valid key...")
-        result = manager._try_save_to_key(cursor, "kirocli:social:token")
-
-        conn.commit()
-        conn.close()
-
-        print("Verification: Returns True...")
-        print(f"Comparing result: Expected True, Got {result}")
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_save_after_token_refresh_kiro_desktop(self, tmp_path, mock_kiro_token_response):
-        """
-        What it does: Verifies tokens are saved after Kiro Desktop refresh with extra fields preserved.
-        Purpose: Integration test for Issue #131 fix with Kiro Desktop auth.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with social login + extra fields...")
-        db_file = tmp_path / "data_refresh_desktop.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        # Social login with extra fields
-        token_data = {
-            "access_token": "old_desktop_access",
-            "refresh_token": "old_desktop_refresh",
-            "expires_at": "2020-01-01T00:00:00Z",
-            "region": "us-east-1",
-            "startUrl": "https://example.awsapps.com/start",
-            "provider": "github",
-            "customField": "must_be_preserved",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:social:token", json.dumps(token_data))
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with SQLite...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Setup: Mocking successful Kiro Desktop refresh...")
-        mock_response = AsyncMock()
-        mock_response.status_code = 200
-        mock_response.json = Mock(return_value=mock_kiro_token_response())
-        mock_response.raise_for_status = Mock()
-
-        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_class.return_value = mock_client
-
-            print("Action: Calling _refresh_token_kiro_desktop()...")
-            await manager._refresh_token_kiro_desktop()
-
-            print("Verification: Reading SQLite to check persistence...")
-            conn = sqlite3.connect(str(db_file))
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:social:token",))
-            row = cursor.fetchone()
-            conn.close()
-
-            assert row is not None
-            saved_data = json.loads(row[0])
-
-            print("Verification: New tokens saved...")
-            print(f"Comparing refresh_token: Expected 'new_refresh_token_xyz', Got '{saved_data['refresh_token']}'")
-            assert saved_data["refresh_token"] == "new_refresh_token_xyz"
-
-            print("Verification: Extra fields preserved...")
-            print(
-                f"Comparing startUrl: Expected 'https://example.awsapps.com/start', Got '{saved_data.get('startUrl')}'"
-            )
-            assert saved_data.get("startUrl") == "https://example.awsapps.com/start"
-
-            print(f"Comparing provider: Expected 'github', Got '{saved_data.get('provider')}'")
-            assert saved_data.get("provider") == "github"
-
-            print(f"Comparing customField: Expected 'must_be_preserved', Got '{saved_data.get('customField')}'")
-            assert saved_data.get("customField") == "must_be_preserved"
-
-    @pytest.mark.asyncio
-    async def test_save_after_token_refresh_aws_sso_oidc(self, tmp_path, mock_aws_sso_oidc_token_response):
-        """
-        What it does: Verifies tokens are saved after AWS SSO OIDC refresh with extra fields preserved.
-        Purpose: Integration test for Issue #131 fix with AWS SSO OIDC auth.
-        """
-        import json
-        import sqlite3
-
-        print("Setup: Creating SQLite with OIDC + extra fields...")
-        db_file = tmp_path / "data_refresh_oidc.sqlite3"
-        conn = sqlite3.connect(str(db_file))
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE auth_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        # OIDC with extra fields
-        token_data = {
-            "access_token": "old_oidc_access",
-            "refresh_token": "old_oidc_refresh",
-            "expires_at": "2020-01-01T00:00:00Z",
-            "region": "eu-west-1",
-            "unknownField1": "value1",
-            "unknownField2": "value2",
-            "futureField": "future_value",
-        }
-        cursor.execute("INSERT INTO auth_kv (key, value) VALUES (?, ?)", ("kirocli:odic:token", json.dumps(token_data)))
-
-        registration_data = {
-            "client_id": "test_client_id",
-            "client_secret": "test_client_secret",
-            "region": "eu-west-1",
-        }
-        cursor.execute(
-            "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
-            ("kirocli:odic:device-registration", json.dumps(registration_data)),
-        )
-        conn.commit()
-        conn.close()
-
-        print("Setup: Creating KiroAuthManager with SQLite...")
-        manager = KiroAuthManager(sqlite_db=str(db_file))
-
-        print("Setup: Mocking successful AWS SSO OIDC refresh...")
-        mock_response = AsyncMock()
-        mock_response.status_code = 200
-        mock_response.json = Mock(return_value=mock_aws_sso_oidc_token_response())
-        mock_response.raise_for_status = Mock()
-
-        with patch("kiro.auth.httpx.AsyncClient") as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_class.return_value = mock_client
-
-            print("Action: Calling _do_aws_sso_oidc_refresh()...")
-            await manager._do_aws_sso_oidc_refresh()
-
-            print("Verification: Reading SQLite to check persistence...")
-            conn = sqlite3.connect(str(db_file))
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM auth_kv WHERE key = ?", ("kirocli:odic:token",))
-            row = cursor.fetchone()
-            conn.close()
-
-            assert row is not None
-            saved_data = json.loads(row[0])
-
-            print("Verification: New tokens saved...")
-            print(f"Comparing access_token: Expected 'new_aws_sso_access_token', Got '{saved_data['access_token']}'")
-            assert saved_data["access_token"] == "new_aws_sso_access_token"
-
-            print(f"Comparing refresh_token: Expected 'new_aws_sso_refresh_token', Got '{saved_data['refresh_token']}'")
-            assert saved_data["refresh_token"] == "new_aws_sso_refresh_token"
-
-            print("Verification: Extra fields preserved...")
-            print(f"Comparing unknownField1: Expected 'value1', Got '{saved_data.get('unknownField1')}'")
-            assert saved_data.get("unknownField1") == "value1"
-
-            print(f"Comparing unknownField2: Expected 'value2', Got '{saved_data.get('unknownField2')}'")
-            assert saved_data.get("unknownField2") == "value2"
-
-            print(f"Comparing futureField: Expected 'future_value', Got '{saved_data.get('futureField')}'")
-            assert saved_data.get("futureField") == "future_value"
-
-
-# =============================================================================
-# Tests for API Region Auto-Detection from SQLite
-# =============================================================================
-
-
 class TestAPIRegionAutoDetectionSQLite:
     """Tests for automatic API region detection from SQLite profile ARN.
 
