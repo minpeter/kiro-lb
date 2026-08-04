@@ -780,8 +780,8 @@ async def dashboard_accounts(request: Request) -> dict[str, list[dict[str, Any]]
     }
 
 
-@router.delete("/api/dashboard/accounts/{account_label}")
-async def dashboard_delete_account(account_label: str, request: Request) -> dict[str, bool]:
+@router.delete("/api/dashboard/accounts/{label}")
+async def dashboard_delete_account(label: str, request: Request) -> dict[str, bool]:
     _require_auth(request)
 
     def delete_metadata(account_id: str) -> None:
@@ -790,7 +790,7 @@ async def dashboard_delete_account(account_label: str, request: Request) -> dict
             conn.execute("DELETE FROM rate_observations WHERE account_id = ?", (account_id,))
 
     try:
-        await remove_account(request.app.state.account_manager, account_label, finalize=delete_metadata)
+        await remove_account(request.app.state.account_manager, label, finalize=delete_metadata)
     except AccountNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except AccountConflictError as exc:
