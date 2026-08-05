@@ -14,25 +14,45 @@ const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
   available: "ready",
   rate_limited: "rate limited",
   quota_exhausted: "quota exhausted",
+  quota_depleted: "quota spent",
   cooling_down: "cooling down",
   suspended: "BANNED",
   uninitialized: "pending",
 };
 
-/** Only "ready" is a routing target; everything else is currently excluded. */
+/**
+ * Only "ready" is a routing target, and everything else is excluded — except
+ * "quota spent", which is a reporting state: telemetry says the allowance is
+ * gone with overage off, but the account is still tried because the upstream 402
+ * is the authority and a usage reading can be stale. It is rendered as a warning
+ * rather than an error so it is not mistaken for an exclusion.
+ */
 function RoutingStateCell({ account }: { account: Account }) {
   const state = account.routingState;
   const label = ROUTING_STATE_LABEL[state] ?? state;
-  const variant = state === "available" ? "secondary" : state === "uninitialized" ? "outline" : "destructive";
   const suspended = state === "suspended";
+  const depleted = state === "quota_depleted";
+  const variant =
+    state === "available" ? "secondary" : state === "uninitialized" || depleted ? "outline" : "destructive";
   return (
     <div className="space-y-1">
-      <Badge variant={variant} className={suspended ? "font-semibold tracking-wide" : undefined}>
+      <Badge
+        variant={variant}
+        className={
+          suspended ? "font-semibold tracking-wide" : depleted ? "border-amber-500/50 text-amber-500" : undefined
+        }
+      >
         {suspended && <Ban size={12} />}
         {label}
       </Badge>
       {suspended ? (
         <p className="text-xs text-destructive">locked by Kiro; contact support</p>
+      ) : depleted ? (
+        <p className="text-xs tabular-nums text-muted-foreground">
+          {account.eligibleInSeconds > 0
+            ? `resets in ${formatDuration(account.eligibleInSeconds)}; still tried`
+            : "still tried at low priority"}
+        </p>
       ) : (
         account.eligibleInSeconds > 0 && (
           <p className="text-xs tabular-nums text-muted-foreground">

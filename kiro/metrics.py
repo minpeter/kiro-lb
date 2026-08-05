@@ -77,7 +77,15 @@ _FAMILIES: tuple[tuple[str, str, str], ...] = (
 # Every routing state account_routing_state can return. Emitted even at zero so
 # a state that empties out reads as 0 instead of the series disappearing, which
 # would otherwise make `sum by (state)` silently drop a category.
-_ROUTING_STATES = ("available", "uninitialized", "cooling_down", "rate_limited", "quota_exhausted", "suspended")
+_ROUTING_STATES = (
+    "available",
+    "uninitialized",
+    "cooling_down",
+    "rate_limited",
+    "quota_exhausted",
+    "quota_depleted",
+    "suspended",
+)
 
 
 def _escape(value: str) -> str:

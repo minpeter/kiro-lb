@@ -238,6 +238,51 @@ def load_quota_headroom() -> dict[str, float]:
     return headroom
 
 
+def load_quota_period() -> dict[str, tuple[float | None, bool | None]]:
+    """Return each account's next quota reset and overage flag.
+
+    A 402 quarantine should end when the monthly allowance actually resets, not
+    after a fixed interval, and a spent account should be reported as spent. Both
+    facts are known only to the control-plane usage poll, so a process that
+    restarts mid-quarantine has to recover them from the persisted rows: without
+    the reset date it falls back to the fixed window and re-admits an account
+    whose quota is still gone.
+
+    ``next_date_reset`` is TEXT and has held both epoch seconds and an empty
+    string, so anything unparseable or non-positive becomes None instead of a
+    guess. Only the two conclusive overage values map to a bool. The table
+    belongs to the dashboard and may not exist yet on a fresh database.
+    """
+    try:
+        with connection() as conn:
+            rows = conn.execute("SELECT account_id, next_date_reset, overage_status FROM account_usage").fetchall()
+    except sqlite3.Error:
+        return {}
+
+    period: dict[str, tuple[float | None, bool | None]] = {}
+    for row in rows:
+        try:
+            reset_at: float | None = float(row["next_date_reset"])
+        except (TypeError, ValueError):
+            reset_at = None
+        if reset_at is not None and reset_at <= 0:
+            reset_at = None
+
+        status = row["overage_status"]
+        overage: bool | None = None
+        if isinstance(status, str):
+            normalized = status.strip().upper()
+            if normalized == "ENABLED":
+                overage = True
+            elif normalized == "DISABLED":
+                overage = False
+
+        if reset_at is None and overage is None:
+            continue
+        period[row["account_id"]] = (reset_at, overage)
+    return period
+
+
 def save_runtime_state(
     state: dict[str, Any],
     conn: sqlite3.Connection | None = None,

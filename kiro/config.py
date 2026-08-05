@@ -543,14 +543,29 @@ ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILIST
 # usable pool (observed live: 1m -> 2m -> 4m ... -> 1h within four minutes).
 ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", "10"))
 
-# Quarantine in seconds for an account whose monthly quota is exhausted
+# Minimum quarantine in seconds for an account whose monthly quota is exhausted
 # (402 MONTHLY_REQUEST_COUNT). Such an account cannot serve any request until
 # its quota resets, so it leaves the rotation entirely: no probabilistic retry
 # reaches it, unlike a Circuit Breaker cooldown. Persisted across restarts
-# because the state outlives the process. Default 6h re-checks a few times a
-# day, which is enough to notice a reset or a plan upgrade without spending
-# live requests on a known-empty account.
+# because the state outlives the process.
+#
+# This is the floor and the fallback, not the whole policy: when the usage poll
+# knows the reset date the quarantine runs to that date instead. Waiting a fixed
+# 6h was measured releasing accounts ~34-40h before their reset, which returned
+# them to the pool reading "ready" at 1000/1000 - able only to answer 402 again.
+# The floor still applies when the reset date is unknown or already past, so a
+# bad reading cannot collapse the quarantine into an instant retry.
 ACCOUNT_QUOTA_QUARANTINE: int = int(os.getenv("ACCOUNT_QUOTA_QUARANTINE", "21600"))
+
+# Grace period added after the reported reset timestamp before an exhausted
+# account is retried. The upstream boundary is a date, so retrying at the exact
+# second risks spending another live request on a 402.
+ACCOUNT_QUOTA_RESET_MARGIN: int = int(os.getenv("ACCOUNT_QUOTA_RESET_MARGIN", "300"))
+
+# Ceiling on a reset-derived quarantine. A stale or malformed reset date must not
+# translate into an effectively permanent exclusion; past this bound the account
+# is retried and the upstream 402 becomes the authority again.
+ACCOUNT_QUOTA_QUARANTINE_MAX: int = int(os.getenv("ACCOUNT_QUOTA_QUARANTINE_MAX", "2764800"))
 
 # An upstream suspension is not a timed condition: the account stays locked until
 # Kiro support restores it. The window only bounds how long the gateway trusts a

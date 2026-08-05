@@ -36,6 +36,8 @@ from kiro.config import (
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
     ACCOUNT_QUOTA_QUARANTINE,
+    ACCOUNT_QUOTA_QUARANTINE_MAX,
+    ACCOUNT_QUOTA_RESET_MARGIN,
     ACCOUNT_QUOTA_WEIGHTED_ROUTING,
     ACCOUNT_RATE_LIMIT_COOLDOWN,
     ACCOUNT_RECOVERY_TIMEOUT,
@@ -116,9 +118,9 @@ def account_routing_state(account: "Account", now: Optional[float] = None) -> Tu
 
     Returns:
         Tuple of (state, seconds_until_eligible). State is one of
-        "suspended", "quota_exhausted", "rate_limited", "cooling_down",
-        "uninitialized", or "available"; the second element is 0 when nothing
-        is pending.
+        "suspended", "quota_exhausted", "quota_depleted", "rate_limited",
+        "cooling_down", "uninitialized", or "available"; the second element is 0
+        when nothing is pending.
     """
     now = time.time() if now is None else now
 
@@ -145,6 +147,17 @@ def account_routing_state(account: "Account", now: Optional[float] = None) -> Tu
 
     if account.auth_manager is None:
         return ("uninitialized", 0)
+
+    # Telemetry says the allowance is gone and overage is off, but nothing has
+    # excluded the account: either the 402 quarantine already expired or the
+    # account has not been tried since the quota ran out. Reporting "available"
+    # here is what made a spent account read as ready on the dashboard. This is
+    # a display state only - routing still treats the account as a candidate,
+    # deprioritized by its weight, because a usage reading can be stale and the
+    # authoritative answer is the upstream 402.
+    if account.quota_headroom is not None and account.quota_headroom <= 0.0 and account.quota_overage_enabled is False:
+        remaining = account.quota_resets_at - now
+        return ("quota_depleted", int(remaining) if remaining > 0 else 0)
 
     return ("available", 0)
 
@@ -244,6 +257,16 @@ class Account:
             account that truly cannot serve returns 402 and is handled by
             ``quota_exhausted_until``. Not persisted - a stale headroom is worse
             than no headroom, and the first refresh after start repopulates it.
+        quota_resets_at: Epoch seconds at which the monthly allowance next
+            resets, from the control-plane usage poll, or 0.0 when unknown. This
+            is what a 402 quarantine waits for: a fixed window expires while the
+            quota is still spent, re-admitting an account that can only answer
+            402 again. Not persisted with runtime state - it is re-seeded from
+            the usage rows on load, like ``quota_headroom``.
+        quota_overage_enabled: Whether the account may keep serving past its
+            allowance. Display only: it distinguishes "at 100% and therefore
+            done" from "at 100% but billing overage", which the routing state
+            alone cannot express.
         stats: Usage statistics
     """
 
@@ -258,6 +281,8 @@ class Account:
     suspended_until: float = 0.0
     models_cached_at: float = 0.0
     quota_headroom: Optional[float] = None
+    quota_resets_at: float = 0.0
+    quota_overage_enabled: Optional[bool] = None
     stats: AccountStats = field(default_factory=AccountStats)
 
 
@@ -543,9 +568,10 @@ class AccountManager:
         overwrites them.
         """
         try:
-            from kiro.store import load_quota_headroom
+            from kiro.store import load_quota_headroom, load_quota_period
 
             headroom = load_quota_headroom()
+            period = load_quota_period()
         except Exception as e:
             logger.debug(f"No persisted quota headroom to seed routing weights: {e}")
             return
@@ -557,8 +583,25 @@ class AccountManager:
                 continue
             account.quota_headroom = min(1.0, max(0.0, value))
             seeded += 1
-        if seeded:
-            logger.info(f"Seeded routing quota headroom for {seeded} account(s)")
+
+        # Reset date and overage flag are seeded independently of headroom: a row
+        # can carry a usable reset date while its usage reading is unusable, a
+        # restart mid-quarantine needs the date to avoid falling back to the fixed
+        # window, and the depleted display state needs the overage flag before the
+        # first poll or a spent account reads as ready again.
+        period_seeded = 0
+        for account_id, (reset_at, overage) in period.items():
+            account = self._accounts.get(account_id)
+            if account is None:
+                continue
+            account.quota_resets_at = reset_at or 0.0
+            account.quota_overage_enabled = overage
+            period_seeded += 1
+
+        if seeded or period_seeded:
+            logger.info(
+                f"Seeded routing quota headroom for {seeded} account(s), quota period for {period_seeded} account(s)"
+            )
 
     async def reload_durable_state(self) -> None:
         """Replace the live pool with the latest durable handoff snapshot."""
@@ -982,6 +1025,30 @@ class AccountManager:
         finally:
             await http_client.close()
 
+    def _quota_quarantine_until(self, account: Account, now: Optional[float] = None) -> float:
+        """Return when a 402-exhausted account should re-enter the rotation.
+
+        The quarantine exists to wait out a spent monthly allowance, so it ends
+        when that allowance resets. A fixed interval was measured expiring ~34-40
+        hours before the reset on live accounts, which put three accounts back in
+        the pool reading "ready" while still at 1000/1000 - they could only answer
+        402 again.
+
+        ``ACCOUNT_QUOTA_QUARANTINE`` remains the fallback for when the reset date
+        is unknown, and also the floor and ceiling: a reset that is already past
+        or implausibly far out (a bad or stale reading) must not translate into
+        an instant retry or an unbounded exclusion.
+        """
+        now = time.time() if now is None else now
+        floor = now + ACCOUNT_QUOTA_QUARANTINE
+        reset_at = account.quota_resets_at
+        if reset_at <= 0:
+            return floor
+        # A small margin past the reset: the upstream boundary is a date, and
+        # retrying a second early just spends another request on a 402.
+        target = reset_at + ACCOUNT_QUOTA_RESET_MARGIN
+        return max(floor, min(target, now + ACCOUNT_QUOTA_QUARANTINE_MAX))
+
     def set_quota_headroom(self, account_id: str, headroom: Optional[float]) -> None:
         """Record how much monthly quota an account has left, for routing weight.
 
@@ -1003,6 +1070,31 @@ class AccountManager:
             account.quota_headroom = None
             return
         account.quota_headroom = min(1.0, max(0.0, float(headroom)))
+
+    def set_quota_period(self, account_id: str, resets_at: Optional[float], overage_enabled: Optional[bool]) -> None:
+        """Record when the quota resets and whether overage keeps it serving.
+
+        Same contract as ``set_quota_headroom``: lock-free, non-throwing, and
+        purely additive telemetry. The reset time bounds a 402 quarantine so it
+        ends with the allowance instead of on a fixed timer; the overage flag only
+        distinguishes "spent and therefore done" from "spent but still billing"
+        for reporting.
+
+        Args:
+            account_id: Internal account ID
+            resets_at: Epoch seconds of the next quota reset, or None/non-positive
+                when unknown
+            overage_enabled: Whether the account may serve past its allowance, or
+                None when the reading does not say
+        """
+        account = self._accounts.get(account_id)
+        if account is None:
+            return
+        try:
+            account.quota_resets_at = float(resets_at) if resets_at and float(resets_at) > 0 else 0.0
+        except (TypeError, ValueError):
+            account.quota_resets_at = 0.0
+        account.quota_overage_enabled = overage_enabled
 
     def _routing_weight(self, account: Account) -> float:
         """Return the selection weight for one account.
@@ -1311,7 +1403,7 @@ class AccountManager:
             # long quarantine rather than leaving the Circuit Breaker to leak
             # probabilistic retries into an account that can only answer 402.
             if reason == "MONTHLY_REQUEST_COUNT":
-                account.quota_exhausted_until = time.time() + ACCOUNT_QUOTA_QUARANTINE
+                account.quota_exhausted_until = self._quota_quarantine_until(account)
                 account.stats.total_requests += 1
                 account.stats.failed_requests += 1
                 self._record_routing_event(account_id, "quota_exhausted")
@@ -1319,7 +1411,8 @@ class AccountManager:
                 logger.warning(
                     f"Account {account_id} monthly quota exhausted: "
                     f"status={status_code}, reason={reason}, "
-                    f"excluded from routing for {_format_duration(ACCOUNT_QUOTA_QUARANTINE)}"
+                    f"excluded from routing for "
+                    f"{_format_duration(max(0.0, account.quota_exhausted_until - time.time()))}"
                 )
                 return
 
@@ -1560,8 +1653,19 @@ class AccountManager:
 
             state, seconds = account_routing_state(account, now)
 
-            if state == "quota_exhausted":
+            if state == "suspended":
+                # Without this the hardest exclusion of all reported "available",
+                # sending an operator to debug the pool instead of the account.
+                parts.append(f"{label}: suspended upstream; Kiro support must restore it")
+            elif state == "quota_exhausted":
                 parts.append(f"{label}: monthly quota exhausted, excluded for {_format_duration(seconds)}")
+            elif state == "quota_depleted":
+                # Still a routing candidate, so this explains a 503 only as
+                # context: it says the pool is out of allowance rather than broken.
+                if seconds > 0:
+                    parts.append(f"{label}: quota spent, resets in {_format_duration(seconds)} (still tried)")
+                else:
+                    parts.append(f"{label}: quota spent (still tried)")
             elif state == "rate_limited":
                 parts.append(f"{label}: rate limited for {_format_duration(seconds)}")
             elif state == "cooling_down":
