@@ -49,10 +49,19 @@ function AccountRow({ row, total }: { row: Row; total: number }) {
         aria-expanded={expanded}
         className="flex w-full items-center gap-2 py-1.5 text-left text-sm hover:bg-muted/40"
       >
-        <span className="min-w-0 flex-1 truncate">
-          {/* Email when the quota poll has supplied one: the hashed label is
-              stable but tells an operator nothing about which account this is. */}
-          {row.email ?? <span className="font-mono text-xs">{row.account}</span>}
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+          {/* Email when the quota poll has supplied one, with the hashed label
+              kept underneath rather than replaced: two accounts can report the
+              same email, and the label is what 503 diagnostics and the metrics
+              name. Same treatment as AccountsPanel, so rows cross-reference. */}
+          {row.email ? (
+            <>
+              <span className="truncate">{row.email}</span>
+              <span className="truncate font-mono text-xs text-muted-foreground">{row.account}</span>
+            </>
+          ) : (
+            <span className="truncate font-mono text-xs">{row.account}</span>
+          )}
         </span>
         <span className="shrink-0 tabular-nums" title={exactTokens(row.totalTokens)}>
           {formatTokens(row.totalTokens)}

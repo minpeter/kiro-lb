@@ -699,6 +699,14 @@ class TestAccountTokenMetrics:
         with dashboard._db() as conn:
             conn.execute("DROP TABLE account_model_usage")
 
-        series = _series(_render(dashboard))
+        body = _render(dashboard)
+        series = _series(body)
         assert series["kiro_lb_up"] == 1
-        assert "kiro_lb_requests_total" in _render(dashboard) or series["kiro_lb_models"] >= 0
+        # The point of the assertion is that the *other* SQL-backed sections still
+        # rendered. kiro_lb_models is emitted before any query, so asserting on it
+        # would pass even if every database read had failed.
+        assert "kiro_lb_requests_total" in body
+        assert "kiro_lb_tokens_total" in body
+        # And the section that lost its table contributes nothing rather than
+        # aborting the scrape.
+        assert "kiro_lb_account_tokens_total{" not in body

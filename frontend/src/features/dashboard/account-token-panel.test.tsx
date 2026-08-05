@@ -37,6 +37,21 @@ describe("AccountTokenPanel", () => {
     expect(html).toContain("spender@example.com");
   });
 
+  it("keeps the hashed label visible next to the email", () => {
+    // Two accounts can report the same email, and the label is what the 503
+    // diagnostics and the Prometheus series name. Replacing it with the email
+    // would make same-email accounts indistinguishable in this breakdown.
+    const sameEmail: AccountTokenUsage = {
+      aaaaaaaaaaaa: { email: "dup@example.com", models: [model("claude-sonnet-4.5", 10, 0)], totalTokens: 10, requests: 1 },
+      bbbbbbbbbbbb: { email: "dup@example.com", models: [model("claude-sonnet-4.5", 20, 0)], totalTokens: 20, requests: 1 },
+    };
+
+    const html = renderToString(<AccountTokenPanel accountTokenUsage={sameEmail} isLoading={false} />);
+
+    expect(html).toContain("aaaaaaaaaaaa");
+    expect(html).toContain("bbbbbbbbbbbb");
+  });
+
   it("falls back to the hashed label when no email is known", () => {
     const html = renderToString(<AccountTokenPanel accountTokenUsage={usage} isLoading={false} />);
     expect(html).toContain("58e33ab2f014");

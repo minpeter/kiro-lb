@@ -713,3 +713,128 @@ class TestFailoverTokenAttribution:
         finally:
             drain_pending_usage()
             current_account_id.set(None)
+
+
+class TestFailoverAttributionThroughTheRoute:
+    """The route's per-attempt attribution, exercised through the failover loop.
+
+    The tests above pin the accounting primitive; this one pins the wiring. A
+    change that moved `current_account_id.set` out of the loop - or dropped it -
+    would leave those passing while every token landed on the wrong account, so
+    the assertion here is specifically that the *second* account owns the tokens
+    after the first one fails.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_account_that_answered_owns_the_tokens(self, monkeypatch, tmp_path):
+        import json as json_module
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kiro import routes_openai
+        from kiro.account_manager import AccountManager
+        from kiro.usage_tracking import (
+            current_account_id,
+            current_api_key_id,
+            drain_pending_usage,
+            record_token_usage,
+        )
+
+        # Two accounts, both initialized, in a manager the route will select from.
+        entries = [
+            {"type": "json", "path": str(tmp_path / f"{name}.json"), "enabled": True} for name in ("first", "second")
+        ]
+        for entry in entries:
+            with open(entry["path"], "w") as handle:
+                json_module.dump({"accessToken": "t", "refreshToken": "r"}, handle)
+        credentials = tmp_path / "credentials.json"
+        with open(credentials, "w") as handle:
+            json_module.dump(entries, handle)
+
+        manager = AccountManager(str(credentials), str(tmp_path / "state.json"))
+        await manager.load_credentials()
+        for account_id in list(manager._accounts.keys()):
+            account = manager._accounts[account_id]
+            account.auth_manager = MagicMock()
+            account.auth_manager.profile_arn = None
+            account.auth_manager.auth_type = None
+            account.auth_manager.get_access_token = AsyncMock(return_value="token")
+            account.model_cache = MagicMock()
+            account.initialized = True
+            account.is_initializing = False
+        first_id, second_id = list(manager._accounts.keys())
+
+        # The first attempt gets a 429, which classify_error treats as RECOVERABLE
+        # so the loop moves to the next account; the second succeeds. A 500 would
+        # be FATAL and returned to the client without any failover, which is what
+        # the first version of this test hit.
+        attempts: list[str] = []
+
+        class FakeResponse:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.headers = {}
+
+            async def aread(self):
+                return b'{"message": "upstream exploded"}'
+
+        async def fake_request_with_retry(self, *args, **kwargs):
+            # Whichever account the loop set is the one this attempt belongs to.
+            attempts.append(current_account_id.get())
+            return FakeResponse(429 if len(attempts) == 1 else 200)
+
+        async def fake_collect(*args, **kwargs):
+            # Stands in for the serializer, which is where tokens are really
+            # recorded. Deliberately does NOT set the account: it reads whatever
+            # the route left in the ContextVar, which is the thing under test.
+            record_token_usage("claude-sonnet-4.5", 100, 20)
+            return {"id": "x", "choices": [], "usage": {}}
+
+        monkeypatch.setattr(routes_openai.KiroHttpClient, "request_with_retry", fake_request_with_retry)
+        monkeypatch.setattr(routes_openai.KiroHttpClient, "close", AsyncMock())
+        monkeypatch.setattr(routes_openai.KiroHttpClient, "client", MagicMock(), raising=False)
+        monkeypatch.setattr(routes_openai, "collect_stream_response", fake_collect)
+        monkeypatch.setattr(routes_openai, "build_kiro_payload", lambda *a, **k: {"payload": True})
+        app = FastAPI()
+        app.include_router(routes_openai.router)
+        app.state.account_manager = manager
+        app.state.http_client = MagicMock()
+        # The route reads the multi-account failover switch off app.state, not
+        # config, and the loop under test only runs when it is on.
+        app.state.account_system = True
+        # Auth is a separate concern with its own tests; overridden so this one
+        # fails only on attribution.
+        app.dependency_overrides[routes_openai.verify_api_key] = lambda: True
+
+        drain_pending_usage()
+        # Recording needs a key as well as an account; authentication normally
+        # sets it and is stubbed out here.
+        current_api_key_id.set("key_a")
+        try:
+            with patch("random.random", return_value=0.5):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/v1/chat/completions",
+                        headers={"Authorization": "Bearer test-key"},
+                        json={
+                            "model": "claude-sonnet-4.5",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                        },
+                    )
+
+            assert response.status_code == 200
+            # The loop really did fail over: two attempts, two different accounts.
+            assert len(attempts) == 2
+            assert attempts[0] != attempts[1]
+
+            drained = drain_pending_usage()
+            attributed = {row[1] for row in drained}
+            # Exactly one account is charged, and it is the one that answered -
+            # not the first one tried.
+            assert attributed == {attempts[1]}
+            assert first_id not in attributed or second_id not in attributed
+        finally:
+            drain_pending_usage()
+            current_account_id.set(None)
