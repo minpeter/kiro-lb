@@ -134,6 +134,20 @@ def test_view_reports_unknown_quota_period_as_null(dashboard):
     assert view["quotaOverageEnabled"] is None
 
 
+def test_spent_account_reports_an_exclusion_window(dashboard):
+    # The state has to carry the same shape as quota_exhausted: an operator reading
+    # the row should not have to know which of the two is the weaker signal.
+    account = _initialized_account()
+    account.quota_headroom = 0.0
+    account.quota_overage_enabled = False
+    account.quota_resets_at = time.time() + 3 * 86400
+
+    view = dashboard._account_view(account)
+
+    assert view["routingState"] == "quota_depleted"
+    assert view["eligibleInSeconds"] > 2 * 86400
+
+
 def test_spent_account_is_not_reported_as_available(dashboard):
     account = _initialized_account()
     account.quota_headroom = 0.0

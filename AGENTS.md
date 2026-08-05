@@ -199,9 +199,11 @@ trusting a pin here.
   (`_quota_quarantine_until`); `ACCOUNT_QUOTA_QUARANTINE` is the floor and the
   no-date fallback only. A fixed window released accounts ~26 days early at
   1000/1000, where they could answer nothing but 402.
-- Letting `quota_depleted` exclude an account, or treating it as one. It is a
-  reporting state that ranks below every real exclusion; the upstream 402 is what
-  removes an account from rotation, never a usage reading.
+- Removing the last-resort pass in `get_next_account`. `quota_depleted` is
+  inferred from telemetry, not from an upstream refusal, so it is the one
+  exclusion allowed to be wrong: if it empties the pool, the second pass ignores
+  it and lets the upstream answer. Returning "no accounts available" because a
+  usage poll stalled is worse than returning a 402.
 - Letting a burst escalate into a long exclusion. `USER_REQUEST_RATE_EXCEEDED`
   parks an account for `ACCOUNT_RATE_LIMIT_COOLDOWN` (10s, `config.py:540`) and
   leaves the circuit breaker untouched; only `MONTHLY_REQUEST_COUNT`

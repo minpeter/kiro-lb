@@ -10,6 +10,12 @@ import { formatDuration, formatTimestamp, formatUsage } from "../format";
 import type { Account, AccountRoutingState } from "../types";
 import { TableSkeleton } from "./skeletons";
 
+/**
+ * "quota exhausted" and "quota spent" are deliberately near-identical: the same
+ * condition, reached by different evidence. Exhausted means the upstream refused
+ * with a 402; spent means the usage poll reports the allowance gone. Both exclude
+ * the account, so both read as an exclusion rather than one looking milder.
+ */
 const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
   available: "ready",
   rate_limited: "rate limited",
@@ -20,38 +26,26 @@ const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
   uninitialized: "pending",
 };
 
-/**
- * Only "ready" is a routing target, and everything else is excluded — except
- * "quota spent", which is a reporting state: telemetry says the allowance is
- * gone with overage off, but the account is still tried because the upstream 402
- * is the authority and a usage reading can be stale. It is rendered as a warning
- * rather than an error so it is not mistaken for an exclusion.
- */
+/** Only "ready" is a routing target; everything else is currently excluded. */
 function RoutingStateCell({ account }: { account: Account }) {
   const state = account.routingState;
   const label = ROUTING_STATE_LABEL[state] ?? state;
+  const variant = state === "available" ? "secondary" : state === "uninitialized" ? "outline" : "destructive";
   const suspended = state === "suspended";
-  const depleted = state === "quota_depleted";
-  const variant =
-    state === "available" ? "secondary" : state === "uninitialized" || depleted ? "outline" : "destructive";
+  // Both quota states carry the same wording, so a reader does not have to infer
+  // that one of them is a weaker condition than the other. It is not.
+  const quotaGone = state === "quota_exhausted" || state === "quota_depleted";
   return (
     <div className="space-y-1">
-      <Badge
-        variant={variant}
-        className={
-          suspended ? "font-semibold tracking-wide" : depleted ? "border-amber-500/50 text-amber-500" : undefined
-        }
-      >
+      <Badge variant={variant} className={suspended ? "font-semibold tracking-wide" : undefined}>
         {suspended && <Ban size={12} />}
         {label}
       </Badge>
       {suspended ? (
         <p className="text-xs text-destructive">locked by Kiro; contact support</p>
-      ) : depleted ? (
+      ) : quotaGone ? (
         <p className="text-xs tabular-nums text-muted-foreground">
-          {account.eligibleInSeconds > 0
-            ? `resets in ${formatDuration(account.eligibleInSeconds)}; still tried`
-            : "still tried at low priority"}
+          {account.eligibleInSeconds > 0 ? `resets in ${formatDuration(account.eligibleInSeconds)}` : "until it resets"}
         </p>
       ) : (
         account.eligibleInSeconds > 0 && (

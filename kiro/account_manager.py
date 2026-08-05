@@ -149,18 +149,33 @@ def account_routing_state(account: "Account", now: Optional[float] = None) -> Tu
     if account.auth_manager is None:
         return ("uninitialized", 0)
 
-    # Telemetry says the allowance is gone and overage is off, but nothing has
-    # excluded the account: either the 402 quarantine already expired or the
-    # account has not been tried since the quota ran out. Reporting "available"
-    # here is what made a spent account read as ready on the dashboard. This is
-    # a display state only - routing still treats the account as a candidate,
-    # deprioritized by its weight, because a usage reading can be stale and the
-    # authoritative answer is the upstream 402.
-    if account.quota_headroom is not None and account.quota_headroom <= 0.0 and account.quota_overage_enabled is False:
+    # Telemetry says the allowance is gone and overage is off, but no 402 window
+    # is active: either the quarantine already expired or the account has not
+    # been tried since the quota ran out. Either way the account cannot serve,
+    # so it is excluded from routing like any other spent account.
+    if is_quota_depleted(account):
         remaining = account.quota_resets_at - now
         return ("quota_depleted", int(remaining) if remaining > 0 else 0)
 
     return ("available", 0)
+
+
+def is_quota_depleted(account: "Account") -> bool:
+    """Report whether usage says this account's allowance is spent.
+
+    Requires all three facts to be conclusive: a reading exists, it shows nothing
+    left, and overage billing is off so 100% really is the ceiling. An unpolled
+    account, an unreadable reading, or an unknown overage status is never treated
+    as depleted - the gateway does not exclude an account on a guess.
+
+    Unlike ``quota_exhausted``, this is derived from telemetry rather than an
+    upstream refusal, so it is the one exclusion that can be wrong. Callers that
+    route on it must keep the last-resort path in ``get_next_account``: a stalled
+    usage poll must not be able to empty the pool.
+    """
+    return (
+        account.quota_headroom is not None and account.quota_headroom <= 0.0 and account.quota_overage_enabled is False
+    )
 
 
 def _reason_of(body: str) -> Optional[str]:
@@ -1121,6 +1136,9 @@ class AccountManager:
         headroom = account.quota_headroom
         if headroom is None:
             return max(ACCOUNT_UNKNOWN_QUOTA_WEIGHT, MINIMUM_ROUTING_WEIGHT)
+        # A spent allowance is normally excluded outright, so this weight only
+        # decides ordering among spent accounts on the last-resort pass, or for an
+        # account at 0% whose overage status leaves it eligible.
         if headroom <= 0.0:
             return max(ACCOUNT_DEPLETED_QUOTA_WEIGHT, MINIMUM_ROUTING_WEIGHT)
         return max(headroom, MINIMUM_ROUTING_WEIGHT)
@@ -1163,6 +1181,8 @@ class AccountManager:
         - Probabilistic retry for "dead" accounts (10%)
         - Short skip for rate-limited accounts (no failure penalty)
         - Full exclusion of quota-exhausted accounts (no probabilistic retry)
+        - Exclusion of accounts whose usage reports the allowance spent, lifted
+          on a last-resort pass so stale telemetry cannot empty the pool
         - TTL-based model cache refresh
         - Exclusion of already-tried accounts in current failover loop
 
@@ -1172,6 +1192,37 @@ class AccountManager:
 
         Returns:
             Account object or None if no accounts available
+        """
+        # Two passes. The first honors every exclusion. If that finds nothing, the
+        # second retries ignoring the one exclusion that is inferred rather than
+        # observed: a usage reading can be stale or its poll stalled, and answering
+        # 402 beats answering "no accounts available" when the alternative is a
+        # pool that is only empty according to telemetry.
+        account = await self._select_account(model, exclude_accounts)
+        if account is not None:
+            return account
+
+        # Only worth a second pass if that exclusion actually applied to someone;
+        # otherwise the first pass already considered every account.
+        async with self._lock:
+            depleted = [a.id for a in self._accounts.values() if is_quota_depleted(a)]
+        if not depleted:
+            return None
+
+        account = await self._select_account(model, exclude_accounts, last_resort=True)
+        if account is not None:
+            logger.warning(
+                f"Routing to {account.id} despite usage reporting its quota spent: no other account is eligible"
+            )
+        return account
+
+    async def _select_account(
+        self, model: str, exclude_accounts: Optional[set] = None, last_resort: bool = False
+    ) -> Optional[Account]:
+        """One selection pass. See ``get_next_account`` for the policy.
+
+        ``last_resort`` lifts only the telemetry-derived quota exclusion; every
+        exclusion backed by an upstream response still applies.
         """
         async with self._lock:
             all_account_ids = list(self._accounts)
@@ -1203,6 +1254,13 @@ class AccountManager:
                     # expires: no probabilistic retry, because there is nothing to
                     # discover before the quota resets.
                     if account.quota_exhausted_until > time.time():
+                        continue
+
+                    # Skip accounts whose usage says the allowance is spent. Unlike
+                    # the checks above this is derived from telemetry rather than an
+                    # upstream refusal, so it is skipped on the last-resort pass:
+                    # a stalled usage poll must not be able to empty the pool.
+                    if not last_resort and is_quota_depleted(account):
                         continue
 
                     # Skip accounts inside their rate-limit window. This is checked
@@ -1663,14 +1721,14 @@ class AccountManager:
                 # sending an operator to debug the pool instead of the account.
                 parts.append(f"{label}: suspended upstream; Kiro support must restore it")
             elif state == "quota_exhausted":
+                # Phrased in parallel with quota_depleted below: same condition,
+                # different evidence. This one was refused upstream.
                 parts.append(f"{label}: monthly quota exhausted, excluded for {_format_duration(seconds)}")
             elif state == "quota_depleted":
-                # Still a routing candidate, so this explains a 503 only as
-                # context: it says the pool is out of allowance rather than broken.
                 if seconds > 0:
-                    parts.append(f"{label}: quota spent, resets in {_format_duration(seconds)} (still tried)")
+                    parts.append(f"{label}: monthly quota spent, excluded for {_format_duration(seconds)}")
                 else:
-                    parts.append(f"{label}: quota spent (still tried)")
+                    parts.append(f"{label}: monthly quota spent, excluded until it resets")
             elif state == "rate_limited":
                 parts.append(f"{label}: rate limited for {_format_duration(seconds)}")
             elif state == "cooling_down":

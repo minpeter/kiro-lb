@@ -218,38 +218,139 @@ class TestDepletedIsReportedNotHidden:
         assert state == "uninitialized"
 
 
-class TestDepletedAccountsStillRoute:
-    """The report state must not become a hidden exclusion."""
+class TestDepletedAccountsAreExcluded:
+    """A spent allowance is excluded, with one deliberate escape hatch."""
 
-    @pytest.mark.asyncio
-    async def test_depleted_account_is_still_selected(self, tmp_path):
-        manager = _manager(tmp_path)
-        account_id = "/creds/account0.json"
+    def _deplete(self, manager: AccountManager, account_id: str) -> Account:
         account = manager._accounts[account_id]
         account.quota_headroom = 0.0
         account.quota_overage_enabled = False
         account.quota_resets_at = time.time() + DAY
+        return account
 
-        assert account_routing_state(account)[0] == "quota_depleted"
+    @pytest.mark.asyncio
+    async def test_depleted_account_is_skipped_for_a_healthy_one(self, tmp_path):
+        manager = _manager(tmp_path, ("/creds/spent.json", "/creds/healthy.json"))
+        self._deplete(manager, "/creds/spent.json")
+        manager._accounts["/creds/healthy.json"].quota_headroom = 0.5
 
-        # A stale reading must not strand the pool: the upstream 402 is the
-        # authority, so the account remains a candidate.
+        # Repeated draws: the order is randomized, so a single call could pick the
+        # healthy account by luck rather than by the exclusion.
+        for _ in range(40):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id == "/creds/healthy.json"
+
+    @pytest.mark.asyncio
+    async def test_every_depleted_account_is_skipped(self, tmp_path):
+        manager = _manager(tmp_path, (f"/creds/spent{i}.json" for i in range(4)))
+        for account_id in list(manager._accounts):
+            self._deplete(manager, account_id)
+        manager._accounts["/creds/healthy.json"] = Account(id="/creds/healthy.json")
+        manager._accounts["/creds/healthy.json"].auth_manager = MagicMock()
+        manager._accounts["/creds/healthy.json"].models_cached_at = time.time()
+        manager._accounts["/creds/healthy.json"].quota_headroom = 0.1
+
+        for _ in range(40):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id == "/creds/healthy.json"
+
+    @pytest.mark.asyncio
+    async def test_overage_enabled_account_at_zero_is_not_excluded(self, tmp_path):
+        # 100% with overage billing on can still serve, so it stays eligible.
+        manager = _manager(tmp_path, ("/creds/overage.json", "/creds/spent.json"))
+        self._deplete(manager, "/creds/spent.json")
+        overage = self._deplete(manager, "/creds/overage.json")
+        overage.quota_overage_enabled = True
+
+        for _ in range(30):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id == "/creds/overage.json"
+
+    @pytest.mark.asyncio
+    async def test_unpolled_account_is_not_excluded(self, tmp_path):
+        # No reading is not evidence of a spent quota.
+        manager = _manager(tmp_path, ("/creds/unpolled.json", "/creds/spent.json"))
+        self._deplete(manager, "/creds/spent.json")
+        manager._accounts["/creds/unpolled.json"].quota_headroom = None
+
+        for _ in range(30):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id == "/creds/unpolled.json"
+
+    @pytest.mark.asyncio
+    async def test_all_depleted_falls_back_rather_than_emptying_the_pool(self, tmp_path):
+        # The escape hatch: this exclusion is inferred from telemetry, so a stalled
+        # usage poll must not turn into "no accounts available". Let the upstream
+        # answer instead.
+        manager = _manager(tmp_path, ("/creds/spent0.json", "/creds/spent1.json"))
+        for account_id in list(manager._accounts):
+            self._deplete(manager, account_id)
+
         selected = await manager.get_next_account("claude-sonnet-4-5")
 
         assert selected is not None
-        assert selected.id == account_id
+        assert selected.id in manager._accounts
 
-    def test_pool_description_marks_it_as_still_tried(self, tmp_path):
-        manager = _manager(tmp_path)
-        account = manager._accounts["/creds/account0.json"]
-        account.quota_headroom = 0.0
-        account.quota_overage_enabled = False
-        account.quota_resets_at = time.time() + DAY
+    @pytest.mark.asyncio
+    async def test_last_resort_still_honors_upstream_backed_exclusions(self, tmp_path):
+        # The fallback lifts only the telemetry-derived exclusion. A suspension is
+        # an upstream fact and must survive it.
+        manager = _manager(tmp_path, ("/creds/spent.json", "/creds/banned.json"))
+        self._deplete(manager, "/creds/spent.json")
+        banned = self._deplete(manager, "/creds/banned.json")
+        banned.suspended_until = time.time() + 3600
+
+        for _ in range(30):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id == "/creds/spent.json"
+
+    @pytest.mark.asyncio
+    async def test_last_resort_does_not_revive_a_quota_quarantine(self, tmp_path):
+        manager = _manager(tmp_path, ("/creds/spent.json", "/creds/quarantined.json"))
+        self._deplete(manager, "/creds/spent.json")
+        quarantined = self._deplete(manager, "/creds/quarantined.json")
+        quarantined.quota_exhausted_until = time.time() + 3600
+
+        for _ in range(30):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id == "/creds/spent.json"
+
+    @pytest.mark.asyncio
+    async def test_exhausted_pool_still_returns_none(self, tmp_path):
+        # The fallback must not resurrect an account excluded for a real reason.
+        manager = _manager(tmp_path, ("/creds/a.json", "/creds/b.json"))
+        for account_id in list(manager._accounts):
+            manager._accounts[account_id].suspended_until = time.time() + 3600
+
+        assert await manager.get_next_account("claude-sonnet-4-5") is None
+
+    def test_pool_description_reports_it_as_an_exclusion(self, tmp_path):
+        manager = _manager(tmp_path, ("/creds/account0.json", "/creds/other.json"))
+        self._deplete(manager, "/creds/account0.json")
 
         description = manager.describe_pool_state()
 
-        assert "quota spent" in description
-        assert "still tried" in description
+        assert "monthly quota spent" in description
+        # The old wording advertised it as a candidate; it is not one any more.
+        assert "still tried" not in description
+
+    def test_both_quota_states_read_the_same_way(self, tmp_path):
+        # Same operational fact, different evidence: the phrasing stays parallel so
+        # neither reads as the milder condition.
+        manager = _manager(tmp_path, ("/creds/spent.json", "/creds/exhausted.json"))
+        self._deplete(manager, "/creds/spent.json")
+        manager._accounts["/creds/exhausted.json"].quota_exhausted_until = time.time() + DAY
+
+        description = manager.describe_pool_state()
+
+        assert "monthly quota spent, excluded for" in description
+        assert "monthly quota exhausted, excluded for" in description
 
     def test_pool_description_names_a_suspension(self, tmp_path):
         # Previously a suspended account fell through to "available" here, which
