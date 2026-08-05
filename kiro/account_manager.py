@@ -44,6 +44,7 @@ from kiro.config import (
     FALLBACK_MODELS,
     HIDDEN_FROM_LIST,
     HIDDEN_MODELS,
+    MINIMUM_ROUTING_WEIGHT,
     MODEL_ALIASES,
     RATE_ESTIMATE_WINDOW_SECONDS,
     RATE_WINDOW_SECONDS,
@@ -1012,13 +1013,20 @@ class AccountManager:
         trip the per-account request-rate limit; the fraction drains every
         account toward empty at the same relative pace, which also spreads the
         rate-limit pressure.
+
+        The result is always positive. A zero weight cannot be sampled, so
+        several zero-weight accounts would fall back to a fixed order and the
+        ones behind the first would never be reached - the starvation this
+        policy exists to remove. Operators can drive a category's share
+        arbitrarily low, but not to zero; removing an account from rotation is
+        the health policy's job, not a weight's.
         """
         headroom = account.quota_headroom
         if headroom is None:
-            return max(ACCOUNT_UNKNOWN_QUOTA_WEIGHT, 0.0)
+            return max(ACCOUNT_UNKNOWN_QUOTA_WEIGHT, MINIMUM_ROUTING_WEIGHT)
         if headroom <= 0.0:
-            return max(ACCOUNT_DEPLETED_QUOTA_WEIGHT, 0.0)
-        return headroom
+            return max(ACCOUNT_DEPLETED_QUOTA_WEIGHT, MINIMUM_ROUTING_WEIGHT)
+        return max(headroom, MINIMUM_ROUTING_WEIGHT)
 
     def _weighted_candidate_order(self, account_ids: List[str]) -> List[str]:
         """Order candidates by a quota-weighted random draw, best first.
@@ -1037,11 +1045,11 @@ class AccountManager:
         keyed: List[Tuple[float, str]] = []
         for account_id in account_ids:
             account = self._accounts.get(account_id)
-            weight = self._routing_weight(account) if account is not None else 0.0
-            if weight <= 0.0:
-                # Never unreachable: sort last instead of being dropped.
-                keyed.append((float("inf"), account_id))
-                continue
+            # _routing_weight is always positive, and a vanished account still
+            # gets a real draw rather than a fixed position: a constant key would
+            # tie with every other such account and order them by insertion,
+            # which is how the sticky cursor starved everything behind it.
+            weight = self._routing_weight(account) if account is not None else MINIMUM_ROUTING_WEIGHT
             keyed.append((random.expovariate(1.0) / weight, account_id))
 
         keyed.sort(key=lambda item: item[0])

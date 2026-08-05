@@ -199,3 +199,53 @@ class TestHeadroomSeeding:
         await manager.load_state()
 
         assert manager._accounts["/creds/account0.json"].quota_headroom == pytest.approx(0.5)
+
+
+class TestRegistrationSeedsWeight:
+    """A newly registered account must not route at the neutral weight."""
+
+    @pytest.mark.asyncio
+    async def test_registration_poll_sets_routing_weight(self, dashboard, tmp_path, monkeypatch):
+        manager = _manager(tmp_path, ["/creds/new.json"])
+        assert manager._accounts["/creds/new.json"].quota_headroom is None
+
+        async def fake_refresh(account):
+            return {"currentUsage": 20.0, "usageLimit": 1000.0, "error": None}
+
+        monkeypatch.setattr(dashboard, "refresh_account_usage", fake_refresh)
+
+        result = await dashboard.prime_registered_account_usage(manager, {"accountKey": "/creds/new.json"})
+
+        # A fresh account is usually the emptiest in the pool; leaving it at the
+        # unknown weight until the next bulk refresh understates it.
+        assert manager._accounts["/creds/new.json"].quota_headroom == pytest.approx(0.98)
+        # The internal account key must never reach the client.
+        assert "accountKey" not in result
+
+    @pytest.mark.asyncio
+    async def test_registration_still_succeeds_when_weight_update_fails(self, dashboard, tmp_path, monkeypatch):
+        manager = _manager(tmp_path, ["/creds/new.json"])
+        manager.set_quota_headroom = MagicMock(side_effect=RuntimeError("nope"))
+
+        async def fake_refresh(account):
+            return {"currentUsage": 1.0, "usageLimit": 10.0, "error": None}
+
+        monkeypatch.setattr(dashboard, "refresh_account_usage", fake_refresh)
+
+        result = await dashboard.prime_registered_account_usage(manager, {"accountKey": "/creds/new.json", "id": "x"})
+
+        assert result == {"id": "x"}
+
+    @pytest.mark.asyncio
+    async def test_uninitialized_registration_is_left_unknown(self, dashboard, tmp_path, monkeypatch):
+        manager = _manager(tmp_path, ["/creds/new.json"])
+        manager._accounts["/creds/new.json"].auth_manager = None
+
+        async def fail(account):  # pragma: no cover - must not be reached
+            raise AssertionError("must not poll an uninitialized account")
+
+        monkeypatch.setattr(dashboard, "refresh_account_usage", fail)
+
+        await dashboard.prime_registered_account_usage(manager, {"accountKey": "/creds/new.json"})
+
+        assert manager._accounts["/creds/new.json"].quota_headroom is None

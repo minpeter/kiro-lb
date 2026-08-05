@@ -630,6 +630,13 @@ ACCOUNT_UNKNOWN_QUOTA_WEIGHT: float = float(os.getenv("ACCOUNT_UNKNOWN_QUOTA_WEI
 # handled by quota_exhausted_until, which does remove the account.
 ACCOUNT_DEPLETED_QUOTA_WEIGHT: float = float(os.getenv("ACCOUNT_DEPLETED_QUOTA_WEIGHT", "0.01"))
 
+# Absolute floor under every routing weight, including an operator-configured
+# one of 0. A zero weight cannot be sampled, so equally-zero accounts would be
+# ordered by pool insertion and everything behind the first would never be
+# reached - precisely the starvation weighted routing removes. Not configurable:
+# it is the invariant that keeps the policy honest.
+MINIMUM_ROUTING_WEIGHT: float = 1e-9
+
 # ==================================================================================================
 # Application Version
 # ==================================================================================================

@@ -562,21 +562,6 @@ async def refresh_account_usage(account: Any) -> dict[str, Any]:
         return {"updatedAt": updated_at, "error": error}
 
 
-async def prime_registered_account_usage(manager: Any, result: dict[str, Any]) -> dict[str, Any]:
-    """Poll quota for a freshly registered account and drop the internal key.
-
-    `register_account` returns the raw account ID (a credential path or token
-    hash) so the caller can find the new pool entry. That key must never reach
-    the client, and every registration route has to poll usage here: the
-    periodic refresh is up to USAGE_REFRESH_INTERVAL_SECONDS away, so without
-    this the new account shows no email, tier, or usage until then.
-    """
-    account = manager._accounts.get(result.pop("accountKey", ""))
-    if account is not None and account.auth_manager is not None:
-        await refresh_account_usage(account)
-    return result
-
-
 def _headroom_from_usage(usage: dict[str, Any]) -> float | None:
     """Convert a usage summary into the unused quota fraction, or None.
 
@@ -596,6 +581,42 @@ def _headroom_from_usage(usage: dict[str, Any]) -> float | None:
     return max(0.0, min(1.0, 1.0 - (float(current) / float(limit))))
 
 
+def _apply_routing_weight(manager: Any, account_id: str, usage: dict[str, Any]) -> None:
+    """Push a fresh usage reading into the router's selection weight.
+
+    Every path that polls quota must go through here. A poll that updated only
+    the dashboard row would leave selection weighting the account on whatever it
+    last believed, which for a newly registered account is nothing at all.
+    Failures are contained: routing weight is an optimization, and losing it must
+    never fail the poll or the registration that triggered it.
+    """
+    try:
+        manager.set_quota_headroom(account_id, _headroom_from_usage(usage))
+    except Exception as exc:
+        logger.warning("Failed to update routing weight for {}: {}", account_label(account_id), exc)
+
+
+async def prime_registered_account_usage(manager: Any, result: dict[str, Any]) -> dict[str, Any]:
+    """Poll quota for a freshly registered account and drop the internal key.
+
+    `register_account` returns the raw account ID (a credential path or token
+    hash) so the caller can find the new pool entry. That key must never reach
+    the client, and every registration route has to poll usage here: the
+    periodic refresh is up to USAGE_REFRESH_INTERVAL_SECONDS away, so without
+    this the new account shows no email, tier, or usage until then.
+
+    The same poll seeds the routing weight. Without it a new account routes at
+    the neutral unknown weight until the next bulk refresh, which understates a
+    fresh account that is usually the emptiest one in the pool.
+    """
+    account_id = result.pop("accountKey", "")
+    account = manager._accounts.get(account_id)
+    if account is not None and account.auth_manager is not None:
+        usage = await refresh_account_usage(account)
+        _apply_routing_weight(manager, account_id, usage)
+    return result
+
+
 async def refresh_all_account_usage(manager: Any) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for account_id, account in list(manager._accounts.items()):
@@ -609,10 +630,7 @@ async def refresh_all_account_usage(manager: Any) -> list[dict[str, Any]]:
         # Feed routing weight from the same poll. Selection prefers accounts
         # with quota left, so a refresh that updated the dashboard but not the
         # router would leave routing pinned to whatever it last believed.
-        try:
-            manager.set_quota_headroom(account_id, _headroom_from_usage(usage))
-        except Exception as exc:
-            logger.warning("Failed to update routing weight for {}: {}", account_label(account_id), exc)
+        _apply_routing_weight(manager, account_id, usage)
         results.append(usage)
     return results
 

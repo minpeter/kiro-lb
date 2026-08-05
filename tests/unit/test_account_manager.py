@@ -1868,3 +1868,69 @@ class TestQuotaWeightedRouting:
         serialized = json.dumps(document)
         print(f"State keys: {sorted(document.keys())}")
         assert "quota_headroom" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_zero_configured_floor_does_not_starve(self, tmp_path):
+        """
+        What it does: Forces both quota floors to 0 and draws from a pool whose
+                      accounts all read as fully used
+        Purpose: A zero weight cannot be sampled, so equal zero weights would
+                 order by pool insertion and starve everything behind the first
+                 entry - the exact bug this policy removes. MINIMUM_ROUTING_WEIGHT
+                 must keep every account drawable.
+        """
+        print("\n=== Test: a zero-configured weight floor still rotates ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.0, 0.0, 0.0])
+
+        counts = {f"/creds/account{i}.json": 0 for i in range(3)}
+        with (
+            patch("kiro.account_manager.ACCOUNT_DEPLETED_QUOTA_WEIGHT", 0.0),
+            patch("kiro.account_manager.ACCOUNT_UNKNOWN_QUOTA_WEIGHT", 0.0),
+        ):
+            for _ in range(300):
+                selected = await manager.get_next_account("claude-sonnet-4-5")
+                assert selected is not None
+                counts[selected.id] += 1
+
+        print(f"Selection counts with zero floors: {counts}")
+        assert all(count > 0 for count in counts.values())
+
+    @pytest.mark.asyncio
+    async def test_all_unknown_headroom_rotates(self, tmp_path):
+        """
+        What it does: Draws from a pool where no account has a quota reading
+        Purpose: Before the first usage poll every weight is equal; selection
+                 must still spread instead of collapsing onto one account
+        """
+        print("\n=== Test: an unpolled pool still rotates ===")
+
+        manager = self._pool(tmp_path, headrooms=[None, None, None])
+
+        counts = {f"/creds/account{i}.json": 0 for i in range(3)}
+        for _ in range(300):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            counts[selected.id] += 1
+
+        print(f"Selection counts with no readings: {counts}")
+        assert all(count > 0 for count in counts.values())
+
+    def test_routing_weight_is_always_positive(self, tmp_path):
+        """
+        What it does: Inspects the weight for depleted and unknown accounts under
+                      zeroed configuration
+        Purpose: Locks the invariant directly rather than only through sampling
+        """
+        print("\n=== Test: routing weight never reaches zero ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.0, None])
+        depleted = manager._accounts["/creds/account0.json"]
+        unknown = manager._accounts["/creds/account1.json"]
+
+        with (
+            patch("kiro.account_manager.ACCOUNT_DEPLETED_QUOTA_WEIGHT", 0.0),
+            patch("kiro.account_manager.ACCOUNT_UNKNOWN_QUOTA_WEIGHT", 0.0),
+        ):
+            assert manager._routing_weight(depleted) > 0.0
+            assert manager._routing_weight(unknown) > 0.0
