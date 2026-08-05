@@ -38,6 +38,12 @@ all wrong; trust `vite.config.ts` and `package.json`.
   (`use-dashboard.ts:53`).
 - Device-login registration is single-shot, guarded by a ref against overlapping
   polls.
+- `isUnroutable()` (`src/features/dashboard/routing-state.ts`) decides which
+  accounts the rate chart hides. It is deliberately narrower than "renders as a
+  destructive badge": `rate_limited` and `cooling_down` are red but clear on their
+  own, and they are exactly what the rate chart is for. Only `suspended`,
+  `quota_exhausted`, and `quota_depleted` hide. Hidden panels are disclosed by a
+  toggle, never silently dropped.
 - `cn()` in `src/lib/utils.ts` (clsx + tailwind-merge) is how class names compose;
   shadcn config lives in `components.json` (new-york, CSS variables, Lucide).
 
@@ -46,6 +52,9 @@ all wrong; trust `vite.config.ts` and `package.json`.
 - Editing `../kiro/static/**` directly instead of rebuilding here.
 - Adding a dev-only proxy assumption; the SPA is served same-origin in production.
 - Committing a build without running `bun run typecheck`.
+- Widening the rate chart's hide rule to every `destructive` badge state. It
+  would hide rate-limited accounts from the rate chart, removing the evidence of
+  the condition being diagnosed.
 - Ad hoc tab buttons; extend the `Tabs` primitive and `useTabHash()` instead
   (an unknown hash falls back to `overview`).
 - Adding a formatter config. There is no Prettier or Biome here; ESLint flat

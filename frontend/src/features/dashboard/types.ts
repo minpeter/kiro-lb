@@ -52,6 +52,12 @@ export type Account = {
 
 export type AccountRateSeries = {
   account: string;
+  /**
+   * Why the account is or is not a routing target, as of this response. Null
+   * when the series outlived the account it came from: rate observations are
+   * kept for the window, so a deregistered account still charts.
+   */
+  routingState: AccountRoutingState | null;
   success: number[];
   rateLimited: number[];
   failure: number[];
