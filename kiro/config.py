@@ -601,6 +601,43 @@ STATE_SAVE_INTERVAL_SECONDS: int = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", 
 USAGE_REFRESH_INTERVAL_SECONDS: int = int(os.getenv("USAGE_REFRESH_INTERVAL_SECONDS", "900"))
 
 # ==================================================================================================
+# Routing Policy
+# ==================================================================================================
+
+# Route by remaining monthly quota instead of pinning to the last account that
+# succeeded. The global sticky index only moved on success, so a healthy account
+# that was never reached stayed unreached: the pinned account answered every
+# request and the pool drained one account at a time (observed live: one account
+# took 11 of 11 requests while a 9%-used account took 0). Weighted selection
+# spreads traffic so the pool exhausts together instead of serially.
+ACCOUNT_QUOTA_WEIGHTED_ROUTING: bool = os.getenv("ACCOUNT_QUOTA_WEIGHTED_ROUTING", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# Weight floor for an account with no usable quota reading. Usage polling is
+# control-plane telemetry that can lag a restart or fail per account, and a
+# zero floor would make an unpolled account unreachable — reintroducing the
+# starvation this policy exists to remove. Kept low so a known-idle account is
+# still preferred over an unknown one.
+ACCOUNT_UNKNOWN_QUOTA_WEIGHT: float = float(os.getenv("ACCOUNT_UNKNOWN_QUOTA_WEIGHT", "0.25"))
+
+# Weight floor for an account whose quota is fully consumed. A 100%-used account
+# is not necessarily refusing traffic (overage may be enabled, and the reading
+# can be stale), so it stays reachable at a low weight rather than being pinned
+# out of the pool by telemetry alone. Real exhaustion arrives as a 402 and is
+# handled by quota_exhausted_until, which does remove the account.
+ACCOUNT_DEPLETED_QUOTA_WEIGHT: float = float(os.getenv("ACCOUNT_DEPLETED_QUOTA_WEIGHT", "0.01"))
+
+# Absolute floor under every routing weight, including an operator-configured
+# one of 0. A zero weight cannot be sampled, so equally-zero accounts would be
+# ordered by pool insertion and everything behind the first would never be
+# reached - precisely the starvation weighted routing removes. Not configurable:
+# it is the invariant that keeps the policy honest.
+MINIMUM_ROUTING_WEIGHT: float = 1e-9
+
+# ==================================================================================================
 # Application Version
 # ==================================================================================================
 

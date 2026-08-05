@@ -32,15 +32,19 @@ from kiro.auth import AuthType, KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.config import (
     ACCOUNT_CACHE_TTL,
+    ACCOUNT_DEPLETED_QUOTA_WEIGHT,
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
     ACCOUNT_QUOTA_QUARANTINE,
+    ACCOUNT_QUOTA_WEIGHTED_ROUTING,
     ACCOUNT_RATE_LIMIT_COOLDOWN,
     ACCOUNT_RECOVERY_TIMEOUT,
     ACCOUNT_SUSPENSION_QUARANTINE,
+    ACCOUNT_UNKNOWN_QUOTA_WEIGHT,
     FALLBACK_MODELS,
     HIDDEN_FROM_LIST,
     HIDDEN_MODELS,
+    MINIMUM_ROUTING_WEIGHT,
     MODEL_ALIASES,
     RATE_ESTIMATE_WINDOW_SECONDS,
     RATE_WINDOW_SECONDS,
@@ -234,6 +238,12 @@ class Account:
             account leaves the rotation completely and the Circuit Breaker is
             left untouched. Persisted; a restart must not resurrect it.
         models_cached_at: Timestamp of last model cache update
+        quota_headroom: Fraction of the monthly quota still unused (0.0-1.0), or
+            None when no usage reading is available. Fed by control-plane usage
+            polling and used only to weight routing, never to exclude: an
+            account that truly cannot serve returns 402 and is handled by
+            ``quota_exhausted_until``. Not persisted - a stale headroom is worse
+            than no headroom, and the first refresh after start repopulates it.
         stats: Usage statistics
     """
 
@@ -247,6 +257,7 @@ class Account:
     quota_exhausted_until: float = 0.0
     suspended_until: float = 0.0
     models_cached_at: float = 0.0
+    quota_headroom: Optional[float] = None
     stats: AccountStats = field(default_factory=AccountStats)
 
 
@@ -484,6 +495,11 @@ class AccountManager:
             state_data = load_runtime_state()
             if state_data is None:
                 logger.debug("No persisted account runtime state")
+                # Routing weights live in a different table and are seeded even
+                # with no runtime state: a first-ever start still has usage rows
+                # once the dashboard has polled, and routing blind is exactly
+                # the condition weighted selection exists to avoid.
+                self._seed_quota_headroom()
                 return
             # Restore global current_account_index
             self._current_account_index = state_data.get("current_account_index", 0)
@@ -509,10 +525,40 @@ class AccountManager:
                         failed_requests=stats_data.get("failed_requests", 0),
                     )
 
+            self._seed_quota_headroom()
+
             logger.info(f"Loaded state: {len(self._model_to_accounts)} model mappings, {len(self._accounts)} accounts")
 
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
+
+    def _seed_quota_headroom(self) -> None:
+        """Prime routing weights from the last persisted usage readings.
+
+        Routing weight is deliberately not part of the runtime state document -
+        a stale headroom would misroute - but starting with none means every
+        cold start and every blue/green handoff routes blind until the first
+        usage poll, up to USAGE_REFRESH_INTERVAL_SECONDS later. The persisted
+        dashboard readings are the best available bridge, and the next poll
+        overwrites them.
+        """
+        try:
+            from kiro.store import load_quota_headroom
+
+            headroom = load_quota_headroom()
+        except Exception as e:
+            logger.debug(f"No persisted quota headroom to seed routing weights: {e}")
+            return
+
+        seeded = 0
+        for account_id, value in headroom.items():
+            account = self._accounts.get(account_id)
+            if account is None:
+                continue
+            account.quota_headroom = min(1.0, max(0.0, value))
+            seeded += 1
+        if seeded:
+            logger.info(f"Seeded routing quota headroom for {seeded} account(s)")
 
     async def reload_durable_state(self) -> None:
         """Replace the live pool with the latest durable handoff snapshot."""
@@ -936,12 +982,86 @@ class AccountManager:
         finally:
             await http_client.close()
 
+    def set_quota_headroom(self, account_id: str, headroom: Optional[float]) -> None:
+        """Record how much monthly quota an account has left, for routing weight.
+
+        Called by the control-plane usage refresh. Kept lock-free and
+        non-throwing: this is telemetry feeding a routing preference, and a
+        missing value degrades to the unknown-quota weight rather than removing
+        the account from the pool.
+
+        Args:
+            account_id: Internal account ID
+            headroom: Unused fraction of the monthly quota (0.0-1.0), or None
+                when the reading is unavailable. Values outside the range are
+                clamped.
+        """
+        account = self._accounts.get(account_id)
+        if account is None:
+            return
+        if headroom is None:
+            account.quota_headroom = None
+            return
+        account.quota_headroom = min(1.0, max(0.0, float(headroom)))
+
+    def _routing_weight(self, account: Account) -> float:
+        """Return the selection weight for one account.
+
+        The weight is the account's remaining quota *fraction*, not its absolute
+        remaining requests. Absolute headroom would hand a 1000-request account
+        20x the traffic of a 50-request one and concentrate it hard enough to
+        trip the per-account request-rate limit; the fraction drains every
+        account toward empty at the same relative pace, which also spreads the
+        rate-limit pressure.
+
+        The result is always positive. A zero weight cannot be sampled, so
+        several zero-weight accounts would fall back to a fixed order and the
+        ones behind the first would never be reached - the starvation this
+        policy exists to remove. Operators can drive a category's share
+        arbitrarily low, but not to zero; removing an account from rotation is
+        the health policy's job, not a weight's.
+        """
+        headroom = account.quota_headroom
+        if headroom is None:
+            return max(ACCOUNT_UNKNOWN_QUOTA_WEIGHT, MINIMUM_ROUTING_WEIGHT)
+        if headroom <= 0.0:
+            return max(ACCOUNT_DEPLETED_QUOTA_WEIGHT, MINIMUM_ROUTING_WEIGHT)
+        return max(headroom, MINIMUM_ROUTING_WEIGHT)
+
+    def _weighted_candidate_order(self, account_ids: List[str]) -> List[str]:
+        """Order candidates by a quota-weighted random draw, best first.
+
+        Every account keeps a nonzero chance of being picked, so this is a
+        preference, not a filter: the caller still walks the whole list and
+        applies health policy per candidate. Selection uses weighted sampling
+        without replacement (exponential jump keys), which needs no persisted
+        cursor - the reason the sticky index could starve an account in the
+        first place.
+        """
+        if not ACCOUNT_QUOTA_WEIGHTED_ROUTING:
+            start = self._current_account_index
+            return [account_ids[(start + offset) % len(account_ids)] for offset in range(len(account_ids))]
+
+        keyed: List[Tuple[float, str]] = []
+        for account_id in account_ids:
+            account = self._accounts.get(account_id)
+            # _routing_weight is always positive, and a vanished account still
+            # gets a real draw rather than a fixed position: a constant key would
+            # tie with every other such account and order them by insertion,
+            # which is how the sticky cursor starved everything behind it.
+            weight = self._routing_weight(account) if account is not None else MINIMUM_ROUTING_WEIGHT
+            keyed.append((random.expovariate(1.0) / weight, account_id))
+
+        keyed.sort(key=lambda item: item[0])
+        return [account_id for _, account_id in keyed]
+
     async def get_next_account(self, model: str, exclude_accounts: Optional[set] = None) -> Optional[Account]:
         """
-        Get next available account for model (Circuit Breaker + Sticky).
+        Get next available account for model (Circuit Breaker + quota weighting).
 
         Implements:
-        - Sticky behavior (prefer successful account)
+        - Quota-weighted selection order (accounts with more remaining quota are
+          preferred; every account keeps a nonzero chance)
         - Circuit Breaker with exponential backoff
         - Probabilistic retry for "dead" accounts (10%)
         - Short skip for rate-limited accounts (no failure penalty)
@@ -958,11 +1078,10 @@ class AccountManager:
         """
         async with self._lock:
             all_account_ids = list(self._accounts)
-            start_index = self._current_account_index
             single_account = len(all_account_ids) == 1
+            candidate_order = self._weighted_candidate_order(all_account_ids) if all_account_ids else []
 
-        for i in range(len(all_account_ids)):
-            account_id = all_account_ids[(start_index + i) % len(all_account_ids)]
+        for account_id in candidate_order:
             async with self._lock:
                 account = self._accounts.get(account_id)
                 if account is None:
@@ -1092,7 +1211,11 @@ class AccountManager:
                 logger.debug(f"Dynamic learning: model '{normalized_model}' works on account {account_id}")
                 self._dirty = True
 
-            # GLOBAL STICKY: Update global current_account_index
+            # Track the last successful account. Under quota-weighted routing
+            # this is no longer the selection cursor - it is kept because it is
+            # the rotation start for the legacy sticky policy
+            # (ACCOUNT_QUOTA_WEIGHTED_ROUTING=false) and part of the persisted
+            # state document, which a mixed-version blue/green pair still reads.
             all_account_ids = list(self._accounts.keys())
             try:
                 successful_index = all_account_ids.index(account_id)

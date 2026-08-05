@@ -884,9 +884,9 @@ class TestAccountManagerRateLimitCooldown:
     @pytest.mark.asyncio
     async def test_rate_limited_account_is_skipped_then_returns(self, tmp_path):
         """
-        What it does: Rate limits the sticky account, then expires the window
-        Purpose: Selection must rotate away during the window and come back
-                 afterwards at full health
+        What it does: Rate limits one account, then expires the window
+        Purpose: Selection must exclude the account for the whole window and
+                 make it reachable again afterwards at full health
         """
         print("\n=== Test: rate-limited account is skipped, then reused ===")
 
@@ -897,17 +897,25 @@ class TestAccountManagerRateLimitCooldown:
             first, "claude-sonnet-4-5", ErrorType.RECOVERABLE, 429, "USER_REQUEST_RATE_EXCEEDED"
         )
 
-        # Within the window: rotate to the other account.
-        selected = await manager.get_next_account("claude-sonnet-4-5")
-        print(f"During window selected: {selected.id}")
-        assert selected.id == second
+        # Within the window: every attempt lands on the other account. Routing
+        # order is randomized by quota weight, so the exclusion is asserted over
+        # repeated draws rather than a single deterministic pick.
+        for _ in range(20):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id == second
+        print(f"During window selected: {second} on every attempt")
 
         # Expire the window without sleeping.
         manager._accounts[first].rate_limited_until = time.time() - 1
 
-        selected = await manager.get_next_account("claude-sonnet-4-5")
-        print(f"After window selected: {selected.id}")
-        assert selected.id == first
+        seen = set()
+        for _ in range(40):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            seen.add(selected.id)
+        print(f"After window reachable: {sorted(seen)}")
+        assert first in seen
         assert manager._accounts[first].failures == 0
 
     @pytest.mark.asyncio
@@ -1060,12 +1068,25 @@ class TestAccountManagerQuotaExclusion:
         await manager.report_failure(
             recovered, "claude-sonnet-4-5", ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
         )
+
+        # Still quarantined: the account must not be selected at all.
+        for _ in range(20):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id != recovered
+
         manager._accounts[recovered].quota_exhausted_until = time.time() - 1
 
-        selected = await manager.get_next_account("claude-sonnet-4-5")
-        print(f"Selected after expiry: {selected.id}")
+        # Reachable again. Selection order is quota-weighted and randomized, so
+        # reachability is asserted over repeated draws rather than one pick.
+        seen = set()
+        for _ in range(40):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            seen.add(selected.id)
+        print(f"Reachable after expiry: {sorted(seen)}")
 
-        assert selected.id == recovered
+        assert recovered in seen
 
     @pytest.mark.asyncio
     async def test_success_clears_quota_quarantine(self, tmp_path):
@@ -1649,3 +1670,267 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+class TestQuotaWeightedRouting:
+    """
+    Tests for quota-weighted account selection.
+
+    Replaces the global sticky index, whose cursor only advanced on success: an
+    account that was never selected could never succeed, so it was never
+    selected. Live symptom: the pinned account answered 11 of 11 requests while
+    a 9%-used account answered none.
+    """
+
+    def _pool(self, tmp_path, headrooms: list[float | None]) -> AccountManager:
+        manager = AccountManager(
+            credentials_file=str(tmp_path / "credentials.json"), state_file=str(tmp_path / "state.json")
+        )
+        for index, headroom in enumerate(headrooms):
+            account_id = f"/creds/account{index}.json"
+            account = Account(id=account_id)
+            account.auth_manager = MagicMock()
+            account.models_cached_at = time.time()
+            account.quota_headroom = headroom
+            manager._accounts[account_id] = account
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_last_position_account_is_not_starved(self, tmp_path):
+        """
+        What it does: Pins the legacy sticky index to the last account and draws
+                      many times from a pool whose last entry has quota left
+        Purpose: Reproduces the live starvation bug. Under the sticky policy the
+                 pinned account won every draw; weighted routing must reach the
+                 account sitting behind it in insertion order.
+        """
+        print("\n=== Test: the account behind the sticky cursor still gets traffic ===")
+
+        # Mirrors the live pool: the low-usage account sits at index 0 and the
+        # cursor is pinned to the account after it.
+        manager = self._pool(tmp_path, headrooms=[0.9, 0.73])
+        starved, pinned = "/creds/account0.json", "/creds/account1.json"
+        manager._current_account_index = 1
+
+        counts = {starved: 0, pinned: 0}
+        for _ in range(400):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            counts[selected.id] += 1
+
+        print(f"Selection counts: {counts}")
+        assert counts[starved] > 0
+        assert counts[pinned] > 0
+
+    @pytest.mark.asyncio
+    async def test_more_headroom_wins_more_traffic(self, tmp_path):
+        """
+        What it does: Draws repeatedly from a pool with very different headroom
+        Purpose: Selection must prefer the account with more quota left, which is
+                 what makes the pool drain evenly instead of one account at a time
+        """
+        print("\n=== Test: more remaining quota earns more traffic ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.9, 0.1])
+        rich, poor = "/creds/account0.json", "/creds/account1.json"
+
+        counts = {rich: 0, poor: 0}
+        for _ in range(600):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            counts[selected.id] += 1
+
+        print(f"Selection counts: {counts} (weights 0.9 vs 0.1)")
+        assert counts[rich] > counts[poor]
+        # Both stay reachable: weighting is a preference, not a filter.
+        assert counts[poor] > 0
+
+    @pytest.mark.asyncio
+    async def test_depleted_account_stays_reachable(self, tmp_path):
+        """
+        What it does: Gives one account zero headroom and drains draws
+        Purpose: A 100%-used reading is not a refusal (overage may be on, the
+                 reading may be stale), so the account must keep a low but real
+                 chance instead of being excluded by telemetry alone
+        """
+        print("\n=== Test: a fully-used account is deprioritized, not excluded ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.5, 0.0])
+        healthy, depleted = "/creds/account0.json", "/creds/account1.json"
+
+        counts = {healthy: 0, depleted: 0}
+        for _ in range(2000):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            counts[selected.id] += 1
+
+        print(f"Selection counts: {counts}")
+        assert counts[healthy] > counts[depleted]
+        assert counts[depleted] > 0
+
+    @pytest.mark.asyncio
+    async def test_unknown_headroom_is_reachable(self, tmp_path):
+        """
+        What it does: Leaves one account's headroom unset
+        Purpose: Usage polling can lag or fail per account; an unpolled account
+                 must not become unroutable, which would reintroduce starvation
+        """
+        print("\n=== Test: an account with no quota reading still routes ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.6, None])
+        known, unknown = "/creds/account0.json", "/creds/account1.json"
+
+        counts = {known: 0, unknown: 0}
+        for _ in range(400):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            counts[selected.id] += 1
+
+        print(f"Selection counts: {counts}")
+        assert counts[unknown] > 0
+        assert counts[known] > 0
+
+    @pytest.mark.asyncio
+    async def test_health_policy_still_excludes(self, tmp_path):
+        """
+        What it does: Suspends the highest-weight account
+        Purpose: Weighting reorders candidates only; every existing exclusion
+                 (suspension, quota quarantine, rate limit, breaker) must still win
+        """
+        print("\n=== Test: weighting never overrides an exclusion ===")
+
+        manager = self._pool(tmp_path, headrooms=[1.0, 0.05])
+        suspended, usable = "/creds/account0.json", "/creds/account1.json"
+        manager._accounts[suspended].suspended_until = time.time() + 3600
+
+        for _ in range(50):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            assert selected.id == usable
+
+        print("✓ Suspended account never selected despite the highest weight")
+
+    @pytest.mark.asyncio
+    async def test_sticky_policy_can_be_restored(self, tmp_path):
+        """
+        What it does: Disables ACCOUNT_QUOTA_WEIGHTED_ROUTING and draws twice
+        Purpose: The old behavior stays available as a rollback switch, and with
+                 it selection is deterministic from the persisted cursor again
+        """
+        print("\n=== Test: the legacy sticky policy remains selectable ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.1, 0.9])
+        manager._current_account_index = 1
+
+        with patch("kiro.account_manager.ACCOUNT_QUOTA_WEIGHTED_ROUTING", False):
+            for _ in range(10):
+                selected = await manager.get_next_account("claude-sonnet-4-5")
+                assert selected is not None
+                # Pinned account wins every time despite the lower headroom.
+                assert selected.id == "/creds/account1.json"
+
+        print("✓ Sticky rotation restored when the flag is off")
+
+    def test_set_quota_headroom_clamps_and_accepts_none(self, tmp_path):
+        """
+        What it does: Feeds out-of-range and missing headroom values
+        Purpose: Telemetry must never produce a negative or >1 weight, and a
+                 missing reading must reset to unknown rather than to zero
+        """
+        print("\n=== Test: headroom input is clamped ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.5])
+        account_id = "/creds/account0.json"
+
+        manager.set_quota_headroom(account_id, 4.2)
+        assert manager._accounts[account_id].quota_headroom == 1.0
+
+        manager.set_quota_headroom(account_id, -3.0)
+        assert manager._accounts[account_id].quota_headroom == 0.0
+
+        manager.set_quota_headroom(account_id, None)
+        assert manager._accounts[account_id].quota_headroom is None
+
+        # An unknown account is ignored rather than raising.
+        manager.set_quota_headroom("/creds/missing.json", 0.5)
+
+    def test_headroom_is_not_persisted(self, tmp_path):
+        """
+        What it does: Inspects the durable state document
+        Purpose: A stale headroom misroutes, so the weight is deliberately
+                 rebuilt from usage rows instead of being persisted with state
+        """
+        print("\n=== Test: routing weight stays out of the state document ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.42])
+        document = manager._state_document()
+
+        serialized = json.dumps(document)
+        print(f"State keys: {sorted(document.keys())}")
+        assert "quota_headroom" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_zero_configured_floor_does_not_starve(self, tmp_path):
+        """
+        What it does: Forces both quota floors to 0 and draws from a pool whose
+                      accounts all read as fully used
+        Purpose: A zero weight cannot be sampled, so equal zero weights would
+                 order by pool insertion and starve everything behind the first
+                 entry - the exact bug this policy removes. MINIMUM_ROUTING_WEIGHT
+                 must keep every account drawable.
+        """
+        print("\n=== Test: a zero-configured weight floor still rotates ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.0, 0.0, 0.0])
+
+        counts = {f"/creds/account{i}.json": 0 for i in range(3)}
+        with (
+            patch("kiro.account_manager.ACCOUNT_DEPLETED_QUOTA_WEIGHT", 0.0),
+            patch("kiro.account_manager.ACCOUNT_UNKNOWN_QUOTA_WEIGHT", 0.0),
+        ):
+            for _ in range(300):
+                selected = await manager.get_next_account("claude-sonnet-4-5")
+                assert selected is not None
+                counts[selected.id] += 1
+
+        print(f"Selection counts with zero floors: {counts}")
+        assert all(count > 0 for count in counts.values())
+
+    @pytest.mark.asyncio
+    async def test_all_unknown_headroom_rotates(self, tmp_path):
+        """
+        What it does: Draws from a pool where no account has a quota reading
+        Purpose: Before the first usage poll every weight is equal; selection
+                 must still spread instead of collapsing onto one account
+        """
+        print("\n=== Test: an unpolled pool still rotates ===")
+
+        manager = self._pool(tmp_path, headrooms=[None, None, None])
+
+        counts = {f"/creds/account{i}.json": 0 for i in range(3)}
+        for _ in range(300):
+            selected = await manager.get_next_account("claude-sonnet-4-5")
+            assert selected is not None
+            counts[selected.id] += 1
+
+        print(f"Selection counts with no readings: {counts}")
+        assert all(count > 0 for count in counts.values())
+
+    def test_routing_weight_is_always_positive(self, tmp_path):
+        """
+        What it does: Inspects the weight for depleted and unknown accounts under
+                      zeroed configuration
+        Purpose: Locks the invariant directly rather than only through sampling
+        """
+        print("\n=== Test: routing weight never reaches zero ===")
+
+        manager = self._pool(tmp_path, headrooms=[0.0, None])
+        depleted = manager._accounts["/creds/account0.json"]
+        unknown = manager._accounts["/creds/account1.json"]
+
+        with (
+            patch("kiro.account_manager.ACCOUNT_DEPLETED_QUOTA_WEIGHT", 0.0),
+            patch("kiro.account_manager.ACCOUNT_UNKNOWN_QUOTA_WEIGHT", 0.0),
+        ):
+            assert manager._routing_weight(depleted) > 0.0
+            assert manager._routing_weight(unknown) > 0.0
