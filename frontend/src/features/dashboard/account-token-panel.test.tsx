@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it } from "vitest";
 import { renderToString } from "react-dom/server";
 import { AccountTokenPanel } from "./components/account-token-panel";
 import type { AccountTokenUsage, KeyModelUsage } from "./types";

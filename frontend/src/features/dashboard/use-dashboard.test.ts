@@ -18,6 +18,8 @@ interface Harness {
     accounts: ReturnType<typeof vi.fn>;
     apiKeys: ReturnType<typeof vi.fn>;
     keyUsage: ReturnType<typeof vi.fn>;
+    accountTokenUsage: ReturnType<typeof vi.fn>;
+    deleteAccount: ReturnType<typeof vi.fn>;
     login: ReturnType<typeof vi.fn>;
     logout: ReturnType<typeof vi.fn>;
     overview: ReturnType<typeof vi.fn>;
@@ -37,6 +39,7 @@ const harness = vi.hoisted((): Harness => ({
     accounts: vi.fn(),
     apiKeys: vi.fn(),
     keyUsage: vi.fn(),
+    accountTokenUsage: vi.fn(),
     deleteAccount: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
@@ -49,6 +52,18 @@ const harness = vi.hoisted((): Harness => ({
 const isAccountArray = (value: unknown): value is Account[] =>
   Array.isArray(value) && value.every((account) => typeof account === "object" && account !== null && "id" in account);
 
+// The hook's useState calls are identified by call order, so these indices must
+// track use-dashboard.ts. Named rather than inlined as magic numbers: adding a
+// state above one of them shifts every index below, which is exactly how the
+// accountTokenUsage state broke this file.
+const STATE_OVERVIEW = 0;
+const STATE_ACCOUNTS = 1;
+const STATE_RATE = 6;
+// Forced true so the live-polling effect registers its interval; the hook only
+// polls once authenticated. Previously the literal 12, which the new
+// accountTokenUsage state shifted to 13.
+const STATE_IS_AUTHENTICATED = 13;
+
 vi.mock("react", () => {
   const useEffect = (effect: Effect) => {
     harness.effects.push(effect);
@@ -57,10 +72,10 @@ vi.mock("react", () => {
   function useState<T>(initial: T): [T, (value: T) => void];
   function useState(initial: unknown): [unknown, (value: unknown) => void] {
     const index = harness.stateIndex++;
-    return [index === 12 ? true : initial, (value: unknown) => {
-      if (index === 0) harness.latestOverview = value as Overview;
-      if (index === 1 && isAccountArray(value)) harness.latestAccounts = value;
-      if (index === 5) harness.latestRate = value as RequestRate;
+    return [index === STATE_IS_AUTHENTICATED ? true : initial, (value: unknown) => {
+      if (index === STATE_OVERVIEW) harness.latestOverview = value as Overview;
+      if (index === STATE_ACCOUNTS && isAccountArray(value)) harness.latestAccounts = value;
+      if (index === STATE_RATE) harness.latestRate = value as RequestRate;
     }];
   }
   return { useCallback: <T,>(callback: T) => callback, useEffect, useRef, useState };
@@ -151,6 +166,9 @@ describe("useDashboard", () => {
     harness.api.overview.mockReturnValueOnce(staleOverview.promise).mockReturnValueOnce(freshOverview.promise);
     harness.api.requestRate.mockReturnValueOnce(staleRate.promise).mockReturnValueOnce(freshRate.promise);
     harness.api.keyUsage.mockReturnValueOnce(staleUsage.promise).mockReturnValueOnce(freshUsage.promise);
+    // Resolved rather than deferred: this test is about the accounts/overview/rate
+    // race, and leaving the new call pending would stall the Promise.all it sits in.
+    harness.api.accountTokenUsage.mockResolvedValue({ usage: {} });
     harness.api.apiKeys.mockResolvedValue({ apiKeys: [] });
     harness.api.deleteAccount.mockResolvedValue({ ok: true });
 
