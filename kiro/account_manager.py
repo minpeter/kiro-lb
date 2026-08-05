@@ -17,6 +17,7 @@ Key features:
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -1091,9 +1092,13 @@ class AccountManager:
         if account is None:
             return
         try:
-            account.quota_resets_at = float(resets_at) if resets_at and float(resets_at) > 0 else 0.0
+            candidate = float(resets_at) if resets_at else 0.0
         except (TypeError, ValueError):
-            account.quota_resets_at = 0.0
+            candidate = 0.0
+        # Reject inf/nan here too, not just at the parse sites: this field is
+        # serialized straight onto the accounts route, where a non-finite value
+        # fails JSON encoding for every account at once.
+        account.quota_resets_at = candidate if math.isfinite(candidate) and candidate > 0 else 0.0
         account.quota_overage_enabled = overage_enabled
 
     def _routing_weight(self, account: Account) -> float:

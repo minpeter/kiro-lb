@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import math
 import os
 import secrets
 import sqlite3
@@ -597,6 +598,11 @@ def _reset_at_from_usage(usage: dict[str, Any]) -> float | None:
     try:
         reset_at = float(raw)
     except (TypeError, ValueError):
+        return None
+    # inf and nan survive float() but break JSON serialization on the accounts
+    # route, and neither is a date. An infinite reset would also pin the
+    # quarantine to its ceiling instead of falling back to the fixed window.
+    if not math.isfinite(reset_at):
         return None
     return reset_at if reset_at > 0 else None
 

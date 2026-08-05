@@ -359,11 +359,11 @@ class TestQuotaPeriodPlumbing:
         with store.connection() as conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS account_usage (
-                    account_id TEXT PRIMARY KEY, next_date_reset TEXT, overage_status TEXT
+                    account_id TEXT PRIMARY KEY, next_date_reset TEXT, overage_status TEXT, error TEXT
                 )"""
             )
             conn.executemany(
-                "INSERT INTO account_usage(account_id, next_date_reset, overage_status) VALUES (?, ?, ?)",
+                "INSERT INTO account_usage(account_id, next_date_reset, overage_status, error) VALUES (?, ?, ?, NULL)",
                 [
                     ("/creds/good.json", "1785542400.0", "DISABLED"),
                     ("/creds/blank.json", "", "ENABLED"),
@@ -388,11 +388,11 @@ class TestQuotaPeriodPlumbing:
         with store.connection() as conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS account_usage (
-                    account_id TEXT PRIMARY KEY, next_date_reset TEXT, overage_status TEXT
+                    account_id TEXT PRIMARY KEY, next_date_reset TEXT, overage_status TEXT, error TEXT
                 )"""
             )
             conn.execute(
-                "INSERT INTO account_usage(account_id, next_date_reset, overage_status) VALUES (?, ?, ?)",
+                "INSERT INTO account_usage(account_id, next_date_reset, overage_status, error) VALUES (?, ?, ?, NULL)",
                 ("/creds/account0.json", str(reset_at), "DISABLED"),
             )
 
@@ -405,3 +405,156 @@ class TestQuotaPeriodPlumbing:
         account = manager._accounts["/creds/account0.json"]
         assert account.quota_resets_at == pytest.approx(reset_at)
         assert account.quota_overage_enabled is False
+
+
+class TestErroredRowsAreNotRevived:
+    """A failed poll must not leave stale facts for a restart to pick up."""
+
+    @pytest.fixture
+    def store(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_DATA_DIR", str(tmp_path))
+        module = importlib.reload(importlib.import_module("kiro.store"))
+        module.initialize()
+        return module
+
+    def _usage_table(self, store, rows):
+        with store.connection() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS account_usage (
+                    account_id TEXT PRIMARY KEY, next_date_reset TEXT, overage_status TEXT, error TEXT
+                )"""
+            )
+            conn.executemany(
+                "INSERT INTO account_usage(account_id, next_date_reset, overage_status, error) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+
+    def test_errored_row_is_skipped(self, store):
+        # A failed refresh rewrites only updated_at and error, so the row keeps a
+        # reset date the current poll could not confirm. Reading it would
+        # quarantine to an obsolete date instead of the safe fixed window.
+        self._usage_table(
+            store,
+            [
+                ("/creds/ok.json", "1785542400.0", "DISABLED", None),
+                ("/creds/stale.json", "1785542400.0", "DISABLED", "Account is not initialized"),
+            ],
+        )
+
+        period = store.load_quota_period()
+
+        assert "/creds/ok.json" in period
+        assert "/creds/stale.json" not in period
+
+    @pytest.mark.asyncio
+    async def test_restart_after_failed_poll_uses_the_fixed_window(self, store, tmp_path):
+        self._usage_table(store, [("/creds/account0.json", str(time.time() + 20 * DAY), "DISABLED", "boom")])
+
+        manager = _manager(tmp_path)
+        await manager.load_state()
+
+        assert manager._accounts["/creds/account0.json"].quota_resets_at == 0.0
+
+        before = time.time()
+        await manager.report_failure(
+            "/creds/account0.json", "claude-sonnet-4-5", ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+        )
+
+        remaining = manager._accounts["/creds/account0.json"].quota_exhausted_until - before
+        assert remaining == pytest.approx(ACCOUNT_QUOTA_QUARANTINE, abs=2)
+
+    @pytest.mark.asyncio
+    async def test_failed_poll_clears_a_live_reset(self, tmp_path, monkeypatch):
+        # The in-process path has to forget too, not just the seeding path.
+        monkeypatch.setenv("DASHBOARD_DATA_DIR", str(tmp_path))
+        dashboard = importlib.reload(importlib.import_module("kiro.dashboard"))
+        dashboard.initialize_dashboard_store()
+
+        manager = _manager(tmp_path)
+        account = manager._accounts["/creds/account0.json"]
+        account.quota_resets_at = time.time() + 20 * DAY
+        account.quota_overage_enabled = False
+
+        async def failing_refresh(acct):
+            return {"updatedAt": 1, "error": "boom"}
+
+        monkeypatch.setattr(dashboard, "refresh_account_usage", failing_refresh)
+
+        await dashboard.refresh_all_account_usage(manager)
+
+        assert account.quota_resets_at == 0.0
+        assert account.quota_overage_enabled is None
+
+
+class TestNonFiniteResetIsRejected:
+    """inf/nan survive float() but are not dates and break JSON encoding."""
+
+    @pytest.fixture
+    def dashboard(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_DATA_DIR", str(tmp_path))
+        module = importlib.reload(importlib.import_module("kiro.dashboard"))
+        module.initialize_dashboard_store()
+        return module
+
+    @pytest.fixture
+    def store(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_DATA_DIR", str(tmp_path))
+        module = importlib.reload(importlib.import_module("kiro.store"))
+        module.initialize()
+        return module
+
+    @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", float("inf"), float("nan")])
+    def test_parser_rejects_non_finite(self, dashboard, raw):
+        assert dashboard._reset_at_from_usage({"nextDateReset": raw}) is None
+
+    def test_setter_rejects_non_finite(self, tmp_path):
+        manager = _manager(tmp_path)
+        account_id = "/creds/account0.json"
+
+        manager.set_quota_period(account_id, float("inf"), False)
+        assert manager._accounts[account_id].quota_resets_at == 0.0
+
+        manager.set_quota_period(account_id, float("nan"), False)
+        assert manager._accounts[account_id].quota_resets_at == 0.0
+
+    def test_store_rejects_non_finite(self, store):
+        with store.connection() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS account_usage (
+                    account_id TEXT PRIMARY KEY, next_date_reset TEXT, overage_status TEXT, error TEXT
+                )"""
+            )
+            conn.execute(
+                "INSERT INTO account_usage(account_id, next_date_reset, overage_status, error) VALUES (?,?,?,NULL)",
+                ("/creds/inf.json", "inf", "DISABLED"),
+            )
+
+        assert store.load_quota_period()["/creds/inf.json"] == (None, False)
+
+    def test_account_view_stays_json_serializable(self, dashboard, tmp_path):
+        # The regression this guards: one non-finite value fails encoding for the
+        # whole /api/dashboard/accounts response, not just its own account.
+        import json as json_module
+
+        manager = _manager(tmp_path)
+        account_id = "/creds/account0.json"
+        manager.set_quota_period(account_id, float("inf"), False)
+
+        view = dashboard._account_view(manager._accounts[account_id])
+
+        assert json_module.dumps(view, allow_nan=False)
+        assert view["quotaResetsAt"] is None
+
+    @pytest.mark.asyncio
+    async def test_infinite_reset_does_not_pin_the_quarantine_to_the_cap(self, tmp_path):
+        manager = _manager(tmp_path)
+        account_id = "/creds/account0.json"
+        manager.set_quota_period(account_id, float("inf"), False)
+
+        before = time.time()
+        await manager.report_failure(
+            account_id, "claude-sonnet-4-5", ErrorType.RECOVERABLE, 402, "MONTHLY_REQUEST_COUNT"
+        )
+
+        remaining = manager._accounts[account_id].quota_exhausted_until - before
+        assert remaining == pytest.approx(ACCOUNT_QUOTA_QUARANTINE, abs=2)

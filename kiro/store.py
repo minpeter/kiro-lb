@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import sqlite3
 import time
@@ -252,10 +253,18 @@ def load_quota_period() -> dict[str, tuple[float | None, bool | None]]:
     string, so anything unparseable or non-positive becomes None instead of a
     guess. Only the two conclusive overage values map to a bool. The table
     belongs to the dashboard and may not exist yet on a fresh database.
+
+    Errored rows are excluded, matching ``load_quota_headroom``. A failed poll
+    rewrites only ``updated_at`` and ``error``, leaving the previous reset date
+    and overage flag in place, so reading those rows would let a restart revive
+    facts the current poll could not confirm - and quarantine an account until an
+    obsolete reset instead of falling back to the fixed window.
     """
     try:
         with connection() as conn:
-            rows = conn.execute("SELECT account_id, next_date_reset, overage_status FROM account_usage").fetchall()
+            rows = conn.execute(
+                "SELECT account_id, next_date_reset, overage_status FROM account_usage WHERE error IS NULL"
+            ).fetchall()
     except sqlite3.Error:
         return {}
 
@@ -265,7 +274,9 @@ def load_quota_period() -> dict[str, tuple[float | None, bool | None]]:
             reset_at: float | None = float(row["next_date_reset"])
         except (TypeError, ValueError):
             reset_at = None
-        if reset_at is not None and reset_at <= 0:
+        # A stored "inf"/"nan" parses but is not a date, and would break JSON
+        # serialization once the seeded value is echoed back on the accounts route.
+        if reset_at is not None and (not math.isfinite(reset_at) or reset_at <= 0):
             reset_at = None
 
         status = row["overage_status"]
