@@ -53,7 +53,12 @@ from kiro.model_resolver import normalize_model_name
 from kiro.store import connection as _db
 from kiro.store import initialize as initialize_shared_store
 from kiro.usage import fetch_account_usage
-from kiro.usage_tracking import ROOT_KEY_ID, drain_pending_usage, restore_pending_usage
+from kiro.usage_tracking import (
+    ROOT_KEY_ID,
+    UNKNOWN_ACCOUNT_ID,
+    drain_pending_usage,
+    restore_pending_usage,
+)
 
 router = APIRouter(tags=["dashboard"])
 
@@ -176,6 +181,35 @@ def initialize_dashboard_store() -> None:
         for column in ("generation_ms", "timed_completion_tokens"):
             if column not in usage_columns:
                 conn.execute(f"ALTER TABLE key_model_usage ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+        # Token totals per (key, account, model). This is the grain the two older
+        # tables could not express between them: key_model_usage knows tokens but
+        # not which account served them, and the account request counters know the
+        # account but hold no tokens, so "tokens per account per model" had no
+        # answer and could not be backfilled - request_logs carries no account_id.
+        #
+        # Cumulative like key_model_usage, so the row count stays bounded by
+        # keys x accounts x models rather than by traffic. Every narrower view
+        # (per key, per account, per model) is a projection of this one, which is
+        # why no additional counter table is introduced alongside it.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS account_model_usage (
+                key_id TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                requests INTEGER NOT NULL DEFAULT 0,
+                generation_ms INTEGER NOT NULL DEFAULT 0,
+                timed_completion_tokens INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (key_id, account_id, model)
+            )"""
+        )
+        # Aggregations filter by account or by model, never by key alone, so the
+        # primary key's leading column is the wrong index for them.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_account_model_usage_account ON account_model_usage(account_id, model)"
+        )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS account_usage (
                 account_id TEXT PRIMARY KEY,
@@ -309,7 +343,13 @@ def prune_rate_observations() -> int:
 
 
 def flush_key_model_usage() -> int:
-    """Fold accumulated per-key token counts into the store."""
+    """Fold accumulated token counts into the store.
+
+    One drained batch writes both tables inside a single transaction. The per-key
+    table is the sum of the per-account one over accounts, and that only holds if
+    neither can be written without the other: a partial flush would leave the two
+    views permanently disagreeing with no way to tell which is short.
+    """
     pending = drain_pending_usage()
     if not pending:
         return 0
@@ -328,14 +368,54 @@ def flush_key_model_usage() -> int:
                     updated_at = excluded.updated_at""",
                 [
                     (key_id, model, prompt, completion, requests, generation_ms, timed, now)
-                    for key_id, model, prompt, completion, requests, generation_ms, timed in pending
+                    for key_id, _account_id, model, prompt, completion, requests, generation_ms, timed in pending
+                ],
+            )
+            conn.executemany(
+                """INSERT INTO account_model_usage(key_id, account_id, model, prompt_tokens, completion_tokens, requests, generation_ms, timed_completion_tokens, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key_id, account_id, model) DO UPDATE SET
+                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    requests = requests + excluded.requests,
+                    generation_ms = generation_ms + excluded.generation_ms,
+                    timed_completion_tokens = timed_completion_tokens + excluded.timed_completion_tokens,
+                    updated_at = excluded.updated_at""",
+                [
+                    (key_id, account_id, model, prompt, completion, requests, generation_ms, timed, now)
+                    for key_id, account_id, model, prompt, completion, requests, generation_ms, timed in pending
                 ],
             )
         return len(pending)
     except Exception as exc:
         restore_pending_usage(pending)
-        logger.error("Failed to flush key-model usage; restored pending batch: {}", exc)
+        logger.error("Failed to flush token usage; restored pending batch: {}", exc)
         return 0
+
+
+def _usage_view(row: Any, label_column: str, label_key: str) -> dict[str, Any]:
+    """Shape one cumulative token row for the dashboard.
+
+    Shared by the per-key and per-account views so the throughput rule below is
+    stated once. Duplicating it is how the 82,752 tok/s reading got shipped.
+    """
+    generation_ms = row["generation_ms"] or 0
+    completion = row["completion_tokens"]
+    timed_completion = row["timed_completion_tokens"] or 0
+    return {
+        label_key: row[label_column],
+        "promptTokens": row["prompt_tokens"],
+        "completionTokens": completion,
+        "totalTokens": row["prompt_tokens"] + completion,
+        "requests": row["requests"],
+        "generationSeconds": generation_ms / 1000,
+        # Only the tokens that were also timed may divide the duration. Using the
+        # full total mixes in rows recorded before timing existed and reported
+        # 82,752 tok/s on the live store. Absent rather than 0 when nothing has
+        # been timed yet.
+        "tokensPerSecond": (timed_completion / (generation_ms / 1000)) if generation_ms > 0 else None,
+        "updatedAt": row["updated_at"],
+    }
 
 
 def key_model_usage() -> dict[str, list[dict[str, Any]]]:
@@ -350,25 +430,33 @@ def key_model_usage() -> dict[str, list[dict[str, Any]]]:
         return {}
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        generation_ms = row["generation_ms"] or 0
-        completion = row["completion_tokens"]
-        timed_completion = row["timed_completion_tokens"] or 0
-        grouped.setdefault(row["key_id"], []).append(
-            {
-                "model": row["model"],
-                "promptTokens": row["prompt_tokens"],
-                "completionTokens": completion,
-                "totalTokens": row["prompt_tokens"] + completion,
-                "requests": row["requests"],
-                "generationSeconds": generation_ms / 1000,
-                # Only the tokens that were also timed may divide the duration.
-                # Using the full total mixes in rows recorded before timing
-                # existed and reported 82,752 tok/s on the live store. Absent
-                # rather than 0 when nothing has been timed yet.
-                "tokensPerSecond": (timed_completion / (generation_ms / 1000)) if generation_ms > 0 else None,
-                "updatedAt": row["updated_at"],
-            }
-        )
+        grouped.setdefault(row["key_id"], []).append(_usage_view(row, "model", "model"))
+    return grouped
+
+
+def account_model_usage() -> dict[str, list[dict[str, Any]]]:
+    """Cumulative tokens per account, broken down by model.
+
+    Summed over keys: the operational question is what an account spent, and which
+    key drove it is already answerable from ``key_model_usage``. Keeping the key
+    axis here would multiply the rows an operator has to read for no extra fact.
+    """
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT account_id, model, SUM(prompt_tokens) AS prompt_tokens,"
+                " SUM(completion_tokens) AS completion_tokens, SUM(requests) AS requests,"
+                " SUM(generation_ms) AS generation_ms,"
+                " SUM(timed_completion_tokens) AS timed_completion_tokens,"
+                " MAX(updated_at) AS updated_at"
+                " FROM account_model_usage GROUP BY account_id, model"
+                " ORDER BY SUM(prompt_tokens) + SUM(completion_tokens) DESC"
+            ).fetchall()
+    except Exception:
+        return {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["account_id"], []).append(_usage_view(row, "model", "model"))
     return grouped
 
 
@@ -499,6 +587,21 @@ def _authenticated(request: Request) -> bool:
 def _require_auth(request: Request) -> None:
     if not _authenticated(request):
         raise HTTPException(status_code=401, detail="Dashboard authentication required")
+
+
+def _account_emails() -> dict[str, str]:
+    """Map internal account id to email, for labelling usage rows.
+
+    One query rather than a ``_cached_usage`` call per account: the usage route
+    already returns a row per account and model, and the N+1 would grow with the
+    pool.
+    """
+    try:
+        with _db() as conn:
+            rows = conn.execute("SELECT account_id, email FROM account_usage WHERE email IS NOT NULL").fetchall()
+    except Exception:
+        return {}
+    return {row["account_id"]: row["email"] for row in rows}
 
 
 def _cached_usage(account_id: str) -> dict[str, Any] | None:
@@ -774,6 +877,29 @@ async def dashboard_key_usage(request: Request) -> dict[str, Any]:
     # hit the periodic flush yet.
     await asyncio.to_thread(flush_key_model_usage)
     return {"usage": key_model_usage()}
+
+
+@router.get("/api/dashboard/accounts/usage")
+async def dashboard_account_usage(request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    # Same flush-first rule as the per-key route: both read the tables the flush
+    # writes, so without it a just-served request is missing from the answer.
+    await asyncio.to_thread(flush_key_model_usage)
+    usage = account_model_usage()
+    # Internal account ids are credential file paths. Every other account route
+    # exposes the hashed label instead, and leaking a path here would also make
+    # the response impossible to join against the accounts panel.
+    emails = _account_emails()
+    grouped: dict[str, Any] = {}
+    for account_id, models in usage.items():
+        label = account_label(account_id) if account_id != UNKNOWN_ACCOUNT_ID else UNKNOWN_ACCOUNT_ID
+        grouped[label] = {
+            "email": emails.get(account_id),
+            "models": models,
+            "totalTokens": sum(entry["totalTokens"] for entry in models),
+            "requests": sum(entry["requests"] for entry in models),
+        }
+    return {"usage": grouped}
 
 
 @router.post("/api/dashboard/keys")

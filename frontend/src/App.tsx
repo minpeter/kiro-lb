@@ -12,6 +12,7 @@ import { LoginCard } from "@/features/dashboard/components/login-card";
 import { RequestLogTable } from "@/features/dashboard/components/request-log-table";
 import { RequestRateChart } from "@/features/dashboard/components/request-rate-chart";
 import { TokenUsagePanel } from "@/features/dashboard/components/token-usage-panel";
+import { AccountTokenPanel } from "@/features/dashboard/components/account-token-panel";
 import { TotalRateChart } from "@/features/dashboard/components/total-rate-chart";
 import { AppHeader, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
@@ -107,6 +108,11 @@ export default function App() {
               isMutating={isMutating}
               onDeleteAccount={(id) => void runAction(() => dashboardApi.deleteAccount(id))}
             />
+            {/* Placed here rather than on Overview for the reason stated above:
+                Overview stays pool-wide, and this is a per-account breakdown. It
+                pairs with the quota column in the panel above - that one is what
+                Kiro counts, this one is what the gateway measured. */}
+            <AccountTokenPanel accountTokenUsage={dashboard.accountTokenUsage} isLoading={isLoading} />
             <RequestRateChart rate={dashboard.rate} isLoading={isLoading} />
             <DeviceLoginCard onRegistered={dashboard.reload} />
           </TabsContent>

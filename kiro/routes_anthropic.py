@@ -34,7 +34,7 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.tokenizer import estimate_request_tokens
-from kiro.usage_tracking import current_api_key_id
+from kiro.usage_tracking import current_account_id, current_api_key_id
 from kiro.utils import generate_conversation_id
 
 if TYPE_CHECKING:
@@ -253,6 +253,10 @@ async def messages(
 
             # Mark account as tried in current failover loop
             tried_accounts.add(account.id)
+            # Attribute any tokens this attempt produces to this account. Set per
+            # attempt, not once per request: on failover the tokens belong to the
+            # account that actually answered, and only the last write survives.
+            current_account_id.set(account.id)
 
             # Use objects from account
             auth_manager = account.auth_manager

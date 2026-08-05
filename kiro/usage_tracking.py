@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Per-key, per-model token accounting for the dashboard.
+"""Token accounting per key, account, and model.
 
-The calling key is known at authentication time but the token counts are only
-final deep inside the serializers, so the identity travels in a ContextVar
-instead of through four call signatures. Counts accumulate in memory and are
-flushed to the dashboard store in batches, keeping the data path free of a
+Both facts a finished request has to be attributed to are known long before the
+token counts are: the key at authentication, the account at selection. The counts
+are only final deep inside the serializers, so both identities travel in
+ContextVars instead of through four call signatures. Counts accumulate in memory
+and are flushed to the dashboard store in batches, keeping the data path free of a
 write per request while still surviving a restart.
+
+The account is recorded at the same grain as the key rather than in a separate
+counter, because "which account served these tokens" is a property of the same
+event: splitting it out is what left the store unable to answer it at all. A
+request that fails over across several accounts attributes its tokens to the one
+that actually produced the response - the earlier attempts produced none.
 """
 
 from __future__ import annotations
@@ -25,9 +32,19 @@ ROOT_KEY_ID = "root"
 
 current_api_key_id: ContextVar[str | None] = ContextVar("current_api_key_id", default=None)
 
-# (key_id, model) -> [prompt_tokens, completion_tokens, requests, generation_ms,
-#                     timed_completion_tokens]
-_pending: Dict[Tuple[str, str], List[int]] = {}
+# Account that produced the current response. Set when an attempt is about to be
+# made and overwritten on failover, so at completion it names the account that
+# actually served rather than the first one tried. UNKNOWN_ACCOUNT_ID covers the
+# legacy single-account mode and any path that records tokens without going
+# through selection: the tokens are real and must not be dropped, but they cannot
+# be attributed to an account.
+UNKNOWN_ACCOUNT_ID = "unknown"
+
+current_account_id: ContextVar[str | None] = ContextVar("current_account_id", default=None)
+
+# (key_id, account_id, model) -> [prompt_tokens, completion_tokens, requests,
+#                                 generation_ms, timed_completion_tokens]
+_pending: Dict[Tuple[str, str, str], List[int]] = {}
 _lock = threading.Lock()
 
 
@@ -59,12 +76,16 @@ def record_token_usage(
     key_id = current_api_key_id.get()
     if key_id is None or not model:
         return
+    # An unattributed account is recorded as UNKNOWN_ACCOUNT_ID rather than
+    # dropped. The tokens were really spent, and losing them would make the
+    # per-account totals silently disagree with the per-key ones.
+    account_id = current_account_id.get() or UNKNOWN_ACCOUNT_ID
     model = normalize_model_name(model) or model
     completion = max(0, int(completion_tokens or 0))
     timed = generation_seconds is not None and generation_seconds > 0
     try:
         with _lock:
-            entry = _pending.setdefault((key_id, model), [0, 0, 0, 0, 0])
+            entry = _pending.setdefault((key_id, account_id, model), [0, 0, 0, 0, 0])
             entry[0] += max(0, int(prompt_tokens or 0))
             entry[1] += completion
             entry[2] += 1
@@ -96,20 +117,20 @@ class GenerationTimer:
         return max(0.0, time.perf_counter() - self._started)
 
 
-def drain_pending_usage() -> List[Tuple[str, str, int, int, int, int, int]]:
+def drain_pending_usage() -> List[Tuple[str, str, str, int, int, int, int, int]]:
     with _lock:
         drained = [
-            (key_id, model, counts[0], counts[1], counts[2], counts[3], counts[4])
-            for (key_id, model), counts in _pending.items()
+            (key_id, account_id, model, counts[0], counts[1], counts[2], counts[3], counts[4])
+            for (key_id, account_id, model), counts in _pending.items()
         ]
         _pending.clear()
     return drained
 
 
-def restore_pending_usage(rows: List[Tuple[str, str, int, int, int, int, int]]) -> None:
+def restore_pending_usage(rows: List[Tuple[str, str, str, int, int, int, int, int]]) -> None:
     """Add a failed durable flush back without overwriting concurrent usage."""
     with _lock:
-        for key_id, model, prompt, completion, requests, generation_ms, timed in rows:
-            entry = _pending.setdefault((key_id, model), [0, 0, 0, 0, 0])
+        for key_id, account_id, model, prompt, completion, requests, generation_ms, timed in rows:
+            entry = _pending.setdefault((key_id, account_id, model), [0, 0, 0, 0, 0])
             for index, value in enumerate((prompt, completion, requests, generation_ms, timed)):
                 entry[index] += value
