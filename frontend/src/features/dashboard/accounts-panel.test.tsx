@@ -60,3 +60,38 @@ describe("AccountsPanel", () => {
     expect(html).toContain('disabled=""');
   });
 });
+
+describe("RoutingStateCell", () => {
+  const spentAccount: Account = {
+    ...mockAccount,
+    id: "acc_spent00001",
+    routingState: "quota_depleted",
+    eligibleInSeconds: 7200,
+    quotaHeadroom: 0,
+    quotaOverageEnabled: false,
+  };
+
+  it("labels a spent allowance instead of showing it as ready", () => {
+    const html = renderToString(<AccountsPanel accounts={[spentAccount]} isLoading={false} />);
+    expect(html).toContain("quota spent");
+    expect(html).not.toContain("ready");
+  });
+
+  it("says a spent account is still tried, since it is not excluded", () => {
+    const html = renderToString(<AccountsPanel accounts={[spentAccount]} isLoading={false} />);
+    expect(html).toContain("still tried");
+  });
+
+  it("reports the reset countdown when one is known", () => {
+    const html = renderToString(<AccountsPanel accounts={[spentAccount]} isLoading={false} />);
+    expect(html).toContain("resets in");
+  });
+
+  it("omits the countdown when no reset date is known", () => {
+    const html = renderToString(
+      <AccountsPanel accounts={[{ ...spentAccount, eligibleInSeconds: 0 }]} isLoading={false} />
+    );
+    expect(html).toContain("still tried at low priority");
+    expect(html).not.toContain("resets in");
+  });
+});

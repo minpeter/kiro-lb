@@ -27,6 +27,8 @@ export type AccountRoutingState =
   | "available"
   | "rate_limited"
   | "quota_exhausted"
+  /** Allowance spent with overage off. Still routed, just deprioritized. */
+  | "quota_depleted"
   | "cooling_down"
   | "suspended"
   | "uninitialized";
@@ -36,6 +38,11 @@ export type Account = {
   initialized: boolean;
   routingState: AccountRoutingState;
   eligibleInSeconds: number;
+  /** Unused quota fraction the router weights by, or null when unpolled. */
+  quotaHeadroom?: number | null;
+  /** Epoch seconds of the next allowance reset, or null when unknown. */
+  quotaResetsAt?: number | null;
+  quotaOverageEnabled?: boolean | null;
   requests: number;
   failures: number;
   cooldownSeconds: number;

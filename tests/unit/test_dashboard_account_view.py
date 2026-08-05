@@ -112,3 +112,35 @@ def test_view_reports_unknown_routing_weight_as_null(dashboard):
     view = dashboard._account_view(_initialized_account())
 
     assert view["quotaHeadroom"] is None
+
+
+def test_view_exposes_the_quota_period(dashboard):
+    account = _initialized_account()
+    account.quota_resets_at = 1785542400.0
+    account.quota_overage_enabled = False
+
+    view = dashboard._account_view(account)
+
+    assert view["quotaResetsAt"] == 1785542400.0
+    assert view["quotaOverageEnabled"] is False
+
+
+def test_view_reports_unknown_quota_period_as_null(dashboard):
+    # 0.0 means "no reset date known", which is a different fact from a reset at
+    # the epoch; the client renders the two differently.
+    view = dashboard._account_view(_initialized_account())
+
+    assert view["quotaResetsAt"] is None
+    assert view["quotaOverageEnabled"] is None
+
+
+def test_spent_account_is_not_reported_as_available(dashboard):
+    account = _initialized_account()
+    account.quota_headroom = 0.0
+    account.quota_overage_enabled = False
+    account.quota_resets_at = time.time() + 86400
+
+    view = dashboard._account_view(account)
+
+    assert view["routingState"] == "quota_depleted"
+    assert view["eligibleInSeconds"] > 0

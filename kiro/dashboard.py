@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import math
 import os
 import secrets
 import sqlite3
@@ -581,6 +582,51 @@ def _headroom_from_usage(usage: dict[str, Any]) -> float | None:
     return max(0.0, min(1.0, 1.0 - (float(current) / float(limit))))
 
 
+def _reset_at_from_usage(usage: dict[str, Any]) -> float | None:
+    """Pull the next quota reset out of a usage summary, or None.
+
+    The upstream value has arrived as a number and as a numeric string, and the
+    persisted column is TEXT, so both shapes are accepted. Anything unparseable
+    or non-positive is None: a 402 quarantine then falls back to the fixed window
+    rather than trusting a fabricated date.
+    """
+    if usage.get("error"):
+        return None
+    raw = usage.get("nextDateReset")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        reset_at = float(raw)
+    except (TypeError, ValueError):
+        return None
+    # inf and nan survive float() but break JSON serialization on the accounts
+    # route, and neither is a date. An infinite reset would also pin the
+    # quarantine to its ceiling instead of falling back to the fixed window.
+    if not math.isfinite(reset_at):
+        return None
+    return reset_at if reset_at > 0 else None
+
+
+def _overage_enabled_from_usage(usage: dict[str, Any]) -> bool | None:
+    """Report whether overage lets the account serve past its allowance.
+
+    Only the two values the upstream actually states are conclusive; "UNKNOWN",
+    a missing field, or a failed reading stay None so a spent account is never
+    labelled done on a guess.
+    """
+    if usage.get("error"):
+        return None
+    status = usage.get("overageStatus")
+    if not isinstance(status, str):
+        return None
+    normalized = status.strip().upper()
+    if normalized == "ENABLED":
+        return True
+    if normalized == "DISABLED":
+        return False
+    return None
+
+
 def _apply_routing_weight(manager: Any, account_id: str, usage: dict[str, Any]) -> None:
     """Push a fresh usage reading into the router's selection weight.
 
@@ -592,6 +638,7 @@ def _apply_routing_weight(manager: Any, account_id: str, usage: dict[str, Any]) 
     """
     try:
         manager.set_quota_headroom(account_id, _headroom_from_usage(usage))
+        manager.set_quota_period(account_id, _reset_at_from_usage(usage), _overage_enabled_from_usage(usage))
     except Exception as exc:
         logger.warning("Failed to update routing weight for {}: {}", account_label(account_id), exc)
 
@@ -659,6 +706,10 @@ def _account_view(account: Any, *, deletable: bool = False) -> dict[str, Any]:
         # actually holds, so a stale or failed refresh is visible as null here
         # instead of being inferred from a row that still looks fresh.
         "quotaHeadroom": getattr(account, "quota_headroom", None),
+        # Null rather than 0 when unknown: "no reset date known" and "resets at
+        # the epoch" are different facts, and the client renders them differently.
+        "quotaResetsAt": getattr(account, "quota_resets_at", 0.0) or None,
+        "quotaOverageEnabled": getattr(account, "quota_overage_enabled", None),
         "usage": _cached_usage(account.id),
     }
 

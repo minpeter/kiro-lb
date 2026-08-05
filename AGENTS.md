@@ -191,8 +191,17 @@ trusting a pin here.
   exclude an account. The weight is the remaining *fraction*, and every account
   keeps a nonzero chance — a zero-chance weight is how the sticky cursor starved
   a healthy account in the first place. Exclusion is the health policy's job.
-- Persisting `quota_headroom` with runtime state. It is re-seeded from the
-  usage rows on load (`store.load_quota_headroom`); a stale weight misroutes.
+- Persisting `quota_headroom`, `quota_resets_at`, or `quota_overage_enabled` with
+  runtime state. They are re-seeded from the usage rows on load
+  (`store.load_quota_headroom`, `store.load_quota_period`); a stale weight
+  misroutes and a stale reset date distorts the quarantine.
+- Ending a 402 quota quarantine on a fixed timer. It runs to the reported reset
+  (`_quota_quarantine_until`); `ACCOUNT_QUOTA_QUARANTINE` is the floor and the
+  no-date fallback only. A fixed window released accounts ~26 days early at
+  1000/1000, where they could answer nothing but 402.
+- Letting `quota_depleted` exclude an account, or treating it as one. It is a
+  reporting state that ranks below every real exclusion; the upstream 402 is what
+  removes an account from rotation, never a usage reading.
 - Letting a burst escalate into a long exclusion. `USER_REQUEST_RATE_EXCEEDED`
   parks an account for `ACCOUNT_RATE_LIMIT_COOLDOWN` (10s, `config.py:540`) and
   leaves the circuit breaker untouched; only `MONTHLY_REQUEST_COUNT`
