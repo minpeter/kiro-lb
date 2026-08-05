@@ -49,10 +49,10 @@ they held are folded into this file; do not link to them.
 | Credentials + host selection | `kiro/auth.py`, `kiro/config.py` | 4 sources; Builder ID routes to a different host |
 | Add an account by browser login | `kiro/device_login.py` | Social + Builder ID device flows |
 | Shared SQLite persistence | `kiro/store.py` | Accounts, runtime state, internal login credentials; mode 0600/WAL |
-| Dashboard API | `kiro/dashboard.py` | 18 routes under `/api/dashboard`, plus `/` and `/metrics` |
+| Dashboard API | `kiro/dashboard.py` | 19 routes under `/api/dashboard`, plus `/` and `/metrics` |
 | Prometheus exposition | `kiro/metrics.py` | Pure renderer; the route and its auth live in `dashboard.py` |
 | Grafana dashboard / metrics wiring | `deploy/` | Dashboard JSON is asserted against the exporter by `tests/unit/test_dashboard_provisioning.py` |
-| Per-key token accounting | `kiro/usage_tracking.py` | ContextVar identity, batched flush |
+| Token accounting (key/account/model) | `kiro/usage_tracking.py` | Two ContextVar identities, batched flush |
 | Token counting / encodings | `kiro/tokenizer.py` | Per-family encoding + CJK-only correction |
 | Model name handling | `kiro/model_resolver.py` | Never raises; unknown names pass through |
 | Model list + token limits | `kiro/routes_openai.py:203`, `kiro/config.py:294` | One superset response; limits from live API or `FALLBACK_MODELS` |
@@ -77,7 +77,7 @@ they held are folded into this file; do not link to them.
 | `resolve_token_profile` | function | `kiro/tokenizer.py:87` | Model name -> (encoding, CJK correction) |
 | `validate_live_openai_payload` | function | `kiro/sse_validation.py:196` | Fails the stream instead of shipping bad order |
 | `identify_data_api_key` | function | `kiro/dashboard.py:298` | Legacy env key -> `ROOT_KEY_ID`, else hashed `klb_` key |
-| `record_token_usage` | function | `kiro/usage_tracking.py:30` | Attributes tokens to the calling key |
+| `record_token_usage` | function | `kiro/usage_tracking.py` | Attributes tokens to the calling key **and** the serving account |
 | `start_device_login` | function | `kiro/device_login.py:299` | Social vs Builder ID flows, deliberately unshared |
 | `get_kiro_api_host` / `get_kiro_q_host` | function | `kiro/config.py:613`, `:619` | Builder ID flag picks the host template |
 

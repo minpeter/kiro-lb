@@ -114,6 +114,24 @@ export type KeyModelUsage = {
 
 export type KeyUsage = Record<string, KeyModelUsage[]>;
 
+/**
+ * What one account spent, by model. Same row shape as the per-key breakdown, so
+ * the token formatting and slice helpers are shared rather than reimplemented.
+ *
+ * Distinct from `AccountUsage` above, which is the upstream *quota* reading for
+ * an account. This is what this gateway measured; that is what Kiro reports.
+ */
+export type AccountTokenUsageEntry = {
+  /** Absent until the usage poll has read the account's profile. */
+  email: string | null;
+  models: KeyModelUsage[];
+  totalTokens: number;
+  requests: number;
+};
+
+/** Keyed by the hashed account label, matching the accounts panel. */
+export type AccountTokenUsage = Record<string, AccountTokenUsageEntry>;
+
 export type DeviceLoginProvider = "builder-id" | "google" | "github";
 
 export type DeviceLoginFlow = {

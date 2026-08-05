@@ -2,7 +2,8 @@
 """Prometheus exposition for kiro-lb.
 
 Everything here is derived from state the gateway already keeps: the dashboard
-SQLite store (request logs, per-key token totals, cached account quota) and the
+SQLite store (request logs, token totals per key and per account, cached account
+quota) and the
 live AccountManager pool. Nothing new is recorded to serve this endpoint, so
 scraping cannot change the gateway's behaviour.
 
@@ -30,6 +31,7 @@ import time
 from typing import Any, Iterable, Iterator
 
 from kiro.model_resolver import normalize_model_name
+from kiro.usage_tracking import UNKNOWN_ACCOUNT_ID
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
@@ -63,6 +65,16 @@ _FAMILIES: tuple[tuple[str, str, str], ...] = (
         "Output tokens from requests that were also timed. Numerator for tokens/sec.",
     ),
     ("kiro_lb_key_requests_total", "counter", "Requests attributed to an API key, by model."),
+    (
+        "kiro_lb_account_tokens_total",
+        "counter",
+        "Tokens attributed to the serving account, by model and direction.",
+    ),
+    (
+        "kiro_lb_account_model_requests_total",
+        "counter",
+        "Requests attributed to the serving account, by model.",
+    ),
     ("kiro_lb_accounts", "gauge", "Accounts in the pool by routing state."),
     ("kiro_lb_account_requests_total", "counter", "Upstream requests per account by outcome."),
     ("kiro_lb_account_failures", "gauge", "Consecutive failures feeding the circuit breaker, per account."),
@@ -213,6 +225,39 @@ def _token_metrics(conn: Any, key_names: dict[str, str], known: frozenset[str]) 
         yield _line("kiro_lb_timed_output_tokens_total", {"model": model}, timed_output.get(model, 0))
 
 
+def _account_token_metrics(conn: Any, label_for: Any, known: frozenset[str]) -> Iterator[str]:
+    """Tokens attributed to the account that served them, by model.
+
+    Summed over keys, unlike ``_token_metrics``: crossing account with key would
+    multiply the series count by the number of keys to answer a question nobody
+    asks of Prometheus. The account label is the hashed one, matching every other
+    account series so they join.
+    """
+    rows = conn.execute(
+        "SELECT account_id, model, SUM(prompt_tokens) AS prompt_tokens,"
+        " SUM(completion_tokens) AS completion_tokens, SUM(requests) AS requests"
+        " FROM account_model_usage GROUP BY account_id, model"
+    ).fetchall()
+    totals: dict[tuple[str, str], tuple[int, int, int]] = {}
+    for row in rows:
+        account_id = row["account_id"]
+        # UNKNOWN_ACCOUNT_ID is not a credential path and must not be hashed, or
+        # the unattributed bucket would look like a real account.
+        account = account_id if account_id == UNKNOWN_ACCOUNT_ID else label_for(account_id)
+        usage_key = (account, _model(row["model"], known))
+        previous = totals.get(usage_key, (0, 0, 0))
+        totals[usage_key] = (
+            previous[0] + (row["prompt_tokens"] or 0),
+            previous[1] + (row["completion_tokens"] or 0),
+            previous[2] + (row["requests"] or 0),
+        )
+    for (account, model), (prompt, completion, requests) in totals.items():
+        labels = {"account": account, "model": model}
+        yield _line("kiro_lb_account_tokens_total", {**labels, "direction": "input"}, prompt)
+        yield _line("kiro_lb_account_tokens_total", {**labels, "direction": "output"}, completion)
+        yield _line("kiro_lb_account_model_requests_total", labels, requests)
+
+
 def _account_metrics(accounts: Iterable[Any], usage_for: Any, label_for: Any, state_for: Any) -> Iterator[str]:
     counts = dict.fromkeys(_ROUTING_STATES, 0)
     lines: list[str] = []
@@ -288,6 +333,12 @@ def render_metrics(
         with connection_factory() as conn:
             lines.extend(_request_metrics(conn, known))
             lines.extend(_token_metrics(conn, key_names, known))
+            # Separate try so a failure here cannot cost the two sections above,
+            # which is the same rule the account section below follows.
+            try:
+                lines.extend(_account_token_metrics(conn, label_for, known))
+            except Exception:
+                pass
     except Exception:
         pass
 

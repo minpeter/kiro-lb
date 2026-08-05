@@ -9,7 +9,7 @@ routes -> converters -> http_client -> streaming.
 ```
 kiro/
 ├── routes_openai.py / routes_anthropic.py                  # data-plane HTTP surface
-├── dashboard.py                                            # control plane: 17 API routes + `/` + SQLite store
+├── dashboard.py                                            # control plane: 19 API routes + `/` + SQLite store
 ├── device_login.py / accounts_admin.py                     # add an account without shell access
 ├── usage_tracking.py / usage.py                            # per-key tokens; upstream quota lookup
 ├── converters_core.py                                      # shared payload builder
@@ -43,7 +43,7 @@ No module has been added or removed since `a9fadd7`; 37 of the 39 were modified.
 | Token counting | `tokenizer.py` (`resolve_token_profile`), `streaming_core.py:calculate_tokens_from_context_usage` |
 | Model list + per-model limits | `routes_openai.py:203` (`_resolve_model_limits` at `:180`) |
 | Payload size limit | `payload_guards.py`, `config.py:482` (`KIRO_MAX_PAYLOAD_BYTES`) |
-| Per-key/model usage rows | `usage_tracking.py` -> `dashboard.py:206` (`flush_key_model_usage`) |
+| Token usage rows (key/account/model) | `usage_tracking.py` -> `dashboard.py` (`flush_key_model_usage`) |
 | Web search emulation | `mcp_tools.py` (transport shim, not a tool framework) |
 | Extended thinking budget rules | `native_thinking.py` (min 1024; unknown fields rejected) |
 | Rate estimate + chart data | `account_manager.py:1047` (`estimate_rate_limit`), `:1103` (`request_rate_series`) |
@@ -99,7 +99,21 @@ No module has been added or removed since `a9fadd7`; 37 of the 39 were modified.
   their own exceptions and return a neutral value (`usage_tracking.py:42`,
   `dashboard.py:265`).
 - The calling key's identity travels in a `ContextVar`, not through converter and
-  serializer signatures (`usage_tracking.py`).
+  serializer signatures (`usage_tracking.py`). The serving account travels the same
+  way (`current_account_id`), set once per **attempt** in both route modules so a
+  failover attributes tokens to the account that actually answered rather than the
+  first one tried. A module-level global would cross-attribute concurrent requests.
+- `flush_key_model_usage` writes `key_model_usage` and `account_model_usage` from
+  one drained batch in a single transaction. The per-key table is the sum of the
+  per-account one over accounts, and that invariant only holds if neither can be
+  written without the other.
+- Tokens with no account are bucketed as `UNKNOWN_ACCOUNT_ID` ("unknown"), never
+  dropped: legacy single-account mode records without going through selection, and
+  discarding those rows would make the two views silently disagree. That id is not
+  a credential path, so it must not be passed through `account_label`.
+- `account_model_usage` history cannot be backfilled. `request_logs` carries no
+  account id, so rows predating this table stay unattributed by design; the panel
+  says so rather than showing zero.
 - Social and Builder ID login polling are deliberately not shared; their pending
   semantics are near-inverses (HTTP 200 + `status` vs HTTP 400 + `authorization_pending`).
 - `/v1/messages/count_tokens` (`routes_anthropic.py:740`) must use the same

@@ -617,3 +617,99 @@ class TestAccountSystemExhaustedPoolDiagnostics:
         assert exc_info.value.status_code == 503
         assert f"{account_label(cooling_id)}: cooling down for" in detail
         assert f"{account_label(broken_id)}: not initialized" in detail
+
+
+class TestFailoverTokenAttribution:
+    """Tokens belong to the account that answered, not the one first tried.
+
+    This is the fact the old counters could not express. `AccountStats` increments
+    once per attempt, so a request that failed over across four accounts looked
+    like four requests with no way to tell they were one; and the token table had
+    no account axis at all. Attribution is now carried in a ContextVar written per
+    attempt, so the last write - the account that actually produced the response -
+    is the one the tokens land on.
+    """
+
+    def _record_for(self, account_id, model="claude-sonnet-4.5", prompt=10, completion=5):
+        from kiro.usage_tracking import current_account_id, current_api_key_id, record_token_usage
+
+        current_api_key_id.set("key_a")
+        current_account_id.set(account_id)
+        record_token_usage(model, prompt, completion)
+
+    def _record_against_current(self, model="claude-sonnet-4.5", prompt=10, completion=5):
+        """Record without re-setting the account, reading whatever the context holds.
+
+        The concurrency test needs this: re-setting the account immediately before
+        recording would defeat the interleaving it is trying to expose, and the
+        test would pass even against a shared global.
+        """
+        from kiro.usage_tracking import current_api_key_id, record_token_usage
+
+        current_api_key_id.set("key_a")
+        record_token_usage(model, prompt, completion)
+
+    def test_tokens_land_on_the_account_that_answered(self):
+        from kiro.usage_tracking import current_account_id, drain_pending_usage
+
+        drain_pending_usage()
+        try:
+            # Two attempts fail before a third serves. Only the third produced
+            # tokens, so only it may be charged for them.
+            current_account_id.set("/creds/failed-one.json")
+            current_account_id.set("/creds/failed-two.json")
+            self._record_for("/creds/served.json")
+
+            drained = drain_pending_usage()
+            assert [(row[1], row[3], row[4]) for row in drained] == [("/creds/served.json", 10, 5)]
+        finally:
+            drain_pending_usage()
+            current_account_id.set(None)
+
+    def test_two_requests_served_by_different_accounts_split(self):
+        from kiro.usage_tracking import current_account_id, drain_pending_usage
+
+        drain_pending_usage()
+        try:
+            self._record_for("/creds/one.json", completion=5)
+            self._record_for("/creds/two.json", completion=7)
+
+            drained = {row[1]: row[4] for row in drain_pending_usage()}
+            assert drained == {"/creds/one.json": 5, "/creds/two.json": 7}
+        finally:
+            drain_pending_usage()
+            current_account_id.set(None)
+
+    @pytest.mark.asyncio
+    async def test_attribution_survives_concurrent_requests(self):
+        """Two in-flight requests on different accounts must not cross-attribute.
+
+        A ContextVar is the reason this holds: a module-level variable would be
+        shared, and whichever request finished last would silently claim the
+        other's tokens.
+        """
+        import asyncio
+
+        from kiro.usage_tracking import current_account_id, drain_pending_usage
+
+        drain_pending_usage()
+
+        async def serve(account_id, completion):
+            current_account_id.set(account_id)
+            # Yield control so the other coroutine sets its own account in
+            # between, then record against whatever this task's context still
+            # holds. Re-setting it here would hide a shared-state bug.
+            await asyncio.sleep(0)
+            self._record_against_current(completion=completion)
+
+        try:
+            await asyncio.gather(
+                serve("/creds/one.json", 11),
+                serve("/creds/two.json", 22),
+            )
+
+            drained = {row[1]: row[4] for row in drain_pending_usage()}
+            assert drained == {"/creds/one.json": 11, "/creds/two.json": 22}
+        finally:
+            drain_pending_usage()
+            current_account_id.set(None)

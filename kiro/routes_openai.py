@@ -34,7 +34,7 @@ from kiro.models_openai import (
 )
 from kiro.payload_guards import PayloadTooLargeError
 from kiro.streaming_openai import collect_stream_response, stream_with_first_token_retry
-from kiro.usage_tracking import current_api_key_id
+from kiro.usage_tracking import current_account_id, current_api_key_id
 from kiro.utils import generate_conversation_id
 
 if TYPE_CHECKING:
@@ -362,6 +362,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
             # Mark account as tried in current failover loop
             tried_accounts.add(account.id)
+            # Attribute any tokens this attempt produces to this account. Set per
+            # attempt, not once per request: on failover the tokens belong to the
+            # account that actually answered, and only the last write survives.
+            current_account_id.set(account.id)
 
             # Use objects from account
             auth_manager = account.auth_manager

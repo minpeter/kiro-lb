@@ -588,3 +588,117 @@ class TestEndpoint:
         response = client.get("/metrics", headers={"Authorization": "Bearer test-root-key"})
 
         assert _series(response.text)["kiro_lb_models"] > 0
+
+
+class TestAccountTokenMetrics:
+    """Tokens exposed against the account that served them.
+
+    The per-key section answers "who asked"; this one answers "which account
+    paid", which is the question the pool operator has and which no series
+    previously carried.
+    """
+
+    def _seed(self, dashboard, account_id=_ACCOUNT_PATH, key_id=_KEY_ID, model="claude-haiku-4.5", **counts):
+        row = {"prompt_tokens": 10, "completion_tokens": 5, "requests": 1, "generation_ms": 0, "timed": 0}
+        row.update(counts)
+        with dashboard._db() as conn:
+            conn.execute(
+                "INSERT INTO account_model_usage(key_id, account_id, model, prompt_tokens,"
+                " completion_tokens, requests, generation_ms, timed_completion_tokens, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)"
+                " ON CONFLICT(key_id, account_id, model) DO UPDATE SET"
+                " prompt_tokens = prompt_tokens + excluded.prompt_tokens,"
+                " completion_tokens = completion_tokens + excluded.completion_tokens,"
+                " requests = requests + excluded.requests",
+                (
+                    key_id,
+                    account_id,
+                    model,
+                    row["prompt_tokens"],
+                    row["completion_tokens"],
+                    row["requests"],
+                    row["generation_ms"],
+                    row["timed"],
+                ),
+            )
+
+    def test_families_are_declared(self):
+        declared = {name for name, _type, _help in _FAMILIES}
+        assert "kiro_lb_account_tokens_total" in declared
+        assert "kiro_lb_account_model_requests_total" in declared
+
+    def test_tokens_are_split_by_direction(self, dashboard):
+        self._seed(dashboard, prompt_tokens=100, completion_tokens=40)
+
+        series = _series(_render(dashboard))
+        label = account_label(_ACCOUNT_PATH)
+        assert (
+            series[f'kiro_lb_account_tokens_total{{account="{label}",model="claude-haiku-4.5",direction="input"}}']
+            == 100
+        )
+        assert (
+            series[f'kiro_lb_account_tokens_total{{account="{label}",model="claude-haiku-4.5",direction="output"}}']
+            == 40
+        )
+
+    def test_the_account_label_is_hashed_not_a_credential_path(self, dashboard):
+        self._seed(dashboard)
+
+        body = _render(dashboard)
+        assert _ACCOUNT_PATH not in body
+        assert account_label(_ACCOUNT_PATH) in body
+
+    def test_two_keys_on_one_account_sum_into_one_series(self, dashboard):
+        # The account axis is what matters here; keeping the key axis too would
+        # multiply the series count to answer a question the per-key section
+        # already answers.
+        self._seed(dashboard, key_id="key_one", prompt_tokens=10, completion_tokens=0)
+        self._seed(dashboard, key_id="key_two", prompt_tokens=25, completion_tokens=0)
+
+        series = _series(_render(dashboard))
+        label = account_label(_ACCOUNT_PATH)
+        assert (
+            series[f'kiro_lb_account_tokens_total{{account="{label}",model="claude-haiku-4.5",direction="input"}}']
+            == 35
+        )
+
+    def test_an_unknown_model_collapses_instead_of_minting_a_series(self, dashboard):
+        # Model names pass through to Kiro, so they are client-controlled: a
+        # probing client must not be able to grow the series count.
+        self._seed(dashboard, model="totally-made-up-model")
+
+        series = _series(_render(dashboard))
+        label = account_label(_ACCOUNT_PATH)
+        assert f'kiro_lb_account_tokens_total{{account="{label}",model="other",direction="input"}}' in series
+        assert "totally-made-up-model" not in _render(dashboard)
+
+    def test_the_unattributed_bucket_is_not_hashed_into_a_fake_account(self, dashboard):
+        # "unknown" is not a credential path. Hashing it would make the
+        # unattributed bucket indistinguishable from a real account.
+        from kiro.usage_tracking import UNKNOWN_ACCOUNT_ID
+
+        self._seed(dashboard, account_id=UNKNOWN_ACCOUNT_ID)
+
+        series = _series(_render(dashboard))
+        assert (
+            f'kiro_lb_account_tokens_total{{account="{UNKNOWN_ACCOUNT_ID}",model="claude-haiku-4.5",direction="input"}}'
+            in series
+        )
+        assert account_label(UNKNOWN_ACCOUNT_ID) not in _render(dashboard)
+
+    def test_requests_are_counted_per_account_and_model(self, dashboard):
+        self._seed(dashboard, requests=4)
+
+        series = _series(_render(dashboard))
+        label = account_label(_ACCOUNT_PATH)
+        assert series[f'kiro_lb_account_model_requests_total{{account="{label}",model="claude-haiku-4.5"}}'] == 4
+
+    def test_a_missing_table_does_not_cost_the_other_sections(self, dashboard):
+        # Same degradation rule the rest of the exporter follows: one broken
+        # section must not empty the scrape.
+        with dashboard._db() as conn:
+            conn.execute("DROP TABLE account_model_usage")
+
+        series = _series(_render(dashboard))
+        assert series["kiro_lb_up"] == 1
+        assert "kiro_lb_requests_total" in _render(dashboard) or series["kiro_lb_models"] >= 0
