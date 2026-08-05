@@ -77,12 +77,17 @@ No module has been added or removed since `a9fadd7`; 37 of the 39 were modified.
   is only the floor and the fallback when no reset date is known, with
   `ACCOUNT_QUOTA_QUARANTINE_MAX` capping a stale date. A fixed 6h window was
   measured releasing accounts ~26 days early, back into the pool at 1000/1000.
-- `quota_depleted` is a reporting state, not an exclusion: usage says the
-  allowance is spent and overage is off, but the account is still routed
-  (deprioritized by weight) because a reading can be stale and the upstream 402
-  is the authority. It ranks below every real exclusion in
-  `account_routing_state`, and telemetry must never remove an account from
-  rotation on its own.
+- `quota_depleted` excludes an account (`is_quota_depleted`): usage reports the
+  allowance spent with overage off, so it cannot serve. It is the same condition
+  as `quota_exhausted` reached by weaker evidence — telemetry rather than an
+  upstream 402 — so it is the one exclusion that can be wrong, and
+  `get_next_account` therefore runs a **second last-resort pass** that lifts only
+  this exclusion. A stalled usage poll must never be able to empty the pool.
+  Every other exclusion is backed by an upstream response and always applies.
+- The two quota states are worded in parallel on purpose ("monthly quota
+  exhausted" / "monthly quota spent", both `excluded for ...`) in
+  `describe_pool_state` and the dashboard badge. They are the same operational
+  fact; do not make one read milder than the other.
 - `_current_account_index` is no longer the selection cursor. It records the last
   success and is the rotation start only for the legacy sticky policy
   (`ACCOUNT_QUOTA_WEIGHTED_ROUTING=false`, the rollback switch).

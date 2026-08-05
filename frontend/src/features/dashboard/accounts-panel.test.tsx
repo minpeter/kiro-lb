@@ -71,15 +71,22 @@ describe("RoutingStateCell", () => {
     quotaOverageEnabled: false,
   };
 
+  const exhaustedAccount: Account = {
+    ...mockAccount,
+    id: "acc_exhausted1",
+    routingState: "quota_exhausted",
+    eligibleInSeconds: 7200,
+  };
+
   it("labels a spent allowance instead of showing it as ready", () => {
     const html = renderToString(<AccountsPanel accounts={[spentAccount]} isLoading={false} />);
     expect(html).toContain("quota spent");
     expect(html).not.toContain("ready");
   });
 
-  it("says a spent account is still tried, since it is not excluded", () => {
+  it("does not advertise a spent account as still being tried", () => {
     const html = renderToString(<AccountsPanel accounts={[spentAccount]} isLoading={false} />);
-    expect(html).toContain("still tried");
+    expect(html).not.toContain("still tried");
   });
 
   it("reports the reset countdown when one is known", () => {
@@ -87,11 +94,22 @@ describe("RoutingStateCell", () => {
     expect(html).toContain("resets in");
   });
 
-  it("omits the countdown when no reset date is known", () => {
+  it("says so plainly when no reset date is known", () => {
     const html = renderToString(
       <AccountsPanel accounts={[{ ...spentAccount, eligibleInSeconds: 0 }]} isLoading={false} />
     );
-    expect(html).toContain("still tried at low priority");
+    expect(html).toContain("until it resets");
     expect(html).not.toContain("resets in");
+  });
+
+  it("renders both quota states the same way, since both exclude", () => {
+    // Same evidence-independent outcome, so neither should look milder than the
+    // other to whoever is reading the table.
+    const spent = renderToString(<AccountsPanel accounts={[spentAccount]} isLoading={false} />);
+    const exhausted = renderToString(<AccountsPanel accounts={[exhaustedAccount]} isLoading={false} />);
+
+    expect(spent.replace("quota spent", "QUOTA").replace(spentAccount.id, "ID")).toBe(
+      exhausted.replace("quota exhausted", "QUOTA").replace(exhaustedAccount.id, "ID")
+    );
   });
 });
