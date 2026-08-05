@@ -88,6 +88,11 @@ No module has been added or removed since `a9fadd7`; 37 of the 39 were modified.
   exhausted" / "monthly quota spent", both `excluded for ...`) in
   `describe_pool_state` and the dashboard badge. They are the same operational
   fact; do not make one read milder than the other.
+- `request_rate_series` reports each series' `routingState` alongside its buckets.
+  The dashboard hides accounts that cannot serve the next request from the rate
+  chart, and it must not have to join the accounts endpoint (pool as of now)
+  against a windowed history to decide. Series are seeded from the live pool, so a
+  deregistered account drops out entirely rather than charting with a null state.
 - `_current_account_index` is no longer the selection cursor. It records the last
   success and is the rotation start only for the legacy sticky policy
   (`ACCOUNT_QUOTA_WEIGHTED_ROUTING=false`, the rollback switch).

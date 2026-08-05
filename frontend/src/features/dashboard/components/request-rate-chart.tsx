@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Activity } from "lucide-react";
 import { Area } from "@/components/dither-kit/area";
 import { AreaChart } from "@/components/dither-kit/area-chart";
@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
 import { accountRateSeries } from "../dither-series";
+import { isUnroutable } from "../routing-state";
 import type { AccountRateSeries } from "../types";
 import type { RequestRate } from "../types";
 import { ChartSkeleton } from "./skeletons";
@@ -15,13 +16,24 @@ function formatClock(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+
+
 function AccountRatePanel({ series }: { series: AccountRateSeries }) {
   const view = useMemo(() => accountRateSeries(series), [series]);
 
   return (
     <div className="space-y-2 rounded-lg border p-3">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="font-mono text-xs">{series.account}</span>
+        <span className="flex min-w-0 items-baseline gap-1.5">
+          <span className="font-mono text-xs">{series.account}</span>
+          {/* Only shown when the panel was revealed by the toggle. Without it a
+              suspended account is indistinguishable from an idle healthy one. */}
+          {isUnroutable(series.routingState) && (
+            <Badge variant="destructive" className="text-[10px]">
+              {series.routingState === "suspended" ? "BANNED" : "no quota"}
+            </Badge>
+          )}
+        </span>
         <span className="text-xs tabular-nums text-muted-foreground">
           {view.peak}/min peak
           {view.load !== null && (
@@ -95,9 +107,20 @@ function AccountRatePanel({ series }: { series: AccountRateSeries }) {
 }
 
 export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLoading: boolean }) {
+  const [showUnroutable, setShowUnroutable] = useState(false);
+
+  const { shown, hidden } = useMemo(() => {
+    const all = rate?.accounts ?? [];
+    return {
+      shown: all.filter((series) => !isUnroutable(series.routingState)),
+      hidden: all.filter((series) => isUnroutable(series.routingState)),
+    };
+  }, [rate]);
+
   // Emptiness is a per-account fact, so it is reported inside each panel. The
   // card only collapses when there is no account to chart at all.
   const hasAccounts = (rate?.accounts.length ?? 0) > 0;
+  const visible = showUnroutable ? [...shown, ...hidden] : shown;
 
   return (
     <Card>
@@ -121,10 +144,38 @@ export function RequestRateChart({ rate, isLoading }: { rate?: RequestRate; isLo
             description="Rate history appears once an account joins the pool."
           />
         ) : (
-          <div className="grid gap-3 lg:grid-cols-2">
-            {rate.accounts.map((series) => (
-              <AccountRatePanel key={series.account} series={series} />
-            ))}
+          <div className="space-y-3">
+            {visible.length > 0 ? (
+              <div className="grid gap-3 lg:grid-cols-2">
+                {visible.map((series) => (
+                  <AccountRatePanel key={series.account} series={series} />
+                ))}
+              </div>
+            ) : (
+              // Every account in the pool is unroutable. Saying so beats an
+              // empty card that reads as "no data".
+              <EmptyState
+                icon={Activity}
+                title="No routable accounts"
+                description="Every account is suspended or out of quota. Show them below to see their history."
+              />
+            )}
+
+            {/* Hidden panels are disclosed, never silently dropped: an operator
+                who knows the pool size would otherwise be left wondering which
+                account went missing and why. */}
+            {hidden.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowUnroutable((previous) => !previous)}
+                aria-expanded={showUnroutable}
+                className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+              >
+                {showUnroutable
+                  ? `Hide ${hidden.length} unroutable account${hidden.length === 1 ? "" : "s"}`
+                  : `${hidden.length} unroutable account${hidden.length === 1 ? "" : "s"} hidden (suspended or out of quota)`}
+              </button>
+            )}
           </div>
         )}
       </CardContent>

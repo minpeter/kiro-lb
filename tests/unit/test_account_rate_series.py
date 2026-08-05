@@ -402,3 +402,87 @@ async def test_non_rate_failures_are_still_charted(manager):
 
     assert sum(series["failure"]) == 1
     assert sum(series["rateLimited"]) == 0
+
+
+class TestRoutingStateOnTheSeries:
+    """The series carries why an account is (not) a routing target.
+
+    The dashboard hides unroutable accounts from the rate chart, so this field is
+    load-bearing rather than decorative: without it the client would have to join
+    two endpoints and guess, and the accounts endpoint reports the pool as it is
+    now while rate observations cover a window.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_account_reports_available(self, manager):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+        # An account with no auth_manager classifies as "uninitialized" before any
+        # quota check is reached, so initialize the ones under test.
+        manager._accounts["/creds/account0.json"].auth_manager = object()
+
+        series = _series_for(manager.request_rate_series(60, 15), "/creds/account0.json")
+
+        assert series["routingState"] == "available"
+
+    @pytest.mark.asyncio
+    async def test_a_suspended_account_reports_suspended(self, manager):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+        manager._accounts["/creds/account0.json"].suspended_until = time.time() + 3600
+
+        series = _series_for(manager.request_rate_series(60, 15), "/creds/account0.json")
+
+        assert series["routingState"] == "suspended"
+
+    @pytest.mark.asyncio
+    async def test_a_quota_exhausted_account_reports_it(self, manager):
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+        manager._accounts["/creds/account0.json"].quota_exhausted_until = time.time() + 3600
+
+        series = _series_for(manager.request_rate_series(60, 15), "/creds/account0.json")
+
+        assert series["routingState"] == "quota_exhausted"
+
+    @pytest.mark.asyncio
+    async def test_a_spent_account_reports_depleted(self, manager):
+        # Usage telemetry says the allowance is gone and overage is off. Excluded
+        # from routing, so the chart hides it, but by inference rather than an
+        # upstream verdict.
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+        account = manager._accounts["/creds/account0.json"]
+        account.auth_manager = object()
+        account.quota_headroom = 0.0
+        account.quota_overage_enabled = False
+
+        series = _series_for(manager.request_rate_series(60, 15), "/creds/account0.json")
+
+        assert series["routingState"] == "quota_depleted"
+
+    @pytest.mark.asyncio
+    async def test_a_deregistered_account_leaves_the_series_entirely(self, manager):
+        """Series are seeded from the live pool, so removing an account drops its history.
+
+        Pinned because the dashboard's hide rule treats a null state as "keep
+        charting". That branch is unreachable today, and this test is what would
+        fail first if `_observations_by_account` ever started emitting orphaned
+        observations - at which point the frontend contract needs revisiting
+        rather than silently charting an account that no longer exists.
+        """
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+        del manager._accounts["/creds/account0.json"]
+
+        payload = manager.request_rate_series(60, 15)
+
+        labels = [entry["account"] for entry in payload["accounts"]]
+        assert account_label("/creds/account0.json") not in labels
+
+    @pytest.mark.asyncio
+    async def test_every_series_carries_the_field(self, manager):
+        """No consumer has to treat the key as optional."""
+        await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
+        await manager.report_success("/creds/account1.json", "claude-sonnet-4-5")
+
+        payload = manager.request_rate_series(60, 15)
+
+        assert payload["accounts"]
+        for entry in payload["accounts"]:
+            assert "routingState" in entry

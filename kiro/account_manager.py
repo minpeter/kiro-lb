@@ -1673,6 +1673,7 @@ class AccountManager:
                     failure[bucket] += 1
                 peak_rpm[bucket] = max(peak_rpm[bucket], observation.rpm)
 
+            account = self._accounts.get(account_id)
             accounts.append(
                 {
                     "account": account_label(account_id),
@@ -1680,6 +1681,16 @@ class AccountManager:
                     "rateLimited": rate_limited,
                     "failure": failure,
                     "peakRpm": peak_rpm,
+                    # The routing state travels with the series so the dashboard
+                    # can tell an account that served nothing from one that cannot
+                    # serve at all, without joining a second endpoint that reports
+                    # the pool as of now against a windowed history.
+                    #
+                    # Series are seeded from the current pool
+                    # (_observations_by_account), so `account` is normally present;
+                    # None is kept as an explicit "unknown" rather than defaulting
+                    # to a state that would claim something untrue.
+                    "routingState": account_routing_state(account, now)[0] if account is not None else None,
                     **self.estimate_rate_limit(account_id, now),
                 }
             )
