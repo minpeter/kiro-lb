@@ -577,6 +577,25 @@ async def prime_registered_account_usage(manager: Any, result: dict[str, Any]) -
     return result
 
 
+def _headroom_from_usage(usage: dict[str, Any]) -> float | None:
+    """Convert a usage summary into the unused quota fraction, or None.
+
+    Returns None rather than a guess whenever the reading cannot support the
+    ratio: the router treats None as "unknown" and falls back to a neutral
+    weight, which is honest, while a fabricated 0.0 or 1.0 would silently bias
+    routing on missing telemetry.
+    """
+    if usage.get("error"):
+        return None
+    current = usage.get("currentUsage")
+    limit = usage.get("usageLimit")
+    if not isinstance(current, (int, float)) or not isinstance(limit, (int, float)):
+        return None
+    if limit <= 0:
+        return None
+    return max(0.0, min(1.0, 1.0 - (float(current) / float(limit))))
+
+
 async def refresh_all_account_usage(manager: Any) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for account_id, account in list(manager._accounts.items()):
@@ -586,7 +605,15 @@ async def refresh_all_account_usage(manager: Any) -> list[dict[str, Any]]:
                 await manager._initialize_account(account_id)
             except Exception:
                 pass
-        results.append(await refresh_account_usage(manager._accounts[account_id]))
+        usage = await refresh_account_usage(manager._accounts[account_id])
+        # Feed routing weight from the same poll. Selection prefers accounts
+        # with quota left, so a refresh that updated the dashboard but not the
+        # router would leave routing pinned to whatever it last believed.
+        try:
+            manager.set_quota_headroom(account_id, _headroom_from_usage(usage))
+        except Exception as exc:
+            logger.warning("Failed to update routing weight for {}: {}", account_label(account_id), exc)
+        results.append(usage)
     return results
 
 
@@ -609,6 +636,11 @@ def _account_view(account: Any, *, deletable: bool = False) -> dict[str, Any]:
         "requests": account.stats.total_requests,
         "successfulRequests": account.stats.successful_requests,
         "failedRequests": account.stats.failed_requests,
+        # Routing weight input. `usagePercent` is the dashboard's own view of the
+        # same quota, but it is the persisted reading; this is what selection
+        # actually holds, so a stale or failed refresh is visible as null here
+        # instead of being inferred from a row that still looks fresh.
+        "quotaHeadroom": getattr(account, "quota_headroom", None),
         "usage": _cached_usage(account.id),
     }
 

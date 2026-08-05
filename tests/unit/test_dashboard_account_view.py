@@ -94,3 +94,21 @@ def test_longer_quota_exclusion_outranks_shorter_cooldown():
     state, _ = account_routing_state(account)
 
     assert state == "quota_exhausted"
+
+
+def test_view_exposes_routing_weight_input(dashboard):
+    account = _initialized_account()
+    account.quota_headroom = 0.42
+
+    view = dashboard._account_view(account)
+
+    assert view["quotaHeadroom"] == 0.42
+
+
+def test_view_reports_unknown_routing_weight_as_null(dashboard):
+    # The persisted `usage` row can look fresh while the router holds no weight
+    # (failed poll, or a restart before the first refresh). Reporting null here
+    # is what lets an operator tell those apart.
+    view = dashboard._account_view(_initialized_account())
+
+    assert view["quotaHeadroom"] is None

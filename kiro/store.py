@@ -202,6 +202,42 @@ def load_runtime_state() -> dict[str, Any] | None:
     return json.loads(row[0]) if row else None
 
 
+def load_quota_headroom() -> dict[str, float]:
+    """Return the last known unused-quota fraction per account.
+
+    Quota-weighted routing needs a weight from the first request onward, but the
+    live reading comes from a poll that runs after startup and again only every
+    USAGE_REFRESH_INTERVAL_SECONDS. Seeding from the persisted usage rows closes
+    that window for both a cold start and a blue/green handoff, where
+    ``reload_durable_state`` rebuilds the pool from scratch.
+
+    Rows carrying an error, a non-numeric reading, or a non-positive limit are
+    omitted so the router sees "unknown" instead of a fabricated ratio. The
+    ``account_usage`` table belongs to the dashboard and may not exist yet on a
+    fresh database, which is not an error here.
+    """
+    try:
+        with connection() as conn:
+            rows = conn.execute(
+                """SELECT account_id, current_usage, usage_limit FROM account_usage
+                   WHERE error IS NULL AND current_usage IS NOT NULL AND usage_limit > 0"""
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    headroom: dict[str, float] = {}
+    for row in rows:
+        try:
+            current = float(row["current_usage"])
+            limit = float(row["usage_limit"])
+        except (TypeError, ValueError):
+            continue
+        if limit <= 0:
+            continue
+        headroom[row["account_id"]] = max(0.0, min(1.0, 1.0 - (current / limit)))
+    return headroom
+
+
 def save_runtime_state(
     state: dict[str, Any],
     conn: sqlite3.Connection | None = None,

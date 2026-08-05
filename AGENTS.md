@@ -45,7 +45,7 @@ they held are folded into this file; do not link to them.
 | Kiro -> client stream | `kiro/streaming_openai.py`, `kiro/streaming_anthropic.py` | Shared event model in `kiro/streaming_core.py` |
 | AWS event-stream framing | `kiro/parsers.py` | Frame reassembly + bracket tool-call recovery |
 | Stream order invariants | `kiro/sse_validation.py` | Raises mid-stream instead of shipping bad order |
-| Account failover / rotation | `kiro/account_manager.py` | Circuit breaker, global sticky, lazy init |
+| Account failover / rotation | `kiro/account_manager.py` | Circuit breaker, quota-weighted selection, lazy init |
 | Credentials + host selection | `kiro/auth.py`, `kiro/config.py` | 4 sources; Builder ID routes to a different host |
 | Add an account by browser login | `kiro/device_login.py` | Social + Builder ID device flows |
 | Shared SQLite persistence | `kiro/store.py` | Accounts, runtime state, internal login credentials; mode 0600/WAL |
@@ -69,7 +69,8 @@ they held are folded into this file; do not link to them.
 | `parse_kiro_stream` | async gen | `kiro/streaming_core.py:119` | Only place raw frames become `KiroEvent` |
 | `KiroEvent` | dataclass | `kiro/streaming_core.py:51` | Protocol-neutral event both adapters consume |
 | `AccountManager` | class | `kiro/account_manager.py:260` | Pool state, failover, rate series, persistence |
-| `AccountManager.get_next_account` | method | `kiro/account_manager.py:727` | Rotation from the global index; skips quota-exhausted accounts |
+| `AccountManager.get_next_account` | method | `kiro/account_manager.py:727` | Quota-weighted candidate order; skips quota-exhausted accounts |
+| `AccountManager._weighted_candidate_order` | method | `kiro/account_manager.py` | Weighted sampling by remaining quota fraction; no persisted cursor |
 | `AccountManager.report_failure` | method | `kiro/account_manager.py:914` | Classifies 429 / 402 / INVALID_MODEL_ID separately |
 | `KiroAuthManager` | class | `kiro/auth.py:67` | Token lifecycle, region + host resolution |
 | `ModelResolver` | class | `kiro/model_resolver.py:242` | normalize -> cache -> hidden -> passthrough |
@@ -182,8 +183,16 @@ trusting a pin here.
   stays on the Kiro host (`kiro/config.py:613`). Absence of a profile alone is
   not the test, and Builder ID accounts must never receive the global fallback
   profile ARN (`routes_openai.py:371`, `routes_anthropic.py:255`).
-- Moving `_current_account_index` on failure. It advances only on success —
-  that is the global sticky behavior (`account_manager.py:999`).
+- Treating `_current_account_index` as the selection cursor. Routing is
+  quota-weighted (`ACCOUNT_QUOTA_WEIGHTED_ROUTING`); the index only records the
+  last success and drives the legacy sticky rollback path. It still advances
+  only on success.
+- Weighting account selection by absolute remaining quota, or letting a weight
+  exclude an account. The weight is the remaining *fraction*, and every account
+  keeps a nonzero chance — a zero-chance weight is how the sticky cursor starved
+  a healthy account in the first place. Exclusion is the health policy's job.
+- Persisting `quota_headroom` with runtime state. It is re-seeded from the
+  usage rows on load (`store.load_quota_headroom`); a stale weight misroutes.
 - Letting a burst escalate into a long exclusion. `USER_REQUEST_RATE_EXCEEDED`
   parks an account for `ACCOUNT_RATE_LIMIT_COOLDOWN` (10s, `config.py:540`) and
   leaves the circuit breaker untouched; only `MONTHLY_REQUEST_COUNT`

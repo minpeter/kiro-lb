@@ -58,9 +58,21 @@ No module has been added or removed since `a9fadd7`; 37 of the 39 were modified.
   Claude profile, which over-counts rather than under-counts (`tokenizer.py:87`).
 - `AccountManager` returns 429 to the caller immediately so failover happens
   before backoff.
-- Account selection always starts from the global index
-  (`account_manager.py:786`) and that index moves only on success
-  (`account_manager.py:999`).
+- Account selection visits candidates in quota-weighted random order
+  (`account_manager.py:_weighted_candidate_order`), weighting by the *fraction*
+  of monthly quota left, never the absolute remainder: absolute headroom
+  concentrates traffic on the largest plan hard enough to trip its own request
+  rate limit. Weighting only reorders — every exclusion (suspension, quota
+  quarantine, rate limit, breaker) is still applied per candidate, and every
+  account keeps a nonzero chance so none can be starved.
+- Routing weight comes from `Account.quota_headroom`, fed by the control-plane
+  usage poll (`dashboard.refresh_all_account_usage`) and seeded on load from the
+  persisted usage rows (`store.load_quota_headroom`). It is deliberately absent
+  from the runtime state document: a stale weight misroutes, and every start or
+  blue/green handoff re-seeds instead.
+- `_current_account_index` is no longer the selection cursor. It records the last
+  success and is the rotation start only for the legacy sticky policy
+  (`ACCOUNT_QUOTA_WEIGHTED_ROUTING=false`, the rollback switch).
 - Every emitted chunk goes through `sse_validation`; a protocol violation fails
   the stream loudly rather than reaching the client.
 - Debug capture redacts content unless `DEBUG_CAPTURE_CONTENT=true`; credential

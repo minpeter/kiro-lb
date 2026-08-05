@@ -136,10 +136,30 @@ class TestAccountSystemFullFlow:
         await manager.report_success(account2_id, "claude-opus-4.5")
         print(f"Account 2 succeeded: failures={manager._accounts[account2_id].failures}")
 
-        # 4. Verify sticky behavior - should prefer account2 now
-        next_account_again = await manager.get_next_account("claude-opus-4.5")
-        print(f"Next account (sticky): {next_account_again.id if next_account_again else None}")
-        assert next_account_again.id == account2_id
+        # 4. While account1 is still cooling down it stays out of the rotation,
+        # so account2 serves every request.
+        with patch("random.random", return_value=0.5):
+            for _ in range(10):
+                candidate = await manager.get_next_account("claude-opus-4.5")
+                assert candidate is not None
+                assert candidate.id == account2_id
+
+        # 5. Once the cooldown expires, account1 becomes reachable again.
+        # Success no longer pins selection to account2: under quota-weighted
+        # routing both accounts are selectable, and asserting a single winner
+        # here would only re-encode the starvation this policy removed.
+        manager._accounts[account1_id].failures = 0
+        manager._accounts[account1_id].last_failure_time = 0.0
+
+        seen = set()
+        with patch("random.random", return_value=0.5):
+            for _ in range(40):
+                candidate = await manager.get_next_account("claude-opus-4.5")
+                assert candidate is not None
+                seen.add(candidate.id)
+
+        print(f"Accounts reachable after recovery: {sorted(seen)}")
+        assert seen == {account1_id, account2_id}
 
         print("✓ Full failover flow completed successfully")
 
@@ -194,10 +214,13 @@ class TestAccountSystemFullFlow:
         account2_id = list(manager._accounts.keys())[1]
         await manager.report_success(account2_id, "claude-opus-4.5")
 
-        # Assert: Global index updated to 1
+        # Assert: the last-success marker still tracks the account. It is no
+        # longer the selection cursor under quota-weighted routing, but it is
+        # the rotation start for the legacy sticky policy and part of the
+        # persisted state document.
         print(f"Updated global index: {manager._current_account_index}")
         assert manager._current_account_index == 1
-        print("✓ Global index was updated on success")
+        print("✓ Last-success index was updated on success")
 
     @pytest.mark.asyncio
     async def test_circuit_breaker_blocks_broken_account(self, tmp_path, temp_account_credentials_files, mock_time):
