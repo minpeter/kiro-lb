@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from kiro.account_errors import ErrorType
-from kiro.account_manager import Account, AccountManager, account_routing_state
+from kiro.account_manager import Account, AccountManager, account_routing_state, is_quota_depleted
 from kiro.config import (
     ACCOUNT_QUOTA_QUARANTINE,
     ACCOUNT_QUOTA_QUARANTINE_MAX,
@@ -219,7 +219,23 @@ class TestDepletedIsReportedNotHidden:
 
 
 class TestDepletedAccountsAreExcluded:
-    """A spent allowance is excluded, with one deliberate escape hatch."""
+    """A spent allowance is excluded, with one deliberate escape hatch.
+
+    Selection is a weighted random draw, so a test that just repeats it is only as
+    strong as the odds of the wrong pick. A spent account normally carries
+    ACCOUNT_DEPLETED_QUOTA_WEIGHT (0.01) against a healthy 0.5, i.e. a ~2% chance
+    per draw: 40 draws would catch a broken exclusion barely half the time and the
+    test would pass on ~45% of runs with the bug present.
+
+    ``favor_spent`` inverts that. It weights spent accounts far above healthy ones,
+    so the exclusion is the *only* reason a spent account can lose. If it were
+    removed, the assertions below fail on essentially the first draw.
+    """
+
+    @pytest.fixture
+    def favor_spent(self, monkeypatch):
+        monkeypatch.setattr("kiro.account_manager.ACCOUNT_DEPLETED_QUOTA_WEIGHT", 100.0)
+        monkeypatch.setattr("kiro.account_manager.ACCOUNT_UNKNOWN_QUOTA_WEIGHT", 100.0)
 
     def _deplete(self, manager: AccountManager, account_id: str) -> Account:
         account = manager._accounts[account_id]
@@ -229,20 +245,30 @@ class TestDepletedAccountsAreExcluded:
         return account
 
     @pytest.mark.asyncio
-    async def test_depleted_account_is_skipped_for_a_healthy_one(self, tmp_path):
+    async def test_depleted_account_is_skipped_for_a_healthy_one(self, tmp_path, favor_spent):
         manager = _manager(tmp_path, ("/creds/spent.json", "/creds/healthy.json"))
         self._deplete(manager, "/creds/spent.json")
         manager._accounts["/creds/healthy.json"].quota_headroom = 0.5
 
-        # Repeated draws: the order is randomized, so a single call could pick the
-        # healthy account by luck rather than by the exclusion.
+        # The spent account is weighted 200x the healthy one, so it would be drawn
+        # first almost every time if the exclusion were not applied.
         for _ in range(40):
             selected = await manager.get_next_account("claude-sonnet-4-5")
             assert selected is not None
             assert selected.id == "/creds/healthy.json"
 
     @pytest.mark.asyncio
-    async def test_every_depleted_account_is_skipped(self, tmp_path):
+    async def test_depleted_account_never_qualifies(self, tmp_path):
+        # The draw-based tests above depend on weights; this one does not, so a
+        # change to the weighting scheme cannot quietly weaken the guarantee.
+        manager = _manager(tmp_path, ("/creds/spent.json",))
+        account = self._deplete(manager, "/creds/spent.json")
+
+        assert is_quota_depleted(account) is True
+        assert account_routing_state(account)[0] == "quota_depleted"
+
+    @pytest.mark.asyncio
+    async def test_every_depleted_account_is_skipped(self, tmp_path, favor_spent):
         manager = _manager(tmp_path, (f"/creds/spent{i}.json" for i in range(4)))
         for account_id in list(manager._accounts):
             self._deplete(manager, account_id)
@@ -251,6 +277,8 @@ class TestDepletedAccountsAreExcluded:
         manager._accounts["/creds/healthy.json"].models_cached_at = time.time()
         manager._accounts["/creds/healthy.json"].quota_headroom = 0.1
 
+        # Four spent accounts at 100.0 against one healthy at 0.1: a broken
+        # exclusion loses here with probability ~2.5e-4 per draw.
         for _ in range(40):
             selected = await manager.get_next_account("claude-sonnet-4-5")
             assert selected is not None
@@ -258,7 +286,9 @@ class TestDepletedAccountsAreExcluded:
 
     @pytest.mark.asyncio
     async def test_overage_enabled_account_at_zero_is_not_excluded(self, tmp_path):
-        # 100% with overage billing on can still serve, so it stays eligible.
+        # 100% with overage billing on can still serve, so it stays eligible. Both
+        # accounts sit at headroom 0.0 and therefore carry the same weight, so the
+        # overage flag is the only thing that can separate them.
         manager = _manager(tmp_path, ("/creds/overage.json", "/creds/spent.json"))
         self._deplete(manager, "/creds/spent.json")
         overage = self._deplete(manager, "/creds/overage.json")
@@ -270,8 +300,9 @@ class TestDepletedAccountsAreExcluded:
             assert selected.id == "/creds/overage.json"
 
     @pytest.mark.asyncio
-    async def test_unpolled_account_is_not_excluded(self, tmp_path):
-        # No reading is not evidence of a spent quota.
+    async def test_unpolled_account_is_not_excluded(self, tmp_path, favor_spent):
+        # No reading is not evidence of a spent quota. favor_spent pins the unknown
+        # and depleted weights equal, so eligibility is the only differentiator.
         manager = _manager(tmp_path, ("/creds/unpolled.json", "/creds/spent.json"))
         self._deplete(manager, "/creds/spent.json")
         manager._accounts["/creds/unpolled.json"].quota_headroom = None

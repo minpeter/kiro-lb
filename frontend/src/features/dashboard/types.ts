@@ -27,7 +27,7 @@ export type AccountRoutingState =
   | "available"
   | "rate_limited"
   | "quota_exhausted"
-  /** Allowance spent with overage off. Still routed, just deprioritized. */
+  /** Allowance spent with overage off. Excluded, same as quota_exhausted. */
   | "quota_depleted"
   | "cooling_down"
   | "suspended"

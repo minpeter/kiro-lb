@@ -269,10 +269,12 @@ class Account:
         models_cached_at: Timestamp of last model cache update
         quota_headroom: Fraction of the monthly quota still unused (0.0-1.0), or
             None when no usage reading is available. Fed by control-plane usage
-            polling and used only to weight routing, never to exclude: an
-            account that truly cannot serve returns 402 and is handled by
-            ``quota_exhausted_until``. Not persisted - a stale headroom is worse
-            than no headroom, and the first refresh after start repopulates it.
+            polling. Weights routing while any quota remains, and at 0.0 combines
+            with ``quota_overage_enabled`` to exclude the account outright - see
+            ``is_quota_depleted``. That exclusion is inferred rather than observed,
+            so ``get_next_account`` keeps a last-resort pass that ignores it; a
+            stalled poll must not empty the pool. Not persisted - a stale headroom
+            is worse than none, and load re-seeds it from the usage rows.
         quota_resets_at: Epoch seconds at which the monthly allowance next
             resets, from the control-plane usage poll, or 0.0 when unknown. This
             is what a 402 quarantine waits for: a fixed window expires while the
@@ -280,9 +282,10 @@ class Account:
             402 again. Not persisted with runtime state - it is re-seeded from
             the usage rows on load, like ``quota_headroom``.
         quota_overage_enabled: Whether the account may keep serving past its
-            allowance. Display only: it distinguishes "at 100% and therefore
-            done" from "at 100% but billing overage", which the routing state
-            alone cannot express.
+            allowance, or None when the status is unknown. Load-bearing for
+            routing, not display: it separates "at 100% and therefore done" from
+            "at 100% but billing overage", and only the former is excluded. None
+            never excludes - an unknown status is not evidence.
         stats: Usage statistics
     """
 
@@ -603,7 +606,7 @@ class AccountManager:
         # Reset date and overage flag are seeded independently of headroom: a row
         # can carry a usable reset date while its usage reading is unusable, a
         # restart mid-quarantine needs the date to avoid falling back to the fixed
-        # window, and the depleted display state needs the overage flag before the
+        # window, and the depleted exclusion needs the overage flag before the
         # first poll or a spent account reads as ready again.
         period_seeded = 0
         for account_id, (reset_at, overage) in period.items():
@@ -1066,12 +1069,14 @@ class AccountManager:
         return max(floor, min(target, now + ACCOUNT_QUOTA_QUARANTINE_MAX))
 
     def set_quota_headroom(self, account_id: str, headroom: Optional[float]) -> None:
-        """Record how much monthly quota an account has left, for routing weight.
+        """Record how much monthly quota an account has left.
 
         Called by the control-plane usage refresh. Kept lock-free and
-        non-throwing: this is telemetry feeding a routing preference, and a
-        missing value degrades to the unknown-quota weight rather than removing
-        the account from the pool.
+        non-throwing: a missing value degrades to the unknown-quota weight, which
+        never excludes, so a failed poll cannot take an account out of the pool.
+        A reading of 0.0 does gate routing once overage is known to be off (see
+        ``is_quota_depleted``), which is why an unusable reading must arrive here
+        as None rather than as a zero.
 
         Args:
             account_id: Internal account ID
@@ -1090,11 +1095,11 @@ class AccountManager:
     def set_quota_period(self, account_id: str, resets_at: Optional[float], overage_enabled: Optional[bool]) -> None:
         """Record when the quota resets and whether overage keeps it serving.
 
-        Same contract as ``set_quota_headroom``: lock-free, non-throwing, and
-        purely additive telemetry. The reset time bounds a 402 quarantine so it
-        ends with the allowance instead of on a fixed timer; the overage flag only
-        distinguishes "spent and therefore done" from "spent but still billing"
-        for reporting.
+        Same contract as ``set_quota_headroom``: lock-free and non-throwing. The
+        reset time bounds a 402 quarantine so it ends with the allowance instead of
+        on a fixed timer. The overage flag separates "spent and therefore done"
+        from "spent but still billing", and only the first of those is excluded
+        from routing, so passing None (unknown) must leave the account eligible.
 
         Args:
             account_id: Internal account ID
