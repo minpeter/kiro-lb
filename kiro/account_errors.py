@@ -13,9 +13,46 @@ requests that will fail on all accounts.
 from enum import Enum
 from typing import Optional
 
-from kiro.kiro_errors import SUSPENSION_REASON, is_suspension_error
+from kiro.kiro_errors import (
+    CREDENTIAL_DEAD_REASON,
+    SUSPENSION_REASON,
+    is_credential_dead_status,
+    is_suspension_error,
+)
 
-__all__ = ["ErrorType", "classify_error", "is_suspension_error", "SUSPENSION_REASON"]
+__all__ = [
+    "ErrorType",
+    "classify_error",
+    "is_suspension_error",
+    "SUSPENSION_REASON",
+    "CredentialDeadError",
+    "CREDENTIAL_DEAD_REASON",
+    "is_credential_dead_status",
+]
+
+
+class CredentialDeadError(Exception):
+    """The auth host rejected the stored refresh token, so it cannot be renewed.
+
+    Raised instead of letting ``httpx.HTTPStatusError`` escape ``get_access_token``.
+    That exception is neither ``RequestError`` nor ``TimeoutException``, so it
+    slipped past every handler in the retry loop and the route's
+    ``except HTTPException``, surfacing as a bare 500 with no ``report_failure``
+    call - which left a permanently dead account holding its place in the
+    rotation. A distinct type lets the route classify it as RECOVERABLE and fail
+    over, while the pool quarantines the account instead of retrying a credential
+    that can only be repaired by a re-login.
+    """
+
+    def __init__(self, account_hint: str, status_code: int, message: str = "") -> None:
+        self.status_code = status_code
+        self.account_hint = account_hint
+        # The upstream body is deliberately not interpolated: it carries no
+        # operator-actionable detail beyond the status, and the refresh URL that
+        # httpx puts in its own message is the one string long enough to break
+        # the dashboard cell that renders it.
+        self.message = message or "refresh token rejected by the auth host"
+        super().__init__(f"Credential for {account_hint} is no longer valid (HTTP {status_code}): {self.message}")
 
 
 class ErrorType(Enum):

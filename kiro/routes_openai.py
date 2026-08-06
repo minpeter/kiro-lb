@@ -320,7 +320,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
     account_system = request.app.state.account_system
     while True:
-        from kiro.account_errors import ErrorType, classify_error
+        from kiro.account_errors import CredentialDeadError, ErrorType, classify_error
 
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
@@ -628,6 +628,31 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 if debug_logger:
                     debug_logger.flush_on_error(e.status_code, str(e.detail))
                 raise
+            except CredentialDeadError as e:
+                # The account could not obtain a token at all, so this attempt
+                # never reached Kiro. That is an account-scoped failure, not a
+                # request-scoped one: park the credential and fail over. Before
+                # this branch existed the raw HTTPStatusError fell through to the
+                # generic handler below and became a 500, with no report_failure
+                # and the dead account still first in line for the next request.
+                await http_client.close()
+                if account_system:
+                    await account_manager.report_credential_dead(account.id, e.status_code)
+
+                last_error_status = 502
+                last_error_message = (
+                    f"Account credential rejected by the auth host (HTTP {e.status_code}); re-login required."
+                )
+                logger.warning(f"Dead credential on account {account.id}; trying next account")
+
+                if single_attempt:
+                    if not account_system:
+                        if debug_logger:
+                            debug_logger.flush_on_error(last_error_status, last_error_message)
+                        raise HTTPException(status_code=last_error_status, detail=last_error_message)
+                    break
+
+                continue  # Try next account
             except Exception as e:
                 await http_client.close()
                 logger.error(f"Internal error: {e}", exc_info=True)

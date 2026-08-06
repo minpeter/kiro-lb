@@ -42,8 +42,15 @@ all wrong; trust `vite.config.ts` and `package.json`.
   accounts the rate chart hides. It is deliberately narrower than "renders as a
   destructive badge": `rate_limited` and `cooling_down` are red but clear on their
   own, and they are exactly what the rate chart is for. Only `suspended`,
-  `quota_exhausted`, and `quota_depleted` hide. Hidden panels are disclosed by a
-  toggle, never silently dropped.
+  `auth_dead`, `quota_exhausted`, and `quota_depleted` hide. Hidden panels are
+  disclosed by a toggle, never silently dropped.
+- Any cell rendering upstream text must bound its own width. `UsageErrorCell`
+  (`components/accounts-panel.tsx`) exists because `usage.error` was rendered bare
+  into a `whitespace-nowrap` `TableCell`: an httpx 401 message is 188 characters
+  across two lines, so the row grew past the viewport and pushed every later column
+  off-screen. The backend now summarizes these, but the cell must not rely on that
+  — `max-w-40` + `whitespace-normal break-words line-clamp-2` holds for any string,
+  with the full text kept reachable via `title` rather than truncated away.
 - `cn()` in `src/lib/utils.ts` (clsx + tailwind-merge) is how class names compose;
   shadcn config lives in `components.json` (new-york, CSS variables, Lucide).
 

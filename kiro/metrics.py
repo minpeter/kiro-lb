@@ -97,6 +97,7 @@ _ROUTING_STATES = (
     "quota_exhausted",
     "quota_depleted",
     "suspended",
+    "auth_dead",
 )
 
 

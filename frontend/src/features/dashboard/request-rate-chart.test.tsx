@@ -36,6 +36,9 @@ describe("isUnroutable", () => {
     expect(isUnroutable("suspended")).toBe(true);
     expect(isUnroutable("quota_exhausted")).toBe(true);
     expect(isUnroutable("quota_depleted")).toBe(true);
+    // A rejected credential needs a re-login, so it charts a permanent flat line
+    // exactly like a suspension.
+    expect(isUnroutable("auth_dead")).toBe(true);
   });
 
   it("keeps states that clear on their own", () => {

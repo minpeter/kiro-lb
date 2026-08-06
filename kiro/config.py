@@ -574,6 +574,14 @@ ACCOUNT_QUOTA_QUARANTINE_MAX: int = int(os.getenv("ACCOUNT_QUOTA_QUARANTINE_MAX"
 # only earn another 403 here.
 ACCOUNT_SUSPENSION_QUARANTINE: int = int(os.getenv("ACCOUNT_SUSPENSION_QUARANTINE", "86400"))
 
+# A refresh token the auth host has rejected is dead until a human re-logs in, so
+# this window only bounds how long the gateway trusts that verdict without
+# re-testing. It matches the suspension quarantine deliberately: both describe a
+# condition no request can clear, and a shorter window would re-admit an account
+# whose every request must fail at the token step, before a model is even chosen.
+# Re-registering the account clears it immediately, which is the real remedy.
+ACCOUNT_AUTH_DEAD_QUARANTINE: int = int(os.getenv("ACCOUNT_AUTH_DEAD_QUARANTINE", "86400"))
+
 # Averaging window for the dashboard's requests-per-minute figure. Kiro rejects
 # on instantaneous speed, so the chart measures a sliding count over this many
 # seconds at each request instant rather than averaging a whole bucket.
