@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 import pytest
 
+from kiro.account_errors import CredentialDeadError
 from kiro.auth import AuthType, KiroAuthManager
 from kiro.config import TOKEN_REFRESH_THRESHOLD
 from kiro.store import connection, initialize, replace_account_sources
@@ -1900,8 +1901,17 @@ class TestKiroAuthManagerGracefulDegradation:
     @pytest.mark.asyncio
     async def test_get_access_token_non_sqlite_mode_propagates_400_error(self):
         """
-        What it does: Verifies 400 error is propagated in non-SQLite mode.
+        What it does: Verifies a 400 still fails the call in non-SQLite mode.
         Purpose: Ensure graceful degradation only applies to SQLite mode.
+
+        The failure surfaces as CredentialDeadError rather than the raw
+        httpx.HTTPStatusError. With no SQLite database there is no raw source to
+        reload and no still-valid access token to fall back to, so a 400 here is
+        terminal - the refresh token is finished. The raw exception is deliberately
+        no longer allowed to escape: being neither RequestError nor
+        TimeoutException, it matched no handler in the retry loop or the routes and
+        became a bare 500 with no failover. The status code stays assertable on the
+        typed error.
         """
         print("Setup: Creating KiroAuthManager WITHOUT sqlite_db...")
         manager = KiroAuthManager(
@@ -1929,12 +1939,15 @@ class TestKiroAuthManagerGracefulDegradation:
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_class.return_value = mock_client
 
-            print("Action: Calling get_access_token() (expecting HTTPStatusError)...")
-            with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            print("Action: Calling get_access_token() (expecting CredentialDeadError)...")
+            with pytest.raises(CredentialDeadError) as exc_info:
                 await manager.get_access_token()
 
             print("Verification: 400 error was propagated (no graceful degradation)...")
-            assert exc_info.value.response.status_code == 400
+            assert exc_info.value.status_code == 400
+            # The stale access token must not be handed out: that fallback is
+            # SQLite-only, where kiro-cli may have rotated the token out of band.
+            assert manager._access_token == "expiring_token"
 
 
 class TestExternalCredentialOverlayPersistence:

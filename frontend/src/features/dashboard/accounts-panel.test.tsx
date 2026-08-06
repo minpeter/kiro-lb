@@ -112,4 +112,69 @@ describe("RoutingStateCell", () => {
       exhausted.replace("quota exhausted", "QUOTA").replace(exhaustedAccount.id, "ID")
     );
   });
+
+  const authDeadAccount: Account = {
+    ...mockAccount,
+    id: "acc_authdead01",
+    routingState: "auth_dead",
+  };
+
+  it("labels a rejected credential rather than reporting it as ready", () => {
+    const html = renderToString(<AccountsPanel accounts={[authDeadAccount]} isLoading={false} />);
+    expect(html).toContain("AUTH DEAD");
+    expect(html).not.toContain(">ready<");
+  });
+
+  it("names the remedy, because this exclusion is the operator's to fix", () => {
+    // A suspension needs Kiro support; a dead credential needs a re-login. The
+    // row has to say which, or an operator files the wrong ticket.
+    const html = renderToString(<AccountsPanel accounts={[authDeadAccount]} isLoading={false} />);
+    expect(html).toContain("re-login required");
+    expect(html).not.toContain("contact support");
+  });
+});
+
+describe("UsageCell error rendering", () => {
+  // The exact string that broke the table: httpx's 401 message, 188 characters
+  // with an embedded newline.
+  const HTTPX_401 =
+    "Client error '401 Unauthorized' for url 'https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken'\n" +
+    "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/401";
+
+  const erroredAccount: Account = {
+    ...mockAccount,
+    id: "acc_errored001",
+    usage: { error: HTTPX_401 },
+  };
+
+  it("still reports the error text", () => {
+    const html = renderToString(<AccountsPanel accounts={[erroredAccount]} isLoading={false} />);
+    expect(html).toContain("401 Unauthorized");
+  });
+
+  it("constrains the cell so a long error cannot widen the table", () => {
+    // The regression was a nowrap cell growing to fit an unbounded string. The
+    // width cap plus wrapping is what keeps the remaining columns on screen.
+    const html = renderToString(<AccountsPanel accounts={[erroredAccount]} isLoading={false} />);
+    expect(html).toContain("max-w-40");
+    expect(html).toContain("whitespace-normal");
+    expect(html).toContain("break-words");
+    expect(html).toContain("line-clamp-2");
+  });
+
+  it("keeps the full message reachable instead of truncating it away", () => {
+    const html = renderToString(<AccountsPanel accounts={[erroredAccount]} isLoading={false} />);
+    expect(html).toContain("title=");
+    expect(html).toContain("developer.mozilla.org");
+  });
+
+  it("renders the usage bar for a healthy account, not the error path", () => {
+    const healthy: Account = {
+      ...mockAccount,
+      usage: { usagePercent: 42, currentUsage: 420, usageLimit: 1000, error: null },
+    };
+    const html = renderToString(<AccountsPanel accounts={[healthy]} isLoading={false} />);
+    expect(html).toContain("42.00%");
+    expect(html).not.toContain("line-clamp-2");
+  });
 });

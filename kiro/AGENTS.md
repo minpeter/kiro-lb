@@ -88,6 +88,29 @@ No module has been added or removed since `a9fadd7`; 37 of the 39 were modified.
   exhausted" / "monthly quota spent", both `excluded for ...`) in
   `describe_pool_state` and the dashboard badge. They are the same operational
   fact; do not make one read milder than the other.
+- A refresh token the auth host rejects raises `CredentialDeadError`
+  (`account_errors.py`), never a bare `httpx.HTTPStatusError`. That exception is
+  neither `RequestError` nor `TimeoutException`, so it matched no handler in
+  `request_with_retry` and none in the routes' `except HTTPException` — it escaped
+  as a 500 with no `report_failure`, leaving a permanently dead account in
+  rotation. `get_access_token` and `force_refresh` translate it at the single
+  choke point, **after** the raw-source reload and the SQLite graceful-degradation
+  fallback have had their chance; only 400/401 convert, so a 5xx from the auth
+  host keeps its transient retry meaning.
+- `auth_dead` (`Account.auth_dead_until`) ranks **above** `suspended` in
+  `account_routing_state`: a suspension is a reachable upstream verdict, whereas an
+  account that cannot obtain a token has nothing left to ask. Like a suspension it
+  leaves the Circuit Breaker untouched — a probabilistic retry would spend real
+  requests re-proving a dead credential. `report_success` clears it, because a
+  served request outranks any stored prediction of death. Persisted (the condition
+  outlives a restart), and its pool-state text names the remedy ("re-login
+  required") rather than the symptom, since unlike a suspension this one is the
+  operator's to fix.
+- A stored usage-poll error is operator-facing text in a table cell, so
+  `_summarize_usage_error` (`dashboard.py`) bounds it and strips newlines and the
+  endpoint URL. Persisting `str(exc)` put httpx's 188-character two-line message in
+  the accounts table and pushed every later column off-screen. Do not widen it back
+  to a raw upstream string.
 - `request_rate_series` reports each series' `routingState` alongside its buckets.
   The dashboard hides accounts that cannot serve the next request from the rate
   chart, and it must not have to join the accounts endpoint (pool as of now)

@@ -27,6 +27,29 @@ SUSPENSION_REASON = "TEMPORARILY_SUSPENDED"
 
 _SUSPENSION_MARKERS = ("temporarily suspended", "temporarily is suspended", "locked your account", "locked it as a")
 
+#: Synthetic reason code for a refresh token the auth host has rejected outright.
+#: Not an upstream value: the refresh endpoint answers with a bare status and
+#: ``{"message": "Bad credentials"}``, so the pool needs its own label to tell
+#: this apart from the data-plane refusals that share a status code.
+CREDENTIAL_DEAD_REASON = "CREDENTIAL_REJECTED"
+
+#: Statuses from the token endpoint that mean the credential itself is finished.
+#: 401 is the observed verdict ("Bad credentials"); 400 ``invalid_grant`` is the
+#: OIDC spelling of the same thing. Both are finalized only after the retry with
+#: freshly reloaded source credentials has already failed, so reaching here means
+#: no stored copy of the token works any more.
+CREDENTIAL_DEAD_STATUSES = (400, 401)
+
+
+def is_credential_dead_status(status_code: int) -> bool:
+    """Report whether a token-endpoint refusal means the credential is dead.
+
+    Scoped to the refresh endpoints on purpose. The same status from the data
+    plane means something else entirely - a 400 there is a malformed payload -
+    so callers must only ask this about a token refresh response.
+    """
+    return status_code in CREDENTIAL_DEAD_STATUSES
+
 
 def is_suspension_error(status_code: int, message: Optional[str], reason: Optional[str] = None) -> bool:
     """Report whether an upstream refusal means the account itself is locked.

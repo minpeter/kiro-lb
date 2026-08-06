@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { AtSign, Ban, ServerCog, Trash2 } from "lucide-react";
+import { AtSign, Ban, KeyRound, ServerCog, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,6 +23,7 @@ const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
   quota_depleted: "quota spent",
   cooling_down: "cooling down",
   suspended: "BANNED",
+  auth_dead: "AUTH DEAD",
   uninitialized: "pending",
 };
 
@@ -32,16 +33,22 @@ function RoutingStateCell({ account }: { account: Account }) {
   const label = ROUTING_STATE_LABEL[state] ?? state;
   const variant = state === "available" ? "secondary" : state === "uninitialized" ? "outline" : "destructive";
   const suspended = state === "suspended";
+  const authDead = state === "auth_dead";
   // Both quota states carry the same wording, so a reader does not have to infer
   // that one of them is a weaker condition than the other. It is not.
   const quotaGone = state === "quota_exhausted" || state === "quota_depleted";
   return (
     <div className="space-y-1">
-      <Badge variant={variant} className={suspended ? "font-semibold tracking-wide" : undefined}>
+      <Badge variant={variant} className={suspended || authDead ? "font-semibold tracking-wide" : undefined}>
         {suspended && <Ban size={12} />}
+        {authDead && <KeyRound size={12} />}
         {label}
       </Badge>
-      {suspended ? (
+      {authDead ? (
+        // Names the remedy rather than the symptom: unlike a suspension, this one
+        // is fixed by the operator re-registering the account.
+        <p className="text-xs text-destructive">credential rejected; re-login required</p>
+      ) : suspended ? (
         <p className="text-xs text-destructive">locked by Kiro; contact support</p>
       ) : quotaGone ? (
         <p className="text-xs tabular-nums text-muted-foreground">
@@ -77,9 +84,31 @@ function AccountCell({ account }: { account: Account }) {
   );
 }
 
+/**
+ * A failed poll reports why, without being able to resize the table.
+ *
+ * The message is upstream text of unbounded length: an httpx status error is 188
+ * characters across two lines, and rendering it bare into a `whitespace-nowrap`
+ * cell forced the row wider than the viewport and pushed every later column
+ * off-screen. The backend now summarizes these, but the cell must not depend on
+ * that: a width cap plus clamped wrapping makes the layout hold for any string,
+ * and the full text stays available through the `title` tooltip rather than
+ * being truncated away.
+ */
+function UsageErrorCell({ message }: { message: string }) {
+  return (
+    <p
+      title={message}
+      className="line-clamp-2 max-w-40 text-xs break-words whitespace-normal text-destructive"
+    >
+      {message}
+    </p>
+  );
+}
+
 function UsageCell({ account }: { account: Account }) {
   const usage = account.usage;
-  if (usage?.error) return <span className="text-xs text-destructive">{usage.error}</span>;
+  if (usage?.error) return <UsageErrorCell message={usage.error} />;
   if (!usage || usage.usagePercent == null) return <span className="text-muted-foreground">—</span>;
   return (
     <div className="min-w-40 space-y-1.5">

@@ -656,6 +656,29 @@ class KiroAuthManager:
             else:
                 raise
 
+    def _credential_dead_error(self, exc: httpx.HTTPStatusError) -> Exception:
+        """Translate a terminal token-endpoint refusal into a typed failure.
+
+        Called only once every in-layer recovery has been tried: the raw-source
+        reload and, for a kiro-cli database, the graceful degradation onto a
+        still-valid access token. Anything other than the credential-death
+        statuses is handed back unchanged, so a 5xx from the auth host keeps its
+        transient retry meaning instead of permanently parking the account.
+        """
+        from kiro.account_errors import CredentialDeadError, is_credential_dead_status
+
+        status = exc.response.status_code
+        if not is_credential_dead_status(status):
+            return exc
+        hint = self._internal_account_id or self._external_account_id() or "refresh_token account"
+        logger.error(
+            "Refresh token for {} was rejected by the auth host (HTTP {}); "
+            "the credential cannot be renewed and needs a re-login.",
+            hint,
+            status,
+        )
+        return CredentialDeadError(hint, status)
+
     async def _do_kiro_desktop_refresh(self) -> None:
         """
         Refreshes token using Kiro Desktop Auth endpoint.
@@ -896,8 +919,13 @@ class KiroAuthManager:
                         raise ValueError(
                             "Token expired and refresh failed. Please run 'kiro-cli login' to refresh your credentials."
                         )
-                # Non-SQLite mode or non-400 error - propagate the exception
-                raise
+                # Every in-layer recovery is spent, so a credential-death status
+                # is final. Translate it here rather than letting the raw
+                # HTTPStatusError escape: it is neither RequestError nor
+                # TimeoutException, so it slipped past every handler in the retry
+                # loop and the routes' except HTTPException, becoming a bare 500
+                # with no report_failure and leaving a dead account in rotation.
+                raise self._credential_dead_error(e) from e
             except Exception:
                 # For any other exception, propagate it
                 raise
@@ -917,7 +945,13 @@ class KiroAuthManager:
             New access token
         """
         async with self._lock:
-            await self._refresh_with_store_lease(force=True)
+            try:
+                await self._refresh_with_store_lease(force=True)
+            except httpx.HTTPStatusError as e:
+                # Same translation as get_access_token: this path runs on a 403
+                # from the data plane, where an unconverted HTTPStatusError would
+                # escape the retry loop as a 500 instead of failing over.
+                raise self._credential_dead_error(e) from e
             assert self._access_token is not None
             return self._access_token
 

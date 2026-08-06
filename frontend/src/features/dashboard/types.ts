@@ -31,6 +31,12 @@ export type AccountRoutingState =
   | "quota_depleted"
   | "cooling_down"
   | "suspended"
+  /**
+   * The stored refresh token was rejected by the auth host, so the account
+   * cannot obtain a token at all. Outranks every other exclusion and only a
+   * re-login clears it.
+   */
+  | "auth_dead"
   | "uninitialized";
 
 export type Account = {

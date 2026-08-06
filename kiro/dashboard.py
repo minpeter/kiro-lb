@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from loguru import logger
@@ -627,6 +628,41 @@ def _cached_usage(account_id: str) -> dict[str, Any] | None:
     }
 
 
+#: Upper bound on a stored poll error. The column is operator-facing text in a
+#: table cell, not a log line: httpx's own HTTPStatusError message is 188 chars
+#: across two lines and made the accounts table render wider than the viewport.
+_MAX_USAGE_ERROR_CHARS = 120
+
+
+def _summarize_usage_error(exc: Exception) -> str:
+    """Reduce a failed usage poll to one short, single-line operator message.
+
+    Three things are deliberately stripped. The embedded newline, because the
+    dashboard renders this string in a table cell. The refresh/usage URL that
+    httpx interpolates, because it is fixed infrastructure the operator cannot
+    act on. And the length, because an unbounded upstream string is a layout bug
+    waiting to happen in any consumer.
+    """
+    from kiro.account_errors import CredentialDeadError
+
+    if isinstance(exc, CredentialDeadError):
+        return f"credential rejected by the auth host (HTTP {exc.status_code}); re-login required"
+    if isinstance(exc, httpx.HTTPStatusError):
+        # Status plus reason only. The verdict is the status code; the URL and the
+        # MDN link httpx appends carry no account-specific information.
+        return f"upstream returned HTTP {exc.response.status_code} for the usage query"
+    if isinstance(exc, httpx.TimeoutException):
+        return "usage query timed out"
+    if isinstance(exc, httpx.RequestError):
+        return f"usage query failed to reach the upstream ({type(exc).__name__})"
+    collapsed = " ".join(str(exc).split())
+    if not collapsed:
+        collapsed = type(exc).__name__
+    if len(collapsed) > _MAX_USAGE_ERROR_CHARS:
+        return collapsed[: _MAX_USAGE_ERROR_CHARS - 1].rstrip() + "…"
+    return collapsed
+
+
 async def refresh_account_usage(account: Any) -> dict[str, Any]:
     """Refresh one account and persist only the normalized, non-secret summary."""
     updated_at = int(time.time())
@@ -656,7 +692,7 @@ async def refresh_account_usage(account: Any) -> dict[str, Any]:
             )
         return {**usage, "updatedAt": updated_at, "error": None}
     except Exception as exc:
-        error = str(exc)[:240]
+        error = _summarize_usage_error(exc)
         with _db() as conn:
             conn.execute(
                 """INSERT INTO account_usage(account_id, updated_at, error) VALUES (?, ?, ?)

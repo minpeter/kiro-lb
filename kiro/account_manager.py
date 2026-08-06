@@ -28,10 +28,11 @@ from typing import Dict, List, Optional, Tuple
 import httpx
 from loguru import logger
 
-from kiro.account_errors import ErrorType
+from kiro.account_errors import CredentialDeadError, ErrorType
 from kiro.auth import AuthType, KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.config import (
+    ACCOUNT_AUTH_DEAD_QUARANTINE,
     ACCOUNT_CACHE_TTL,
     ACCOUNT_DEPLETED_QUOTA_WEIGHT,
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
@@ -119,14 +120,22 @@ def account_routing_state(account: "Account", now: Optional[float] = None) -> Tu
 
     Returns:
         Tuple of (state, seconds_until_eligible). State is one of
-        "suspended", "quota_exhausted", "quota_depleted", "rate_limited",
-        "cooling_down", "uninitialized", or "available"; the second element is 0
-        when nothing is pending.
+        "auth_dead", "suspended", "quota_exhausted", "quota_depleted",
+        "rate_limited", "cooling_down", "uninitialized", or "available"; the
+        second element is 0 when nothing is pending.
     """
     now = time.time() if now is None else now
 
-    # A suspension outranks every other exclusion: the others describe a
-    # condition that clears on its own, this one does not.
+    # A rejected credential outranks every other exclusion, suspension included:
+    # a suspension is a verdict about the account that support can lift, while
+    # this account cannot even obtain a token, so nothing downstream is reachable
+    # to ask for a newer verdict.
+    auth_dead_remaining = account.auth_dead_until - now
+    if auth_dead_remaining > 0:
+        return ("auth_dead", int(auth_dead_remaining))
+
+    # A suspension outranks the remaining exclusions: they describe a condition
+    # that clears on its own, this one does not.
     suspension_remaining = account.suspended_until - now
     if suspension_remaining > 0:
         return ("suspended", int(suspension_remaining))
@@ -266,6 +275,14 @@ class Account:
             one cannot expire on its own - only Kiro support lifts it - so the
             account leaves the rotation completely and the Circuit Breaker is
             left untouched. Persisted; a restart must not resurrect it.
+        auth_dead_until: Timestamp until which the account's stored refresh token
+            is known rejected by the auth host (401, or 400 after the raw-source
+            reload already failed). Ranked above ``suspended_until`` because the
+            account cannot obtain a token at all, so no upstream verdict about it
+            is even reachable; only a re-login clears it. Like a suspension it
+            leaves the Circuit Breaker untouched - a probabilistic retry would
+            only spend a request re-proving the credential is dead. Persisted,
+            because the condition outlives the process.
         models_cached_at: Timestamp of last model cache update
         quota_headroom: Fraction of the monthly quota still unused (0.0-1.0), or
             None when no usage reading is available. Fed by control-plane usage
@@ -298,6 +315,7 @@ class Account:
     rate_limited_until: float = 0.0
     quota_exhausted_until: float = 0.0
     suspended_until: float = 0.0
+    auth_dead_until: float = 0.0
     models_cached_at: float = 0.0
     quota_headroom: Optional[float] = None
     quota_resets_at: float = 0.0
@@ -560,6 +578,7 @@ class AccountManager:
                     account.last_failure_time = data.get("last_failure_time", 0.0)
                     account.quota_exhausted_until = data.get("quota_exhausted_until", 0.0)
                     account.suspended_until = data.get("suspended_until", 0.0)
+                    account.auth_dead_until = data.get("auth_dead_until", 0.0)
                     account.models_cached_at = data.get("models_cached_at", 0.0)
 
                     stats_data = data.get("stats", {})
@@ -677,6 +696,7 @@ class AccountManager:
                     "last_failure_time": account.last_failure_time,
                     "quota_exhausted_until": account.quota_exhausted_until,
                     "suspended_until": account.suspended_until,
+                    "auth_dead_until": account.auth_dead_until,
                     "models_cached_at": account.models_cached_at,
                     "stats": {
                         "total_requests": account.stats.total_requests,
@@ -882,6 +902,14 @@ class AccountManager:
             logger.info(f"Initialized account: {account_id} ({len(available_models)} models)")
             return True
 
+        except CredentialDeadError as e:
+            # Initialization is where a dead credential usually surfaces first,
+            # since obtaining a token is the first thing it does. Park the account
+            # here rather than only counting a failure: otherwise the caller adds
+            # a Circuit Breaker cooldown that expires and re-admits an account
+            # whose every future request must fail at the same token step.
+            await self.report_credential_dead(account_id, e.status_code)
+            return False
         except Exception as e:
             logger.error(f"Failed to initialize account {account_id}: {e}")
             return False
@@ -966,6 +994,34 @@ class AccountManager:
             f"Kiro support must restore this account."
         )
         return True
+
+    async def report_credential_dead(self, account_id: str, status_code: int) -> None:
+        """Park an account whose refresh token the auth host has rejected.
+
+        Kept separate from ``report_failure`` because this verdict arrives before
+        any model is chosen: the account never reached the data plane, so there is
+        no reason code or upstream message to classify. Like a suspension it
+        leaves the Circuit Breaker alone - inflating ``failures`` would only add
+        an unrelated backoff to an account that is already fully excluded, and
+        the 10% probabilistic retry would spend real requests re-proving a dead
+        credential.
+        """
+        async with self._lock:
+            account = self._accounts.get(account_id)
+            if not account:
+                return
+            already_parked = account.auth_dead_until > time.time()
+            account.auth_dead_until = time.time() + ACCOUNT_AUTH_DEAD_QUARANTINE
+            account.stats.total_requests += 1
+            account.stats.failed_requests += 1
+            self._dirty = True
+            if not already_parked:
+                self._record_routing_event(account_id, "auth_dead")
+                logger.error(
+                    f"Account {account_id} credential is DEAD (HTTP {status_code} from the auth host); "
+                    f"excluded from routing for {_format_duration(ACCOUNT_AUTH_DEAD_QUARANTINE)}. "
+                    f"Re-register or re-login this account to restore it."
+                )
 
     async def _refresh_account_models(self, account_id: str) -> None:
         """
@@ -1247,6 +1303,14 @@ class AccountManager:
                 # A sole account bypasses health policy so callers see the real
                 # upstream error rather than a generic unavailable response.
                 if not single_account:
+                    # A rejected refresh token cannot be renewed by retrying. The
+                    # account is excluded outright, ahead of every other check:
+                    # without a token it cannot reach the upstream at all, so
+                    # there is no verdict left to discover and each attempt only
+                    # spends a failover hop re-proving the credential is dead.
+                    if account.auth_dead_until > time.time():
+                        continue
+
                     # An upstream suspension takes the account out of the rotation
                     # completely. No probabilistic retry: the lock is lifted by Kiro
                     # support, never by another request, and each attempt still costs
@@ -1347,6 +1411,12 @@ class AccountManager:
             # A success proves the account is accepting requests again, so drop
             # any leftover rate-limit or quota window instead of waiting it out.
             account.rate_limited_until = 0.0
+            # A served request proves the credential was renewed - by a
+            # re-registration, or by another process writing a fresh token - so a
+            # stale death verdict must not outlive the evidence against it.
+            if account.auth_dead_until:
+                account.auth_dead_until = 0.0
+                self._dirty = True
             if account.suspended_until:
                 account.suspended_until = 0.0
                 logger.info(f"Account {account_id} is serving again; suspension lifted")
@@ -1732,7 +1802,11 @@ class AccountManager:
 
             state, seconds = account_routing_state(account, now)
 
-            if state == "suspended":
+            if state == "auth_dead":
+                # Names the remedy, because unlike a suspension this one is the
+                # operator's to fix: no amount of waiting renews a rejected token.
+                parts.append(f"{label}: credential rejected by the auth host; re-login required")
+            elif state == "suspended":
                 # Without this the hardest exclusion of all reported "available",
                 # sending an operator to debug the pool instead of the account.
                 parts.append(f"{label}: suspended upstream; Kiro support must restore it")

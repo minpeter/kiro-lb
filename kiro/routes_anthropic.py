@@ -199,7 +199,7 @@ async def messages(
 
     account_system = request.app.state.account_system
     while True:
-        from kiro.account_errors import ErrorType, classify_error
+        from kiro.account_errors import CredentialDeadError, ErrorType, classify_error
 
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
@@ -544,6 +544,32 @@ async def messages(
                 if debug_logger:
                     debug_logger.flush_on_error(e.status_code, str(e.detail))
                 raise
+            except CredentialDeadError as e:
+                # Same contract as the OpenAI route: a token that cannot be
+                # obtained is an account-scoped failure, so park the credential
+                # and fail over instead of returning 500 for a pool that still
+                # has healthy accounts.
+                await http_client.close()
+                if account_system:
+                    await account_manager.report_credential_dead(account.id, e.status_code)
+
+                last_error_status = 502
+                last_error_message = (
+                    f"Account credential rejected by the auth host (HTTP {e.status_code}); re-login required."
+                )
+                logger.warning(f"Dead credential on account {account.id}; trying next account")
+
+                if single_attempt:
+                    if not account_system:
+                        if debug_logger:
+                            debug_logger.flush_on_error(last_error_status, last_error_message)
+                        return JSONResponse(
+                            status_code=last_error_status,
+                            content={"type": "error", "error": {"type": "api_error", "message": last_error_message}},
+                        )
+                    break
+
+                continue  # Try next account
             except Exception as e:
                 await http_client.close()
                 logger.error(f"Internal error: {e}", exc_info=True)
