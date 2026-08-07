@@ -180,20 +180,13 @@ class KiroAuthManager:
 
         # Determine final API region with priority hierarchy:
         # 1. Explicit api_region parameter (per-account) - HIGHEST
-        # 2. KIRO_API_REGION env var (global override)
-        # 3. Auto-detected from credentials (SQLite ARN or JSON region)
-        # 4. SSO region (fallback)
-        # 5. Default region parameter (us-east-1)
-        api_region_override = os.getenv("KIRO_API_REGION")
-
+        # 2. Auto-detected from credentials (SQLite ARN or JSON region)
+        # 3. SSO region (fallback)
+        # 4. Default region parameter (us-east-1)
         if api_region:
             # Explicit per-account override
             final_api_region = api_region
             logger.info(f"API region: {final_api_region} (from account config)")
-        elif api_region_override:
-            # Global env var override
-            final_api_region = api_region_override
-            logger.info(f"API region: {final_api_region} (from KIRO_API_REGION env var)")
         elif self._detected_api_region:
             # Auto-detected from credentials (SQLite profile ARN or JSON region field)
             final_api_region = self._detected_api_region
@@ -435,7 +428,7 @@ class KiroAuthManager:
         if "region" in data:
             # Store as SSO region for OIDC token refresh
             self._sso_region = data["region"]
-            # Also use as detected API region (can be overridden by KIRO_API_REGION env var)
+            # Also use as detected API region
             self._detected_api_region = data["region"]
             logger.debug(f"Region from JSON credentials: {data['region']}")
 

@@ -373,40 +373,15 @@ class AccountManager:
     - Persist runtime state to the private SQLite store
 
     Example:
-        >>> manager = AccountManager("credentials.json", "state.json")
+        >>> manager = AccountManager()
         >>> await manager.load_credentials()
         >>> await manager.load_state()
         >>> account = await manager.get_next_account("claude-opus-4.5")
         >>> await manager.report_success(account.id, "claude-opus-4.5")
     """
 
-    def __init__(self, credentials_file: str, state_file: str):
-        """
-        Initialize AccountManager.
-
-        Direct construction remains backwards compatible with the legacy JSON
-        files. The one-time import also checks the account-deletion recovery
-        record before completing its marker, so an interrupted deletion cannot
-        be mistaken for the source of truth.
-
-        Args:
-            credentials_file: Legacy credentials.json import path
-            state_file: Legacy state.json import path
-        """
-        from kiro.store import import_legacy_files
-
-        credentials_path = Path(credentials_file).expanduser()
-        recovery_file = str(credentials_path.with_name(f"{credentials_path.name}.account-deletion-recovery"))
-        try:
-            import_legacy_files(credentials_file, state_file, recovery_file)
-        except Exception as e:
-            # Preserve the old manager contract for malformed optional files.
-            # The import transaction rolls back, leaving its marker incomplete
-            # so corrected files (or a recovery record) can be retried later.
-            logger.error(f"Failed to import legacy account files: {e}")
-
-        self._credentials_file = credentials_file
-        self._state_file = state_file
+    def __init__(self):
+        """Initialize AccountManager against the private SQLite account store."""
         self._accounts: Dict[str, Account] = {}
         self._model_to_accounts: Dict[str, ModelAccountList] = {}
         self._lock = asyncio.Lock()

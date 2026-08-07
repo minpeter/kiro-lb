@@ -119,7 +119,7 @@ class TestSuspendedAccountState:
 
 @pytest.fixture
 def manager(tmp_path):
-    mgr = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+    mgr = AccountManager()
     mgr._save_state = AsyncMock()
     return mgr
 
@@ -285,8 +285,11 @@ class TestSuspensionDetectedAtInitialization:
             )
         )
         pool = tmp_path / "credentials.json"
-        pool.write_text(json_module.dumps([{"type": "json", "path": str(creds)}]))
-        mgr = AccountManager(str(pool), str(tmp_path / "state.json"))
+        entries = [{"type": "json", "path": str(creds)}]
+        pool.write_text(json_module.dumps(entries))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(entries)
+        mgr = AccountManager()
         mgr._save_state = AsyncMock()
         return mgr, str(creds.resolve())
 
@@ -452,7 +455,7 @@ class TestSuspensionPersistence:
         from kiro.store import load_runtime_state
 
         state_file = tmp_path / "state.json"
-        mgr = AccountManager(str(tmp_path / "credentials.json"), str(state_file))
+        mgr = AccountManager()
         account = _account()
         account.suspended_until = time.time() + 3600
         mgr._accounts[account.id] = account
@@ -462,7 +465,7 @@ class TestSuspensionPersistence:
         assert saved is not None
         assert saved["accounts"][account.id]["suspended_until"] == pytest.approx(account.suspended_until)
 
-        reloaded = AccountManager(str(tmp_path / "credentials.json"), str(state_file))
+        reloaded = AccountManager()
         reloaded._accounts[account.id] = _account()
         asyncio.run(reloaded.load_state())
         assert reloaded._accounts[account.id].suspended_until == pytest.approx(account.suspended_until)

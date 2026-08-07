@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 
-# Kiro Gateway
-# https://github.com/jwadow/kiro-gateway
+# kiro-lb (based on Kiro Gateway)
+# https://github.com/minpeter/kiro-lb-python
 # Copyright (C) 2025 Jwadow
+# Copyright (C) 2026 minpeter
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by

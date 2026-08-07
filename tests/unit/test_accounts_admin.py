@@ -32,7 +32,7 @@ def _pool(tmp_path: Path, names: tuple[str, ...]) -> tuple[AccountManager, dict[
     from kiro.dashboard import initialize_dashboard_store
 
     initialize_dashboard_store()
-    return AccountManager("unused-accounts.json", "unused-runtime.json"), sources, entries
+    return AccountManager(), sources, entries
 
 
 def _snapshot(manager: AccountManager) -> tuple[object, object, tuple[str, ...], bool]:
@@ -145,7 +145,7 @@ async def test_removed_account_stays_removed_after_restart(tmp_path):
     manager._model_to_accounts = {"shared": ModelAccountList(accounts=[removed_id, survivor_id])}
     await remove_account(manager, account_label(removed_id))
 
-    restarted = AccountManager("unused-accounts.json", "unused-runtime.json")
+    restarted = AccountManager()
     await restarted.load_credentials()
     await restarted.load_state()
     restarted._accounts[survivor_id].auth_manager = KiroAuthManager(creds_file=str(sources["survivor"]))
@@ -168,6 +168,8 @@ def test_imports_legacy_recovery_record_once(tmp_path):
         },
     )
 
+    from tests.conftest import seed_account_sources
+    seed_account_sources([])  # clear the default mock seed
     assert store.import_legacy_files("missing.json", "missing-state.json", str(recovery)) is True
     assert store.load_account_sources() == original_entries
     assert store.load_runtime_state() == runtime

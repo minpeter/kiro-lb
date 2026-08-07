@@ -108,8 +108,10 @@ class TestAccountManagerLoadCredentials:
 
         credentials = [{"type": "json", "path": str(test_json), "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         # Act
         await manager.load_credentials()
@@ -135,8 +137,10 @@ class TestAccountManagerLoadCredentials:
         creds_file = tmp_path / "credentials.json"
         credentials = [{"type": "sqlite", "path": temp_sqlite_db, "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         # Act
         await manager.load_credentials()
@@ -169,12 +173,14 @@ class TestAccountManagerLoadCredentials:
             }
         ]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
         # Create state file to avoid errors
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({"current_account_index": 0, "model_to_accounts": {}, "accounts": {}}))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(state_file))
+        manager = AccountManager()
 
         # Act
         await manager.load_credentials()
@@ -216,8 +222,10 @@ class TestAccountManagerLoadCredentials:
         creds_file = tmp_path / "credentials.json"
         credentials = [{"type": "json", "path": str(folder), "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         # Act
         await manager.load_credentials()
@@ -258,8 +266,10 @@ class TestAccountManagerLoadCredentials:
         creds_file = tmp_path / "credentials.json"
         credentials = [{"type": "json", "path": str(folder), "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         # Act
         await manager.load_credentials()
@@ -294,8 +304,10 @@ class TestAccountManagerLoadCredentials:
             }
         ]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         # Act
         await manager.load_credentials()
@@ -325,8 +337,10 @@ class TestAccountManagerLoadCredentials:
             }
         ]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         # Act
         await manager.load_credentials()
@@ -356,15 +370,16 @@ class TestAccountManagerLoadCredentials:
             }
         ]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        # Missing path is either rejected at seed or soft-skipped at load.
+        try:
+            seed_account_sources(credentials)
+        except (ValueError, KeyError, TypeError):
+            pass
 
-        # Act
+        manager = AccountManager()
         await manager.load_credentials()
-
-        # Assert
-        print(f"Loaded accounts: {len(manager._accounts)}")
-
         assert len(manager._accounts) == 0
 
     @pytest.mark.asyncio
@@ -388,15 +403,15 @@ class TestAccountManagerLoadCredentials:
             }
         ]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        with pytest.raises(ValueError):
+            seed_account_sources(credentials)
 
-        # Act
+        # Clear the default mock seed so the pool is empty.
+        seed_account_sources([])
+        manager = AccountManager()
         await manager.load_credentials()
-
-        # Assert
-        print(f"Loaded accounts: {len(manager._accounts)}")
-
         assert len(manager._accounts) == 0
 
     @pytest.mark.asyncio
@@ -410,9 +425,9 @@ class TestAccountManagerLoadCredentials:
         print("\n=== Test: load_credentials with missing file ===")
 
         # Arrange
-        manager = AccountManager(
-            credentials_file=str(tmp_path / "nonexistent.json"), state_file=str(tmp_path / "state.json")
-        )
+        from tests.conftest import seed_account_sources
+        seed_account_sources([])
+        manager = AccountManager()
 
         # Act
         await manager.load_credentials()
@@ -441,6 +456,10 @@ class TestAccountManagerLoadState:
         # Arrange
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(sample_state_with_data))
+        from kiro.store import save_runtime_state
+        save_runtime_state(sample_state_with_data, ungated=True)
+        from kiro.store import save_runtime_state
+        save_runtime_state(sample_state_with_data, ungated=True)
 
         # Create accounts first
         test_json = tmp_path / "test.json"
@@ -448,8 +467,10 @@ class TestAccountManagerLoadState:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(state_file))
+        manager = AccountManager()
 
         await manager.load_credentials()
 
@@ -477,8 +498,10 @@ class TestAccountManagerLoadState:
 
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(state_data))
+        from kiro.store import save_runtime_state
+        save_runtime_state(state_data, ungated=True)
 
-        manager = AccountManager(credentials_file=str(tmp_path / "creds.json"), state_file=str(state_file))
+        manager = AccountManager()
 
         # Act
         await manager.load_state()
@@ -507,8 +530,10 @@ class TestAccountManagerLoadState:
 
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(state_data))
+        from kiro.store import save_runtime_state
+        save_runtime_state(state_data, ungated=True)
 
-        manager = AccountManager(credentials_file=str(tmp_path / "creds.json"), state_file=str(state_file))
+        manager = AccountManager()
 
         # Act
         await manager.load_state()
@@ -550,11 +575,15 @@ class TestAccountManagerLoadState:
 
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(state_data))
+        from kiro.store import save_runtime_state
+        save_runtime_state(state_data, ungated=True)
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(state_file))
+        manager = AccountManager()
 
         await manager.load_credentials()
 
@@ -582,9 +611,7 @@ class TestAccountManagerLoadState:
         print("\n=== Test: load_state with missing file ===")
 
         # Arrange
-        manager = AccountManager(
-            credentials_file=str(tmp_path / "creds.json"), state_file=str(tmp_path / "nonexistent.json")
-        )
+        manager = AccountManager()
 
         # Act
         await manager.load_state()
@@ -610,7 +637,7 @@ class TestAccountManagerLoadState:
         state_file = tmp_path / "state.json"
         state_file.write_text("not a valid json {{{")
 
-        manager = AccountManager(credentials_file=str(tmp_path / "creds.json"), state_file=str(state_file))
+        manager = AccountManager()
 
         # Act
         await manager.load_state()
@@ -627,7 +654,7 @@ class TestAccountManagerInitializeAccount:
     """
 
     def test_internal_source_matches_only_its_explicit_id(self, tmp_path):
-        manager = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+        manager = AccountManager()
         internal = {"type": "internal", "id": "internal-1"}
         file_source = {"type": "json", "path": str(tmp_path / "account.json")}
         manager._credentials_config = [internal, file_source]
@@ -638,7 +665,7 @@ class TestAccountManagerInitializeAccount:
 
     @pytest.mark.asyncio
     async def test_deleted_account_is_not_committed_after_initialization(self, tmp_path):
-        manager = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+        manager = AccountManager()
         account_id = "internal-1"
         source = {"type": "internal", "id": account_id}
         manager._credentials_config = [source]
@@ -689,8 +716,10 @@ class TestAccountManagerInitializeAccount:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -735,8 +764,10 @@ class TestAccountManagerInitializeAccount:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -782,8 +813,10 @@ class TestAccountManagerGetNextAccount:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -822,9 +855,7 @@ class TestAccountManagerRateLimitCooldown:
     """
 
     def _pool(self, tmp_path, account_count: int = 2) -> AccountManager:
-        manager = AccountManager(
-            credentials_file=str(tmp_path / "credentials.json"), state_file=str(tmp_path / "state.json")
-        )
+        manager = AccountManager()
         for index in range(account_count):
             account_id = f"/creds/account{index}.json"
             account = Account(id=account_id)
@@ -975,9 +1006,7 @@ class TestAccountManagerQuotaExclusion:
     """
 
     def _pool(self, tmp_path, account_count: int = 2) -> AccountManager:
-        manager = AccountManager(
-            credentials_file=str(tmp_path / "credentials.json"), state_file=str(tmp_path / "state.json")
-        )
+        manager = AccountManager()
         for index in range(account_count):
             account_id = f"/creds/account{index}.json"
             account = Account(id=account_id)
@@ -1132,7 +1161,7 @@ class TestAccountManagerQuotaExclusion:
         await manager._save_state()
 
         # Fresh process: same credentials, state reloaded from disk.
-        restarted = AccountManager(credentials_file=str(creds_file), state_file=str(state_file))
+        restarted = AccountManager()
         restarted._accounts = {
             "/creds/account0.json": Account(id="/creds/account0.json"),
             "/creds/account1.json": Account(id="/creds/account1.json"),
@@ -1152,9 +1181,7 @@ class TestAccountManagerDescribePoolState:
     """
 
     def _manager(self, tmp_path) -> AccountManager:
-        return AccountManager(
-            credentials_file=str(tmp_path / "credentials.json"), state_file=str(tmp_path / "state.json")
-        )
+        return AccountManager()
 
     def test_describe_pool_state_empty_pool(self, tmp_path):
         """
@@ -1306,8 +1333,10 @@ class TestAccountManagerReportSuccess:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -1354,8 +1383,10 @@ class TestAccountManagerReportSuccess:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -1407,8 +1438,10 @@ class TestAccountManagerReportFailure:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -1452,8 +1485,10 @@ class TestAccountManagerReportFailure:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -1487,7 +1522,7 @@ class TestAccountManagerSaveState:
 
     @pytest.mark.asyncio
     async def test_non_writer_skip_reports_false_and_preserves_dirty(self, tmp_path):
-        manager = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+        manager = AccountManager()
         manager._dirty = True
 
         with patch("kiro.store.save_runtime_state", return_value=False):
@@ -1508,7 +1543,7 @@ class TestAccountManagerSaveState:
 
         # Arrange
         state_file = tmp_path / "state.json"
-        manager = AccountManager(credentials_file=str(tmp_path / "creds.json"), state_file=str(state_file))
+        manager = AccountManager()
 
         # Act
         await manager._save_state()
@@ -1548,8 +1583,10 @@ class TestAccountManagerGetFirstAccount:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -1584,7 +1621,7 @@ class TestAccountManagerGetFirstAccount:
         print("\n=== Test: get_first_account with no initialized accounts ===")
 
         # Arrange
-        manager = AccountManager(credentials_file=str(tmp_path / "creds.json"), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         # Act & Assert
         with pytest.raises(RuntimeError, match="No initialized accounts available"):
@@ -1616,8 +1653,10 @@ class TestAccountManagerGetAllAvailableModels:
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(json.loads(creds_file.read_text()))
 
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        manager = AccountManager()
 
         await manager.load_credentials()
         account_id = str(test_json.resolve())
@@ -1683,9 +1722,7 @@ class TestQuotaWeightedRouting:
     """
 
     def _pool(self, tmp_path, headrooms: list[float | None]) -> AccountManager:
-        manager = AccountManager(
-            credentials_file=str(tmp_path / "credentials.json"), state_file=str(tmp_path / "state.json")
-        )
+        manager = AccountManager()
         for index, headroom in enumerate(headrooms):
             account_id = f"/creds/account{index}.json"
             account = Account(id=account_id)

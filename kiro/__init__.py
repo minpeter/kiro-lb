@@ -23,7 +23,7 @@ Modules:
 # This allows changing the version in only one place
 from kiro.config import APP_VERSION as __version__
 
-__author__ = "Jwadow"
+__author__ = "Jwadow, minpeter"
 
 # Main components for convenient import
 from kiro.auth import KiroAuthManager

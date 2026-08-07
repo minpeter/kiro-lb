@@ -145,7 +145,7 @@ When adding new tests:
 
 ```bash
 # Make sure you're in project root
-cd /path/to/kiro-gateway
+cd /path/to/kiro-lb
 
 # pytest.ini already contains pythonpath = .
 # Just run pytest

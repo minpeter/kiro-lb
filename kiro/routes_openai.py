@@ -21,7 +21,6 @@ from loguru import logger
 from kiro.auth import AuthType
 from kiro.config import (
     APP_VERSION,
-    PROFILE_ARN,
     WEB_SEARCH_ENABLED,
 )
 from kiro.converters_openai import build_kiro_payload
@@ -218,14 +217,8 @@ async def get_models(request: Request):
     """
     logger.info("Request to /v1/models")
 
-    # Get available models based on mode
-    if request.app.state.account_system:
-        # Account system: collect models from all initialized accounts
-        available_model_ids = request.app.state.account_manager.get_all_available_models()
-    else:
-        # Legacy: use resolver from first account
-        account = request.app.state.account_manager.get_first_account()
-        available_model_ids = account.model_resolver.get_available_models()
+    # Collect models from all initialized accounts in the pool
+    available_model_ids = request.app.state.account_manager.get_all_available_models()
 
     limits = _resolve_model_limits(request, available_model_ids)
     created = int(time.time())
@@ -315,36 +308,30 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             logger.debug("Auto-injected web_search tool for MCP emulation (Path B)")
 
     # ==============================================================================
-    # Account System: Account System Failover or Legacy Mode
+    # Multi-account failover
     # ==============================================================================
 
-    account_system = request.app.state.account_system
     while True:
         from kiro.account_errors import CredentialDeadError, ErrorType, classify_error
 
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
-        single_attempt = not account_system or len(all_accounts) == 1
-        max_attempts = 1 if not account_system else max(1, len(all_accounts) * 2)
+        single_attempt = len(all_accounts) == 1
+        max_attempts = max(1, len(all_accounts) * 2)
 
         last_error_message = None
         last_error_status = None
         tried_accounts: set[str] = set()  # Track tried accounts in current failover loop
 
         for _attempt in range(max_attempts):
-            account = (
-                await account_manager.get_next_account(request_data.model, exclude_accounts=tried_accounts)
-                if account_system
-                else account_manager.get_first_account()
+            account = await account_manager.get_next_account(
+                request_data.model, exclude_accounts=tried_accounts
             )
 
             if account is None or not account.auth_manager:
                 # All accounts unavailable
                 if single_attempt:
                     # Single account - return original error with original status code
-                    if not account_system:
-                        logger.error("No initialized accounts available (legacy mode)")
-                        raise HTTPException(503, "No initialized accounts available")
                     raise HTTPException(
                         status_code=last_error_status or 503, detail=last_error_message or "Account unavailable"
                     )
@@ -374,12 +361,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             # Generate conversation ID
             conversation_id = generate_conversation_id()
 
-            # Build payload for Kiro
-            # A Builder ID account has no profile and must not be given one: the
-            # global fallback would send a foreign ARN and fail the request.
-            profile_arn_for_payload = auth_manager.profile_arn or (
-                "" if auth_manager.auth_type == AuthType.AWS_SSO_OIDC else PROFILE_ARN or ""
-            )
+            # Build payload for Kiro — profile ARN is always account-scoped.
+            profile_arn_for_payload = auth_manager.profile_arn or ""
 
             try:
                 kiro_payload = build_kiro_payload(request_data, conversation_id, profile_arn_for_payload)
@@ -444,8 +427,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     parallel_tool_calls=request_data.parallel_tool_calls is not False,
                                 ):
                                     yield chunk
-                                if account_system:
-                                    await account_manager.report_success(account.id, request_data.model)
+                                await account_manager.report_success(account.id, request_data.model)
                             except GeneratorExit:
                                 client_disconnected = True
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -489,8 +471,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             include_reasoning=request_data.include_reasoning,
                             parallel_tool_calls=request_data.parallel_tool_calls is not False,
                         )
-                        if account_system:
-                            await account_manager.report_success(account.id, request_data.model)
+                        await account_manager.report_success(account.id, request_data.model)
 
                         await http_client.close()
                         logger.info("HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
@@ -538,15 +519,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
                     if error_type == ErrorType.FATAL:
                         # FATAL - return to client immediately
-                        if account_system:
-                            await account_manager.report_failure(
-                                account.id,
-                                request_data.model,
-                                error_type,
-                                response.status_code,
-                                error_reason,
-                                upstream_message,
-                            )
+                        await account_manager.report_failure(
+                            account.id,
+                            request_data.model,
+                            error_type,
+                            response.status_code,
+                            error_reason,
+                            upstream_message,
+                        )
 
                         logger.warning(
                             f"HTTP {response.status_code} - POST /v1/chat/completions - {last_error_message[:100]}"
@@ -568,28 +548,16 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
 
                     else:  # ErrorType.RECOVERABLE
                         # RECOVERABLE - try next account
-                        if account_system:
-                            await account_manager.report_failure(
-                                account.id,
-                                request_data.model,
-                                error_type,
-                                response.status_code,
-                                error_reason,
-                                upstream_message,
-                            )
+                        await account_manager.report_failure(
+                            account.id,
+                            request_data.model,
+                            error_type,
+                            response.status_code,
+                            error_reason,
+                            upstream_message,
+                        )
 
                         if single_attempt:
-                            if not account_system:
-                                return JSONResponse(
-                                    status_code=response.status_code,
-                                    content={
-                                        "error": {
-                                            "message": last_error_message,
-                                            "type": "kiro_api_error",
-                                            "code": response.status_code,
-                                        }
-                                    },
-                                )
                             break
 
                         continue  # Next iteration
@@ -602,21 +570,15 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 # NOT for HTTP-level errors (which are returned as response objects)
                 if e.status_code in (502, 504):
                     # Network error → try next account
-                    if account_system:
-                        await account_manager.report_failure(
-                            account.id, request_data.model, ErrorType.RECOVERABLE, e.status_code, None
-                        )
+                    await account_manager.report_failure(
+                        account.id, request_data.model, ErrorType.RECOVERABLE, e.status_code, None
+                    )
 
                     last_error_message = str(e.detail)
                     last_error_status = e.status_code
 
                     # Single account - no point in failover, break immediately
                     if single_attempt:
-                        if not account_system:
-                            logger.warning("Network error (legacy mode, no failover available)")
-                            if debug_logger:
-                                debug_logger.flush_on_error(e.status_code, str(e.detail))
-                            raise
                         break
 
                     logger.warning(f"Network error on account {account.id}, trying next account")
@@ -636,8 +598,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 # generic handler below and became a 500, with no report_failure
                 # and the dead account still first in line for the next request.
                 await http_client.close()
-                if account_system:
-                    await account_manager.report_credential_dead(account.id, e.status_code)
+                await account_manager.report_credential_dead(account.id, e.status_code)
 
                 last_error_status = 502
                 last_error_message = (
@@ -646,10 +607,6 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 logger.warning(f"Dead credential on account {account.id}; trying next account")
 
                 if single_attempt:
-                    if not account_system:
-                        if debug_logger:
-                            debug_logger.flush_on_error(last_error_status, last_error_message)
-                        raise HTTPException(status_code=last_error_status, detail=last_error_message)
                     break
 
                 continue  # Try next account

@@ -77,70 +77,83 @@ def setup_test_environment(tmp_path_factory):
     mock_creds_file = tmp_dir / "mock_kiro_creds.json"
     mock_creds_file.write_text(json.dumps(mock_kiro_creds, indent=2))
 
-    # Create credentials.json pointing to mock file
+    # Seed account path for tests that still construct json/sqlite account sources.
     credentials_data = [{"type": "json", "path": str(mock_creds_file), "enabled": True}]
     creds_file = tmp_dir / "credentials.json"
     creds_file.write_text(json.dumps(credentials_data, indent=2))
 
-    # Patch config paths to use temporary files
     import kiro.config
 
-    original_creds_file = kiro.config.ACCOUNTS_CONFIG_FILE
-    original_state_file = kiro.config.ACCOUNTS_STATE_FILE
     original_proxy_api_key = kiro.config.PROXY_API_KEY
-
-    kiro.config.ACCOUNTS_CONFIG_FILE = str(creds_file)
-    kiro.config.ACCOUNTS_STATE_FILE = str(tmp_dir / "state.json")
     kiro.config.PROXY_API_KEY = "test_proxy_key_12345"
 
-    # main.py binds these at import time, and .env may point at deployment-only
-    # container paths, so the environment must be isolated too.
     original_environ = {
         key: os.environ.get(key)
-        for key in ("ACCOUNTS_CONFIG_FILE", "ACCOUNTS_STATE_FILE", "DASHBOARD_DATA_DIR", "PROXY_API_KEY")
+        for key in ("DASHBOARD_DATA_DIR", "PROXY_API_KEY")
     }
-    os.environ["ACCOUNTS_CONFIG_FILE"] = str(creds_file)
-    os.environ["ACCOUNTS_STATE_FILE"] = str(tmp_dir / "state.json")
     os.environ["DASHBOARD_DATA_DIR"] = str(tmp_dir / "dashboard")
-    # Authentication has no insecure production default. Pin an explicit test
-    # key in both the imported config and request-time environment.
     os.environ["PROXY_API_KEY"] = kiro.config.PROXY_API_KEY
+    # Stash mock paths for fixtures that still seed the SQLite account store.
+    os.environ["TEST_MOCK_CREDS_FILE"] = str(mock_creds_file)
+    os.environ["TEST_CREDENTIALS_JSON"] = str(creds_file)
 
-    import main
+    import main  # noqa: F401 — ensure app module is importable under the test env
 
-    main.ACCOUNTS_CONFIG_FILE = str(creds_file)
-    main.ACCOUNTS_STATE_FILE = str(tmp_dir / "state.json")
-
-    print(f"✅ Test credentials: {creds_file}")
-    print(f"✅ Test state: {tmp_dir / 'state.json'}")
+    print(f"✅ Test mock kiro creds: {mock_creds_file}")
+    print(f"✅ Dashboard data dir: {tmp_dir / 'dashboard'}")
 
     yield
 
-    # Restore original paths
-    kiro.config.ACCOUNTS_CONFIG_FILE = original_creds_file
-    kiro.config.ACCOUNTS_STATE_FILE = original_state_file
     kiro.config.PROXY_API_KEY = original_proxy_api_key
-    main.ACCOUNTS_CONFIG_FILE = original_creds_file
-    main.ACCOUNTS_STATE_FILE = original_state_file
     for key, value in original_environ.items():
         if value is None:
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+    os.environ.pop("TEST_MOCK_CREDS_FILE", None)
+    os.environ.pop("TEST_CREDENTIALS_JSON", None)
 
     print("🧹 Test environment cleaned up")
 
 
 @pytest.fixture(autouse=True)
 def isolate_gateway_store(setup_test_environment):
-    """Give each test a clean gateway partition in the shared dashboard DB."""
-    from kiro.store import connection, initialize
+    """Clean the gateway partition, then seed the default mock JSON account."""
+    from kiro.store import canonicalize_account_sources, connection, initialize, replace_account_sources
 
     initialize()
     with connection() as conn:
         conn.execute("DELETE FROM account_sources")
         conn.execute("DELETE FROM account_runtime")
         conn.execute("DELETE FROM store_migrations")
+        mock_path = os.environ.get("TEST_MOCK_CREDS_FILE")
+        if mock_path:
+            replace_account_sources(
+                canonicalize_account_sources([{"type": "json", "path": mock_path, "enabled": True}]),
+                conn,
+                ungated=True,
+            )
+
+
+def seed_account_sources(entries):
+    """Write account source entries into the private SQLite store for tests."""
+    from kiro.store import canonicalize_account_sources, connection, replace_account_sources
+
+    with connection() as conn:
+        replace_account_sources(canonicalize_account_sources(entries), conn, ungated=True)
+
+
+
+@pytest.fixture
+def seed_mock_account(isolate_gateway_store):
+    """Seed the default mock JSON credential into the SQLite account store."""
+    from kiro.store import canonicalize_account_sources, connection, replace_account_sources
+
+    mock_path = os.environ["TEST_MOCK_CREDS_FILE"]
+    entries = canonicalize_account_sources([{"type": "json", "path": mock_path, "enabled": True}])
+    with connection() as conn:
+        replace_account_sources(entries, conn, ungated=True)
+    return entries
 
 
 @pytest.fixture
@@ -1679,7 +1692,7 @@ def mock_account_manager(tmp_path):
             state_file.write_text(json.dumps(state_data, indent=2))
 
         # Create AccountManager
-        manager = AccountManager(credentials_file=str(creds_file), state_file=str(state_file))
+        manager = AccountManager()
 
         return manager
 

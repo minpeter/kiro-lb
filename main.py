@@ -41,18 +41,13 @@ from loguru import logger
 
 from kiro.account_manager import AccountManager
 from kiro.config import (
-    ACCOUNT_SYSTEM,
-    ACCOUNTS_CONFIG_FILE,
-    ACCOUNTS_STATE_FILE,
     APP_DESCRIPTION,
     APP_TITLE,
     APP_VERSION,
     DEFAULT_SERVER_HOST,
     DEFAULT_SERVER_PORT,
-    KIRO_CLI_DB_FILE,
-    KIRO_CREDS_FILE,
     LOG_LEVEL,
-    REFRESH_TOKEN,
+    PROXY_API_KEY,
     SERVER_HOST,
     SERVER_PORT,
     STREAMING_READ_TIMEOUT,
@@ -200,110 +195,25 @@ if VPN_PROXY_URL:
 
 # --- Configuration Validation ---
 def validate_configuration() -> None:
+    """Validate bootstrap configuration and open the private store.
+
+    Accounts are managed via the dashboard (device login), not environment
+    seed credentials. The process may start with an empty pool.
     """
-    Validates that required configuration is present.
-
-    Priority:
-    1. Existing SQLite account sources or legacy credentials.json import
-    2. Environment sources (REFRESH_TOKEN, KIRO_CREDS_FILE, KIRO_CLI_DB_FILE)
-
-    Checks:
-    - Either a stored/importable account exists or an environment source is configured
-    - Supports both .env file (local) and environment variables (Docker)
-
-    Raises:
-        SystemExit: If critical configuration is missing
-    """
-    from kiro.store import initialize, load_account_sources
+    from kiro.store import initialize
 
     initialize()
-    if load_account_sources() or Path(ACCOUNTS_CONFIG_FILE).exists():
-        return
-
-    # Priority 2: no stored/importable account - validate environment sources
-    errors = []
-
-    # Check if .env file exists (optional - can use environment variables)
-    env_file = Path(".env")
-
-    # Check for credentials (from .env or environment variables)
-    has_refresh_token = bool(REFRESH_TOKEN)
-    has_creds_file = bool(KIRO_CREDS_FILE)
-    has_cli_db = bool(KIRO_CLI_DB_FILE)
-
-    # Check if creds file actually exists
-    if KIRO_CREDS_FILE:
-        creds_path = Path(KIRO_CREDS_FILE).expanduser()
-        if not creds_path.exists():
-            has_creds_file = False
-            logger.warning(f"KIRO_CREDS_FILE not found: {KIRO_CREDS_FILE}")
-
-    # Check if CLI database file actually exists
-    if KIRO_CLI_DB_FILE:
-        cli_db_path = Path(KIRO_CLI_DB_FILE).expanduser()
-        if not cli_db_path.exists():
-            has_cli_db = False
-            logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
-
-    # If no credentials found, show helpful error
-    if not has_refresh_token and not has_creds_file and not has_cli_db:
-        if not env_file.exists():
-            # No .env file and no environment variables
-            errors.append(
-                "No Kiro credentials configured!\n"
-                "\n"
-                "To get started:\n"
-                "1. Create .env file:\n"
-                "   cp .env.example .env\n"
-                "\n"
-                "2. Edit .env and configure your credentials:\n"
-                "   2.1. Set you super-secret password as PROXY_API_KEY\n"
-                "   2.2. Set your Kiro credentials:\n"
-                "      - Option 1: KIRO_CREDS_FILE to your Kiro credentials JSON file\n"
-                "      - Option 2: REFRESH_TOKEN from Kiro IDE traffic\n"
-                "      - Option 3: KIRO_CLI_DB_FILE to kiro-cli SQLite database\n"
-                "\n"
-                "Or use environment variables (for Docker):\n"
-                '   docker run -e PROXY_API_KEY="..." -e REFRESH_TOKEN="..." ...\n'
-                "\n"
-                "See README.md for detailed instructions."
-            )
-        else:
-            # .env exists but no credentials configured
-            errors.append(
-                "No Kiro credentials configured!\n"
-                "\n"
-                "   Configure one of the following in your .env file:\n"
-                "\n"
-                "Set you super-secret password as PROXY_API_KEY\n"
-                '   PROXY_API_KEY="my-super-secret-password-123"\n'
-                "\n"
-                "   Option 1 (Recommended): JSON credentials file\n"
-                '      KIRO_CREDS_FILE="path/to/your/kiro-credentials.json"\n'
-                "\n"
-                "   Option 2: Refresh token\n"
-                '      REFRESH_TOKEN="your_refresh_token_here"\n'
-                "\n"
-                "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
-                '      KIRO_CLI_DB_FILE="~/.local/share/kiro-cli/data.sqlite3"\n'
-                "\n"
-                "   See README.md for how to obtain credentials."
-            )
-
-    # Print errors and exit if any
-    if errors:
+    if not PROXY_API_KEY:
         logger.error("")
         logger.error("=" * 60)
         logger.error("  CONFIGURATION ERROR")
         logger.error("=" * 60)
-        for error in errors:
-            for line in error.split("\n"):
-                logger.error(f"  {line}")
+        logger.error("  PROXY_API_KEY is required.")
+        logger.error('  Generate one:  openssl rand -hex 32')
+        logger.error('  Then set:      PROXY_API_KEY="..." in .env')
         logger.error("=" * 60)
         logger.error("")
         raise RuntimeError("Configuration validation failed")
-
-    # Note: Credential loading details are logged by KiroAuthManager
 
 
 # --- Lifespan Manager ---
@@ -382,68 +292,14 @@ async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
     logger.info("Shared HTTP client created with connection pooling")
 
-    # Import old gateway JSON once, then apply the legacy environment policy in
-    # SQLite. External JSON and kiro-cli SQLite paths remain source adapters.
-    from kiro.store import (
-        canonicalize_account_sources,
-        connection,
-        import_legacy_files,
-        load_account_sources,
-        replace_account_sources,
-    )
-
-    recovery_file = str(
-        Path(ACCOUNTS_CONFIG_FILE)
-        .expanduser()
-        .with_name(f"{Path(ACCOUNTS_CONFIG_FILE).name}.account-deletion-recovery")
-    )
-    import_legacy_files(ACCOUNTS_CONFIG_FILE, ACCOUNTS_STATE_FILE, recovery_file)
-
-    # Check if we have legacy .env credentials
-    has_refresh_token = bool(REFRESH_TOKEN)
-    has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
-    has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
-
-    # Helper function to add optional per-account overrides from .env
-    def _add_env_overrides(entry: dict) -> None:
-        """Add optional per-account overrides from .env (only if set)"""
-        profile_arn = os.getenv("PROFILE_ARN")
-        if profile_arn:
-            entry["profile_arn"] = profile_arn
-
-        region = os.getenv("KIRO_REGION")
-        if region:
-            entry["region"] = region
-
-        api_region = os.getenv("KIRO_API_REGION")
-        if api_region:
-            entry["api_region"] = api_region
-
-    env_entry = None
-    if has_cli_db:
-        env_entry = {"type": "sqlite", "path": KIRO_CLI_DB_FILE}
-    elif has_creds_file:
-        env_entry = {"type": "json", "path": KIRO_CREDS_FILE}
-    elif has_refresh_token:
-        env_entry = {"type": "refresh_token", "refresh_token": REFRESH_TOKEN}
-    if env_entry:
-        _add_env_overrides(env_entry)
-        env_entry = canonicalize_account_sources([env_entry])[0]
-        if not ACCOUNT_SYSTEM or not load_account_sources():
-            with connection() as conn:
-                replace_account_sources([env_entry], conn)
-
     # ==============================================================================
-    # Create AccountManager
+    # Create AccountManager (accounts live in the private SQLite store)
     # ==============================================================================
-    app.state.account_manager = AccountManager(credentials_file=ACCOUNTS_CONFIG_FILE, state_file=ACCOUNTS_STATE_FILE)
+    app.state.account_manager = AccountManager()
 
     # Load credentials and state
     await app.state.account_manager.load_credentials()
     await app.state.account_manager.load_state()
-
-    # Store account_system flag
-    app.state.account_system = ACCOUNT_SYSTEM
 
     # ==============================================================================
     # Initialize first working account (blocking)
@@ -451,33 +307,36 @@ async def lifespan(app: FastAPI):
     all_accounts = list(app.state.account_manager._accounts.keys())
 
     if not all_accounts:
-        logger.error("No accounts configured in the private store")
-        raise RuntimeError("No accounts configured in the private store")
+        logger.warning(
+            "No accounts in the pool yet — open the dashboard and add one via device login"
+        )
+    else:
+        # Determine start index from persisted runtime state
+        start_index = app.state.account_manager._current_account_index
 
-    # Determine start index from persisted runtime state
-    start_index = app.state.account_manager._current_account_index
+        # Try to initialize accounts (full circle)
+        initialized = False
 
-    # Try to initialize accounts (full circle)
-    initialized = False
+        for i in range(len(all_accounts)):
+            current_index = (start_index + i) % len(all_accounts)
+            account_id = all_accounts[current_index]
 
-    for i in range(len(all_accounts)):
-        current_index = (start_index + i) % len(all_accounts)
-        account_id = all_accounts[current_index]
+            logger.info(f"Attempting to initialize account: {account_id}")
 
-        logger.info(f"Attempting to initialize account: {account_id}")
+            success = await app.state.account_manager._initialize_account(account_id)
 
-        success = await app.state.account_manager._initialize_account(account_id)
+            if success:
+                logger.info(f"Successfully initialized account: {account_id}")
+                initialized = True
+                break
+            else:
+                logger.warning(f"Failed to initialize account: {account_id}")
 
-        if success:
-            logger.info(f"Successfully initialized account: {account_id}")
-            initialized = True
-            break
-        else:
-            logger.warning(f"Failed to initialize account: {account_id}")
-
-    if not initialized:
-        logger.error("Failed to initialize any account. Check your credentials.")
-        raise RuntimeError("Failed to initialize any account")
+        if not initialized:
+            logger.warning(
+                "Failed to initialize any account; API will return errors until one works. "
+                "Re-login via the dashboard if credentials are stale."
+            )
 
     # Start background task for periodic state saving.
     save_task = asyncio.create_task(app.state.account_manager.save_state_periodically())
@@ -839,7 +698,7 @@ def print_startup_banner(host: str, port: int) -> None:
     print()
     print(f"  {DIM}{'─' * 48}{RESET}")
     print(f"  {WHITE}💬 Found a bug? Need help? Have questions?{RESET}")
-    print(f"  {YELLOW}➜  https://github.com/jwadow/kiro-gateway/issues{RESET}")
+    print(f"  {YELLOW}➜  https://github.com/minpeter/kiro-lb-python/issues{RESET}")
     print(f"  {DIM}{'─' * 48}{RESET}")
     print()
 

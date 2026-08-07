@@ -5,12 +5,11 @@
 
 ## OVERVIEW
 
-`kiro-lb` is a FastAPI reverse-engineered proxy that exposes Kiro (Amazon Q
-Developer / CodeWhisperer) through OpenAI- and Anthropic-compatible APIs, load
-balances across a pool of Kiro accounts, and ships a private React operations
-dashboard. Python 3.10 (`Dockerfile`, CI), httpx, loguru, tiktoken. AGPL-3.0,
-partly derived from Kiro Gateway (`jwadow/kiro-gateway`) — keep the per-file
-license headers.
+`kiro-lb` is a FastAPI gateway that exposes Kiro (Amazon Q Developer /
+CodeWhisperer) through OpenAI- and Anthropic-compatible APIs, load balances
+across a pool of Kiro accounts, and ships a React operations dashboard.
+Python 3.10 (`Dockerfile`, CI), httpx, loguru, tiktoken. **AGPL-3.0** — based on
+`jwadow/kiro-gateway`; see `LICENSE` and `NOTICE.md` (do not relicense).
 
 ## STRUCTURE
 
@@ -25,16 +24,15 @@ kiro-lb-python/
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
 ├── pyproject.toml           # ruff + mypy config only; the project is not packaged
-├── docker-compose.yml       # Upstream-style deployment (service kiro-gateway)
+├── docker-compose.yml       # Default deployment (service kiro-lb)
 ├── docker-compose.homelab.yml  # Live: edge HAProxy :8000 + kiro-blue/green slots
 ├── docker/haproxy-edge.cfg.template  # rendered → haproxy-edge.generated.cfg
 ├── deploy/bluegreen/        # zero-downtime deploy.sh (nginx-fixed lab IP)
 └── manual_api_test.py       # Manual live-API script, excluded from pytest
 ```
 
-No `docs/`, root `README.md`, or license/community docs exist any more: `48e728d`
-removed the root docs, `a9fadd7` removed the whole `docs/` tree. The invariants
-they held are folded into this file; do not link to them.
+Root docs: `README.md`, `LICENSE` (AGPL-3.0), `NOTICE.md` (upstream attribution).
+Operational detail lives in this file; do not relicense away from AGPL-3.0.
 
 ## WHERE TO LOOK
 
@@ -258,9 +256,9 @@ multi-arch images on non-PR runs. Tool versions are pinned in
 - `/metrics` is not recorded by the request-metrics middleware (`main.py:623`
   filters to `/v1/`), so scraping does not inflate the counters it reports.
 - `main.py` refuses to start when the unified store has no usable account, even
-  with `ACCOUNT_SYSTEM=false`; set `KIRO_CLI_DB_FILE` for a standalone run.
-  `validate_configuration` (`main.py:201`) skips legacy `.env` checks entirely
-  once legacy credentials have been imported. Legacy mode replaces its SQLite
+  
+  Account pool is always on; `validate_configuration` skips .env checks once accounts exist
+ 
   account policy from `.env` without writing gateway-owned JSON.
 - The OpenAI `developer` role must be folded into the system prompt
   (`converters_openai.py:149`); dropping it makes Kiro answer `REQUEST_BODY_INVALID`.
@@ -274,6 +272,5 @@ multi-arch images on non-PR runs. Tool versions are pinned in
 - Truncated upstream turns must not be reported as clean finishes
   (`kiro/stop_reasons.py`).
 - The homelab compose mounts the host `kiro-cli` store read-only at
-  `/host/kiro-cli` with `SQLITE_READONLY=true`. The gateway must never write it.
 - 13 files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1363)
   and `kiro/account_manager.py` (1252) are the highest-risk edit sites.

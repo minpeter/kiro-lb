@@ -49,10 +49,9 @@ def _manager_for_entries(
     credentials_file = tmp_path / "credentials.json"
     state_file = tmp_path / "state.json"
     _write_json(credentials_file, entries)
-    monkeypatch.setenv("ACCOUNTS_CONFIG_FILE", str(credentials_file))
     with connection() as conn:
         replace_account_sources(entries, conn)
-    manager = AccountManager(str(credentials_file), str(state_file))
+    manager = AccountManager()
     asyncio.run(manager.load_credentials())
     return manager, credentials_file, state_file
 

@@ -17,10 +17,7 @@ from kiro.config import RATE_ESTIMATE_WINDOW_SECONDS, RATE_WINDOW_SECONDS
 
 @pytest.fixture
 def manager(tmp_path) -> AccountManager:
-    instance = AccountManager(
-        credentials_file=str(tmp_path / "credentials.json"),
-        state_file=str(tmp_path / "state.json"),
-    )
+    instance = AccountManager()
     for index in range(2):
         account_id = f"/creds/account{index}.json"
         instance._accounts[account_id] = Account(id=account_id)
@@ -324,10 +321,7 @@ async def test_observations_survive_a_restart(manager, tmp_path):
     assert rows
     assert manager.drain_unsaved_rate_observations() == []
 
-    restarted = AccountManager(
-        credentials_file=str(tmp_path / "credentials.json"),
-        state_file=str(tmp_path / "state.json"),
-    )
+    restarted = AccountManager()
     restarted._accounts["/creds/account0.json"] = Account(id="/creds/account0.json")
     assert restarted.estimate_rate_limit("/creds/account0.json")["limitRpm"] is None
 
@@ -356,10 +350,7 @@ async def test_chart_history_survives_a_restart(manager, tmp_path):
     before = _series_for(manager.request_rate_series(900, 5), "/creds/account0.json")
     rows = manager.drain_unsaved_rate_observations()
 
-    restarted = AccountManager(
-        credentials_file=str(tmp_path / "credentials.json"),
-        state_file=str(tmp_path / "state.json"),
-    )
+    restarted = AccountManager()
     restarted._accounts["/creds/account0.json"] = Account(id="/creds/account0.json")
     blank = _series_for(restarted.request_rate_series(900, 5), "/creds/account0.json")
     assert sum(blank["success"]) == 0
@@ -380,10 +371,7 @@ async def test_rate_is_correct_on_the_first_request_after_a_restart(manager, tmp
         await manager.report_success("/creds/account0.json", "claude-sonnet-4-5")
     rows = manager.drain_unsaved_rate_observations()
 
-    restarted = AccountManager(
-        credentials_file=str(tmp_path / "credentials.json"),
-        state_file=str(tmp_path / "state.json"),
-    )
+    restarted = AccountManager()
     restarted._accounts["/creds/account0.json"] = Account(id="/creds/account0.json")
     restarted.load_rate_observations(rows)
 

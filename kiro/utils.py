@@ -24,7 +24,7 @@ def get_machine_fingerprint() -> str:
     Used for User-Agent formation to identify a specific gateway installation.
 
     Returns:
-        SHA256 hash of the string "{hostname}-{username}-kiro-gateway"
+        SHA256 hash of the string "{hostname}-{username}-kiro-lb"
     """
     try:
         import getpass
@@ -32,12 +32,12 @@ def get_machine_fingerprint() -> str:
 
         hostname = socket.gethostname()
         username = getpass.getuser()
-        unique_string = f"{hostname}-{username}-kiro-gateway"
+        unique_string = f"{hostname}-{username}-kiro-lb"
 
         return hashlib.sha256(unique_string.encode()).hexdigest()
     except Exception as e:
         logger.warning(f"Failed to get machine fingerprint: {e}")
-        return hashlib.sha256(b"default-kiro-gateway").hexdigest()
+        return hashlib.sha256(b"default-kiro-lb").hexdigest()
 
 
 def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:

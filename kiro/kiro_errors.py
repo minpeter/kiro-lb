@@ -157,7 +157,7 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
         # Generic 400 error
         user_message = (
             "Kiro API rejected the request. If problem persists, open issue with info and attached debug logs at:"
-            "https://github.com/jwadow/kiro-gateway/issues"
+            "https://github.com/minpeter/kiro-lb-python/issues"
         )
 
     # Future error enhancements can be added here:
