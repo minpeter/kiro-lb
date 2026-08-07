@@ -1,4 +1,4 @@
-# Kiro Gateway - Docker Image
+# kiro-lb - Docker Image
 # Optimized single-stage build
 
 FROM python:3.10-slim

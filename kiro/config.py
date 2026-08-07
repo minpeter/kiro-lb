@@ -127,7 +127,7 @@ PROFILE_ARN: str = os.getenv("PROFILE_ARN", "")
 # - Environment variables: Falls back to this SSO region
 #
 # For manual override of API region, use KIRO_API_REGION environment variable.
-# See: https://github.com/jwadow/kiro-gateway/issues/132
+# See upstream discussion (kiro-gateway#132) on SSO vs API region
 REGION: str = os.getenv("KIRO_REGION", "us-east-1")
 
 # Path to credentials file (optional, alternative to .env)
