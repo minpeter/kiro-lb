@@ -505,10 +505,6 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "false").lower() in (
 # Account System Settings
 # ==================================================================================================
 
-# Enable account system with failover (default: false)
-# When false: uses first account without failover (legacy mode)
-# When true: enables full failover loop with Circuit Breaker
-ACCOUNT_SYSTEM: bool = os.getenv("ACCOUNT_SYSTEM", "false").lower() in ("true", "1", "yes")
 
 # Legacy gateway JSON import paths. SQLite is authoritative after first import;
 # these files are never written or deleted by the gateway.

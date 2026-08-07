@@ -954,56 +954,7 @@ class TestWebSearchConfig:
 class TestAccountSystemConfig:
     """Tests for Account System configuration constants."""
 
-    def test_account_system_default_false(self):
-        """
-        What it does: Verifies ACCOUNT_SYSTEM defaults to false.
-        Purpose: Ensure legacy mode is default (backward compatibility).
-        """
-        print("Setup: Mocking os.getenv for ACCOUNT_SYSTEM...")
 
-        original_getenv = os.getenv
-
-        def mock_getenv(key, default=None):
-            if key == "ACCOUNT_SYSTEM":
-                print(f"os.getenv('{key}') -> None (mocked)")
-                return default  # Return default, simulating missing variable
-            return original_getenv(key, default)
-
-        with patch.object(os, "getenv", side_effect=mock_getenv):
-            print("Action: Reloading config module...")
-            from importlib import reload
-
-            import kiro.config as config_module
-
-            reload(config_module)
-
-            print(f"Comparing ACCOUNT_SYSTEM: Expected False, Got {config_module.ACCOUNT_SYSTEM}")
-            assert config_module.ACCOUNT_SYSTEM is False
-
-        # Restore module with real values
-        from importlib import reload
-
-        import kiro.config as config_module
-
-        reload(config_module)
-
-    def test_account_system_enabled(self, monkeypatch):
-        """
-        What it does: Verifies ACCOUNT_SYSTEM=true enables account system.
-        Purpose: Ensure account system can be enabled via environment variable.
-        """
-        print("Setup: Setting ACCOUNT_SYSTEM=true...")
-        monkeypatch.setenv("ACCOUNT_SYSTEM", "true")
-
-        print("Action: Reloading config module...")
-        from importlib import reload
-
-        import kiro.config as config_module
-
-        reload(config_module)
-
-        print(f"Comparing ACCOUNT_SYSTEM: Expected True, Got {config_module.ACCOUNT_SYSTEM}")
-        assert config_module.ACCOUNT_SYSTEM is True
 
     def test_accounts_config_file_default(self, monkeypatch):
         """

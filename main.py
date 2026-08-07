@@ -41,7 +41,6 @@ from loguru import logger
 
 from kiro.account_manager import AccountManager
 from kiro.config import (
-    ACCOUNT_SYSTEM,
     ACCOUNTS_CONFIG_FILE,
     ACCOUNTS_STATE_FILE,
     APP_DESCRIPTION,
@@ -429,7 +428,9 @@ async def lifespan(app: FastAPI):
     if env_entry:
         _add_env_overrides(env_entry)
         env_entry = canonicalize_account_sources([env_entry])[0]
-        if not ACCOUNT_SYSTEM or not load_account_sources():
+        # Seed the pool only when empty — env credentials never overwrite
+        # accounts already managed via the dashboard or prior import.
+        if not load_account_sources():
             with connection() as conn:
                 replace_account_sources([env_entry], conn)
 
@@ -441,9 +442,6 @@ async def lifespan(app: FastAPI):
     # Load credentials and state
     await app.state.account_manager.load_credentials()
     await app.state.account_manager.load_state()
-
-    # Store account_system flag
-    app.state.account_system = ACCOUNT_SYSTEM
 
     # ==============================================================================
     # Initialize first working account (blocking)

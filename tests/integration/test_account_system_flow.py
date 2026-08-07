@@ -508,7 +508,6 @@ class TestAccountSystemExhaustedPoolDiagnostics:
 
     def _request(self, manager: AccountManager) -> MagicMock:
         request = MagicMock()
-        request.app.state.account_system = True
         request.app.state.account_manager = manager
         request.app.state.http_client = MagicMock()
         return request
@@ -802,7 +801,6 @@ class TestFailoverAttributionThroughTheRoute:
         app.state.http_client = MagicMock()
         # The route reads the multi-account failover switch off app.state, not
         # config, and the loop under test only runs when it is on.
-        app.state.account_system = True
         # Auth is a separate concern with its own tests; overridden so this one
         # fails only on attribution.
         app.dependency_overrides[routes_openai.verify_api_key] = lambda: True

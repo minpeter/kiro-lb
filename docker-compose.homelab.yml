@@ -17,7 +17,6 @@ name: kiro-lb
 x-kiro-environment: &kiro-environment
   SERVER_HOST: "0.0.0.0"
   SERVER_PORT: "8000"
-  ACCOUNT_SYSTEM: "true"
   ACCOUNTS_CONFIG_FILE: /app/data/credentials.json
   ACCOUNTS_STATE_FILE: /app/data/state.json
   DASHBOARD_DATA_DIR: /app/data

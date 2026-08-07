@@ -981,82 +981,24 @@ class TestWebSearchAutoInjectionOpenAI:
 
 
 class TestModelsEndpointAccountSystem:
-    """Tests for /v1/models endpoint with Account System."""
+    """Tests for /v1/models endpoint with multi-account pool."""
 
-    def test_get_models_account_system_logic(self):
-        """
-        What it does: Verifies logic for collecting models in account system mode.
-        Purpose: Ensure models are collected from all initialized accounts.
-        """
-        print("\n--- Test: /v1/models account system logic ---")
-
-        # Simulate account system mode logic
-        account_system = True
-
+    def test_get_models_collects_from_all_accounts(self):
+        """Models are collected from every initialized account in the pool."""
+        print("\n--- Test: /v1/models multi-account logic ---")
         mock_account_manager = Mock()
         mock_account_manager.get_all_available_models.return_value = [
             "claude-opus-4.5",
             "claude-sonnet-4.5",
             "claude-haiku-4.5",
         ]
-
-        print("Action: Getting models in account system mode...")
-        if account_system:
-            available_model_ids = mock_account_manager.get_all_available_models()
-        else:
-            available_model_ids = []
-
-        print("Checking: get_all_available_models() was called...")
+        available_model_ids = mock_account_manager.get_all_available_models()
         mock_account_manager.get_all_available_models.assert_called_once()
-
-        print("Checking: Models from all accounts collected...")
         assert "claude-opus-4.5" in available_model_ids
         assert "claude-sonnet-4.5" in available_model_ids
         assert "claude-haiku-4.5" in available_model_ids
         assert len(available_model_ids) == 3
-        print("✅ Account system mode correctly collects models from all accounts")
-
-    def test_get_models_legacy_logic(self):
-        """
-        What it does: Verifies logic for getting models in legacy mode.
-        Purpose: Ensure backward compatibility with single account.
-        """
-        print("\n--- Test: /v1/models legacy mode logic ---")
-
-        # Simulate legacy mode logic
-        account_system = False
-
-        mock_account = Mock()
-        mock_resolver = Mock()
-        mock_resolver.get_available_models.return_value = ["claude-opus-4.5", "claude-sonnet-4.5"]
-        mock_account.model_resolver = mock_resolver
-
-        mock_account_manager = Mock()
-        mock_account_manager.get_first_account.return_value = mock_account
-
-        print("Action: Getting models in legacy mode...")
-        if account_system:
-            available_model_ids = []
-        else:
-            account = mock_account_manager.get_first_account()
-            available_model_ids = account.model_resolver.get_available_models()
-
-        print("Checking: get_first_account() was called...")
-        mock_account_manager.get_first_account.assert_called_once()
-
-        print("Checking: model_resolver.get_available_models() was called...")
-        mock_resolver.get_available_models.assert_called_once()
-
-        print("Checking: Models from first account returned...")
-        assert "claude-opus-4.5" in available_model_ids
-        assert "claude-sonnet-4.5" in available_model_ids
-        assert len(available_model_ids) == 2
-        print("✅ Legacy mode correctly uses first account's resolver")
-
-
-# ==================================================================================================
-# Tests for Account System - Failover Loop
-# ==================================================================================================
+        print("✅ Multi-account mode collects models from all accounts")
 
 
 class TestChatCompletionsFailoverLoop:
@@ -1363,94 +1305,6 @@ class TestChatCompletionsFailoverLoop:
 
         assert attempts == MAX_ATTEMPTS
         print("✅ MAX_ATTEMPTS correctly limits failover loop")
-
-
-# ==================================================================================================
-# Tests for Account System - Legacy Mode
-# ==================================================================================================
-
-
-class TestChatCompletionsLegacyMode:
-    """Tests for legacy mode (ACCOUNT_SYSTEM=false) in /v1/chat/completions."""
-
-    @pytest.mark.asyncio
-    async def test_legacy_uninitialized_account_is_selected_once_without_failover(self):
-        from kiro.models_openai import ChatCompletionRequest
-        from kiro.routes_openai import chat_completions
-
-        account = Mock(auth_manager=None)
-        manager = Mock()
-        manager._accounts = {"legacy": account}
-        manager.get_first_account.return_value = account
-        request = Mock()
-        request.app.state.account_system = False
-        request.app.state.account_manager = manager
-        request_data = ChatCompletionRequest(
-            model="claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}], stream=False
-        )
-
-        with pytest.raises(HTTPException) as exc_info:
-            await chat_completions(request, request_data)
-
-        assert exc_info.value.status_code == 503
-        assert exc_info.value.detail == "No initialized accounts available"
-        manager.get_first_account.assert_called_once_with()
-        manager.get_next_account.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_chat_completions_legacy_get_first_account(self):
-        """
-        What it does: Verifies legacy mode uses get_first_account().
-        Purpose: Ensure backward compatibility with single account.
-        """
-        print("\n--- Test: Legacy mode uses get_first_account() ---")
-
-        from kiro.account_manager import Account, AccountStats
-
-        mock_account = Account(
-            id="/home/user/account1.json",
-            failures=0,
-            last_failure_time=0.0,
-            models_cached_at=time.time(),
-            stats=AccountStats(),
-        )
-
-        mock_manager = Mock()
-        mock_manager.get_first_account.return_value = mock_account
-
-        print("Action: Getting first account in legacy mode...")
-        account = mock_manager.get_first_account()
-
-        print("Checking: get_first_account() was called...")
-        mock_manager.get_first_account.assert_called_once()
-
-        print("Checking: Account returned...")
-        assert account is not None
-        assert account.id == "/home/user/account1.json"
-        print("✅ Legacy mode correctly uses get_first_account()")
-
-    def test_chat_completions_legacy_no_failover(self):
-        """
-        What it does: Verifies legacy mode has no failover loop.
-        Purpose: Ensure single account behavior is preserved.
-        """
-        print("\n--- Test: Legacy mode has no failover ---")
-
-        account_system = False
-
-        print("Checking: account_system flag is False...")
-        assert account_system is False
-
-        print("Checking: Failover loop should be skipped...")
-        if account_system:
-            failover_enabled = True
-        else:
-            failover_enabled = False
-
-        assert failover_enabled is False
-        print("✅ Legacy mode correctly skips failover loop")
-
-
 class TestModelsEndpointMetadata:
     """The model list must carry usable, truthful metadata for both SDKs.
 

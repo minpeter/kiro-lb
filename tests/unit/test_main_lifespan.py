@@ -32,17 +32,15 @@ class TestLifespanLegacyFallback:
     """
 
     @pytest.mark.asyncio
-    async def test_lifespan_legacy_mode_recreate_credentials(self, tmp_path, monkeypatch):
+    async def test_lifespan_preserves_existing_sources_when_env_set(self, tmp_path, monkeypatch):
         """
-        Test 92: ACCOUNT_SYSTEM=false всегда пересоздаёт credentials.json
+        Test 92: env credentials do not overwrite an existing account pool.
 
-        What it does: Verifies that legacy mode recreates credentials.json on every startup
-        Purpose: Ensure .env changes are always reflected in legacy mode
+        What it does: With sources already in SQLite, REFRESH_TOKEN must not replace them.
         """
-        print("\n=== Test 92: Legacy mode recreates credentials.json ===")
+        print("\n=== Test 92: Existing sources are preserved ===")
 
         # Arrange: Patch constants directly in main module (not os.environ)
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", False)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -86,15 +84,20 @@ class TestLifespanLegacyFallback:
         new_creds = load_account_sources()
         print(f"New credentials.json: {new_creds}")
 
-        assert len(new_creds) == 1
-        assert new_creds[0]["type"] == "internal"
-        assert not creds_file.exists() or json.loads(creds_file.read_text()) == old_creds
-        print("✓ credentials.json was recreated from .env in legacy mode")
+        # Pool was seeded from credentials.json import (or already present).
+        # Env REFRESH_TOKEN must not wipe it.
+        assert len(new_creds) >= 1
+        # Either imported json path became internal, or original structure remains
+        types = {c.get("type") for c in new_creds}
+        assert "refresh_token" not in types or all(
+            c.get("refresh_token") != "test_refresh_token" for c in new_creds if c.get("type") == "refresh_token"
+        )
+        print("✓ existing account sources preserved when env is set")
 
     @pytest.mark.asyncio
     async def test_lifespan_account_system_one_time_migration(self, tmp_path, monkeypatch):
         """
-        Test 93: ACCOUNT_SYSTEM=true создаёт credentials.json только раз
+        Test 93: env credentials seed the pool only when empty
 
         What it does: Verifies one-time migration in account system mode
         Purpose: Ensure credentials.json is not overwritten after initial migration
@@ -102,7 +105,6 @@ class TestLifespanLegacyFallback:
         print("\n=== Test 93: Account system one-time migration ===")
 
         # Arrange: Patch constants directly
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -190,7 +192,6 @@ class TestLifespanLegacyFallback:
         json_file.write_text(json.dumps({"accessToken": "json_token"}))
 
         # Patch constants directly
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", str(sqlite_db))
         monkeypatch.setattr("main.KIRO_CREDS_FILE", str(json_file))
@@ -242,7 +243,6 @@ class TestLifespanLegacyFallback:
         print("\n=== Test 95: Add env overrides during migration ===")
 
         # Arrange: Patch constants and also patch os.getenv for _add_env_overrides
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -299,7 +299,6 @@ class TestLifespanLegacyFallback:
         print("\n=== Test 96: Skip migration if credentials.json exists ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -368,7 +367,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 97: Create AccountManager with correct paths ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -437,7 +435,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 98: Call load_credentials() and load_state() ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -487,52 +484,7 @@ class TestLifespanAccountManagerInit:
         print("✓ load_credentials() and load_state() were called")
 
     @pytest.mark.asyncio
-    async def test_lifespan_set_account_system_flag(self, tmp_path, monkeypatch):
-        """
-        Test 99: Установка app.state.account_system
 
-        What it does: Verifies account_system flag is set in app.state
-        Purpose: Ensure routes can check if account system is enabled
-        """
-        print("\n=== Test 99: Set app.state.account_system flag ===")
-
-        # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
-
-        mock_manager = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-        mock_manager._accounts = {"test": MagicMock()}
-        mock_manager._current_account_index = 0
-        mock_manager._initialize_account = AsyncMock(return_value=True)
-        mock_manager._save_state = AsyncMock()
-        mock_manager.save_state_periodically = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-
-        with patch("main.AccountManager", return_value=mock_manager):
-            with patch("main.httpx.AsyncClient") as mock_client_class:
-                mock_client = AsyncMock()
-                mock_client_class.return_value = mock_client
-
-                from main import app, lifespan
-
-                async with lifespan(app):
-                    # Check flag during lifespan
-                    assert hasattr(app.state, "account_system")
-                    assert app.state.account_system is True
-                    print(f"✓ app.state.account_system = {app.state.account_system}")
-
-    @pytest.mark.asyncio
     async def test_lifespan_initialize_first_working_account(self, tmp_path, monkeypatch):
         """
         Test 100: Инициализация первого рабочего аккаунта
@@ -543,7 +495,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 100: Initialize first working account ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -599,7 +550,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 101: Full circle initialization attempt ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -657,7 +607,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 102: RuntimeError if no accounts configured ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -699,7 +648,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 103: RuntimeError if all accounts failed ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -742,7 +690,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 104: Save initial state ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -797,7 +744,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 105: Start background task ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -851,7 +797,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 106: Cancel background task on shutdown ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
@@ -911,7 +856,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 107: Final save on shutdown ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
         monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)

@@ -194,42 +194,30 @@ async def messages(
     normalize_native_web_search_tools(request_data.tools)
 
     # ==============================================================================
-    # Account System: Account System Failover or Legacy Mode
+    # Multi-account failover
     # ==============================================================================
 
-    account_system = request.app.state.account_system
     while True:
         from kiro.account_errors import CredentialDeadError, ErrorType, classify_error
 
         account_manager = request.app.state.account_manager
         all_accounts = list(account_manager._accounts.keys())
-        single_attempt = not account_system or len(all_accounts) == 1
-        max_attempts = 1 if not account_system else max(1, len(all_accounts) * 2)
+        single_attempt = len(all_accounts) == 1
+        max_attempts = max(1, len(all_accounts) * 2)
 
         last_error_message = None
         last_error_status = None
         tried_accounts: set[str] = set()  # Track tried accounts in current failover loop
 
         for _attempt in range(max_attempts):
-            account = (
-                await account_manager.get_next_account(request_data.model, exclude_accounts=tried_accounts)
-                if account_system
-                else account_manager.get_first_account()
+            account = await account_manager.get_next_account(
+                request_data.model, exclude_accounts=tried_accounts
             )
 
             if account is None or not account.auth_manager:
                 # All accounts unavailable
                 if single_attempt:
                     # Single account - return original error with original status code
-                    if not account_system:
-                        logger.error("No initialized accounts available (legacy mode)")
-                        return JSONResponse(
-                            status_code=503,
-                            content={
-                                "type": "error",
-                                "error": {"type": "api_error", "message": "No initialized accounts available"},
-                            },
-                        )
                     return JSONResponse(
                         status_code=last_error_status or 503,
                         content={
@@ -364,8 +352,7 @@ async def messages(
                                     make_search_request=make_search_request,
                                 ):
                                     yield chunk
-                                if account_system:
-                                    await account_manager.report_success(account.id, request_data.model)
+                                await account_manager.report_success(account.id, request_data.model)
                             except GeneratorExit:
                                 client_disconnected = True
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
@@ -416,8 +403,7 @@ async def messages(
                             request_system=system_for_tokenizer,
                             make_search_request=make_search_request,
                         )
-                        if account_system:
-                            await account_manager.report_success(account.id, request_data.model)
+                        await account_manager.report_success(account.id, request_data.model)
 
                         await http_client.close()
                         logger.info("HTTP 200 - POST /v1/messages (non-streaming) - completed")
@@ -465,15 +451,14 @@ async def messages(
 
                     if error_type == ErrorType.FATAL:
                         # FATAL - return to client immediately
-                        if account_system:
-                            await account_manager.report_failure(
-                                account.id,
-                                request_data.model,
-                                error_type,
-                                response.status_code,
-                                error_reason,
-                                upstream_message,
-                            )
+                        await account_manager.report_failure(
+                            account.id,
+                            request_data.model,
+                            error_type,
+                            response.status_code,
+                            error_reason,
+                            upstream_message,
+                        )
 
                         logger.warning(f"HTTP {response.status_code} - POST /v1/messages - {last_error_message[:100]}")
 
@@ -487,25 +472,16 @@ async def messages(
 
                     else:  # ErrorType.RECOVERABLE
                         # RECOVERABLE - try next account
-                        if account_system:
-                            await account_manager.report_failure(
-                                account.id,
-                                request_data.model,
-                                error_type,
-                                response.status_code,
-                                error_reason,
-                                upstream_message,
-                            )
+                        await account_manager.report_failure(
+                            account.id,
+                            request_data.model,
+                            error_type,
+                            response.status_code,
+                            error_reason,
+                            upstream_message,
+                        )
 
                         if single_attempt:
-                            if not account_system:
-                                return JSONResponse(
-                                    status_code=response.status_code,
-                                    content={
-                                        "type": "error",
-                                        "error": {"type": "api_error", "message": last_error_message},
-                                    },
-                                )
                             break
 
                         continue  # Next iteration
@@ -518,21 +494,15 @@ async def messages(
                 # NOT for HTTP-level errors (which are returned as response objects)
                 if e.status_code in (502, 504):
                     # Network error → try next account
-                    if account_system:
-                        await account_manager.report_failure(
-                            account.id, request_data.model, ErrorType.RECOVERABLE, e.status_code, None
-                        )
+                    await account_manager.report_failure(
+                        account.id, request_data.model, ErrorType.RECOVERABLE, e.status_code, None
+                    )
 
                     last_error_message = str(e.detail)
                     last_error_status = e.status_code
 
                     # Single account - no point in failover, break immediately
                     if single_attempt:
-                        if not account_system:
-                            logger.warning("Network error (legacy mode, no failover available)")
-                            if debug_logger:
-                                debug_logger.flush_on_error(e.status_code, str(e.detail))
-                            raise
                         break
 
                     logger.warning(f"Network error on account {account.id}, trying next account")
@@ -550,8 +520,7 @@ async def messages(
                 # and fail over instead of returning 500 for a pool that still
                 # has healthy accounts.
                 await http_client.close()
-                if account_system:
-                    await account_manager.report_credential_dead(account.id, e.status_code)
+                await account_manager.report_credential_dead(account.id, e.status_code)
 
                 last_error_status = 502
                 last_error_message = (
@@ -560,13 +529,6 @@ async def messages(
                 logger.warning(f"Dead credential on account {account.id}; trying next account")
 
                 if single_attempt:
-                    if not account_system:
-                        if debug_logger:
-                            debug_logger.flush_on_error(last_error_status, last_error_message)
-                        return JSONResponse(
-                            status_code=last_error_status,
-                            content={"type": "error", "error": {"type": "api_error", "message": last_error_message}},
-                        )
                     break
 
                 continue  # Try next account

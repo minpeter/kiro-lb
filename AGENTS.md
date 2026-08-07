@@ -256,9 +256,9 @@ multi-arch images on non-PR runs. Tool versions are pinned in
 - `/metrics` is not recorded by the request-metrics middleware (`main.py:623`
   filters to `/v1/`), so scraping does not inflate the counters it reports.
 - `main.py` refuses to start when the unified store has no usable account, even
-  with `ACCOUNT_SYSTEM=false`; set `KIRO_CLI_DB_FILE` for a standalone run.
-  `validate_configuration` (`main.py:201`) skips legacy `.env` checks entirely
-  once legacy credentials have been imported. Legacy mode replaces its SQLite
+  
+  Account pool is always on; `validate_configuration` skips .env checks once accounts exist
+ 
   account policy from `.env` without writing gateway-owned JSON.
 - The OpenAI `developer` role must be folded into the system prompt
   (`converters_openai.py:149`); dropping it makes Kiro answer `REQUEST_BODY_INVALID`.
