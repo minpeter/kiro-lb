@@ -60,9 +60,11 @@ class TestAccountSystemFullFlow:
             {"type": "json", "path": account2_path, "enabled": True},
         ]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
         # Create AccountManager
-        manager = AccountManager(str(creds_file), str(state_file))
+        manager = AccountManager()
         await manager.load_credentials()
         await manager.load_state()
 
@@ -187,8 +189,10 @@ class TestAccountSystemFullFlow:
             {"type": "json", "path": account2_path, "enabled": True},
         ]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(str(creds_file), str(state_file))
+        manager = AccountManager()
         await manager.load_credentials()
         await manager.load_state()
 
@@ -244,8 +248,10 @@ class TestAccountSystemFullFlow:
             {"type": "json", "path": account2_path, "enabled": True},
         ]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(str(creds_file), str(state_file))
+        manager = AccountManager()
         await manager.load_credentials()
         await manager.load_state()
 
@@ -299,8 +305,10 @@ class TestAccountSystemFullFlow:
 
         credentials = [{"type": "json", "path": account1_path, "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(str(creds_file), str(state_file))
+        manager = AccountManager()
         await manager.load_credentials()
         await manager.load_state()
 
@@ -360,9 +368,11 @@ class TestAccountSystemFullFlow:
 
         credentials = [{"type": "json", "path": account1_path, "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
         # First manager instance
-        manager1 = AccountManager(str(creds_file), str(state_file))
+        manager1 = AccountManager()
         await manager1.load_credentials()
         await manager1.load_state()
 
@@ -393,7 +403,7 @@ class TestAccountSystemFullFlow:
         print(f"Saved state: failures={account.failures}, stats={account.stats.total_requests}")
 
         # Second manager instance (restart simulation)
-        manager2 = AccountManager(str(creds_file), str(state_file))
+        manager2 = AccountManager()
         await manager2.load_credentials()
         await manager2.load_state()
 
@@ -429,8 +439,10 @@ class TestAccountSystemFullFlow:
 
         credentials = [{"type": "json", "path": account1_path, "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
+        from tests.conftest import seed_account_sources
+        seed_account_sources(credentials)
 
-        manager = AccountManager(str(creds_file), str(state_file))
+        manager = AccountManager()
         await manager.load_credentials()
         await manager.load_state()
 
@@ -493,9 +505,7 @@ class TestAccountSystemExhaustedPoolDiagnostics:
 
     def _exhausted_manager(self, tmp_path, account_count: int = 3) -> AccountManager:
         """Build a manager whose every account is inside its cooldown window."""
-        manager = AccountManager(
-            credentials_file=str(tmp_path / "credentials.json"), state_file=str(tmp_path / "state.json")
-        )
+        manager = AccountManager()
         now = time.time()
         for index in range(account_count):
             account_id = f"/creds/account{index}.json"
@@ -750,8 +760,10 @@ class TestFailoverAttributionThroughTheRoute:
         credentials = tmp_path / "credentials.json"
         with open(credentials, "w") as handle:
             json_module.dump(entries, handle)
+        from tests.conftest import seed_account_sources
+        seed_account_sources(entries)
 
-        manager = AccountManager(str(credentials), str(tmp_path / "state.json"))
+        manager = AccountManager()
         await manager.load_credentials()
         for account_id in list(manager._accounts.keys()):
             account = manager._accounts[account_id]

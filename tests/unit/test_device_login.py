@@ -221,7 +221,6 @@ def dashboard(tmp_path, monkeypatch):
     import importlib
 
     monkeypatch.setenv("DASHBOARD_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("ACCOUNTS_CONFIG_FILE", str(tmp_path / "credentials.json"))
     module = importlib.reload(importlib.import_module("kiro.dashboard"))
     module.initialize_dashboard_store()
     module._authenticated = lambda _request: True
@@ -233,10 +232,7 @@ def _request_with_manager(tmp_path):
 
     from kiro.account_manager import AccountManager
 
-    manager = AccountManager(
-        credentials_file=str(tmp_path / "credentials.json"),
-        state_file=str(tmp_path / "state.json"),
-    )
+    manager = AccountManager()
     request = MagicMock()
     request.app.state.account_manager = manager
     return request, manager

@@ -21,7 +21,6 @@ from loguru import logger
 from kiro.auth import AuthType
 from kiro.config import (
     APP_VERSION,
-    PROFILE_ARN,
     WEB_SEARCH_ENABLED,
 )
 from kiro.converters_openai import build_kiro_payload
@@ -362,12 +361,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             # Generate conversation ID
             conversation_id = generate_conversation_id()
 
-            # Build payload for Kiro
-            # A Builder ID account has no profile and must not be given one: the
-            # global fallback would send a foreign ARN and fail the request.
-            profile_arn_for_payload = auth_manager.profile_arn or (
-                "" if auth_manager.auth_type == AuthType.AWS_SSO_OIDC else PROFILE_ARN or ""
-            )
+            # Build payload for Kiro — profile ARN is always account-scoped.
+            profile_arn_for_payload = auth_manager.profile_arn or ""
 
             try:
                 kiro_payload = build_kiro_payload(request_data, conversation_id, profile_arn_for_payload)

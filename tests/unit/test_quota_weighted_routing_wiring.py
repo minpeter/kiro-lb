@@ -33,9 +33,7 @@ def store(tmp_path, monkeypatch):
 
 
 def _manager(tmp_path, account_ids: list[str]) -> AccountManager:
-    manager = AccountManager(
-        credentials_file=str(tmp_path / "credentials.json"), state_file=str(tmp_path / "state.json")
-    )
+    manager = AccountManager()
     for account_id in account_ids:
         account = Account(id=account_id)
         account.auth_manager = MagicMock()

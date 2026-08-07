@@ -25,9 +25,7 @@ DAY = 86400.0
 
 
 def _manager(tmp_path, account_ids=("/creds/account0.json",)) -> AccountManager:
-    manager = AccountManager(
-        credentials_file=str(tmp_path / "credentials.json"), state_file=str(tmp_path / "state.json")
-    )
+    manager = AccountManager()
     for account_id in account_ids:
         account = Account(id=account_id)
         account.auth_manager = MagicMock()

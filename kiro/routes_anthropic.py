@@ -17,7 +17,7 @@ from fastapi.security import APIKeyHeader
 from loguru import logger
 
 from kiro.auth import AuthType
-from kiro.config import PROFILE_ARN, WEB_SEARCH_ENABLED
+from kiro.config import WEB_SEARCH_ENABLED
 from kiro.converters_anthropic import anthropic_to_kiro
 from kiro.dashboard import identify_data_api_key
 from kiro.http_client import KiroHttpClient
@@ -253,12 +253,8 @@ async def messages(
             # Generate conversation ID
             conversation_id = generate_conversation_id()
 
-            # Build payload for Kiro
-            # A Builder ID account has no profile and must not be given one: the
-            # global fallback would send a foreign ARN and fail the request.
-            profile_arn_for_payload = auth_manager.profile_arn or (
-                "" if auth_manager.auth_type == AuthType.AWS_SSO_OIDC else PROFILE_ARN or ""
-            )
+            # Build payload for Kiro — profile ARN is always account-scoped.
+            profile_arn_for_payload = auth_manager.profile_arn or ""
 
             try:
                 kiro_payload = anthropic_to_kiro(request_data, conversation_id, profile_arn_for_payload)

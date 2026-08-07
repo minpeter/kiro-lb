@@ -23,330 +23,6 @@ from kiro.store import load_account_sources
 # =============================================================================
 
 
-class TestLifespanLegacyFallback:
-    """
-    Tests for legacy .env → credentials.json migration.
-
-    What it does: Verifies automatic migration from .env to credentials.json
-    Purpose: Ensure backward compatibility with existing .env configurations
-    """
-
-    @pytest.mark.asyncio
-    async def test_lifespan_preserves_existing_sources_when_env_set(self, tmp_path, monkeypatch):
-        """
-        Test 92: env credentials do not overwrite an existing account pool.
-
-        What it does: With sources already in SQLite, REFRESH_TOKEN must not replace them.
-        """
-        print("\n=== Test 92: Existing sources are preserved ===")
-
-        # Arrange: Patch constants directly in main module (not os.environ)
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
-        # Create old credentials.json
-        old_creds = [{"type": "json", "path": "/old/path.json"}]
-        creds_file.write_text(json.dumps(old_creds))
-        print(f"Created old credentials.json: {old_creds}")
-
-        # Mock config paths
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
-
-        # Mock AccountManager to prevent actual initialization
-        mock_manager = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-        mock_manager._accounts = {"test": MagicMock()}
-        mock_manager._current_account_index = 0
-        mock_manager._initialize_account = AsyncMock(return_value=True)
-        mock_manager._save_state = AsyncMock()
-        mock_manager.save_state_periodically = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-
-        with patch("main.AccountManager", return_value=mock_manager):
-            with patch("main.httpx.AsyncClient") as mock_client_class:
-                mock_client = AsyncMock()
-                mock_client_class.return_value = mock_client
-
-                # Import and run lifespan
-                from main import app, lifespan
-
-                async with lifespan(app):
-                    pass
-
-        # Assert: legacy environment credentials replace the SQLite source only.
-        new_creds = load_account_sources()
-        print(f"New credentials.json: {new_creds}")
-
-        # Pool was seeded from credentials.json import (or already present).
-        # Env REFRESH_TOKEN must not wipe it.
-        assert len(new_creds) >= 1
-        # Either imported json path became internal, or original structure remains
-        types = {c.get("type") for c in new_creds}
-        assert "refresh_token" not in types or all(
-            c.get("refresh_token") != "test_refresh_token" for c in new_creds if c.get("type") == "refresh_token"
-        )
-        print("✓ existing account sources preserved when env is set")
-
-    @pytest.mark.asyncio
-    async def test_lifespan_account_system_one_time_migration(self, tmp_path, monkeypatch):
-        """
-        Test 93: env credentials seed the pool only when empty
-
-        What it does: Verifies one-time migration in account system mode
-        Purpose: Ensure credentials.json is not overwritten after initial migration
-        """
-        print("\n=== Test 93: Account system one-time migration ===")
-
-        # Arrange: Patch constants directly
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
-        # First run: no credentials.json
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
-
-        mock_manager = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-        mock_manager._accounts = {"test": MagicMock()}
-        mock_manager._current_account_index = 0
-        mock_manager._initialize_account = AsyncMock(return_value=True)
-        mock_manager._save_state = AsyncMock()
-        mock_manager.save_state_periodically = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-
-        with patch("main.AccountManager", return_value=mock_manager):
-            with patch("main.httpx.AsyncClient") as mock_client_class:
-                mock_client = AsyncMock()
-                mock_client_class.return_value = mock_client
-
-                from main import app, lifespan
-
-                # First run
-                async with lifespan(app):
-                    pass
-
-        first_content = load_account_sources()
-        print(f"First run created: {first_content}")
-
-        # Modify credentials.json manually
-        manual_creds = [{"type": "json", "path": "/manual/path.json"}]
-        creds_file.write_text(json.dumps(manual_creds))
-        print(f"Manually modified to: {manual_creds}")
-
-        # Second run: credentials.json exists
-        with patch("main.AccountManager", return_value=mock_manager):
-            with patch("main.httpx.AsyncClient") as mock_client_class:
-                mock_client = AsyncMock()
-                mock_client_class.return_value = mock_client
-
-                async with lifespan(app):
-                    pass
-
-        # Assert: credentials.json was NOT overwritten
-        second_content = load_account_sources()
-        print(f"Second run kept: {second_content}")
-
-        assert second_content == first_content
-        print("✓ credentials.json was not overwritten on second run")
-
-    @pytest.mark.asyncio
-    async def test_lifespan_migration_priority_sqlite(self, tmp_path, monkeypatch):
-        """
-        Test 94: Приоритет SQLite > JSON > refresh_token
-
-        What it does: Verifies credential source priority during migration
-        Purpose: Ensure correct priority order matches KiroAuthManager
-        """
-        print("\n=== Test 94: Migration priority SQLite > JSON > refresh_token ===")
-
-        # Arrange: all three sources present
-        # Create SQLite DB
-        import sqlite3
-
-        sqlite_db = tmp_path / "data.sqlite3"
-        conn = sqlite3.connect(str(sqlite_db))
-        cursor = conn.cursor()
-        cursor.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
-        cursor.execute(
-            "INSERT INTO auth_kv VALUES (?, ?)",
-            ("codewhisperer:odic:token", json.dumps({"access_token": "sqlite_token"})),
-        )
-        conn.commit()
-        conn.close()
-
-        # Create JSON file
-        json_file = tmp_path / "kiro-auth.json"
-        json_file.write_text(json.dumps({"accessToken": "json_token"}))
-
-        # Patch constants directly
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", str(sqlite_db))
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", str(json_file))
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
-
-        mock_manager = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-        mock_manager._accounts = {"test": MagicMock()}
-        mock_manager._current_account_index = 0
-        mock_manager._initialize_account = AsyncMock(return_value=True)
-        mock_manager._save_state = AsyncMock()
-        mock_manager.save_state_periodically = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-
-        with patch("main.AccountManager", return_value=mock_manager):
-            with patch("main.httpx.AsyncClient") as mock_client_class:
-                mock_client = AsyncMock()
-                mock_client_class.return_value = mock_client
-
-                from main import app, lifespan
-
-                async with lifespan(app):
-                    pass
-
-        # Assert: SQLite was chosen (highest priority)
-        creds = load_account_sources()
-        print(f"Created credentials: {creds}")
-
-        assert len(creds) == 1
-        assert creds[0]["type"] == "sqlite"
-        assert creds[0]["path"] == str(sqlite_db)
-        print("✓ SQLite was chosen (highest priority)")
-
-    @pytest.mark.asyncio
-    async def test_lifespan_migration_add_env_overrides(self, tmp_path, monkeypatch):
-        """
-        Test 95: Добавление profile_arn, region, api_region из .env
-
-        What it does: Verifies that env var overrides are added to migrated credentials
-        Purpose: Ensure per-account parameters are preserved during migration
-        """
-        print("\n=== Test 95: Add env overrides during migration ===")
-
-        # Arrange: Patch constants and also patch os.getenv for _add_env_overrides
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
-
-        # Patch os.getenv for the helper function
-        monkeypatch.setenv("PROFILE_ARN", "arn:aws:codewhisperer:eu-central-1:123456789:profile/test")
-        monkeypatch.setenv("KIRO_REGION", "eu-west-1")
-        monkeypatch.setenv("KIRO_API_REGION", "eu-central-1")
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
-
-        mock_manager = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-        mock_manager._accounts = {"test": MagicMock()}
-        mock_manager._current_account_index = 0
-        mock_manager._initialize_account = AsyncMock(return_value=True)
-        mock_manager._save_state = AsyncMock()
-        mock_manager.save_state_periodically = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-
-        with patch("main.AccountManager", return_value=mock_manager):
-            with patch("main.httpx.AsyncClient") as mock_client_class:
-                mock_client = AsyncMock()
-                mock_client_class.return_value = mock_client
-
-                from main import app, lifespan
-
-                async with lifespan(app):
-                    pass
-
-        # Assert: overrides were added
-        creds = load_account_sources()
-        print(f"Created credentials with overrides: {creds}")
-
-        assert creds[0]["profile_arn"] == "arn:aws:codewhisperer:eu-central-1:123456789:profile/test"
-        assert creds[0]["region"] == "eu-west-1"
-        assert creds[0]["api_region"] == "eu-central-1"
-        print("✓ Env overrides were added to credentials.json")
-
-    @pytest.mark.asyncio
-    async def test_lifespan_skip_migration_if_exists(self, tmp_path, monkeypatch):
-        """
-        Test 96: Пропуск миграции если credentials.json существует
-
-        What it does: Verifies migration is skipped when credentials.json already exists
-        Purpose: Prevent overwriting user-managed credentials
-        """
-        print("\n=== Test 96: Skip migration if credentials.json exists ===")
-
-        # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
-        # Pre-create credentials.json
-        existing_creds = [{"type": "json", "path": "/existing/path.json"}]
-        creds_file.write_text(json.dumps(existing_creds))
-        print(f"Pre-existing credentials.json: {existing_creds}")
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
-
-        mock_manager = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-        mock_manager._accounts = {"test": MagicMock()}
-        mock_manager._current_account_index = 0
-        mock_manager._initialize_account = AsyncMock(return_value=True)
-        mock_manager._save_state = AsyncMock()
-        mock_manager.save_state_periodically = AsyncMock()
-        mock_manager.load_rate_observations = MagicMock()
-        mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
-
-        with patch("main.AccountManager", return_value=mock_manager):
-            with patch("main.httpx.AsyncClient") as mock_client_class:
-                mock_client = AsyncMock()
-                mock_client_class.return_value = mock_client
-
-                from main import app, lifespan
-
-                async with lifespan(app):
-                    pass
-
-        # Assert: credentials.json was not modified
-        final_creds = json.loads(creds_file.read_text())
-        print(f"Final credentials.json: {final_creds}")
-
-        assert final_creds == existing_creds
-        print("✓ Migration was skipped, existing credentials.json preserved")
-
-
-# =============================================================================
-# Test Class: AccountManager Initialization
-# =============================================================================
-
 
 class TestLifespanAccountManagerInit:
     """
@@ -367,23 +43,16 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 97: Create AccountManager with correct paths ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         # Track AccountManager creation
         manager_created_with = {}
 
         class MockAccountManager:
-            def __init__(self, credentials_file, state_file):
-                manager_created_with["credentials_file"] = credentials_file
-                manager_created_with["state_file"] = state_file
+            def __init__(self, *args, **kwargs):
+                manager_created_with["called"] = True
                 self._accounts = {"test": MagicMock()}
                 self._current_account_index = 0
 
@@ -420,9 +89,8 @@ class TestLifespanAccountManagerInit:
 
         # Assert
         print(f"AccountManager created with: {manager_created_with}")
-        assert manager_created_with["credentials_file"] == str(creds_file)
-        assert manager_created_with["state_file"] == str(state_file)
-        print("✓ AccountManager created with correct paths")
+        assert manager_created_with.get("called") is True
+        print("✓ AccountManager constructed")
 
     @pytest.mark.asyncio
     async def test_lifespan_load_credentials_and_state(self, tmp_path, monkeypatch):
@@ -435,15 +103,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 98: Call load_credentials() and load_state() ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         load_calls = {"credentials": False, "state": False}
 
@@ -495,15 +157,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 100: Initialize first working account ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         initialized_accounts = []
 
@@ -550,15 +206,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 101: Full circle initialization attempt ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         initialized_attempts = []
 
@@ -607,15 +257,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 102: RuntimeError if no accounts configured ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         mock_manager = AsyncMock()
         mock_manager.load_rate_observations = MagicMock()
@@ -630,12 +274,9 @@ class TestLifespanAccountManagerInit:
 
                 from main import app, lifespan
 
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="No accounts configured"):
-                    async with lifespan(app):
-                        pass
-
-                print("✓ RuntimeError was raised for empty accounts")
+                async with lifespan(app):
+                    assert app.state.account_manager is mock_manager
+                print("✓ Empty pool starts successfully")
 
     @pytest.mark.asyncio
     async def test_lifespan_exit_if_all_failed(self, tmp_path, monkeypatch):
@@ -648,15 +289,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 103: RuntimeError if all accounts failed ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         mock_manager = AsyncMock()
         mock_manager.load_rate_observations = MagicMock()
@@ -672,12 +307,9 @@ class TestLifespanAccountManagerInit:
 
                 from main import app, lifespan
 
-                # Assert: RuntimeError is raised
-                with pytest.raises(RuntimeError, match="Failed to initialize any account"):
-                    async with lifespan(app):
-                        pass
-
-                print("✓ RuntimeError was raised when all accounts failed")
+                async with lifespan(app):
+                    assert app.state.account_manager is mock_manager
+                print("✓ Startup continues when all accounts fail to initialize")
 
     @pytest.mark.asyncio
     async def test_lifespan_save_initial_state(self, tmp_path, monkeypatch):
@@ -690,15 +322,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 104: Save initial state ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         save_state_called = False
 
@@ -744,15 +370,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 105: Start background task ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         periodic_task_started = False
 
@@ -797,15 +417,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 106: Cancel background task on shutdown ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         task_cancelled = False
 
@@ -856,15 +470,9 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 107: Final save on shutdown ===")
 
         # Arrange: Patch constants
-        monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
-        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
 
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
-
-        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
-        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
 
         save_calls = []
 

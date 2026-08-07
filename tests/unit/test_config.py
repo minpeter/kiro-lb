@@ -498,75 +498,6 @@ class TestServerPortConfig:
             print(f"SERVER_PORT: {config_module.SERVER_PORT}")
             assert config_module.SERVER_PORT == 3000
 
-    def test_server_port_is_integer(self):
-        """
-        What it does: Verifies that SERVER_PORT is converted to integer.
-        Purpose: Ensure that string from environment is converted to int.
-        """
-        print("Setup: Setting SERVER_PORT=8080 (as string)...")
-
-        with patch.dict(os.environ, {"SERVER_PORT": "8080"}):
-            import importlib
-
-            import kiro.config as config_module
-
-            importlib.reload(config_module)
-
-            print(f"SERVER_PORT: {config_module.SERVER_PORT}")
-            print(f"Type: {type(config_module.SERVER_PORT)}")
-            assert isinstance(config_module.SERVER_PORT, int)
-            assert config_module.SERVER_PORT == 8080
-
-
-class TestKiroCliDbFileConfig:
-    """Tests for KIRO_CLI_DB_FILE configuration."""
-
-    def test_kiro_cli_db_file_config_exists(self):
-        """
-        What it does: Verifies that KIRO_CLI_DB_FILE constant exists.
-        Purpose: Ensure the config parameter is defined.
-        """
-        print("Setup: Importing config module...")
-        import importlib
-
-        import kiro.config as config_module
-
-        importlib.reload(config_module)
-
-        print("Verification: KIRO_CLI_DB_FILE exists...")
-        assert hasattr(config_module, "KIRO_CLI_DB_FILE")
-
-        print(f"KIRO_CLI_DB_FILE: '{config_module.KIRO_CLI_DB_FILE}'")
-        # Default should be empty string
-        assert isinstance(config_module.KIRO_CLI_DB_FILE, str)
-
-    def test_kiro_cli_db_file_from_environment(self):
-        """
-        What it does: Verifies loading KIRO_CLI_DB_FILE from environment variable.
-        Purpose: Ensure the value from environment is used and normalized.
-        """
-        print("Setup: Importing config module...")
-        import kiro.config as config_module
-
-        # Test that KIRO_CLI_DB_FILE is loaded and is a string
-        print(f"KIRO_CLI_DB_FILE: {config_module.KIRO_CLI_DB_FILE}")
-        assert isinstance(config_module.KIRO_CLI_DB_FILE, str)
-
-        # If value is set (not empty), verify it's a normalized path
-        if config_module.KIRO_CLI_DB_FILE:
-            # Path should be normalized (no raw ~ or forward slashes on Windows)
-            assert not config_module.KIRO_CLI_DB_FILE.startswith("~")
-            # Should be a valid path string (contains path separators or is absolute)
-            from pathlib import Path
-
-            path = Path(config_module.KIRO_CLI_DB_FILE)
-            # Path should be constructable (doesn't raise exception)
-            assert str(path) == config_module.KIRO_CLI_DB_FILE
-
-
-class TestFallbackModelsConfig:
-    """Tests for FALLBACK_MODELS configuration."""
-
     def test_fallback_models_exists(self):
         """
         What it does: Verifies that FALLBACK_MODELS constant exists.
@@ -955,44 +886,6 @@ class TestAccountSystemConfig:
     """Tests for Account System configuration constants."""
 
 
-
-    def test_accounts_config_file_default(self, monkeypatch):
-        """
-        What it does: Verifies ACCOUNTS_CONFIG_FILE defaults to credentials.json.
-        Purpose: Ensure default path for credentials configuration.
-        """
-        print("Setup: Removing ACCOUNTS_CONFIG_FILE from environment...")
-        monkeypatch.delenv("ACCOUNTS_CONFIG_FILE", raising=False)
-
-        print("Action: Reloading config module...")
-        from importlib import reload
-
-        import kiro.config as config_module
-
-        reload(config_module)
-
-        print(
-            f"Comparing ACCOUNTS_CONFIG_FILE: Expected 'credentials.json', Got '{config_module.ACCOUNTS_CONFIG_FILE}'"
-        )
-        assert config_module.ACCOUNTS_CONFIG_FILE == "credentials.json"
-
-    def test_accounts_state_file_default(self, monkeypatch):
-        """
-        What it does: Verifies ACCOUNTS_STATE_FILE defaults to state.json.
-        Purpose: Ensure default path for runtime state file.
-        """
-        print("Setup: Removing ACCOUNTS_STATE_FILE from environment...")
-        monkeypatch.delenv("ACCOUNTS_STATE_FILE", raising=False)
-
-        print("Action: Reloading config module...")
-        from importlib import reload
-
-        import kiro.config as config_module
-
-        reload(config_module)
-
-        print(f"Comparing ACCOUNTS_STATE_FILE: Expected 'state.json', Got '{config_module.ACCOUNTS_STATE_FILE}'")
-        assert config_module.ACCOUNTS_STATE_FILE == "state.json"
 
     def test_account_recovery_timeout_default(self, monkeypatch):
         """

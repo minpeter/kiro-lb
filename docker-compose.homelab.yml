@@ -17,10 +17,7 @@ name: kiro-lb
 x-kiro-environment: &kiro-environment
   SERVER_HOST: "0.0.0.0"
   SERVER_PORT: "8000"
-  ACCOUNTS_CONFIG_FILE: /app/data/credentials.json
-  ACCOUNTS_STATE_FILE: /app/data/state.json
   DASHBOARD_DATA_DIR: /app/data
-  SQLITE_READONLY: ${SQLITE_READONLY:-true}
   HOME: /tmp
   DEBUG_MODE: ${DEBUG_MODE:-off}
   DEBUG_CAPTURE_CONTENT: ${DEBUG_CAPTURE_CONTENT:-false}
@@ -43,7 +40,6 @@ x-kiro-app: &kiro-app
     # Shared data: only the ACTIVE slot should receive traffic (see deploy.sh).
     - ./data:/app/data
     - ./debug_logs:/app/debug_logs
-    - /home/minpeter/.local/share/kiro-cli:/host/kiro-cli:ro
   restart: unless-stopped
   healthcheck:
     test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]

@@ -17,47 +17,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
-    """
-    Read variable value from .env file without processing escape sequences.
-
-    This is necessary for correct handling of Windows paths where backslashes
-    (e.g., D:\\Projects\\file.json) may be incorrectly interpreted
-    as escape sequences (\\a -> bell, \\n -> newline, etc.).
-
-    Args:
-        var_name: Environment variable name
-        env_file: Path to .env file (default ".env")
-
-    Returns:
-        Raw variable value or None if not found
-    """
-    env_path = Path(env_file)
-    if not env_path.exists():
-        return None
-
-    try:
-        # Read file as-is, without interpretation
-        content = env_path.read_text(encoding="utf-8")
-
-        # Search for variable considering different formats:
-        # VAR="value" or VAR='value' or VAR=value
-        # Pattern captures value with or without quotes
-        pattern = rf'^{re.escape(var_name)}=(["\']?)(.+?)\1\s*$'
-
-        for line in content.splitlines():
-            line = line.strip()
-            if line.startswith("#") or not line:
-                continue
-
-            match = re.match(pattern, line)
-            if match:
-                # Return value as-is, without processing escape sequences
-                return match.group(2)
-    except Exception:
-        pass
-
-    return None
 
 
 # ==================================================================================================
@@ -105,49 +64,11 @@ PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "")
 VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
 
 # ==================================================================================================
-# Kiro API Credentials
+# Defaults (not env-seeded — accounts come from the dashboard / SQLite store)
 # ==================================================================================================
 
-# Refresh token for updating access token
-REFRESH_TOKEN: str = os.getenv("REFRESH_TOKEN", "")
-
-# Profile ARN for AWS CodeWhisperer
-PROFILE_ARN: str = os.getenv("PROFILE_ARN", "")
-
-# AWS SSO/auth region (default us-east-1)
-# This region is used for OIDC token refresh endpoint: https://oidc.{region}.amazonaws.com/token
-#
-# IMPORTANT: SSO region may differ from Q API region!
-# - SSO region: Where your AWS SSO/IAM Identity Center is configured
-# - API region: Where Q Developer API endpoints are available (q.{region}.amazonaws.com)
-#
-# The gateway automatically detects the correct API region from your credentials:
-# - SQLite (kiro-cli): Extracts from profile ARN in state table
-# - JSON (Kiro IDE): Uses region field from credentials file
-# - Environment variables: Falls back to this SSO region
-#
-# For manual override of API region, use KIRO_API_REGION environment variable.
-# See upstream discussion (kiro-gateway#132) on SSO vs API region
-REGION: str = os.getenv("KIRO_REGION", "us-east-1")
-
-# Path to credentials file (optional, alternative to .env)
-# Read directly from .env to avoid escape sequence issues on Windows
-# (e.g., \a in path D:\Projects\adolf is interpreted as bell character)
-_raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv("KIRO_CREDS_FILE", "")
-# Normalize path for cross-platform compatibility
-KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
-
-# Path to kiro-cli SQLite database (optional, for AWS SSO OIDC authentication)
-# Default location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
-# or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
-_raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
-KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
-
-# Disable SQLite write-back (read-only mode)
-# When enabled, gateway will only read from kiro-cli database without modifying it.
-# Useful when kiro-cli is actively managing tokens and you don't want gateway to interfere.
-# Default: false (write-back enabled)
-SQLITE_READONLY: bool = os.getenv("SQLITE_READONLY", "false").lower() in ("true", "1", "yes")
+# Fallback region when a credential entry does not carry its own region.
+REGION: str = "us-east-1"
 
 # ==================================================================================================
 # Kiro API URL Templates
@@ -506,11 +427,6 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "false").lower() in (
 # ==================================================================================================
 
 
-# Legacy gateway JSON import paths. SQLite is authoritative after first import;
-# these files are never written or deleted by the gateway.
-ACCOUNTS_CONFIG_FILE: str = os.getenv("ACCOUNTS_CONFIG_FILE", "credentials.json")
-
-ACCOUNTS_STATE_FILE: str = os.getenv("ACCOUNTS_STATE_FILE", "state.json")
 
 # ==================================================================================================
 # Circuit Breaker Settings

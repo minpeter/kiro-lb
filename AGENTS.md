@@ -272,6 +272,5 @@ multi-arch images on non-PR runs. Tool versions are pinned in
 - Truncated upstream turns must not be reported as clean finishes
   (`kiro/stop_reasons.py`).
 - The homelab compose mounts the host `kiro-cli` store read-only at
-  `/host/kiro-cli` with `SQLITE_READONLY=true`. The gateway must never write it.
 - 13 files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1363)
   and `kiro/account_manager.py` (1252) are the highest-risk edit sites.

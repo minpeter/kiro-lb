@@ -26,10 +26,10 @@ for how you obtain credentials and for compliance with applicable terms and law.
 
 ```bash
 cp .env.example .env
-# set PROXY_API_KEY and credential paths in .env / credentials.json
+# set PROXY_API_KEY and DASHBOARD_PASSWORD
 docker compose up -d --build
-# open http://localhost:8000
+# open http://localhost:8000 — add accounts via dashboard device login
 ```
 
-See `.env.example`, `credentials.json.example`, and `AGENTS.md` for configuration
-details. Issues: https://github.com/minpeter/kiro-lb-python/issues
+See `.env.example` and `AGENTS.md` for configuration details.
+Issues: https://github.com/minpeter/kiro-lb-python/issues
