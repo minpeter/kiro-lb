@@ -130,6 +130,11 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
 
     # 400 errors - depends on reason
     if status_code == 400:
+        # RECOVERABLE: Monthly quota exceeded - try next account
+        # AWS sends 400 (not 402) with reason=MONTHLY_REQUEST_COUNT
+        if reason == "MONTHLY_REQUEST_COUNT":
+            return ErrorType.RECOVERABLE
+
         # RECOVERABLE: Model not available on this account (subscription level)
         # Different accounts may have different model access based on their subscription
         if reason == "INVALID_MODEL_ID":
