@@ -12,6 +12,7 @@ import pytest
 from kiro.payload_guards import (
     check_payload_size,
     check_payload_tokens,
+    payload_token_limit_for_model,
     trim_payload_to_limit,
 )
 
@@ -382,27 +383,21 @@ class TestTokenUnitMatchesUpstream:
 
 
 class TestKoreanUnderOldByteCapIsRejectedByTokens:
-    """The regression this change exists to prevent.
+    """800k is the measured opus-5 last-pass; 1M Hangul is a size-reject."""
 
-    250k Hangul is ~750 KiB UTF-8, under KIRO_MAX_PAYLOAD_BYTES=1085435, so
-    today's byte guard sends it and Kiro answers CONTENT_LENGTH_EXCEEDS_THRESHOLD.
-    A token cap of 195000 must refuse it locally with the count in the message.
-    """
-
-    def test_korean_over_token_limit_raises_under_legacy_byte_cap(self, monkeypatch):
+    def test_korean_over_800k_raises_when_byte_cap_disabled(self, monkeypatch):
         import kiro.converters_core as cc
         from kiro.converters_core import UnifiedMessage
         from kiro.payload_guards import PayloadTooLargeError
 
         monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
-        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_TOKENS", 195000)
-        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1085435)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 0)
 
         with pytest.raises(PayloadTooLargeError) as exc_info:
             cc.build_kiro_payload(
-                messages=[UnifiedMessage(role="user", content="가" * 250000)],
+                messages=[UnifiedMessage(role="user", content="가" * 900000)],
                 system_prompt="",
-                model_id="auto",
+                model_id="claude-opus-5",
                 tools=None,
                 conversation_id="conv-korean-over-tokens",
                 profile_arn=None,
@@ -410,16 +405,15 @@ class TestKoreanUnderOldByteCapIsRejectedByTokens:
 
         error = exc_info.value
         assert "token" in str(error).lower()
-        assert "195000" in str(error)
-        assert error.limit_tokens == 195000
-        assert error.payload_tokens > 195000
+        assert "800000" in str(error)
+        assert error.limit_tokens == 800000
+        assert error.payload_tokens > 800000
 
     def test_korean_under_token_limit_does_not_raise(self, monkeypatch):
         import kiro.converters_core as cc
         from kiro.converters_core import UnifiedMessage
 
         monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
-        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_TOKENS", 195000)
         monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1085435)
 
         result = cc.build_kiro_payload(
@@ -434,7 +428,7 @@ class TestKoreanUnderOldByteCapIsRejectedByTokens:
 
     def test_trim_uses_tokens_for_hangul_history(self):
         history = []
-        for i in range(10):
+        for i in range(25):
             history.append({"userInputMessage": {"content": "가" * 40000}})
             history.append({"assistantResponseMessage": {"content": "나" * 1000}})
         payload = {
@@ -445,9 +439,9 @@ class TestKoreanUnderOldByteCapIsRejectedByTokens:
                 "history": history,
             }
         }
-        stats = trim_payload_to_limit(payload, max_tokens=195000)
+        stats = trim_payload_to_limit(payload, max_tokens=800000)
         assert stats.trimmed
-        assert stats.final_tokens <= 195000
+        assert stats.final_tokens <= 800000
         assert "userInputMessage" in payload["conversationState"]["history"][0]
 
     def test_legacy_byte_cap_still_honored(self, monkeypatch):
@@ -456,7 +450,6 @@ class TestKoreanUnderOldByteCapIsRejectedByTokens:
         from kiro.payload_guards import PayloadTooLargeError
 
         monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
-        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_TOKENS", 1_000_000)
         monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1000)
 
         with pytest.raises(PayloadTooLargeError) as exc_info:
@@ -470,3 +463,25 @@ class TestKoreanUnderOldByteCapIsRejectedByTokens:
             )
         assert exc_info.value.limit_bytes == 1000
         assert "byte" in str(exc_info.value).lower()
+
+    def test_cap_is_800k_for_haiku_and_opus(self):
+        assert payload_token_limit_for_model("claude-haiku-4.5") == 800000
+        assert payload_token_limit_for_model("claude-opus-5") == 800000
+
+    def test_opus5_allows_250k_hangul(self, monkeypatch):
+        import kiro.converters_core as cc
+        from kiro.converters_core import UnifiedMessage
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 0)
+
+        result = cc.build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="가" * 250000)],
+            system_prompt="",
+            model_id="claude-opus-5",
+            tools=None,
+            conversation_id="conv-opus-250k",
+            profile_arn=None,
+        )
+        content = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert content == "가" * 250000

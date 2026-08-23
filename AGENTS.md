@@ -160,8 +160,7 @@ trusting a pin here.
   (`kiro/streaming_openai.py:343`) or as a blanket multiplier on Latin text.
 - Measuring the payload guard as UTF-8 bytes of the JSON. Upstream
   `CONTENT_LENGTH_EXCEEDS_THRESHOLD` tracks cl100k tokens of the compact JSON
-  (~195k pass / ~200k fail on runtime.kiro.dev, 2026-08-23). A byte cap lets
-  ~250k Hangul syllables through and then fails with no numbers
+  (claude-opus-5: 800k Hangul pass / 1M fail on runtime.kiro.dev, 2026-08-23).
   (`payload_guards.py` `check_payload_tokens`).
 - Trusting the advertised context window. `claude-opus-4.7`, `claude-opus-4.8`,
   `claude-opus-5` and `claude-sonnet-5` report 1000000 but charge against 666667;

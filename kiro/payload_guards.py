@@ -5,9 +5,9 @@ Payload size guard for Kiro API requests.
 The Kiro API rejects oversized payloads with 400
 "Input content length exceeds threshold." (reason:
 CONTENT_LENGTH_EXCEEDS_THRESHOLD). That name is not a wire-byte count: on
-runtime.us-east-1.kiro.dev / generateAssistantResponse / claude-haiku-4.5 the
-reject boundary tracks cl100k tokens of the compact JSON (~195_000 pass,
-~200_000 fail). This module provides:
+runtime.us-east-1.kiro.dev / generateAssistantResponse the reject boundary
+tracks cl100k tokens of the compact JSON. claude-opus-5: 800_000 Hangul
+pass, 1_000_000 fail. This module provides:
 - Pre-flight token (and legacy byte) checking
 - Auto-trimming of oldest history entries to fit under the limit
 """
@@ -87,6 +87,18 @@ def check_payload_size(payload: Dict[str, Any]) -> int:
     bytes of a \\uXXXX escape instead of one cl100k token.
     """
     return len(_payload_json(payload).encode("utf-8"))
+
+
+def payload_token_limit_for_model(model_id: str) -> int:
+    """Return the pre-flight token cap.
+
+    Single default: 800_000, the largest claude-opus-5 Hangul JSON measured to
+    pass (1_000_000 returned CONTENT_LENGTH_EXCEEDS_THRESHOLD). Override with
+    KIRO_MAX_PAYLOAD_TOKENS.
+    """
+    from kiro.config import KIRO_MAX_PAYLOAD_TOKENS
+
+    return KIRO_MAX_PAYLOAD_TOKENS
 
 
 def check_payload_tokens(payload: Dict[str, Any]) -> int:

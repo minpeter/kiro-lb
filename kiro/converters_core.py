@@ -21,13 +21,13 @@ from loguru import logger
 from kiro.config import (
     AUTO_TRIM_PAYLOAD,
     KIRO_MAX_PAYLOAD_BYTES,
-    KIRO_MAX_PAYLOAD_TOKENS,
     TOOL_DESCRIPTION_MAX_LENGTH,
 )
 from kiro.payload_guards import (
     PayloadTooLargeError,
     check_payload_size,
     check_payload_tokens,
+    payload_token_limit_for_model,
     trim_payload_to_limit,
 )
 
@@ -1404,23 +1404,24 @@ def build_kiro_payload(
     # opt-in because it silently discards the oldest turns.
     payload_tokens = check_payload_tokens(payload)
     payload_size = check_payload_size(payload)
+    token_cap = payload_token_limit_for_model(model_id)
     byte_cap = KIRO_MAX_PAYLOAD_BYTES if KIRO_MAX_PAYLOAD_BYTES > 0 else None
-    over_tokens = payload_tokens > KIRO_MAX_PAYLOAD_TOKENS
+    over_tokens = payload_tokens > token_cap
     over_bytes = byte_cap is not None and payload_size > byte_cap
     if over_tokens or over_bytes:
         if AUTO_TRIM_PAYLOAD:
-            stats = trim_payload_to_limit(payload, max_bytes=byte_cap, max_tokens=KIRO_MAX_PAYLOAD_TOKENS)
+            stats = trim_payload_to_limit(payload, max_bytes=byte_cap, max_tokens=token_cap)
             logger.info(
                 f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
                 f"({stats.original_tokens} -> {stats.final_tokens} tokens, "
-                f"{stats.original_bytes} -> {stats.final_bytes} bytes)"
+                f"{stats.original_bytes} -> {stats.final_bytes} bytes, model={model_id}, cap={token_cap})"
             )
             final_tokens = stats.final_tokens
             final_bytes = stats.final_bytes
-            if final_tokens > KIRO_MAX_PAYLOAD_TOKENS:
+            if final_tokens > token_cap:
                 raise PayloadTooLargeError(
                     final_tokens,
-                    KIRO_MAX_PAYLOAD_TOKENS,
+                    token_cap,
                     unit="tokens",
                     payload_bytes=final_bytes,
                 )
@@ -1428,12 +1429,12 @@ def build_kiro_payload(
                 raise PayloadTooLargeError(final_bytes, byte_cap, unit="bytes", payload_tokens=final_tokens)
         elif over_tokens:
             logger.warning(
-                f"Payload {payload_tokens} tokens exceeds the {KIRO_MAX_PAYLOAD_TOKENS} token limit "
-                f"and AUTO_TRIM_PAYLOAD is disabled"
+                f"Payload {payload_tokens} tokens exceeds the {token_cap} token limit "
+                f"for {model_id} and AUTO_TRIM_PAYLOAD is disabled"
             )
             raise PayloadTooLargeError(
                 payload_tokens,
-                KIRO_MAX_PAYLOAD_TOKENS,
+                token_cap,
                 unit="tokens",
                 payload_bytes=payload_size,
             )

@@ -17,8 +17,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-
-
 # ==================================================================================================
 # Server Settings
 # ==================================================================================================
@@ -392,22 +390,16 @@ def _warn_timeout_configuration():
 # Payload Size Guard Settings
 # ==================================================================================================
 
-# Payload token limit. Measured 2026-08-23 against the live upstream
-# (runtime.us-east-1.kiro.dev / generateAssistantResponse / claude-haiku-4.5,
-# no tools) by bisecting CONTENT_LENGTH_EXCEEDS_THRESHOLD:
+# Payload token limit. Measured 2026-08-23 against runtime.us-east-1.kiro.dev
+# / generateAssistantResponse / no tools:
 #
-#   Hangul JSON chars   195,000 -> 200 (cl100k tokens ~= 195,000)
-#   Hangul JSON chars   200,000 -> 400
-#   repeated ASCII 'x'  1,550,000 chars (~193,750 cl100k) -> 200
-#   repeated ASCII 'x'  1,575,000 chars (~196,875 cl100k) -> 400
-#   cycling [a-z]       1,550,000 chars -> 400
-#   cycling [a-z]         180,000 chars -> 200
+#   claude-haiku-4.5 Hangul JSON  195,000 -> 200; 200,000 -> 400
+#   claude-opus-5    Hangul JSON  800,000 -> 200; 1,000,000 -> 400
+#                    CONTENT_LENGTH_EXCEEDS_THRESHOLD
 #
-# The same UTF-8 byte length therefore passes for 'x' and fails for Hangul, so
-# the limit is tokenizer units, not wire bytes and not Unicode scalars. The
-# default is the largest Hangul size measured to pass. Do not apply the Claude
-# CJK slope here: 가 is 1 cl100k token, and the slope would reject that pass.
-KIRO_MAX_PAYLOAD_TOKENS: int = int(os.getenv("KIRO_MAX_PAYLOAD_TOKENS", "195000"))
+# Default is the largest opus-5 size measured to pass. 1,000,000 Hangul is a
+# size-reject. Do not apply the Claude CJK slope: 가 is 1 cl100k token.
+KIRO_MAX_PAYLOAD_TOKENS: int = int(os.getenv("KIRO_MAX_PAYLOAD_TOKENS", "800000"))
 
 # Legacy UTF-8 byte cap. Still honored when set so existing deployments do not
 # silently widen. The 1,085,435 default was an ASCII-only bisect (1,085,435
@@ -439,7 +431,6 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "false").lower() in (
 # ==================================================================================================
 # Account System Settings
 # ==================================================================================================
-
 
 
 # ==================================================================================================
