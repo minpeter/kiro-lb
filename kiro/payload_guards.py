@@ -4,17 +4,17 @@ Payload size guard for Kiro API requests.
 
 The Kiro API rejects oversized payloads with 400
 "Input content length exceeds threshold." (reason:
-CONTENT_LENGTH_EXCEEDS_THRESHOLD). Measured boundary: 1,085,435 bytes pass and
-1,086,459 bytes fail. This module provides:
-- Pre-flight size checking
+CONTENT_LENGTH_EXCEEDS_THRESHOLD). That name is not a wire-byte count: on
+runtime.us-east-1.kiro.dev / generateAssistantResponse / claude-haiku-4.5 the
+reject boundary tracks cl100k tokens of the compact JSON (~195_000 pass,
+~200_000 fail). This module provides:
+- Pre-flight token (and legacy byte) checking
 - Auto-trimming of oldest history entries to fit under the limit
-
-Ported from sametakofficial's payload_guards.py, simplified.
 """
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -26,6 +26,8 @@ class PayloadTrimStats:
     original_entries: int
     final_entries: int
     trimmed: bool
+    original_tokens: int = 0
+    final_tokens: int = 0
 
 
 class PayloadTooLargeError(Exception):
@@ -38,27 +40,70 @@ class PayloadTooLargeError(Exception):
 
     payload_bytes: int
     limit_bytes: int
+    payload_tokens: int
+    limit_tokens: int
+    unit: str
 
-    def __init__(self, payload_bytes: int, limit_bytes: int) -> None:
-        self.payload_bytes = payload_bytes
-        self.limit_bytes = limit_bytes
+    def __init__(
+        self,
+        payload_size: int,
+        limit: int,
+        *,
+        unit: str = "bytes",
+        payload_bytes: Optional[int] = None,
+        payload_tokens: Optional[int] = None,
+    ) -> None:
+        self.unit = unit
+        if unit == "tokens":
+            self.payload_tokens = payload_size
+            self.limit_tokens = limit
+            self.payload_bytes = payload_bytes or 0
+            self.limit_bytes = 0
+            quantity = "tokens"
+            unit_word = "token"
+        else:
+            self.payload_bytes = payload_size
+            self.limit_bytes = limit
+            self.payload_tokens = payload_tokens or 0
+            self.limit_tokens = 0
+            quantity = "bytes"
+            unit_word = "byte"
         super().__init__(
-            f"Request payload is {payload_bytes} bytes, over the {limit_bytes} byte limit Kiro accepts. "
+            f"Request payload is {payload_size} {quantity}, over the {limit} {unit_word} limit Kiro accepts. "
             f"Shorten the conversation or send fewer tools. Set AUTO_TRIM_PAYLOAD=true to drop the "
             f"oldest history instead (this silently loses earlier context)."
         )
 
 
-def check_payload_size(payload: Dict[str, Any]) -> int:
-    """Return the serialized byte size of the payload as UTF-8 JSON.
+def _payload_json(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
-    ensure_ascii=False matches how the routes actually serialize the upstream
-    body (routes_openai.py, routes_anthropic.py). With the default True, a Hangul
-    character measures as the 6 bytes of a \\uXXXX escape instead of the 3 bytes
-    UTF-8 puts on the wire, so a Korean conversation was rejected at roughly half
-    the size Kiro accepts.
+
+def check_payload_size(payload: Dict[str, Any]) -> int:
+    """Return the serialized UTF-8 byte size of the compact JSON payload.
+
+    ensure_ascii=False matches the decoded Unicode the upstream tokenizer sees
+    after JSON parse. The default True would count a Hangul syllable as the 6
+    bytes of a \\uXXXX escape instead of one cl100k token.
     """
-    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return len(_payload_json(payload).encode("utf-8"))
+
+
+def check_payload_tokens(payload: Dict[str, Any]) -> int:
+    """Return cl100k tokens of the compact JSON, without the CJK slope correction.
+
+    Measured 2026-08-23 against runtime.us-east-1.kiro.dev generateAssistantResponse
+    (claude-haiku-4.5, no tools): a Hangul JSON of 195_000 chars returned 200, and
+    200_000 chars returned 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD. Repeated ASCII
+    ``x`` passed at 1_550_000 chars (~193_750 cl100k tokens) and failed at
+    1_575_000 (~196_875). Cycling ``abcdefghijklmnopqrstuvwxyz`` of 1_550_000
+    chars failed, so the limit is tokenizer units, not wire bytes or Unicode
+    scalars. The Claude CJK slope (1.15) is a local estimator for usage display
+    and must not be applied here: it would reject the Hangul payload that passed.
+    """
+    from kiro.tokenizer import count_tokens
+
+    return count_tokens(_payload_json(payload), apply_claude_correction=False, model="claude-haiku-4.5")
 
 
 def _strip_empty_tool_uses(history: list) -> None:
@@ -131,14 +176,27 @@ def _repair_orphaned_tool_results(history: list) -> None:
                 user_msg["content"] = current_content + marker
 
 
-def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTrimStats:
+def _over_limit(payload: Dict[str, Any], max_bytes: Optional[int], max_tokens: Optional[int]) -> bool:
+    if max_tokens is not None and check_payload_tokens(payload) > max_tokens:
+        return True
+    if max_bytes is not None and check_payload_size(payload) > max_bytes:
+        return True
+    return False
+
+
+def trim_payload_to_limit(
+    payload: Dict[str, Any],
+    max_bytes: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> PayloadTrimStats:
     """
-    Trim oldest history entries so the serialized payload fits under max_bytes.
+    Trim oldest history entries so the payload fits under max_tokens and/or max_bytes.
 
     Trims in user/assistant pairs (2 entries at a time), aligns start to
     userInputMessage, and repairs orphaned toolResults after trimming.
     """
     original_bytes = check_payload_size(payload)
+    original_tokens = check_payload_tokens(payload)
     history = payload.get("conversationState", {}).get("history")
 
     if not history:
@@ -148,6 +206,8 @@ def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTri
             original_entries=0,
             final_entries=0,
             trimmed=False,
+            original_tokens=original_tokens,
+            final_tokens=original_tokens,
         )
 
     original_entries = len(history)
@@ -156,7 +216,7 @@ def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTri
     _strip_empty_tool_uses(history)
 
     # Trim pairs from the beginning until under limit (keep at least 2 entries)
-    while len(history) > 2 and check_payload_size(payload) > max_bytes:
+    while len(history) > 2 and _over_limit(payload, max_bytes, max_tokens):
         # Remove 2 entries (a user/assistant pair)
         history.pop(0)
         history.pop(0)
@@ -168,10 +228,13 @@ def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTri
     _repair_orphaned_tool_results(history)
 
     final_bytes = check_payload_size(payload)
+    final_tokens = check_payload_tokens(payload)
     return PayloadTrimStats(
         original_bytes=original_bytes,
         final_bytes=final_bytes,
         original_entries=original_entries,
         final_entries=len(history),
         trimmed=original_entries != len(history),
+        original_tokens=original_tokens,
+        final_tokens=final_tokens,
     )

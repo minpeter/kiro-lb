@@ -392,14 +392,28 @@ def _warn_timeout_configuration():
 # Payload Size Guard Settings
 # ==================================================================================================
 
-# Payload size limit in bytes. Measured against the live upstream
-# (generateAssistantResponse, claude-haiku-4.5, ASCII history, no tools) by
-# bisecting the reject boundary: 1,085,435 bytes returned 200, and 1,086,459
-# bytes returned 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD. The default is the
-# largest size measured to pass. A later Korean probe pushed 2,070,175 UTF-8
-# bytes through successfully and failed only on the context window, so this
-# threshold is not a plain wire-byte count and the guard is deliberately
-# conservative for multi-byte text.
+# Payload token limit. Measured 2026-08-23 against the live upstream
+# (runtime.us-east-1.kiro.dev / generateAssistantResponse / claude-haiku-4.5,
+# no tools) by bisecting CONTENT_LENGTH_EXCEEDS_THRESHOLD:
+#
+#   Hangul JSON chars   195,000 -> 200 (cl100k tokens ~= 195,000)
+#   Hangul JSON chars   200,000 -> 400
+#   repeated ASCII 'x'  1,550,000 chars (~193,750 cl100k) -> 200
+#   repeated ASCII 'x'  1,575,000 chars (~196,875 cl100k) -> 400
+#   cycling [a-z]       1,550,000 chars -> 400
+#   cycling [a-z]         180,000 chars -> 200
+#
+# The same UTF-8 byte length therefore passes for 'x' and fails for Hangul, so
+# the limit is tokenizer units, not wire bytes and not Unicode scalars. The
+# default is the largest Hangul size measured to pass. Do not apply the Claude
+# CJK slope here: 가 is 1 cl100k token, and the slope would reject that pass.
+KIRO_MAX_PAYLOAD_TOKENS: int = int(os.getenv("KIRO_MAX_PAYLOAD_TOKENS", "195000"))
+
+# Legacy UTF-8 byte cap. Still honored when set so existing deployments do not
+# silently widen. The 1,085,435 default was an ASCII-only bisect (1,085,435
+# pass / 1,086,459 fail on an older host) and lets through ~250k-360k Hangul
+# characters that the upstream then rejects with no numbers. Prefer
+# KIRO_MAX_PAYLOAD_TOKENS. Set KIRO_MAX_PAYLOAD_BYTES=0 to disable this cap.
 KIRO_MAX_PAYLOAD_BYTES: int = int(os.getenv("KIRO_MAX_PAYLOAD_BYTES", "1085435"))
 
 # Auto-trim payload when over limit (default: false - disabled)

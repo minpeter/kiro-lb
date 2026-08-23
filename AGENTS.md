@@ -158,10 +158,11 @@ trusting a pin here.
   converted into a token count, and that conversion already runs.
 - Applying the Claude token-correction coefficient to `prompt_tokens`
   (`kiro/streaming_openai.py:343`) or as a blanket multiplier on Latin text.
-- Measuring the payload guard with `json.dumps` defaults. `check_payload_size`
-  uses `ensure_ascii=False` because that is what the routes send; with escapes a
-  Hangul character measures 6 bytes instead of 3 and Korean conversations were
-  rejected at half the accepted size (`payload_guards.py:52`).
+- Measuring the payload guard as UTF-8 bytes of the JSON. Upstream
+  `CONTENT_LENGTH_EXCEEDS_THRESHOLD` tracks cl100k tokens of the compact JSON
+  (~195k pass / ~200k fail on runtime.kiro.dev, 2026-08-23). A byte cap lets
+  ~250k Hangul syllables through and then fails with no numbers
+  (`payload_guards.py` `check_payload_tokens`).
 - Trusting the advertised context window. `claude-opus-4.7`, `claude-opus-4.8`,
   `claude-opus-5` and `claude-sonnet-5` report 1000000 but charge against 666667;
   `FALLBACK_MODELS` (`config.py:294`) deliberately carries the measured value.
@@ -264,8 +265,9 @@ multi-arch images on non-PR runs. Tool versions are pinned in
   (`converters_openai.py:149`); dropping it makes Kiro answer `REQUEST_BODY_INVALID`.
 - The oversize rejection is `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, which names
   neither the size nor the limit; `PayloadTooLargeError` fails locally instead so
-  both numbers reach the caller. "Improperly formed request" is Kiro's separate
-  catch-all validation error — treat it as a signal to diff the emitted payload.
+  both numbers reach the caller. The unit is cl100k tokens, not bytes.
+  "Improperly formed request" is Kiro's separate catch-all validation error —
+  treat it as a signal to diff the emitted payload.
 - The Docker image bakes the tiktoken vocabularies at build time
   (`TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache`). Without them a network-restricted
   container silently degrades to character-based estimation.

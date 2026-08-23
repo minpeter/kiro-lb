@@ -42,7 +42,7 @@ No module has been added or removed since `a9fadd7`; 37 of the 39 were modified.
 | Adjust finish/stop mapping | `stop_reasons.py` |
 | Token counting | `tokenizer.py` (`resolve_token_profile`), `streaming_core.py:calculate_tokens_from_context_usage` |
 | Model list + per-model limits | `routes_openai.py:203` (`_resolve_model_limits` at `:180`) |
-| Payload size limit | `payload_guards.py`, `config.py:482` (`KIRO_MAX_PAYLOAD_BYTES`) |
+| Payload size limit | `payload_guards.py`, `config.py` (`KIRO_MAX_PAYLOAD_TOKENS`, legacy `KIRO_MAX_PAYLOAD_BYTES`) |
 | Token usage rows (key/account/model) | `usage_tracking.py` -> `dashboard.py` (`flush_key_model_usage`) |
 | Web search emulation | `mcp_tools.py` (transport shim, not a tool framework) |
 | Extended thinking budget rules | `native_thinking.py` (min 1024; unknown fields rejected) |
