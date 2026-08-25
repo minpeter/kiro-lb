@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlencode
 
 import httpx
 
 from kiro.account_manager import Account
+from kiro.auth import AuthType
+from kiro.config import KIRO_BUILDER_ID_PROFILE_ARN
 from kiro.utils import get_kiro_headers
 
 
@@ -48,20 +49,27 @@ async def fetch_account_usage(account: Account) -> dict[str, Any]:
 
     auth = account.auth_manager
     token = await auth.get_access_token()
-    params = {
+    params: dict[str, str] = {
         "origin": "AI_EDITOR",
-        "resourceType": "AGENTIC_REQUEST",
         "isEmailRequired": "true",
     }
-    if auth.profile_arn:
-        params["profileArn"] = auth.profile_arn
-    url = f"https://q.{_usage_region(account)}.amazonaws.com/getUsageLimits?{urlencode(params)}"
+    body: dict[str, str | bool] = {
+        "origin": "AI_EDITOR",
+        "isEmailRequired": True,
+    }
+    profile_arn = auth.profile_arn
+    if profile_arn is None and auth.auth_type == AuthType.AWS_SSO_OIDC:
+        profile_arn = KIRO_BUILDER_ID_PROFILE_ARN
+    if profile_arn:
+        params["profileArn"] = profile_arn
+        body["profileArn"] = profile_arn
+    url = f"https://management.{_usage_region(account)}.kiro.dev/"
     headers = get_kiro_headers(auth, token)
-    headers.pop("x-amz-target", None)
+    headers["x-amz-target"] = "AmazonCodeWhispererService.GetUsageLimits"
     headers["Accept"] = "application/json"
 
     async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(url, headers=headers)
+        response = await client.post(url, params=params, json=body, headers=headers)
     response.raise_for_status()
     payload = response.json()
 

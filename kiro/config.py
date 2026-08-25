@@ -100,6 +100,11 @@ KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # alone is not the test.
 KIRO_BUILDER_ID_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
 
+# Builder ID management and generation requests in Kiro CLI 2.19.1 carry this
+# service profile even though the local credential has no account-specific ARN.
+# Keep it request-scoped: it is not persisted as the account's own profile.
+KIRO_BUILDER_ID_PROFILE_ARN: str = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
