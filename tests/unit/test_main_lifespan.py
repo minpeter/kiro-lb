@@ -11,17 +11,13 @@ Tests cover:
 """
 
 import asyncio
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro.store import load_account_sources
-
 # =============================================================================
 # Test Class: Legacy Fallback (Migration)
 # =============================================================================
-
 
 
 class TestLifespanAccountManagerInit:
@@ -43,9 +39,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 97: Create AccountManager with correct paths ===")
 
         # Arrange: Patch constants
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         # Track AccountManager creation
         manager_created_with = {}
@@ -104,9 +97,6 @@ class TestLifespanAccountManagerInit:
 
         # Arrange: Patch constants
 
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
         load_calls = {"credentials": False, "state": False}
 
         mock_manager = AsyncMock()
@@ -146,7 +136,6 @@ class TestLifespanAccountManagerInit:
         print("✓ load_credentials() and load_state() were called")
 
     @pytest.mark.asyncio
-
     async def test_lifespan_initialize_first_working_account(self, tmp_path, monkeypatch):
         """
         Test 100: Инициализация первого рабочего аккаунта
@@ -157,9 +146,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 100: Initialize first working account ===")
 
         # Arrange: Patch constants
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         initialized_accounts = []
 
@@ -206,9 +192,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 101: Full circle initialization attempt ===")
 
         # Arrange: Patch constants
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         initialized_attempts = []
 
@@ -258,9 +241,6 @@ class TestLifespanAccountManagerInit:
 
         # Arrange: Patch constants
 
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
         mock_manager = AsyncMock()
         mock_manager.load_rate_observations = MagicMock()
         mock_manager.drain_unsaved_rate_observations = MagicMock(return_value=[])
@@ -289,9 +269,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 103: RuntimeError if all accounts failed ===")
 
         # Arrange: Patch constants
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         mock_manager = AsyncMock()
         mock_manager.load_rate_observations = MagicMock()
@@ -322,9 +299,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 104: Save initial state ===")
 
         # Arrange: Patch constants
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         save_state_called = False
 
@@ -371,9 +345,6 @@ class TestLifespanAccountManagerInit:
 
         # Arrange: Patch constants
 
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
-
         periodic_task_started = False
 
         mock_manager = AsyncMock()
@@ -417,9 +388,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 106: Cancel background task on shutdown ===")
 
         # Arrange: Patch constants
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         task_cancelled = False
 
@@ -470,9 +438,6 @@ class TestLifespanAccountManagerInit:
         print("\n=== Test 107: Final save on shutdown ===")
 
         # Arrange: Patch constants
-
-        creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         save_calls = []
 

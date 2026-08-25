@@ -169,6 +169,7 @@ def test_imports_legacy_recovery_record_once(tmp_path):
     )
 
     from tests.conftest import seed_account_sources
+
     seed_account_sources([])  # clear the default mock seed
     assert store.import_legacy_files("missing.json", "missing-state.json", str(recovery)) is True
     assert store.load_account_sources() == original_entries

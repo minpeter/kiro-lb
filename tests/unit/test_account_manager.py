@@ -109,6 +109,7 @@ class TestAccountManagerLoadCredentials:
         credentials = [{"type": "json", "path": str(test_json), "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -138,6 +139,7 @@ class TestAccountManagerLoadCredentials:
         credentials = [{"type": "sqlite", "path": temp_sqlite_db, "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -174,6 +176,7 @@ class TestAccountManagerLoadCredentials:
         ]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         # Create state file to avoid errors
@@ -223,6 +226,7 @@ class TestAccountManagerLoadCredentials:
         credentials = [{"type": "json", "path": str(folder), "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -267,6 +271,7 @@ class TestAccountManagerLoadCredentials:
         credentials = [{"type": "json", "path": str(folder), "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -305,6 +310,7 @@ class TestAccountManagerLoadCredentials:
         ]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -338,6 +344,7 @@ class TestAccountManagerLoadCredentials:
         ]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -426,6 +433,7 @@ class TestAccountManagerLoadCredentials:
 
         # Arrange
         from tests.conftest import seed_account_sources
+
         seed_account_sources([])
         manager = AccountManager()
 
@@ -457,8 +465,10 @@ class TestAccountManagerLoadState:
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(sample_state_with_data))
         from kiro.store import save_runtime_state
+
         save_runtime_state(sample_state_with_data, ungated=True)
         from kiro.store import save_runtime_state
+
         save_runtime_state(sample_state_with_data, ungated=True)
 
         # Create accounts first
@@ -468,6 +478,7 @@ class TestAccountManagerLoadState:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -499,6 +510,7 @@ class TestAccountManagerLoadState:
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(state_data))
         from kiro.store import save_runtime_state
+
         save_runtime_state(state_data, ungated=True)
 
         manager = AccountManager()
@@ -531,6 +543,7 @@ class TestAccountManagerLoadState:
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(state_data))
         from kiro.store import save_runtime_state
+
         save_runtime_state(state_data, ungated=True)
 
         manager = AccountManager()
@@ -576,11 +589,13 @@ class TestAccountManagerLoadState:
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(state_data))
         from kiro.store import save_runtime_state
+
         save_runtime_state(state_data, ungated=True)
 
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -717,6 +732,7 @@ class TestAccountManagerInitializeAccount:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -765,6 +781,7 @@ class TestAccountManagerInitializeAccount:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -814,6 +831,7 @@ class TestAccountManagerGetNextAccount:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -1148,7 +1166,6 @@ class TestAccountManagerQuotaExclusion:
         """
         print("\n=== Test: quarantine is persisted across restart ===")
 
-        creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
         account_id = "/creds/account0.json"
 
@@ -1334,6 +1351,7 @@ class TestAccountManagerReportSuccess:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -1384,6 +1402,7 @@ class TestAccountManagerReportSuccess:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -1439,6 +1458,7 @@ class TestAccountManagerReportFailure:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -1486,6 +1506,7 @@ class TestAccountManagerReportFailure:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -1584,6 +1605,7 @@ class TestAccountManagerGetFirstAccount:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
@@ -1654,6 +1676,7 @@ class TestAccountManagerGetAllAvailableModels:
         creds_file = tmp_path / "credentials.json"
         creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True}]))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(json.loads(creds_file.read_text()))
 
         manager = AccountManager()
