@@ -13,7 +13,11 @@ interface Harness {
   latestAccounts: Account[];
   latestOverview?: Overview;
   latestRate?: RequestRate;
+  latestAuth?: boolean;
+  latestConnectionError?: string | null;
+  latestActionError?: string | null;
   timers: Timer[];
+  timerDelays: number[];
   api: {
     accounts: ReturnType<typeof vi.fn>;
     apiKeys: ReturnType<typeof vi.fn>;
@@ -34,7 +38,11 @@ const harness = vi.hoisted((): Harness => ({
   latestAccounts: [],
   latestOverview: undefined,
   latestRate: undefined,
+  latestAuth: undefined,
+  latestConnectionError: undefined,
+  latestActionError: undefined,
   timers: [],
+  timerDelays: [],
   api: {
     accounts: vi.fn(),
     apiKeys: vi.fn(),
@@ -63,6 +71,10 @@ const STATE_RATE = 6;
 // polls once authenticated. Previously the literal 12, which the new
 // accountTokenUsage state shifted to 13.
 const STATE_IS_AUTHENTICATED = 13;
+// New states are appended at the end of the hook precisely so the indices
+// above stay put.
+const STATE_CONNECTION_ERROR = 16;
+const STATE_ACTION_ERROR = 17;
 
 vi.mock("react", () => {
   const useEffect = (effect: Effect) => {
@@ -76,12 +88,32 @@ vi.mock("react", () => {
       if (index === STATE_OVERVIEW) harness.latestOverview = value as Overview;
       if (index === STATE_ACCOUNTS && isAccountArray(value)) harness.latestAccounts = value;
       if (index === STATE_RATE) harness.latestRate = value as RequestRate;
+      if (index === STATE_IS_AUTHENTICATED) harness.latestAuth = value as boolean;
+      if (index === STATE_CONNECTION_ERROR) harness.latestConnectionError = value as string | null;
+      if (index === STATE_ACTION_ERROR) harness.latestActionError = value as string | null;
     }];
   }
   return { useCallback: <T,>(callback: T) => callback, useEffect, useRef, useState };
 });
 
-vi.mock("./api", () => ({ AUTH_REQUIRED: "Authentication required", dashboardApi: harness.api }));
+const mocked = vi.hoisted(() => {
+  class DashboardApiError extends Error {
+    readonly status: number;
+    constructor(message: string, status: number) {
+      super(message);
+      this.name = "DashboardApiError";
+      this.status = status;
+    }
+  }
+  return { DashboardApiError };
+});
+const { DashboardApiError } = mocked;
+
+vi.mock("./api", () => ({
+  AUTH_REQUIRED: "Authentication required",
+  DashboardApiError: mocked.DashboardApiError,
+  dashboardApi: harness.api,
+}));
 
 import { useDashboard } from "./use-dashboard";
 
@@ -134,14 +166,19 @@ describe("useDashboard", () => {
     harness.latestAccounts = [];
     harness.latestOverview = undefined;
     harness.latestRate = undefined;
+    harness.latestAuth = undefined;
+    harness.latestConnectionError = undefined;
+    harness.latestActionError = undefined;
     harness.timers = [];
+    harness.timerDelays = [];
     Object.values(harness.api).forEach((method) => method.mockReset());
     harness.api.requestLogs.mockResolvedValue(logs);
     vi.stubGlobal("document", { visibilityState: "visible" });
     vi.stubGlobal("window", {
       clearTimeout: vi.fn(),
-      setTimeout: (callback: Timer) => {
+      setTimeout: (callback: Timer, delay?: number) => {
         harness.timers.push(callback);
+        harness.timerDelays.push(delay ?? 0);
         return harness.timers.length;
       },
     });
@@ -195,5 +232,93 @@ describe("useDashboard", () => {
       overviewRequests: harness.latestOverview?.requests24h,
       rateBuckets: harness.latestRate?.bucketStarts,
     }).toEqual({ accountIds: ["survivor"], overviewRequests: 2, rateBuckets: [2] });
+  });
+
+  const healthyOverview = (): Overview => ({
+    proxy: { status: "healthy", uptimeSeconds: 1 },
+    requests24h: 1,
+    successes24h: 1,
+    averageLatencyMs: 1,
+    accounts: { total: 1, initialized: 1 },
+    models: 1,
+  });
+
+  const mockHealthyLoad = () => {
+    harness.api.overview.mockResolvedValue(healthyOverview());
+    harness.api.accounts.mockResolvedValue(accounts(["a"]));
+    harness.api.apiKeys.mockResolvedValue({ apiKeys: [] });
+    harness.api.requestRate.mockResolvedValue({ bucketSeconds: 5, bucketStarts: [1], rateWindowSeconds: 900, accounts: [] });
+    harness.api.keyUsage.mockResolvedValue({ usage: {} });
+    harness.api.accountTokenUsage.mockResolvedValue({ usage: {} });
+  };
+
+  it("keeps data and reports a connection error on a non-401 failure, then clears it on recovery", async () => {
+    mockHealthyLoad();
+    const dashboard = useDashboard();
+    await awaitCompletion(dashboard.reload(), 1_000);
+    expect(harness.latestOverview?.requests24h).toBe(1);
+
+    harness.api.overview.mockRejectedValue(new DashboardApiError("upstream exploded", 500));
+    await awaitCompletion(dashboard.reload(), 1_000);
+
+    expect({
+      overviewKept: harness.latestOverview?.requests24h,
+      accountsKept: harness.latestAccounts.map((account) => account.id),
+      deAuthed: harness.latestAuth,
+      connectionError: harness.latestConnectionError,
+    }).toEqual({ overviewKept: 1, accountsKept: ["a"], deAuthed: true, connectionError: "upstream exploded" });
+
+    harness.api.overview.mockResolvedValue(healthyOverview());
+    await awaitCompletion(dashboard.reload(), 1_000);
+    expect(harness.latestConnectionError).toBeNull();
+  });
+
+  it("de-authenticates and clears data only on a 401 failure", async () => {
+    mockHealthyLoad();
+    const dashboard = useDashboard();
+    await awaitCompletion(dashboard.reload(), 1_000);
+
+    harness.api.overview.mockRejectedValue(new DashboardApiError("Dashboard authentication required", 401));
+    await awaitCompletion(dashboard.reload(), 1_000);
+
+    expect({ deAuthed: harness.latestAuth, overviewCleared: harness.latestOverview }).toEqual({
+      deAuthed: false,
+      overviewCleared: undefined,
+    });
+  });
+
+  it("surfaces a failed action instead of throwing, and still resyncs", async () => {
+    mockHealthyLoad();
+    harness.api.deleteAccount.mockRejectedValue(new DashboardApiError("delete rejected", 500));
+    const dashboard = useDashboard();
+    await awaitCompletion(dashboard.reload(), 1_000);
+    const overviewCallsBefore = harness.api.overview.mock.calls.length;
+
+    await awaitCompletion(dashboard.runAction(() => harness.api.deleteAccount("a")), 1_000);
+
+    expect({
+      actionError: harness.latestActionError,
+      resynced: harness.api.overview.mock.calls.length > overviewCallsBefore,
+    }).toEqual({ actionError: "delete rejected", resynced: true });
+  });
+
+  it("backs off the live poll while failing and resets the cadence on recovery", async () => {
+    mockHealthyLoad();
+    const dashboard = useDashboard();
+    await awaitCompletion(dashboard.reload(), 1_000);
+
+    harness.effects[1]!();
+    expect(harness.timerDelays.at(-1)).toBe(1_000);
+
+    harness.api.overview.mockRejectedValue(new DashboardApiError("blip", 502));
+    await awaitCompletion(harness.timers.at(-1)!(), 1_000);
+    expect(harness.timerDelays.at(-1)).toBe(2_000);
+
+    await awaitCompletion(harness.timers.at(-1)!(), 1_000);
+    expect(harness.timerDelays.at(-1)).toBe(4_000);
+
+    harness.api.overview.mockResolvedValue(healthyOverview());
+    await awaitCompletion(harness.timers.at(-1)!(), 1_000);
+    expect(harness.timerDelays.at(-1)).toBe(1_000);
   });
 });
