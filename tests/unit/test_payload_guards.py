@@ -327,6 +327,23 @@ class TestOversizedPayloadWithoutAutoTrim:
         assert history[0]["userInputMessage"]["content"] == "recent question"
         assert result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"] == "current"
 
+    def test_last_oversized_history_pair_is_removed_by_builder(self, monkeypatch):
+        import kiro.converters_core as cc
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", True)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1000)
+        messages = [
+            cc.UnifiedMessage(role="user", content="old " + "x" * 3000),
+            cc.UnifiedMessage(role="assistant", content="old answer"),
+            cc.UnifiedMessage(role="user", content="current"),
+        ]
+
+        result = cc.build_kiro_payload(messages, "", "auto", None, "conv-full-trim", None)
+
+        conversation_state = result.payload["conversationState"]
+        assert "history" not in conversation_state
+        assert conversation_state["currentMessage"]["userInputMessage"]["content"] == "current"
+
     def test_under_limit_payload_is_untouched_when_trim_disabled(self, monkeypatch):
         import kiro.converters_core as cc
         from kiro.payload_guards import check_payload_size
