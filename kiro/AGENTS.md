@@ -162,8 +162,9 @@ No module has been added or removed since `a9fadd7`; 37 of the 39 were modified.
 - Exposing the device code or token in a device-flow response; `DeviceFlow.view`
   is the only client-facing shape (`device_login.py:82`). Registration discards
   the tokens either way (`dashboard.py:654`).
-- Giving a Builder ID account the global fallback profile ARN
-  (`routes_openai.py:371`, `routes_anthropic.py:255`).
+- Persisting Kiro CLI's Builder ID fallback profile as the account's own
+  profile. Generation and management requests use it only as a request-scoped
+  service routing value; the credential remains profile-less.
 - Adding a field to a protocol's usage object that the protocol does not define.
   `credits_used` on OpenAI is the one sanctioned extension.
 - Counting tokens with a hardcoded encoding or a blanket correction factor. Go

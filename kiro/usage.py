@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlencode
 
 import httpx
 
@@ -48,25 +47,35 @@ async def fetch_account_usage(account: Account) -> dict[str, Any]:
 
     auth = account.auth_manager
     token = await auth.get_access_token()
-    params = {
+    params: dict[str, str] = {
         "origin": "AI_EDITOR",
-        "resourceType": "AGENTIC_REQUEST",
         "isEmailRequired": "true",
     }
-    if auth.profile_arn:
-        params["profileArn"] = auth.profile_arn
-    url = f"https://q.{_usage_region(account)}.amazonaws.com/getUsageLimits?{urlencode(params)}"
+    body: dict[str, str | bool] = {
+        "origin": "AI_EDITOR",
+        "isEmailRequired": True,
+    }
+    profile_arn = auth.request_profile_arn
+    if profile_arn:
+        params["profileArn"] = profile_arn
+        body["profileArn"] = profile_arn
+    # Kiro CLI 2.19.1 duplicates these modeled fields in the query and AWS JSON
+    # body. Preserve that observed wire contract rather than "simplifying" it.
+    url = f"https://management.{_usage_region(account)}.kiro.dev/"
     headers = get_kiro_headers(auth, token)
-    headers.pop("x-amz-target", None)
+    headers["x-amz-target"] = "AmazonCodeWhispererService.GetUsageLimits"
     headers["Accept"] = "application/json"
 
     async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(url, headers=headers)
+        response = await client.post(url, params=params, json=body, headers=headers)
     response.raise_for_status()
     payload = response.json()
 
     breakdowns = payload.get("usageBreakdownList") or []
-    breakdown = breakdowns[0] if breakdowns else {}
+    breakdown = next(
+        (entry for entry in breakdowns if entry.get("resourceType") == "AGENTIC_REQUEST"),
+        breakdowns[0] if breakdowns else {},
+    )
     subscription = payload.get("subscriptionInfo") or {}
     overage = payload.get("overageConfiguration") or {}
     # The request asks for the identity block (isEmailRequired), which is the

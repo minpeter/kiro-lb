@@ -9,10 +9,12 @@ never does.
 
 import asyncio
 import importlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from httpx import AsyncClient, MockTransport, Request, Response
 
 from kiro.account_manager import Account
 from kiro.usage import fetch_account_usage
@@ -48,6 +50,7 @@ def _account_with_auth() -> Account:
     account.auth_manager = SimpleNamespace(
         get_access_token=AsyncMock(return_value="mock-token"),
         profile_arn="arn:aws:codewhisperer:us-east-1:123456789012:profile/example",
+        request_profile_arn="arn:aws:codewhisperer:us-east-1:123456789012:profile/example",
         api_host="https://runtime.us-east-1.kiro.dev",
         region="us-east-1",
         fingerprint="mock-fingerprint",
@@ -60,7 +63,7 @@ def _fetch(payload: dict) -> dict:
     response.raise_for_status = MagicMock()
     response.json.return_value = payload
     client = AsyncMock()
-    client.get = AsyncMock(return_value=response)
+    client.post = AsyncMock(return_value=response)
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
     with patch("kiro.usage.httpx.AsyncClient", return_value=client):
@@ -69,6 +72,63 @@ def _fetch(payload: dict) -> dict:
 
 def test_upstream_email_is_normalized_into_the_usage_summary():
     assert _fetch(_UPSTREAM_PAYLOAD)["email"] == "pool-account@example.test"
+
+
+def test_usage_request_matches_latest_cli_management_contract():
+    captured = {}
+
+    def handler(request: Request) -> Response:
+        captured.update(
+            method=request.method,
+            host=request.url.host,
+            path=request.url.path,
+            query_keys=sorted(request.url.params.keys()),
+            body=json.loads(request.content) if request.content else None,
+            target=request.headers.get("x-amz-target"),
+        )
+        return Response(200, json=_UPSTREAM_PAYLOAD)
+
+    client = AsyncClient(transport=MockTransport(handler))
+    with patch("kiro.usage.httpx.AsyncClient", return_value=client):
+        usage = asyncio.run(fetch_account_usage(_account_with_auth()))
+
+    assert captured == {
+        "method": "POST",
+        "host": "management.us-east-1.kiro.dev",
+        "path": "/",
+        "query_keys": ["isEmailRequired", "origin", "profileArn"],
+        "body": {
+            "isEmailRequired": True,
+            "origin": "AI_EDITOR",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/example",
+        },
+        "target": "AmazonCodeWhispererService.GetUsageLimits",
+    }
+    assert usage["email"] == "pool-account@example.test"
+
+
+def test_builder_id_usage_request_uses_latest_cli_fallback_profile():
+    captured = {}
+
+    def handler(request: Request) -> Response:
+        captured.update(
+            query_profile=request.url.params.get("profileArn"),
+            body_profile=json.loads(request.content).get("profileArn"),
+        )
+        return Response(200, json=_UPSTREAM_PAYLOAD)
+
+    account = _account_with_auth()
+    account.auth_manager.profile_arn = None
+    account.auth_manager.request_profile_arn = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+    account.auth_manager.api_host = "https://q.us-east-1.amazonaws.com"
+    client = AsyncClient(transport=MockTransport(handler))
+    with patch("kiro.usage.httpx.AsyncClient", return_value=client):
+        asyncio.run(fetch_account_usage(account))
+
+    assert captured == {
+        "query_profile": "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+        "body_profile": "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+    }
 
 
 def test_upstream_user_id_is_not_exposed():
@@ -88,6 +148,32 @@ def test_blank_upstream_email_is_stored_as_absent():
     payload = {**_UPSTREAM_PAYLOAD, "userInfo": {"email": "", "userId": "d-1"}}
 
     assert _fetch(payload)["email"] is None
+
+
+def test_agentic_breakdown_is_selected_when_upstream_returns_multiple_resources():
+    payload = {
+        **_UPSTREAM_PAYLOAD,
+        "usageBreakdownList": [
+            {
+                "resourceType": "CREDIT",
+                "currentUsageWithPrecision": 900.0,
+                "usageLimitWithPrecision": 1000.0,
+                "unit": "CREDITS",
+            },
+            {
+                "resourceType": "AGENTIC_REQUEST",
+                "currentUsageWithPrecision": 0.0,
+                "usageLimitWithPrecision": 2000.0,
+                "unit": "INVOCATIONS",
+            },
+        ],
+    }
+
+    usage = _fetch(payload)
+
+    assert usage["resourceType"] == "AGENTIC_REQUEST"
+    assert usage["currentUsage"] == 0.0
+    assert usage["usageLimit"] == 2000.0
 
 
 def test_refreshed_email_reaches_the_account_view(dashboard):

@@ -7,15 +7,12 @@ Loads environment variables and provides typed access to them.
 """
 
 import os
-import re
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-
 
 # ==================================================================================================
 # Server Settings
@@ -87,16 +84,14 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
-# Host for accounts that reach Q Developer without a profile, which in practice
-# means AWS Builder ID (SSO OIDC auth that has no profile ARN). The runtime host
-# rejects those with 400 "profileArn is required for this request", and Builder ID
-# cannot obtain a profile at all: ListAvailableProfiles answers 403 and an empty
-# profileArn fails as REQUEST_BODY_INVALID.
-#
-# Social accounts are a different case: they normally carry a profile, but one
-# configured without it still belongs on the runtime host, so absence of a profile
-# alone is not the test.
+# Legacy Q management host for Builder ID accounts. Current generation requests
+# use the runtime host with the request-scoped profile below.
 KIRO_BUILDER_ID_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+
+# Builder ID management and generation requests in Kiro CLI 2.19.1 carry this
+# service profile even though the local credential has no account-specific ARN.
+# Keep it request-scoped: it is not persisted as the account's own profile.
+KIRO_BUILDER_ID_PROFILE_ARN: str = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 
 # ==================================================================================================
 # Token Settings
@@ -432,7 +427,6 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "false").lower() in (
 # Account System Settings
 # ==================================================================================================
 
-
 # ==================================================================================================
 # Circuit Breaker Settings
 # ==================================================================================================
@@ -599,9 +593,8 @@ def get_aws_sso_oidc_url(region: str) -> str:
 
 
 def get_kiro_api_host(region: str, is_builder_id: bool = False) -> str:
-    """Return the API host for the region, routing Builder ID to Q Developer."""
-    template = KIRO_BUILDER_ID_HOST_TEMPLATE if is_builder_id else KIRO_API_HOST_TEMPLATE
-    return template.format(region=region)
+    """Return the runtime generation host used by current Kiro CLI clients."""
+    return KIRO_API_HOST_TEMPLATE.format(region=region)
 
 
 def get_kiro_q_host(region: str, is_builder_id: bool = False) -> str:

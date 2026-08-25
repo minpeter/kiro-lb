@@ -1122,6 +1122,19 @@ class TestKiroHttpClientConnectionCloseHeader:
         assert response.status_code == 200
 
 
+def test_generation_headers_match_latest_cli_retry_contract():
+    from kiro.utils import get_kiro_headers
+
+    auth_manager = Mock(fingerprint="test-fingerprint")
+    headers = get_kiro_headers(auth_manager, "test-token")
+
+    assert headers["x-amz-target"] == "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+    assert headers["x-kiro-attempt"] == "1;max=3"
+    assert "x-amzn-kiro-agent-mode" not in headers
+    assert "app/AmazonQ-For-CLI" in headers["User-Agent"]
+    assert "api/codewhispererstreaming" in headers["x-amz-user-agent"]
+
+
 class TestKiroHttpClientRequestParameters:
     """Tests for request_with_retry method with params and optional json_data (Account System)."""
 
