@@ -60,7 +60,11 @@ function AccountRow({ row, total }: { row: Row; total: number }) {
               <span className="truncate font-mono text-xs text-muted-foreground">{row.account}</span>
             </>
           ) : (
-            <span className="truncate font-mono text-xs">{row.account}</span>
+            <>
+              <span className="truncate font-mono text-xs">{row.account}</span>
+              {/* No email was ever polled for this one: say what the bare hash is. */}
+              <span className="text-xs text-muted-foreground">key-only account</span>
+            </>
           )}
         </span>
         <span className="shrink-0 tabular-nums" title={exactTokens(row.totalTokens)}>

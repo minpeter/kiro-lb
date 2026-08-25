@@ -108,8 +108,10 @@ describe("RoutingStateCell", () => {
     const spent = renderToString(<AccountsPanel accounts={[spentAccount]} isLoading={false} />);
     const exhausted = renderToString(<AccountsPanel accounts={[exhaustedAccount]} isLoading={false} />);
 
-    expect(spent.replace("quota spent", "QUOTA").replace(spentAccount.id, "ID")).toBe(
-      exhausted.replace("quota exhausted", "QUOTA").replace(exhaustedAccount.id, "ID")
+    // The id appears several times per row (tooltip, aria-label, visible text),
+    // so the normalization has to rewrite every occurrence, not the first.
+    expect(spent.replace("quota spent", "QUOTA").replaceAll(spentAccount.id, "ID")).toBe(
+      exhausted.replace("quota exhausted", "QUOTA").replaceAll(exhaustedAccount.id, "ID")
     );
   });
 

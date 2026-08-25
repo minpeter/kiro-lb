@@ -1,12 +1,14 @@
-import { useState } from "react";
-import { AtSign, Ban, KeyRound, ServerCog, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { AtSign, Ban, Check, Copy, KeyRound, ServerCog, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { formatDuration, formatTimestamp, formatUsage } from "../format";
+import { cn } from "@/lib/utils";
+import { formatTimestamp, formatUsage } from "../format";
+import { resetHint, usageIndicatorClass } from "../quota-display";
 import type { Account, AccountRoutingState } from "../types";
 import { TableSkeleton } from "./skeletons";
 
@@ -34,9 +36,9 @@ function RoutingStateCell({ account }: { account: Account }) {
   const variant = state === "available" ? "secondary" : state === "uninitialized" ? "outline" : "destructive";
   const suspended = state === "suspended";
   const authDead = state === "auth_dead";
-  // Both quota states carry the same wording, so a reader does not have to infer
-  // that one of them is a weaker condition than the other. It is not.
-  const quotaGone = state === "quota_exhausted" || state === "quota_depleted";
+  // The one reset display for the row: the countdown from the router, stated
+  // here and nowhere else.
+  const hint = resetHint(account);
   return (
     <div className="space-y-1">
       <Badge variant={variant} className={suspended || authDead ? "font-semibold tracking-wide" : undefined}>
@@ -50,18 +52,59 @@ function RoutingStateCell({ account }: { account: Account }) {
         <p className="text-xs text-destructive">credential rejected; re-login required</p>
       ) : suspended ? (
         <p className="text-xs text-destructive">locked by Kiro; contact support</p>
-      ) : quotaGone ? (
-        <p className="text-xs tabular-nums text-muted-foreground">
-          {account.eligibleInSeconds > 0 ? `resets in ${formatDuration(account.eligibleInSeconds)}` : "until it resets"}
-        </p>
       ) : (
-        account.eligibleInSeconds > 0 && (
-          <p className="text-xs tabular-nums text-muted-foreground">
-            back in {formatDuration(account.eligibleInSeconds)}
-          </p>
-        )
+        hint && <p className="text-xs tabular-nums text-muted-foreground">{hint}</p>
       )}
     </div>
+  );
+}
+
+/**
+ * The hashed credential label, clickable to copy. The id is what client-facing
+ * 503 diagnostics and metrics name, so an operator reading a log line needs it
+ * on the clipboard, not just on screen. The full id stays in the tooltip and
+ * aria-label while the visible text truncates with the cell.
+ */
+function CopyableAccountId({ id, className }: { id: string; className?: string }) {
+  const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    },
+    [],
+  );
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(id);
+      setCopied(true);
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard unavailable: the id stays visible for manual selection.
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      title={id}
+      aria-label={copied ? `Copied account id ${id}` : `Copy account id ${id}`}
+      className={cn(
+        "group inline-flex max-w-full cursor-pointer items-center gap-1 font-mono text-xs hover:text-foreground",
+        className,
+      )}
+    >
+      {copied ? (
+        <Check size={12} className="shrink-0 text-success" />
+      ) : (
+        <Copy size={12} className="shrink-0 opacity-40 transition-opacity group-hover:opacity-70" />
+      )}
+      <span className="truncate">{id}</span>
+    </button>
   );
 }
 
@@ -72,14 +115,14 @@ function RoutingStateCell({ account }: { account: Account }) {
  */
 function AccountCell({ account }: { account: Account }) {
   const email = account.usage?.email;
-  if (!email) return <span className="font-mono text-xs">{account.id}</span>;
+  if (!email) return <CopyableAccountId id={account.id} />;
   return (
-    <div className="flex min-w-0 flex-col gap-0.5">
+    <div className="group flex min-w-0 flex-col gap-0.5">
       <span className="flex min-w-0 items-center gap-1.5 font-medium" title={email}>
         <AtSign size={13} className="shrink-0 text-muted-foreground" />
         <span className="truncate">{email}</span>
       </span>
-      <span className="pl-[1.15rem] font-mono text-xs text-muted-foreground">{account.id}</span>
+      <CopyableAccountId id={account.id} className="pl-[1.15rem] text-muted-foreground" />
     </div>
   );
 }
@@ -112,7 +155,11 @@ function UsageCell({ account }: { account: Account }) {
   if (!usage || usage.usagePercent == null) return <span className="text-muted-foreground">—</span>;
   return (
     <div className="min-w-40 space-y-1.5">
-      <Progress value={Math.min(usage.usagePercent, 100)} className="h-1.5" />
+      <Progress
+        value={Math.min(usage.usagePercent, 100)}
+        className="h-1.5"
+        indicatorClassName={usageIndicatorClass(usage.usagePercent)}
+      />
       <p className="text-xs tabular-nums text-muted-foreground">{formatUsage(usage)}</p>
     </div>
   );
@@ -137,7 +184,7 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
       </CardHeader>
       <CardContent>
         {isLoading ? (
-          <TableSkeleton rows={2} columns={10} />
+          <TableSkeleton rows={2} columns={9} />
         ) : accounts.length === 0 ? (
           <EmptyState icon={ServerCog} title="No accounts registered" description="Add a credential source below." />
         ) : (
@@ -146,13 +193,13 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
               <TableRow>
                 <TableHead>Account</TableHead>
                 <TableHead>State</TableHead>
-                <TableHead>Plan</TableHead>
-                <TableHead>Overage</TableHead>
+                {/* Low-value columns drop below md so Account/State/Usage fit a phone viewport. */}
+                <TableHead className="hidden md:table-cell">Plan</TableHead>
+                <TableHead className="hidden md:table-cell">Overage</TableHead>
                 <TableHead>Usage</TableHead>
-                <TableHead className="text-right">Reset</TableHead>
                 <TableHead className="text-right">Requests</TableHead>
                 <TableHead className="text-right">Failures</TableHead>
-                <TableHead>Updated</TableHead>
+                <TableHead className="hidden md:table-cell">Updated</TableHead>
                 <TableHead className="w-12" />
               </TableRow>
             </TableHeader>
@@ -165,8 +212,8 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                   <TableCell>
                     <RoutingStateCell account={account} />
                   </TableCell>
-                  <TableCell>{account.usage?.subscriptionTitle ?? "—"}</TableCell>
-                  <TableCell>
+                  <TableCell className="hidden md:table-cell">{account.usage?.subscriptionTitle ?? "—"}</TableCell>
+                  <TableCell className="hidden md:table-cell">
                     {account.usage?.overageStatus == null || account.usage.overageStatus === "UNKNOWN" ? (
                       "—"
                     ) : (
@@ -179,12 +226,11 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                   <TableCell>
                     <UsageCell account={account} />
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">
-                    {account.usage?.daysUntilReset == null ? "—" : `${account.usage.daysUntilReset}d`}
+                  <TableCell className="text-right tabular-nums">{account.requests.toLocaleString()}</TableCell>
+                  <TableCell className="text-right tabular-nums">{account.failures.toLocaleString()}</TableCell>
+                  <TableCell className="hidden text-xs text-muted-foreground md:table-cell">
+                    {formatTimestamp(account.usage?.updatedAt)}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">{account.requests}</TableCell>
-                  <TableCell className="text-right tabular-nums">{account.failures}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{formatTimestamp(account.usage?.updatedAt)}</TableCell>
                   <TableCell className="text-right">
                     {account.deletable ? (
                       confirmingId === account.id ? (
