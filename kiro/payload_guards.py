@@ -133,13 +133,14 @@ def _align_to_user_message(history: list) -> list:
     return history
 
 
-def _repair_orphaned_tool_results(history: list) -> None:
+def _repair_orphaned_tool_results(history: list, current_message: Optional[Dict[str, Any]] = None) -> None:
     """
     Remove orphaned toolResults that reference toolUseIds not present
     in the preceding assistant message. Preserve orphaned text content
     inline with a marker.
     """
-    for i, entry in enumerate(history):
+    entries = history + ([current_message] if current_message else [])
+    for i, entry in enumerate(entries):
         user_msg = entry.get("userInputMessage")
         if not user_msg:
             continue
@@ -151,7 +152,7 @@ def _repair_orphaned_tool_results(history: list) -> None:
         # Collect toolUseIds from the preceding assistant message
         valid_ids = set()
         if i > 0:
-            prev_assistant = history[i - 1].get("assistantResponseMessage")
+            prev_assistant = entries[i - 1].get("assistantResponseMessage")
             if prev_assistant:
                 for tu in prev_assistant.get("toolUses", []):
                     tool_use_id = tu.get("toolUseId")
@@ -209,7 +210,8 @@ def trim_payload_to_limit(
     """
     original_bytes = check_payload_size(payload)
     original_tokens = check_payload_tokens(payload)
-    history = payload.get("conversationState", {}).get("history")
+    conversation_state = payload.get("conversationState", {})
+    history = conversation_state.get("history")
 
     if not history:
         return PayloadTrimStats(
@@ -235,7 +237,10 @@ def trim_payload_to_limit(
     _align_to_user_message(history)
 
     # Repair orphaned tool results after trimming
-    _repair_orphaned_tool_results(history)
+    _repair_orphaned_tool_results(history, conversation_state.get("currentMessage"))
+
+    if not history:
+        del conversation_state["history"]
 
     final_bytes = check_payload_size(payload)
     final_tokens = check_payload_tokens(payload)

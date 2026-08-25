@@ -111,9 +111,48 @@ class TestTrimPayloadToLimit:
         # Set an impossibly low limit
         stats = trim_payload_to_limit(payload, max_bytes=100)
 
-        history = payload["conversationState"]["history"]
-        assert history == []
+        assert "history" not in payload["conversationState"]
         assert stats.final_entries == 0
+
+    def test_trim_repairs_current_tool_result_after_removing_its_tool_use(self):
+        """Converts a current tool result to text when trimming removes its tool use."""
+        payload = {
+            "conversationState": {
+                "conversationId": "test",
+                "chatTriggerType": "MANUAL",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "",
+                        "modelId": "m",
+                        "userInputMessageContext": {
+                            "toolResults": [
+                                {
+                                    "toolUseId": "tool-A",
+                                    "content": [{"text": "result from tool-A"}],
+                                }
+                            ]
+                        },
+                    }
+                },
+                "history": [
+                    {"userInputMessage": {"content": "x" * 3000}},
+                    {
+                        "assistantResponseMessage": {
+                            "content": "using tool",
+                            "toolUses": [{"toolUseId": "tool-A", "name": "read", "input": {}}],
+                        }
+                    },
+                ],
+            }
+        }
+
+        stats = trim_payload_to_limit(payload, max_bytes=1000)
+
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert stats.final_entries == 0
+        assert "history" not in payload["conversationState"]
+        assert "toolResults" not in current.get("userInputMessageContext", {})
+        assert "[trimmed tool result] result from tool-A" in current["content"]
 
     def test_trim_repairs_orphaned_tool_results(self):
         """Orphaned toolResults removed, text preserved inline."""
