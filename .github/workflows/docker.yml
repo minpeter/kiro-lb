@@ -155,6 +155,12 @@ jobs:
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
+          # SARIF output ignores the severity filter unless this is set, which is
+          # how 137 low/medium Debian will-not-fix CVEs flooded code scanning.
+          limit-severities-for-sarif: true
+          # Debian ships no fix for most base-image CVEs; only actionable
+          # findings belong in the report.
+          ignore-unfixed: true
           exit-code: '0'  # Don't fail build, just report
       
       - name: Upload Trivy results to GitHub Security

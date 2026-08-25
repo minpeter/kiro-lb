@@ -10,6 +10,12 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
 
+# Pull in Debian security updates the base image tag lags behind
+# (e.g. the util-linux TOCTOU/SUID fixes in 2.41.5-0+deb13u1).
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create non-root user for security
 RUN groupadd -r kiro && useradd -r -g kiro kiro
 
@@ -17,9 +23,13 @@ RUN groupadd -r kiro && useradd -r -g kiro kiro
 WORKDIR /app
 RUN chown kiro:kiro /app
 
-# Install dependencies first (better layer caching)
+# Install dependencies first (better layer caching).
+# The pip/setuptools/wheel bundled with the base image lag behind and carry
+# known CVEs (Trivy flags the vendored copies under setuptools/_vendor too),
+# so upgrade the packaging toolchain before installing anything with it.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Bake the tiktoken vocabularies into the image. tiktoken ships no BPE data: it
 # downloads it from openaipublic.blob.core.windows.net on first use and caches it

@@ -54,6 +54,10 @@ pytest.ini
 # Debug logs (will be created at runtime)
 debug_logs/
 
+# Private runtime state — the unified store holds account credentials and
+# refresh tokens; baking it into an image leaks every pool account.
+data/
+
 # Manual test script
 manual_api_test.py
 
