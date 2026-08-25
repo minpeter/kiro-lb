@@ -61,12 +61,13 @@ from kiro.model_resolver import ModelResolver, normalize_model_name
 
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
     """
-    Check if auth manager uses runtime endpoint that doesn't provide /ListAvailableModels.
+    Check if the model-list host is a runtime endpoint without that operation.
 
     Runtime endpoint pattern: https://runtime.{region}.kiro.dev
     Old endpoint pattern: https://q.{region}.amazonaws.com
 
-    Runtime endpoint does not provide /ListAvailableModels API (AWS limitation).
+    Generation always uses ``api_host`` now, including Builder ID. Model listing
+    remains on ``q_host``, so that is the host this predicate must inspect.
 
     Args:
         auth_manager: KiroAuthManager instance
@@ -75,17 +76,17 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
         True if using runtime endpoint, False otherwise
 
     Examples:
-        >>> auth_manager.api_host = "https://runtime.us-east-1.kiro.dev"
+        >>> auth_manager.q_host = "https://runtime.us-east-1.kiro.dev"
         >>> _is_runtime_endpoint(auth_manager)
         True
-        >>> auth_manager.api_host = "https://runtime.eu-central-1.kiro.dev"
+        >>> auth_manager.q_host = "https://runtime.eu-central-1.kiro.dev"
         >>> _is_runtime_endpoint(auth_manager)
         True
-        >>> auth_manager.api_host = "https://q.us-east-1.amazonaws.com"
+        >>> auth_manager.q_host = "https://q.us-east-1.amazonaws.com"
         >>> _is_runtime_endpoint(auth_manager)
         False
     """
-    return "://runtime." in auth_manager.api_host
+    return "://runtime." in auth_manager.q_host
 
 
 def account_label(account_id: str) -> str:

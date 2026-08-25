@@ -11,7 +11,6 @@ Manages the lifecycle of access tokens:
 
 import asyncio
 import json
-import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -23,6 +22,7 @@ import httpx
 from loguru import logger
 
 from kiro.config import (
+    KIRO_BUILDER_ID_PROFILE_ARN,
     TOKEN_REFRESH_THRESHOLD,
     get_aws_sso_oidc_url,
     get_kiro_api_host,
@@ -204,9 +204,10 @@ class KiroAuthManager:
         # - OIDC refresh: uses SSO region (for token refresh)
         # - API/Q hosts: use determined API region (for Q Developer API calls)
         #
-        # An account using SSO OIDC with no profile ARN is AWS Builder ID, which
-        # the runtime host rejects with 400 "profileArn is required for this
-        # request". Auth type and credentials are both resolved by this point.
+        # Builder ID is identified by SSO OIDC without an account-scoped profile.
+        # Current Kiro CLI still uses the runtime generation host and supplies a
+        # request-scoped service profile; q_host remains separate for legacy Q
+        # management calls.
         is_builder_id = self._auth_type == AuthType.AWS_SSO_OIDC and not self._profile_arn
         sso_region_for_oidc = self._sso_region or region
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
@@ -984,6 +985,15 @@ class KiroAuthManager:
         return self._profile_arn
 
     @property
+    def request_profile_arn(self) -> Optional[str]:
+        """Profile ARN sent upstream, including Kiro CLI's Builder ID fallback."""
+        if self._profile_arn:
+            return self._profile_arn
+        if self._auth_type == AuthType.AWS_SSO_OIDC:
+            return KIRO_BUILDER_ID_PROFILE_ARN
+        return None
+
+    @property
     def region(self) -> str:
         """AWS region."""
         return self._region
@@ -992,6 +1002,11 @@ class KiroAuthManager:
     def api_host(self) -> str:
         """API host for the current region."""
         return self._api_host
+
+    @property
+    def generation_url(self) -> str:
+        """AWS JSON RPC endpoint for GenerateAssistantResponse."""
+        return f"{self._api_host}/"
 
     @property
     def q_host(self) -> str:

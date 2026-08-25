@@ -440,15 +440,15 @@ async def test_registering_builder_id_adds_a_json_account(dashboard, tmp_path):
 
 
 # =============================================================================
-# Host routing: an account with no profile must not use the runtime host
+# Host routing: Builder ID generation follows the latest Kiro CLI contract
 # =============================================================================
 
 
-def test_builder_id_host_differs_from_the_profile_host():
+def test_builder_id_keeps_q_management_host_but_uses_runtime_generation_host():
     from kiro.config import get_kiro_api_host, get_kiro_q_host
 
     assert get_kiro_api_host("us-east-1", is_builder_id=False) == "https://runtime.us-east-1.kiro.dev"
-    assert get_kiro_api_host("us-east-1", is_builder_id=True) == "https://q.us-east-1.amazonaws.com"
+    assert get_kiro_api_host("us-east-1", is_builder_id=True) == "https://runtime.us-east-1.kiro.dev"
     assert get_kiro_q_host("us-east-1", is_builder_id=True) == "https://q.us-east-1.amazonaws.com"
 
 
@@ -459,9 +459,7 @@ def test_host_selection_defaults_to_the_profile_host():
     assert get_kiro_api_host("eu-central-1") == "https://runtime.eu-central-1.kiro.dev"
 
 
-def test_builder_id_credentials_route_to_the_q_host(tmp_path):
-    """A Builder ID account sent to runtime.kiro.dev fails every request with
-    400 profileArn is required, which is what this routing prevents."""
+def test_builder_id_credentials_match_latest_cli_generation_contract(tmp_path):
     import json as _json
 
     from kiro.auth import AuthType, KiroAuthManager
@@ -484,7 +482,10 @@ def test_builder_id_credentials_route_to_the_q_host(tmp_path):
 
     assert manager.auth_type == AuthType.AWS_SSO_OIDC
     assert manager.profile_arn is None
-    assert manager.api_host == "https://q.us-east-1.amazonaws.com"
+    assert manager.api_host == "https://runtime.us-east-1.kiro.dev"
+    assert manager.q_host == "https://q.us-east-1.amazonaws.com"
+    assert manager.generation_url == "https://runtime.us-east-1.kiro.dev/"
+    assert manager.request_profile_arn == "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 
 
 def test_a_social_account_without_a_profile_keeps_the_runtime_host(tmp_path):

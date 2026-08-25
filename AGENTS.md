@@ -77,7 +77,7 @@ Operational detail lives in this file; do not relicense away from AGPL-3.0.
 | `identify_data_api_key` | function | `kiro/dashboard.py:298` | Legacy env key -> `ROOT_KEY_ID`, else hashed `klb_` key |
 | `record_token_usage` | function | `kiro/usage_tracking.py` | Attributes tokens to the calling key **and** the serving account |
 | `start_device_login` | function | `kiro/device_login.py:299` | Social vs Builder ID flows, deliberately unshared |
-| `get_kiro_api_host` / `get_kiro_q_host` | function | `kiro/config.py:613`, `:619` | Builder ID flag picks the host template |
+| `get_kiro_api_host` / `get_kiro_q_host` | function | `kiro/config.py:613`, `:619` | Runtime generation host vs legacy Builder ID Q host |
 
 Line numbers drift on every edit to these files. Grep the symbol name before
 trusting a pin here.
@@ -176,11 +176,11 @@ trusting a pin here.
   distinct names including probes like `claude-opus-99`. `kiro/metrics.py`
   normalizes, then clamps to what the pool serves and collapses the rest into
   `other`, re-aggregating in Python so no series is emitted twice.
-- Building the upstream host from region alone. A Builder ID account (SSO OIDC
-  with no profile ARN) must go to `q.{region}.amazonaws.com`; everything else
-  stays on the Kiro host (`kiro/config.py:613`). Absence of a profile alone is
-  not the test, and Builder ID accounts must never receive the global fallback
-  profile ARN (`routes_openai.py:371`, `routes_anthropic.py:255`).
+- Sending Builder ID generation to `q.{region}.amazonaws.com` or the legacy
+  `/generateAssistantResponse` path. Kiro CLI 2.19.1 sends AWS JSON RPC to
+  `runtime.{region}.kiro.dev/` and includes its request-scoped Builder ID
+  fallback profile. Keep that fallback out of persisted credentials: it is a
+  service routing value, not the account's own profile ARN.
 - Treating `_current_account_index` as the selection cursor. Routing is
   quota-weighted (`ACCOUNT_QUOTA_WEIGHTED_ROUTING`); the index only records the
   last success and drives the legacy sticky rollback path. It still advances

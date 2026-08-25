@@ -56,16 +56,20 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
     Returns:
         Dictionary with headers for HTTP request
     """
-    fingerprint = auth_manager.fingerprint
-
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/x-amz-json-1.0",
         "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-        "User-Agent": f"aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{fingerprint}",
-        "x-amz-user-agent": f"aws-sdk-js/1.0.27 KiroIDE-0.7.45-{fingerprint}",
+        "User-Agent": (
+            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 "
+            "os/linux lang/rust/1.92.0 md/appVersion-2.19.1 app/AmazonQ-For-CLI"
+        ),
+        "x-amz-user-agent": (
+            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 "
+            "os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI"
+        ),
         "x-amzn-codewhisperer-optout": "true",
-        "x-amzn-kiro-agent-mode": "vibe",
+        "x-kiro-attempt": "1;max=3",
         "amz-sdk-invocation-id": str(uuid.uuid4()),
         "amz-sdk-request": "attempt=1; max=3",
     }

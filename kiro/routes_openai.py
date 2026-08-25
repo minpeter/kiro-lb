@@ -18,7 +18,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.auth import AuthType
 from kiro.config import (
     APP_VERSION,
     WEB_SEARCH_ENABLED,
@@ -324,9 +323,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         tried_accounts: set[str] = set()  # Track tried accounts in current failover loop
 
         for _attempt in range(max_attempts):
-            account = await account_manager.get_next_account(
-                request_data.model, exclude_accounts=tried_accounts
-            )
+            account = await account_manager.get_next_account(request_data.model, exclude_accounts=tried_accounts)
 
             if account is None or not account.auth_manager:
                 # All accounts unavailable
@@ -361,8 +358,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             # Generate conversation ID
             conversation_id = generate_conversation_id()
 
-            # Build payload for Kiro — profile ARN is always account-scoped.
-            profile_arn_for_payload = auth_manager.profile_arn or ""
+            # Builder ID carries Kiro CLI's request-scoped service profile even
+            # though the credential itself has no account-scoped profile ARN.
+            profile_arn_for_payload = auth_manager.request_profile_arn or ""
 
             try:
                 kiro_payload = build_kiro_payload(request_data, conversation_id, profile_arn_for_payload)
@@ -380,7 +378,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 logger.warning(f"Failed to log Kiro request: {e}")
 
             # Create HTTP client
-            url = f"{auth_manager.api_host}/generateAssistantResponse"
+            url = auth_manager.generation_url
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
 
             if request_data.stream:
