@@ -1,10 +1,11 @@
-import { useState } from "react";
-import { ChevronDown, ChevronRight, KeyRound, ShieldCheck } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Check, ChevronDown, ChevronRight, Copy, KeyRound, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { formatKeyPrefix } from "../api-key-display";
 import { exactTokens, formatTimestamp, formatTokens } from "../format";
 import type { ApiKey, KeyModelUsage, KeyUsage } from "../types";
 import { TableSkeleton } from "./skeletons";
@@ -70,6 +71,27 @@ function UsageBreakdown({ rows }: { rows: KeyModelUsage[] }) {
 
 export function ApiKeysPanel({ apiKeys, keyUsage, isLoading, isMutating, onCreate, onRevoke }: ApiKeysPanelProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [confirmingRevokeId, setConfirmingRevokeId] = useState<string | null>(null);
+  const [copiedPrefixId, setCopiedPrefixId] = useState<string | null>(null);
+  const copyTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    },
+    [],
+  );
+
+  const copyPrefix = async (key: ApiKey) => {
+    try {
+      await navigator.clipboard.writeText(key.prefix);
+      setCopiedPrefixId(key.id);
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopiedPrefixId(null), 1500);
+    } catch {
+      // Clipboard unavailable: the prefix stays visible for manual selection.
+    }
+  };
 
   return (
     <Card>
@@ -100,9 +122,9 @@ export function ApiKeysPanel({ apiKeys, keyUsage, isLoading, isMutating, onCreat
                 <TableHead>Name</TableHead>
                 <TableHead>Prefix</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead className="text-right">Requests</TableHead>
+                <TableHead className="hidden text-right md:table-cell">Requests</TableHead>
                 <TableHead className="text-right">Tokens</TableHead>
-                <TableHead>Created</TableHead>
+                <TableHead className="hidden md:table-cell">Created</TableHead>
                 <TableHead />
               </TableRow>
             </TableHeader>
@@ -111,43 +133,117 @@ export function ApiKeysPanel({ apiKeys, keyUsage, isLoading, isMutating, onCreat
                 const rows = keyUsage[key.id] ?? [];
                 const { tokens, requests } = totals(rows);
                 const isOpen = expanded === key.id;
+                const usageRegionId = `api-key-usage-${key.id}`;
+                const toggleExpanded = () => setExpanded(isOpen ? null : key.id);
                 return [
                   <TableRow
                     key={key.id}
-                    className="cursor-pointer"
-                    onClick={() => setExpanded(isOpen ? null : key.id)}
+                    className="cursor-pointer focus-visible:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset focus-visible:outline-none"
+                    tabIndex={0}
+                    aria-label={`Usage details for key ${key.name}`}
+                    aria-expanded={isOpen}
+                    aria-controls={usageRegionId}
+                    onClick={toggleExpanded}
+                    onKeyDown={(event) => {
+                      // Only toggle when the row itself is the target; buttons
+                      // inside handle their own activation.
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        toggleExpanded();
+                      }
+                    }}
                   >
                     <TableCell className="text-muted-foreground">
-                      {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        tabIndex={-1}
+                        aria-hidden
+                        // Decorative for AT: the row itself is the focusable disclosure and carries aria-expanded.
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleExpanded();
+                        }}
+                      >
+                        {isOpen ? <ChevronDown /> : <ChevronRight />}
+                      </Button>
                     </TableCell>
                     <TableCell>
                       <span className="flex items-center gap-1.5">
                         {key.readOnly && <ShieldCheck size={13} className="text-muted-foreground" />}
                         {key.name}
+                        {key.readOnly && <Badge variant="secondary">environment</Badge>}
                       </span>
                     </TableCell>
-                    <TableCell className="font-mono text-xs">{key.prefix}…</TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        className="h-auto gap-1 px-1 font-mono text-xs font-normal"
+                        aria-label={`Copy prefix of key ${key.name}`}
+                        title="Copy prefix"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void copyPrefix(key);
+                        }}
+                      >
+                        {formatKeyPrefix(key.prefix)}
+                        {copiedPrefixId === key.id ? <Check className="text-success" /> : <Copy className="text-muted-foreground" />}
+                      </Button>
+                    </TableCell>
                     <TableCell>
                       <Badge variant={key.readOnly ? "default" : key.revokedAt ? "outline" : "secondary"}>
                         {key.readOnly ? "root" : key.revokedAt ? "revoked" : "active"}
                       </Badge>
                     </TableCell>
-                    <TableCell className="text-right tabular-nums">{requests ? requests.toLocaleString() : "—"}</TableCell>
+                    <TableCell className="hidden text-right tabular-nums md:table-cell">
+                      {requests ? requests.toLocaleString() : "—"}
+                    </TableCell>
                     <TableCell className="text-right tabular-nums" title={tokens ? exactTokens(tokens) : undefined}>
                       {tokens ? formatTokens(tokens) : "—"}
                     </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
-                      {key.readOnly ? "environment" : formatTimestamp(key.createdAt)}
+                    <TableCell className="hidden text-xs text-muted-foreground md:table-cell">
+                      {key.readOnly ? "—" : formatTimestamp(key.createdAt)}
                     </TableCell>
                     <TableCell className="text-right">
-                      {key.readOnly || key.revokedAt ? null : (
+                      {key.readOnly || key.revokedAt ? null : confirmingRevokeId === key.id ? (
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            disabled={isMutating}
+                            aria-label={`Cancel revoking key ${key.name}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setConfirmingRevokeId(null);
+                            }}
+                          >
+                            Cancel
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="destructive"
+                            disabled={isMutating}
+                            aria-label={`Confirm revoke key ${key.name}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setConfirmingRevokeId(null);
+                              onRevoke(key.id);
+                            }}
+                          >
+                            Revoke
+                          </Button>
+                        </div>
+                      ) : (
                         <Button
                           size="xs"
                           variant="outline"
                           disabled={isMutating}
+                          aria-label={`Revoke key ${key.name}`}
                           onClick={(event) => {
                             event.stopPropagation();
-                            onRevoke(key.id);
+                            setConfirmingRevokeId(key.id);
                           }}
                         >
                           Revoke
@@ -156,7 +252,7 @@ export function ApiKeysPanel({ apiKeys, keyUsage, isLoading, isMutating, onCreat
                     </TableCell>
                   </TableRow>,
                   isOpen ? (
-                    <TableRow key={`${key.id}-usage`}>
+                    <TableRow key={`${key.id}-usage`} id={usageRegionId}>
                       <TableCell colSpan={8} className="p-0">
                         <UsageBreakdown rows={rows} />
                       </TableCell>
