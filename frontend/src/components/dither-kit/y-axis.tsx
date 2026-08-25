@@ -1,5 +1,6 @@
 "use client"
 
+import { integerTicks } from "./axis-ticks"
 import { useChartPart } from "./chart-context"
 
 export function YAxis({
@@ -14,9 +15,11 @@ export function YAxis({
   const ctx = useChartPart("YAxis")
   if (!ctx.ready) return null
 
+  const ticks = integerTicks(ctx.y.ticks(tickCount), ctx.y.domain())
+
   return (
     <g className="fill-current font-mono text-[10px] text-muted-foreground">
-      {ctx.y.ticks(tickCount).map((t) => (
+      {ticks.map((t) => (
         <text
           key={t}
           x={-tickMargin}

@@ -1,5 +1,6 @@
 "use client"
 
+import { widthAwareTickCount } from "./axis-ticks"
 import { useChartPart } from "./chart-context"
 
 export function XAxis({
@@ -16,7 +17,8 @@ export function XAxis({
   const ctx = useChartPart("XAxis")
   if (!ctx.ready) return null
 
-  const step = Math.max(1, Math.ceil(ctx.dataLength / maxTicks))
+  const tickCount = widthAwareTickCount(ctx.plot.width, maxTicks)
+  const step = Math.max(1, Math.ceil(ctx.dataLength / tickCount))
   const y = ctx.plot.height + tickMargin
 
   return (

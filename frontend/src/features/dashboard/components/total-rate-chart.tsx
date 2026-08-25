@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { Activity } from "lucide-react";
 import { Area } from "@/components/dither-kit/area";
 import { AreaChart } from "@/components/dither-kit/area-chart";
 import { Grid } from "@/components/dither-kit/grid";
@@ -6,6 +7,7 @@ import { ReferenceLine } from "@/components/dither-kit/reference-line";
 import { Tooltip } from "@/components/dither-kit/tooltip";
 import { XAxis } from "@/components/dither-kit/x-axis";
 import { YAxis } from "@/components/dither-kit/y-axis";
+import { EmptyState } from "@/components/empty-state";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ChartSkeleton } from "./skeletons";
 import { rateChartConfig, rateChartRows } from "../dither-series";
@@ -69,21 +71,29 @@ export function TotalRateChart({ rate, isLoading }: { rate?: RequestRate; isLoad
                   totals.peakPerMinute,
                 )} per minute, average ${round(totals.meanPerMinute)} per minute, ${totals.requests} requests in the window.`}
               >
-                {/* No entrance sweep: live polling bumps the data revision every
-                    second, so the reveal would replay forever instead of playing once. */}
-                <AreaChart data={rows} config={config} bloom="low" bloomOnHover animate={false}>
-                  <Grid />
-                  <XAxis dataKey="at" maxTicks={6} />
-                  <YAxis tickCount={3} tickFormatter={round} />
-                  {/* The mean makes a spike legible as a spike rather than as the
-                      normal level, which a bare area chart cannot convey. */}
-                  <ReferenceLine y={totals.meanPerMinute} label={`avg ${round(totals.meanPerMinute)}/min`} />
-                  <Area dataKey="served" variant="gradient" />
-                  {/* Rejections are drawn on top: they are rare and must not be
-                      lost inside the total they are part of. */}
-                  {config.rejected && <Area dataKey="rejected" variant="hatched" />}
-                  <Tooltip labelKey="at" valueFormatter={(value) => `${round(value)}/min`} />
-                </AreaChart>
+                {totals.requests === 0 ? (
+                  <EmptyState
+                    icon={Activity}
+                    title="No requests in this window"
+                    description="Requests appear here once traffic reaches the gateway."
+                  />
+                ) : (
+                  /* No entrance sweep: live polling bumps the data revision every
+                     second, so the reveal would replay forever instead of playing once. */
+                  <AreaChart data={rows} config={config} bloom="low" bloomOnHover animate={false}>
+                    <Grid />
+                    <XAxis dataKey="at" maxTicks={6} />
+                    <YAxis tickCount={3} tickFormatter={round} />
+                    {/* The mean makes a spike legible as a spike rather than as the
+                        normal level, which a bare area chart cannot convey. */}
+                    <ReferenceLine y={totals.meanPerMinute} label={`avg ${round(totals.meanPerMinute)}/min`} />
+                    <Area dataKey="served" variant="gradient" />
+                    {/* Rejections are drawn on top: they are rare and must not be
+                        lost inside the total they are part of. */}
+                    {config.rejected && <Area dataKey="rejected" variant="hatched" />}
+                    <Tooltip labelKey="at" valueFormatter={(value) => `${round(value)}/min`} />
+                  </AreaChart>
+                )}
               </div>
             </div>
 

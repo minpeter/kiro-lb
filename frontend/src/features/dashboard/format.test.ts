@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatTokens, shareOf, summarizeUsage } from "./format";
+import { formatRelativeTime, formatTimestamp, formatTokens, shareOf, summarizeUsage } from "./format";
 import type { KeyUsage } from "./types";
 
 function row(model: string, promptTokens: number, completionTokens: number, requests = 1) {
@@ -77,6 +77,58 @@ describe("shareOf", () => {
   it("returns 0 instead of dividing by zero", () => {
     // An empty store would otherwise produce NaN and render as "NaN%".
     expect(shareOf(0, 0)).toBe(0);
+  });
+});
+
+describe("formatTimestamp", () => {
+  it("pins en-US and drops the seconds", () => {
+    // Constructed from local date parts so the expectation holds in any TZ.
+    const ts = new Date(2026, 7, 25, 21, 24, 45).getTime() / 1000;
+
+    expect(formatTimestamp(ts)).toBe("Aug 25, 2026, 9:24 PM");
+  });
+
+  it("renders an em dash for a missing value", () => {
+    expect(formatTimestamp(null)).toBe("—");
+    expect(formatTimestamp(undefined)).toBe("—");
+  });
+});
+
+describe("formatRelativeTime", () => {
+  // Fixed instant so every case is deterministic: 2026-08-25T12:00:00 local.
+  const ts = new Date(2026, 7, 25, 12, 0, 0).getTime() / 1000;
+  const nowAfter = (seconds: number) => (ts + seconds) * 1000;
+
+  it("renders sub-minute deltas as just now", () => {
+    expect(formatRelativeTime(nowAfter(0), ts)).toBe("just now");
+    expect(formatRelativeTime(nowAfter(59), ts)).toBe("just now");
+  });
+
+  it("renders minutes and hours with the largest whole unit", () => {
+    expect(formatRelativeTime(nowAfter(60), ts)).toBe("1m ago");
+    expect(formatRelativeTime(nowAfter(120), ts)).toBe("2m ago");
+    expect(formatRelativeTime(nowAfter(3 * 3600), ts)).toBe("3h ago");
+    expect(formatRelativeTime(nowAfter(23 * 3600), ts)).toBe("23h ago");
+  });
+
+  it("renders days up to a week", () => {
+    expect(formatRelativeTime(nowAfter(86400), ts)).toBe("1d ago");
+    expect(formatRelativeTime(nowAfter(6 * 86400 + 3600), ts)).toBe("6d ago");
+  });
+
+  it("falls back to the absolute timestamp beyond 7 days", () => {
+    expect(formatRelativeTime(nowAfter(7 * 86400), ts)).toBe(formatTimestamp(ts));
+    expect(formatRelativeTime(nowAfter(30 * 86400), ts)).toBe(formatTimestamp(ts));
+  });
+
+  it("treats future timestamps as just now", () => {
+    // Clock skew between proxy and browser must not render "-1m ago".
+    expect(formatRelativeTime(nowAfter(-120), ts)).toBe("just now");
+  });
+
+  it("renders an em dash for a missing value", () => {
+    expect(formatRelativeTime(Date.now(), null)).toBe("—");
+    expect(formatRelativeTime(Date.now(), undefined)).toBe("—");
   });
 });
 

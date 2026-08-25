@@ -11,16 +11,18 @@ const idleRate: RequestRate = {
 };
 
 describe("TotalRateChart", () => {
-  it("keeps the empty chart and summary visible when the window has no requests", () => {
+  it("shows an empty state and keeps the summary when the window has no requests", () => {
     const html = renderToString(<TotalRateChart rate={idleRate} isLoading={false} />);
 
     expect(html).toContain("Total requests per minute across all accounts. Peak 0 per minute");
+    expect(html).toContain("No requests in this window");
+    expect(html).toContain("Requests appear here once traffic reaches the gateway.");
     expect(html).toContain("Peak");
     expect(html).toContain("Average");
     expect(html).toContain("Requests");
     expect(html).toContain("Rejected");
     expect(html).toContain("Failed");
     expect(html).toContain("Peak is the busiest bucket scaled to a minute");
-    expect(html).not.toContain("No traffic in this window");
+    expect(html).not.toContain('aria-label="Chart"');
   });
 });

@@ -36,8 +36,10 @@ export function PieCanvas() {
   // (never during render) — mutating a ref mid-render tears under Strict Mode /
   // concurrent rendering.
   const state = useRef(ctx)
+  const wakeRef = useRef<(() => void) | null>(null)
   useEffect(() => {
     state.current = ctx
+    wakeRef.current?.()
   })
 
   useEffect(() => {
@@ -128,8 +130,16 @@ export function PieCanvas() {
       }
     }
 
-    const draw = (now: number) => {
+    const requestDraw = () => {
+      if (raf || document.visibilityState === "hidden") return
       raf = requestAnimationFrame(draw)
+    }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") requestDraw()
+    }
+
+    const draw = (now: number) => {
+      raf = 0
       const s = state.current
       if (!s.ready || !s.pie) return
       if (bloomCtx) {
@@ -182,13 +192,26 @@ export function PieCanvas() {
         needsFill = true
       }
 
-      if (!needsFill) return
-      paint(prog)
-      needsFill = false
+      const keepAlive =
+        prog < 1 ||
+        Math.abs(intensity - itTarget) > 0.001 ||
+        Math.abs(popEase - popTarget) > 0.001 ||
+        s.isMouseInChart
+      if (needsFill) {
+        paint(prog)
+        needsFill = false
+      }
+      if (keepAlive) requestDraw()
     }
 
-    raf = requestAnimationFrame(draw)
-    return () => cancelAnimationFrame(raf)
+    wakeRef.current = requestDraw
+    document.addEventListener("visibilitychange", onVisibilityChange)
+    requestDraw()
+    return () => {
+      wakeRef.current = null
+      document.removeEventListener("visibilitychange", onVisibilityChange)
+      cancelAnimationFrame(raf)
+    }
   }, [cols, rows, width, height])
 
   const bloom = bloomLayerStyle(

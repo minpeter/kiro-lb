@@ -3,15 +3,49 @@ import * as React from "react"
 import { cn } from "@/lib/utils"
 
 function Table({ className, ...props }: React.ComponentProps<"table">) {
+  const scrollRef = React.useRef<HTMLDivElement>(null)
+  const [canScrollRight, setCanScrollRight] = React.useState(false)
+
+  // The 6px custom scrollbar is invisible on touch, so a right-edge fade is
+  // the only signal that more columns exist. Show it only while the table can
+  // actually scroll further right; scroll-driven animations would drop the
+  // affordance entirely in browsers without support.
+  React.useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const update = () => {
+      setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 1)
+    }
+    update()
+    el.addEventListener("scroll", update, { passive: true })
+    const observer = new ResizeObserver(update)
+    observer.observe(el)
+    return () => {
+      el.removeEventListener("scroll", update)
+      observer.disconnect()
+    }
+  }, [])
+
   return (
-    <div
-      data-slot="table-container"
-      className="relative w-full overflow-x-auto"
-    >
-      <table
-        data-slot="table"
-        className={cn("w-full caption-bottom text-sm", className)}
-        {...props}
+    <div data-slot="table-wrapper" className="relative w-full">
+      <div
+        ref={scrollRef}
+        data-slot="table-container"
+        className="w-full overflow-x-auto"
+      >
+        <table
+          data-slot="table"
+          className={cn("w-full caption-bottom text-sm", className)}
+          {...props}
+        />
+      </div>
+      <div
+        aria-hidden
+        data-slot="table-scroll-fade"
+        className={cn(
+          "from-card pointer-events-none absolute inset-y-0 right-0 w-12 bg-gradient-to-l to-transparent transition-opacity duration-200",
+          canScrollRight ? "opacity-100" : "opacity-0"
+        )}
       />
     </div>
   )

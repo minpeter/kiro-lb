@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ComponentType } from "react";
-import { Check, ExternalLink, X } from "lucide-react";
+import { Check, Copy, ExternalLink, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { dashboardApi } from "../api";
+import { copyCodeAriaLabel, copyUserCode } from "../copy-user-code";
 import type { DeviceLoginFlow, DeviceLoginProvider } from "../types";
 import { AwsMark, GithubMark, GoogleMark } from "./provider-marks";
 
@@ -19,12 +20,15 @@ const PROVIDERS: { id: DeviceLoginProvider; label: string; mark: ComponentType<{
 export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<void> }) {
   const [flow, setFlow] = useState<DeviceLoginFlow>();
   const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [message, setMessage] = useState<{ tone: "ok" | "error"; text: string }>();
   const registering = useRef(false);
+  const copiedTimer = useRef<number | undefined>(undefined);
 
   const start = async (provider: DeviceLoginProvider) => {
     setBusy(true);
     setMessage(undefined);
+    setCopied(false);
     try {
       const started = await dashboardApi.startDeviceLogin(provider);
       setFlow(started);
@@ -39,7 +43,16 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   const cancel = useCallback(async () => {
     if (flow) await dashboardApi.cancelDeviceLogin(flow.flowId).catch(() => undefined);
     setFlow(undefined);
+    setCopied(false);
   }, [flow]);
+
+  const copyCode = async () => {
+    if (!flow) return;
+    await copyUserCode(flow.userCode);
+    setCopied(true);
+    window.clearTimeout(copiedTimer.current);
+    copiedTimer.current = window.setTimeout(() => setCopied(false), 1500);
+  };
 
   // Registration is triggered by the approval itself, so the operator only ever
   // clicks once. The ref guards against a second poll landing mid-registration.
@@ -103,6 +116,8 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
     };
   }, [flow, registerApproved]);
 
+  useEffect(() => () => window.clearTimeout(copiedTimer.current), []);
+
   return (
     <Card>
       <CardHeader>
@@ -118,7 +133,19 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="space-y-1">
                 <p className="text-sm">
-                  Waiting for approval · code <span className="font-mono font-medium">{flow.userCode}</span>
+                  Waiting for approval · code{" "}
+                  <span className="inline-flex items-center gap-1">
+                    <span className="font-mono font-medium">{flow.userCode}</span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={copyCodeAriaLabel(copied)}
+                      onClick={() => void copyCode()}
+                    >
+                      {copied ? <Check /> : <Copy />}
+                    </Button>
+                  </span>
                 </p>
                 <p className="text-xs text-muted-foreground">
                   Expires in {Math.floor(flow.expiresInSeconds / 60)}m {flow.expiresInSeconds % 60}s
@@ -160,7 +187,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
           <p
             role={message.tone === "error" ? "alert" : "status"}
             className={`flex items-center gap-1.5 text-sm ${
-              message.tone === "error" ? "text-destructive" : "text-emerald-500"
+              message.tone === "error" ? "text-destructive" : "text-success"
             }`}
           >
             {message.tone === "ok" && <Check size={14} />}

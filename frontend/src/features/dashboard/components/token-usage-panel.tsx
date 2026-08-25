@@ -50,8 +50,8 @@ function Donut({
         animate={false}
         margins={{ top: 4, right: 4, bottom: 4, left: 4 }}
         // Hovering a wedge spotlights it and lifts its legend row. The engine
-        // reports the wedge index, which is not the slice position once
-        // zero-token slices are dropped, so the key is read back from the rows.
+        // reports the wedge index, which is not the slice position once zero or
+        // sub-1% slices are dropped, so the key is read back from the rows.
         focusDataKey={focused}
         onHoverChange={(index) => onFocus(sliceIdAt(rows, index))}
       >
@@ -86,34 +86,39 @@ function Legend({
         const sliceId = `s${index}`;
         const dimmed = focused !== null && focused !== sliceId;
         return (
-          <li
-            key={slice.label}
-            // Hovering a row spotlights its wedge, and a hovered wedge lifts this
-            // row: with 97% of the tokens in one model the runners-up draw arcs a
-            // pixel wide, so the ring alone cannot say which row is which.
-            onPointerEnter={() => onFocus(sliceId)}
-            onPointerLeave={() => onFocus(null)}
-            className={`flex items-center gap-2 rounded-sm text-sm transition-opacity ${
-              dimmed ? "opacity-40" : ""
-            } ${focused === sliceId ? "bg-muted/50" : ""}`}
-          >
-            <span
-              aria-hidden
-              className="size-2.5 shrink-0 rounded-sm"
-              // The swatch reads the same dither seed the wedge is painted with, so
-              // the legend cannot drift from the ring.
-              style={{ backgroundColor: rgb(seedOfColor(config[sliceId].color).fill) }}
-            />
-            <span className={`truncate font-mono text-xs ${slice.label === TAIL_LABEL ? "text-muted-foreground" : ""}`}>
-              {slice.label}
-              {slice.models > 1 && <span className="text-muted-foreground"> ({slice.models})</span>}
-            </span>
-            <span className="ml-auto shrink-0 tabular-nums" title={exactTokens(slice.tokens)}>
-              {formatTokens(slice.tokens)}
-            </span>
-            <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-              {shareLabel(slice.share, slice.tokens)}
-            </span>
+          <li key={slice.label}>
+            <button
+              type="button"
+              // Pointer and keyboard focus spotlight the matching wedge. Tiny
+              // legend-only slices still receive the same accessible affordance.
+              onPointerEnter={() => onFocus(sliceId)}
+              onPointerLeave={() => onFocus(null)}
+              onFocus={() => onFocus(sliceId)}
+              onBlur={() => onFocus(null)}
+              className={`flex w-full items-center gap-2 rounded-sm text-left text-sm transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                dimmed ? "opacity-40" : ""
+              } ${focused === sliceId ? "bg-muted/50" : ""}`}
+            >
+              <span
+                aria-hidden
+                className="size-2.5 shrink-0 rounded-sm"
+                // The swatch reads the same dither seed the wedge is painted with, so
+                // the legend cannot drift from the ring.
+                style={{ backgroundColor: rgb(seedOfColor(config[sliceId].color).fill) }}
+              />
+              <span
+                className={`truncate font-mono text-xs ${slice.label === TAIL_LABEL ? "text-muted-foreground" : ""}`}
+              >
+                {slice.label}
+                {slice.models > 1 && <span className="text-muted-foreground"> ({slice.models})</span>}
+              </span>
+              <span className="ml-auto shrink-0 tabular-nums" title={exactTokens(slice.tokens)}>
+                {formatTokens(slice.tokens)}
+              </span>
+              <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                {shareLabel(slice.share, slice.tokens)}
+              </span>
+            </button>
           </li>
         );
       })}
@@ -127,7 +132,14 @@ export function TokenUsagePanel({ keyUsage, isLoading }: { keyUsage: KeyUsage; i
     () => buildSlices(totals.models, totals.totalTokens),
     [totals.models, totals.totalTokens],
   );
-  const rows = useMemo(() => tokenPieRows(slices), [slices]);
+  const rows = useMemo(
+    () =>
+      tokenPieRows(slices).filter((row) => {
+        const sliceIndex = Number(row.slice.slice(1));
+        return (slices[sliceIndex]?.share ?? 0) >= 1;
+      }),
+    [slices],
+  );
   const config = useMemo(() => tokenPieConfig(slices, TAIL_LABEL), [slices]);
   // Shared hover so the ring and the legend spotlight the same slice, whichever
   // one the pointer is over.

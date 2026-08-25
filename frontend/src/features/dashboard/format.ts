@@ -1,8 +1,39 @@
 import type { AccountUsage, KeyUsage } from "./types";
 
-/** Format a unix timestamp for operator-facing tables. */
+// Pinned to en-US like the token formatter below: operator tables read one
+// locale, and seconds add noise the eye never parses at a glance.
+const absoluteTimestamp = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+/** Format a unix timestamp (seconds) for operator-facing tables: Aug 25, 2026, 9:24 PM. */
 export function formatTimestamp(value?: number | null): string {
-  return value ? new Date(value * 1000).toLocaleString() : "—";
+  return value ? absoluteTimestamp.format(new Date(value * 1000)) : "—";
+}
+
+const MINUTE = 60;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+const WEEK = 7 * DAY;
+
+/**
+ * Relative age of a unix timestamp (seconds) against `nowMs` (milliseconds,
+ * i.e. Date.now()). Recent rows read faster as "2m ago" than as a wall-clock
+ * time; past a week the absolute date is more useful than "14d ago". Future
+ * deltas (clock skew) clamp to "just now" rather than rendering a negative.
+ */
+export function formatRelativeTime(nowMs: number, value?: number | null): string {
+  if (value == null) return "—";
+  const deltaSeconds = Math.floor((nowMs - value * 1000) / 1000);
+  if (deltaSeconds < MINUTE) return "just now";
+  if (deltaSeconds < HOUR) return `${Math.floor(deltaSeconds / MINUTE)}m ago`;
+  if (deltaSeconds < DAY) return `${Math.floor(deltaSeconds / HOUR)}h ago`;
+  if (deltaSeconds < WEEK) return `${Math.floor(deltaSeconds / DAY)}d ago`;
+  return formatTimestamp(value);
 }
 
 /** Compact uptime rendering: 45m, 3h 20m, 2d 5h. */
