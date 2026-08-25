@@ -227,11 +227,9 @@ def trim_payload_to_limit(
     # Strip empty toolUses before measuring
     _strip_empty_tool_uses(history)
 
-    # Trim pairs from the beginning until under limit (keep at least 2 entries)
-    while len(history) > 2 and _over_limit(payload, max_bytes, max_tokens):
-        # Remove 2 entries (a user/assistant pair)
-        history.pop(0)
-        history.pop(0)
+    # Trim pairs from the beginning until under limit or no history remains.
+    while history and _over_limit(payload, max_bytes, max_tokens):
+        del history[:2]
 
     # Align to userInputMessage boundary
     _align_to_user_message(history)

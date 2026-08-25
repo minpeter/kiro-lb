@@ -105,15 +105,15 @@ class TestTrimPayloadToLimit:
         assert len(history) > 0
         assert "userInputMessage" in history[0]
 
-    def test_trim_preserves_minimum_history(self):
-        """Never trims below 2 entries."""
+    def test_trim_removes_last_oversized_history_pair(self):
+        """Drops the final history pair when it alone exceeds the limit."""
         payload = _make_payload(num_pairs=5, content_size=1000)
         # Set an impossibly low limit
         stats = trim_payload_to_limit(payload, max_bytes=100)
 
         history = payload["conversationState"]["history"]
-        assert len(history) >= 2
-        assert stats.final_entries >= 2
+        assert history == []
+        assert stats.final_entries == 0
 
     def test_trim_repairs_orphaned_tool_results(self):
         """Orphaned toolResults removed, text preserved inline."""
