@@ -2735,4 +2735,3 @@ class TestAPIRegionAutoDetectionJSON:
         print("Verification: API hosts use custom default region...")
         print(f"api_host: {manager._api_host}")
         assert "ap-south-1" in manager._api_host
-

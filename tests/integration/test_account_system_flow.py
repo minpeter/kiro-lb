@@ -50,7 +50,6 @@ class TestAccountSystemFullFlow:
 
         # Arrange: Create credentials.json with two accounts
         creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         account1_path = temp_account_credentials_files["account1"]
         account2_path = temp_account_credentials_files["account2"]
@@ -61,6 +60,7 @@ class TestAccountSystemFullFlow:
         ]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         # Create AccountManager
@@ -179,7 +179,6 @@ class TestAccountSystemFullFlow:
 
         # Arrange
         creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         account1_path = temp_account_credentials_files["account1"]
         account2_path = temp_account_credentials_files["account2"]
@@ -190,6 +189,7 @@ class TestAccountSystemFullFlow:
         ]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -238,7 +238,6 @@ class TestAccountSystemFullFlow:
 
         # Arrange
         creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         account1_path = temp_account_credentials_files["account1"]
         account2_path = temp_account_credentials_files["account2"]
@@ -249,6 +248,7 @@ class TestAccountSystemFullFlow:
         ]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -299,13 +299,13 @@ class TestAccountSystemFullFlow:
 
         # Arrange
         creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         account1_path = temp_account_credentials_files["account1"]
 
         credentials = [{"type": "json", "path": account1_path, "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -362,13 +362,13 @@ class TestAccountSystemFullFlow:
 
         # Arrange
         creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         account1_path = temp_account_credentials_files["account1"]
 
         credentials = [{"type": "json", "path": account1_path, "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         # First manager instance
@@ -433,13 +433,13 @@ class TestAccountSystemFullFlow:
 
         # Arrange
         creds_file = tmp_path / "credentials.json"
-        state_file = tmp_path / "state.json"
 
         account1_path = temp_account_credentials_files["account1"]
 
         credentials = [{"type": "json", "path": account1_path, "enabled": True}]
         creds_file.write_text(json.dumps(credentials))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(credentials)
 
         manager = AccountManager()
@@ -761,6 +761,7 @@ class TestFailoverAttributionThroughTheRoute:
         with open(credentials, "w") as handle:
             json_module.dump(entries, handle)
         from tests.conftest import seed_account_sources
+
         seed_account_sources(entries)
 
         manager = AccountManager()

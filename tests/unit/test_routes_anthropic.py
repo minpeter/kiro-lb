@@ -9,7 +9,6 @@ Tests the following endpoint:
 For OpenAI API tests, see test_routes_openai.py.
 """
 
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1429,7 +1428,6 @@ class TestMessagesFailoverLoop:
 
         assert attempts == MAX_ATTEMPTS
         print("✅ MAX_ATTEMPTS prevents infinite loops")
-
 
 
 class TestMessagesNativeWebSearchAccountSelection:

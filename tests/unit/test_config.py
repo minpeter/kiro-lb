@@ -885,8 +885,6 @@ class TestWebSearchConfig:
 class TestAccountSystemConfig:
     """Tests for Account System configuration constants."""
 
-
-
     def test_account_recovery_timeout_default(self, monkeypatch):
         """
         What it does: Verifies ACCOUNT_RECOVERY_TIMEOUT defaults to 60 seconds.

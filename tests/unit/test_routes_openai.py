@@ -1305,6 +1305,8 @@ class TestChatCompletionsFailoverLoop:
 
         assert attempts == MAX_ATTEMPTS
         print("✅ MAX_ATTEMPTS correctly limits failover loop")
+
+
 class TestModelsEndpointMetadata:
     """The model list must carry usable, truthful metadata for both SDKs.
 

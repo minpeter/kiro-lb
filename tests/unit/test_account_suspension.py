@@ -288,6 +288,7 @@ class TestSuspensionDetectedAtInitialization:
         entries = [{"type": "json", "path": str(creds)}]
         pool.write_text(json_module.dumps(entries))
         from tests.conftest import seed_account_sources
+
         seed_account_sources(entries)
         mgr = AccountManager()
         mgr._save_state = AsyncMock()
@@ -454,7 +455,6 @@ class TestSuspensionPersistence:
 
         from kiro.store import load_runtime_state
 
-        state_file = tmp_path / "state.json"
         mgr = AccountManager()
         account = _account()
         account.suspended_until = time.time() + 3600

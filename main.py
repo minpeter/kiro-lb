@@ -209,7 +209,7 @@ def validate_configuration() -> None:
         logger.error("  CONFIGURATION ERROR")
         logger.error("=" * 60)
         logger.error("  PROXY_API_KEY is required.")
-        logger.error('  Generate one:  openssl rand -hex 32')
+        logger.error("  Generate one:  openssl rand -hex 32")
         logger.error('  Then set:      PROXY_API_KEY="..." in .env')
         logger.error("=" * 60)
         logger.error("")
@@ -307,9 +307,7 @@ async def lifespan(app: FastAPI):
     all_accounts = list(app.state.account_manager._accounts.keys())
 
     if not all_accounts:
-        logger.warning(
-            "No accounts in the pool yet — open the dashboard and add one via device login"
-        )
+        logger.warning("No accounts in the pool yet — open the dashboard and add one via device login")
     else:
         # Determine start index from persisted runtime state
         start_index = app.state.account_manager._current_account_index

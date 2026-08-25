@@ -87,10 +87,7 @@ def setup_test_environment(tmp_path_factory):
     original_proxy_api_key = kiro.config.PROXY_API_KEY
     kiro.config.PROXY_API_KEY = "test_proxy_key_12345"
 
-    original_environ = {
-        key: os.environ.get(key)
-        for key in ("DASHBOARD_DATA_DIR", "PROXY_API_KEY")
-    }
+    original_environ = {key: os.environ.get(key) for key in ("DASHBOARD_DATA_DIR", "PROXY_API_KEY")}
     os.environ["DASHBOARD_DATA_DIR"] = str(tmp_dir / "dashboard")
     os.environ["PROXY_API_KEY"] = kiro.config.PROXY_API_KEY
     # Stash mock paths for fixtures that still seed the SQLite account store.
@@ -141,7 +138,6 @@ def seed_account_sources(entries):
 
     with connection() as conn:
         replace_account_sources(canonicalize_account_sources(entries), conn, ungated=True)
-
 
 
 @pytest.fixture
