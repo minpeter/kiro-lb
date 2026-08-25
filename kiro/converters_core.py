@@ -23,7 +23,13 @@ from kiro.config import (
     KIRO_MAX_PAYLOAD_BYTES,
     TOOL_DESCRIPTION_MAX_LENGTH,
 )
-from kiro.payload_guards import PayloadTooLargeError, check_payload_size, trim_payload_to_limit
+from kiro.payload_guards import (
+    PayloadTooLargeError,
+    check_payload_size,
+    check_payload_tokens,
+    payload_token_limit_for_model,
+    trim_payload_to_limit,
+)
 
 # ==================================================================================================
 # Data Classes for Unified Message Format
@@ -1391,25 +1397,54 @@ def build_kiro_payload(
     if profile_arn:
         payload["profileArn"] = profile_arn
 
-    # Payload size guard. Kiro answers an oversized payload with a cryptic
-    # "Improperly formed request." that names no size, so either trim it or fail
-    # here with the real numbers. Trimming is opt-in because it silently discards
-    # the oldest turns.
+    # Payload size guard. Kiro answers an oversized payload with
+    # CONTENT_LENGTH_EXCEEDS_THRESHOLD, which names no size, so either trim it
+    # or fail here with the real numbers. The upstream counts cl100k tokens of
+    # the JSON, not UTF-8 bytes; the byte cap is a legacy extra. Trimming is
+    # opt-in because it silently discards the oldest turns.
+    payload_tokens = check_payload_tokens(payload)
     payload_size = check_payload_size(payload)
-    if payload_size > KIRO_MAX_PAYLOAD_BYTES:
+    token_cap = payload_token_limit_for_model(model_id)
+    byte_cap = KIRO_MAX_PAYLOAD_BYTES if KIRO_MAX_PAYLOAD_BYTES > 0 else None
+    over_tokens = payload_tokens > token_cap
+    over_bytes = byte_cap is not None and payload_size > byte_cap
+    if over_tokens or over_bytes:
         if AUTO_TRIM_PAYLOAD:
-            stats = trim_payload_to_limit(payload, KIRO_MAX_PAYLOAD_BYTES)
+            stats = trim_payload_to_limit(payload, max_bytes=byte_cap, max_tokens=token_cap)
             logger.info(
                 f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
-                f"({stats.original_bytes} -> {stats.final_bytes} bytes)"
+                f"({stats.original_tokens} -> {stats.final_tokens} tokens, "
+                f"{stats.original_bytes} -> {stats.final_bytes} bytes, model={model_id}, cap={token_cap})"
             )
-            if stats.final_bytes > KIRO_MAX_PAYLOAD_BYTES:
-                raise PayloadTooLargeError(stats.final_bytes, KIRO_MAX_PAYLOAD_BYTES)
+            final_tokens = stats.final_tokens
+            final_bytes = stats.final_bytes
+            if final_tokens > token_cap:
+                raise PayloadTooLargeError(
+                    final_tokens,
+                    token_cap,
+                    unit="tokens",
+                    payload_bytes=final_bytes,
+                )
+            if byte_cap is not None and final_bytes > byte_cap:
+                raise PayloadTooLargeError(final_bytes, byte_cap, unit="bytes", payload_tokens=final_tokens)
+        elif over_tokens:
+            logger.warning(
+                f"Payload {payload_tokens} tokens exceeds the {token_cap} token limit "
+                f"for {model_id} and AUTO_TRIM_PAYLOAD is disabled"
+            )
+            raise PayloadTooLargeError(
+                payload_tokens,
+                token_cap,
+                unit="tokens",
+                payload_bytes=payload_size,
+            )
         else:
             logger.warning(
                 f"Payload {payload_size} bytes exceeds the {KIRO_MAX_PAYLOAD_BYTES} byte limit "
                 f"and AUTO_TRIM_PAYLOAD is disabled"
             )
-            raise PayloadTooLargeError(payload_size, KIRO_MAX_PAYLOAD_BYTES)
+            raise PayloadTooLargeError(
+                payload_size, KIRO_MAX_PAYLOAD_BYTES, unit="bytes", payload_tokens=payload_tokens
+            )
 
     return KiroPayloadResult(payload=payload, tool_documentation=tool_documentation)

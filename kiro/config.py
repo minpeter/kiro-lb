@@ -17,8 +17,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-
-
 # ==================================================================================================
 # Server Settings
 # ==================================================================================================
@@ -392,14 +390,22 @@ def _warn_timeout_configuration():
 # Payload Size Guard Settings
 # ==================================================================================================
 
-# Payload size limit in bytes. Measured against the live upstream
-# (generateAssistantResponse, claude-haiku-4.5, ASCII history, no tools) by
-# bisecting the reject boundary: 1,085,435 bytes returned 200, and 1,086,459
-# bytes returned 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD. The default is the
-# largest size measured to pass. A later Korean probe pushed 2,070,175 UTF-8
-# bytes through successfully and failed only on the context window, so this
-# threshold is not a plain wire-byte count and the guard is deliberately
-# conservative for multi-byte text.
+# Payload token limit. Measured 2026-08-23 against runtime.us-east-1.kiro.dev
+# / generateAssistantResponse / no tools:
+#
+#   claude-haiku-4.5 Hangul JSON  195,000 -> 200; 200,000 -> 400
+#   claude-opus-5    Hangul JSON  800,000 -> 200; 1,000,000 -> 400
+#                    CONTENT_LENGTH_EXCEEDS_THRESHOLD
+#
+# Default is the largest opus-5 size measured to pass. 1,000,000 Hangul is a
+# size-reject. Do not apply the Claude CJK slope: 가 is 1 cl100k token.
+KIRO_MAX_PAYLOAD_TOKENS: int = int(os.getenv("KIRO_MAX_PAYLOAD_TOKENS", "800000"))
+
+# Legacy UTF-8 byte cap. Still honored when set so existing deployments do not
+# silently widen. The 1,085,435 default was an ASCII-only bisect (1,085,435
+# pass / 1,086,459 fail on an older host) and lets through ~250k-360k Hangul
+# characters that the upstream then rejects with no numbers. Prefer
+# KIRO_MAX_PAYLOAD_TOKENS. Set KIRO_MAX_PAYLOAD_BYTES=0 to disable this cap.
 KIRO_MAX_PAYLOAD_BYTES: int = int(os.getenv("KIRO_MAX_PAYLOAD_BYTES", "1085435"))
 
 # Auto-trim payload when over limit (default: false - disabled)
@@ -425,7 +431,6 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "false").lower() in (
 # ==================================================================================================
 # Account System Settings
 # ==================================================================================================
-
 
 
 # ==================================================================================================
