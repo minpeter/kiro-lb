@@ -41,50 +41,53 @@ export function PaginationControls({
         </SelectContent>
       </Select>
 
-      <span className="tabular-nums text-muted-foreground">
+      <span className="whitespace-nowrap tabular-nums text-muted-foreground">
         {rangeStart}–{rangeEnd} of {total.toLocaleString()}
       </span>
 
-      <Button
-        type="button"
-        variant="outline"
-        size="icon-sm"
-        disabled={offset <= 0}
-        onClick={() => onOffsetChange(0)}
-        aria-label="First page"
-      >
-        <ChevronsLeft />
-      </Button>
-      <Button
-        type="button"
-        variant="outline"
-        size="icon-sm"
-        disabled={offset <= 0}
-        onClick={() => onOffsetChange(Math.max(0, offset - limit))}
-        aria-label="Previous page"
-      >
-        <ChevronLeft />
-      </Button>
-      <Button
-        type="button"
-        variant="outline"
-        size="icon-sm"
-        disabled={!hasMore}
-        onClick={() => onOffsetChange(offset + limit)}
-        aria-label="Next page"
-      >
-        <ChevronRight />
-      </Button>
-      <Button
-        type="button"
-        variant="outline"
-        size="icon-sm"
-        disabled={!hasMore}
-        onClick={() => onOffsetChange(lastPageOffset)}
-        aria-label="Last page"
-      >
-        <ChevronsRight />
-      </Button>
+      {/* One wrapper so the four nav buttons wrap as a unit, never mid-group. */}
+      <div className="flex shrink-0 items-center gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="icon-sm"
+          disabled={offset <= 0}
+          onClick={() => onOffsetChange(0)}
+          aria-label="First page"
+        >
+          <ChevronsLeft />
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="icon-sm"
+          disabled={offset <= 0}
+          onClick={() => onOffsetChange(Math.max(0, offset - limit))}
+          aria-label="Previous page"
+        >
+          <ChevronLeft />
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="icon-sm"
+          disabled={!hasMore}
+          onClick={() => onOffsetChange(offset + limit)}
+          aria-label="Next page"
+        >
+          <ChevronRight />
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="icon-sm"
+          disabled={!hasMore}
+          onClick={() => onOffsetChange(lastPageOffset)}
+          aria-label="Last page"
+        >
+          <ChevronsRight />
+        </Button>
+      </div>
     </div>
   );
 }

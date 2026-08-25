@@ -1,9 +1,10 @@
+import { useEffect, useState } from "react";
 import { ScrollText } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { formatLatency, formatTimestamp } from "../format";
+import { formatLatency, formatRelativeTime, formatTimestamp } from "../format";
 import type { RequestLogPage } from "../types";
 import { PaginationControls } from "./pagination-controls";
 import { TableSkeleton } from "./skeletons";
@@ -17,6 +18,14 @@ export type RequestLogTableProps = {
 
 export function RequestLogTable({ page, isLoading, onLimitChange, onOffsetChange }: RequestLogTableProps) {
   const isEmpty = !isLoading && page.total === 0;
+  // One shared "now" for every row, ticked coarsely so a long-lived tab does
+  // not freeze at "just now"; the lazy initializer keeps the impure Date.now()
+  // out of the render body.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   return (
     <Card>
@@ -39,19 +48,30 @@ export function RequestLogTable({ page, isLoading, onLimitChange, onOffsetChange
                 <TableHead>Route</TableHead>
                 <TableHead>Model</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead className="text-right">Latency</TableHead>
+                <TableHead className="hidden text-right md:table-cell">Latency</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {page.logs.map((log, index) => (
                 <TableRow key={`${log.created_at}-${page.offset + index}`}>
-                  <TableCell>{formatTimestamp(log.created_at)}</TableCell>
-                  <TableCell className="font-mono text-xs">{log.route}</TableCell>
+                  <TableCell title={formatTimestamp(log.created_at)}>
+                    {formatRelativeTime(now, log.created_at)}
+                  </TableCell>
+                  <TableCell className="max-w-[10rem] truncate font-mono text-xs md:max-w-none">{log.route}</TableCell>
                   <TableCell>{log.model ?? "—"}</TableCell>
                   <TableCell>
-                    <Badge variant={log.status_code < 400 ? "secondary" : "destructive"}>{log.status_code}</Badge>
+                    {/* Status is the point of the table, so both states must read at a
+                        glance: a tinted outline for success against the loud destructive pill. */}
+                    <Badge
+                      variant={log.status_code < 400 ? "outline" : "destructive"}
+                      className={log.status_code < 400 ? "border-success/40 text-success" : undefined}
+                    >
+                      {log.status_code}
+                    </Badge>
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">{formatLatency(log.latency_ms)}</TableCell>
+                  <TableCell className="hidden text-right tabular-nums md:table-cell">
+                    {formatLatency(log.latency_ms)}
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>
