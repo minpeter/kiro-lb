@@ -400,8 +400,7 @@ async def test_builder_id_expired_code_ends_the_flow():
 
 @pytest.mark.asyncio
 async def test_builder_id_approval_carries_no_profile_arn():
-    """Builder ID cannot obtain a profile, and an empty one fails the request, so
-    the account must carry none at all to reach q.amazonaws.com."""
+    """The stored credential stays profile-less; request routing adds the service profile."""
     client = _client(_Response(REGISTRATION), _Response(OIDC_AUTHORIZATION))
     with patch("kiro.device_login.httpx.AsyncClient", return_value=client):
         flow = await start_device_login("BuilderId")

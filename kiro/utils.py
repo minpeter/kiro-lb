@@ -46,11 +46,11 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
 
     Includes all necessary headers for authentication and identification:
     - Authorization with Bearer token
-    - User-Agent with fingerprint
+    - Kiro CLI-compatible User-Agent and retry metadata
     - AWS CodeWhisperer specific headers
 
     Args:
-        auth_manager: Authentication manager for obtaining fingerprint
+        auth_manager: Authentication manager associated with the request
         token: Access token for authorization
 
     Returns:

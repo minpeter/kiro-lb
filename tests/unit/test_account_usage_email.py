@@ -17,7 +17,6 @@ import pytest
 from httpx import AsyncClient, MockTransport, Request, Response
 
 from kiro.account_manager import Account
-from kiro.auth import AuthType
 from kiro.usage import fetch_account_usage
 
 _UPSTREAM_PAYLOAD = {
@@ -51,10 +50,10 @@ def _account_with_auth() -> Account:
     account.auth_manager = SimpleNamespace(
         get_access_token=AsyncMock(return_value="mock-token"),
         profile_arn="arn:aws:codewhisperer:us-east-1:123456789012:profile/example",
+        request_profile_arn="arn:aws:codewhisperer:us-east-1:123456789012:profile/example",
         api_host="https://runtime.us-east-1.kiro.dev",
         region="us-east-1",
         fingerprint="mock-fingerprint",
-        auth_type=AuthType.KIRO_DESKTOP,
     )
     return account
 
@@ -120,8 +119,8 @@ def test_builder_id_usage_request_uses_latest_cli_fallback_profile():
 
     account = _account_with_auth()
     account.auth_manager.profile_arn = None
+    account.auth_manager.request_profile_arn = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
     account.auth_manager.api_host = "https://q.us-east-1.amazonaws.com"
-    account.auth_manager.auth_type = AuthType.AWS_SSO_OIDC
     client = AsyncClient(transport=MockTransport(handler))
     with patch("kiro.usage.httpx.AsyncClient", return_value=client):
         asyncio.run(fetch_account_usage(account))
@@ -149,6 +148,32 @@ def test_blank_upstream_email_is_stored_as_absent():
     payload = {**_UPSTREAM_PAYLOAD, "userInfo": {"email": "", "userId": "d-1"}}
 
     assert _fetch(payload)["email"] is None
+
+
+def test_agentic_breakdown_is_selected_when_upstream_returns_multiple_resources():
+    payload = {
+        **_UPSTREAM_PAYLOAD,
+        "usageBreakdownList": [
+            {
+                "resourceType": "CREDIT",
+                "currentUsageWithPrecision": 900.0,
+                "usageLimitWithPrecision": 1000.0,
+                "unit": "CREDITS",
+            },
+            {
+                "resourceType": "AGENTIC_REQUEST",
+                "currentUsageWithPrecision": 0.0,
+                "usageLimitWithPrecision": 2000.0,
+                "unit": "INVOCATIONS",
+            },
+        ],
+    }
+
+    usage = _fetch(payload)
+
+    assert usage["resourceType"] == "AGENTIC_REQUEST"
+    assert usage["currentUsage"] == 0.0
+    assert usage["usageLimit"] == 2000.0
 
 
 def test_refreshed_email_reaches_the_account_view(dashboard):

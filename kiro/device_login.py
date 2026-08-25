@@ -15,8 +15,8 @@ the polling logic is deliberately not shared:
 - Builder ID (AWS SSO OIDC) on ``oidc.{region}.amazonaws.com``. Pending is HTTP
   400 with an ``authorization_pending`` code, timings are seconds, and refreshing
   needs the client registration, so the client id and secret are stored with the
-  refresh token in SQLite. Builder ID has no profile and must use
-  ``q.{region}.amazonaws.com``.
+  refresh token in SQLite. The credential has no account-scoped profile; current
+  generation adds Kiro CLI's request-scoped service profile instead.
 
 Ported from the kiro-auth TypeScript reference.
 """

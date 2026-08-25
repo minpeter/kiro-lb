@@ -14,8 +14,6 @@ from typing import Any
 import httpx
 
 from kiro.account_manager import Account
-from kiro.auth import AuthType
-from kiro.config import KIRO_BUILDER_ID_PROFILE_ARN
 from kiro.utils import get_kiro_headers
 
 
@@ -57,12 +55,12 @@ async def fetch_account_usage(account: Account) -> dict[str, Any]:
         "origin": "AI_EDITOR",
         "isEmailRequired": True,
     }
-    profile_arn = auth.profile_arn
-    if profile_arn is None and auth.auth_type == AuthType.AWS_SSO_OIDC:
-        profile_arn = KIRO_BUILDER_ID_PROFILE_ARN
+    profile_arn = auth.request_profile_arn
     if profile_arn:
         params["profileArn"] = profile_arn
         body["profileArn"] = profile_arn
+    # Kiro CLI 2.19.1 duplicates these modeled fields in the query and AWS JSON
+    # body. Preserve that observed wire contract rather than "simplifying" it.
     url = f"https://management.{_usage_region(account)}.kiro.dev/"
     headers = get_kiro_headers(auth, token)
     headers["x-amz-target"] = "AmazonCodeWhispererService.GetUsageLimits"
@@ -74,7 +72,10 @@ async def fetch_account_usage(account: Account) -> dict[str, Any]:
     payload = response.json()
 
     breakdowns = payload.get("usageBreakdownList") or []
-    breakdown = breakdowns[0] if breakdowns else {}
+    breakdown = next(
+        (entry for entry in breakdowns if entry.get("resourceType") == "AGENTIC_REQUEST"),
+        breakdowns[0] if breakdowns else {},
+    )
     subscription = payload.get("subscriptionInfo") or {}
     overage = payload.get("overageConfiguration") or {}
     # The request asks for the identity block (isEmailRequired), which is the
