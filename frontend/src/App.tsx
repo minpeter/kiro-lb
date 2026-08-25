@@ -1,12 +1,15 @@
-import { Activity, Coins, Gauge, ServerCog, ShieldCheck } from "lucide-react";
-import { useMemo } from "react";
+import { Activity, Coins, Gauge, ServerCog, ShieldCheck, TriangleAlert, X } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { dashboardApi } from "@/features/dashboard/api";
 import { exactTokens, formatLatency, formatTokens, summarizeUsage } from "@/features/dashboard/format";
+import { deriveOverviewKpis } from "@/features/dashboard/overview-kpis";
 import { useDashboard } from "@/features/dashboard/use-dashboard";
 import { useTabHash } from "@/features/dashboard/use-tab-hash";
 import { AccountsPanel } from "@/features/dashboard/components/accounts-panel";
 import { ApiKeysPanel } from "@/features/dashboard/components/api-keys-panel";
+import { CreateKeyDialog } from "@/features/dashboard/components/create-key-dialog";
 import { DeviceLoginCard } from "@/features/dashboard/components/device-login-card";
 import { LoginCard } from "@/features/dashboard/components/login-card";
 import { RequestLogTable } from "@/features/dashboard/components/request-log-table";
@@ -14,28 +17,43 @@ import { RequestRateChart } from "@/features/dashboard/components/request-rate-c
 import { TokenUsagePanel } from "@/features/dashboard/components/token-usage-panel";
 import { AccountTokenPanel } from "@/features/dashboard/components/account-token-panel";
 import { TotalRateChart } from "@/features/dashboard/components/total-rate-chart";
-import { AppHeader, StatCard } from "@/features/dashboard/components/shell";
+import { AppHeader, KiroLogo, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
 
 export default function App() {
   const dashboard = useDashboard();
   const [tab, selectTab] = useTabHash();
+  const [isCreateKeyOpen, setIsCreateKeyOpen] = useState(false);
   const { overview, isLoading, isMutating, runAction } = dashboard;
   // Totals are derived from the same per-key usage the API keys tab shows, so
   // the two views can never disagree.
   const totals = useMemo(() => summarizeUsage(dashboard.keyUsage), [dashboard.keyUsage]);
+  const kpis = useMemo(
+    () => (overview ? deriveOverviewKpis(dashboard.accounts, overview) : undefined),
+    [dashboard.accounts, overview],
+  );
 
-  if (!dashboard.isAuthenticated && !isLoading) {
-    return <LoginCard error={dashboard.error} onSignIn={dashboard.signIn} />;
+  if (!dashboard.isAuthenticated && isLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">
+        <div role="status" className="flex items-center gap-3 text-sm">
+          <KiroLogo />
+          <span>Loading dashboard…</span>
+        </div>
+      </div>
+    );
   }
 
-  const createKey = () => {
-    const name = window.prompt("Key name");
-    if (name === null) return;
-    void runAction(async () => {
-      const created = await dashboardApi.createApiKey(name);
-      window.prompt("Copy this API key now. It cannot be displayed again.", created.apiKey);
-    });
+  if (!dashboard.isAuthenticated) {
+    // A cold-start outage should not present as a silent login screen: surface
+    // the non-auth failure the hook kept out of the auth error slot.
+    return <LoginCard error={dashboard.error || dashboard.connectionError || ""} onSignIn={dashboard.signIn} />;
+  }
+
+  const createKey = async (name: string) => {
+    const created = await dashboardApi.createApiKey(name);
+    await dashboard.reload();
+    return created.apiKey;
   };
 
   return (
@@ -46,12 +64,47 @@ export default function App() {
         isMutating={isMutating}
         isLive={dashboard.isLive}
         lastUpdatedAt={dashboard.lastUpdatedAt}
+        routableAccounts={kpis?.routableAccounts}
         onToggleLive={() => dashboard.setIsLive(!dashboard.isLive)}
         onRefresh={() => void runAction(dashboardApi.refreshUsage)}
         onSignOut={() => void dashboard.signOut()}
       />
 
-      <main className="mx-auto max-w-7xl p-6">
+      {dashboard.connectionError && (
+        <div role="status" aria-live="polite" className="border-b border-warning/30 bg-warning/10 text-warning">
+          <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
+            <span className="flex items-center gap-2 font-medium">
+              <TriangleAlert size={15} aria-hidden />
+              Connection lost - retrying
+            </span>
+            <Button variant="outline" size="sm" onClick={() => void dashboard.reload()}>
+              Retry
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {dashboard.actionError && (
+        <div role="alert" className="border-b border-destructive/30 bg-destructive/10 text-destructive">
+          <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
+            <span className="flex items-center gap-2">
+              <TriangleAlert size={15} aria-hidden />
+              {dashboard.actionError}
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 shrink-0"
+              aria-label="Dismiss action error"
+              onClick={dashboard.clearActionError}
+            >
+              <X aria-hidden />
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <main className="mx-auto max-w-7xl p-4 sm:p-6">
         <Tabs value={tab} onValueChange={selectTab} className="space-y-6">
           <TabsList>
             <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -71,12 +124,45 @@ export default function App() {
                     icon={<Coins size={15} />}
                   />
                   <StatCard label="24h requests" value={overview.requests24h.toLocaleString()} icon={<Activity size={15} />} />
-                  <StatCard label="24h success" value={overview.successes24h.toLocaleString()} icon={<ShieldCheck size={15} />} />
-                  <StatCard label="Average latency" value={formatLatency(overview.averageLatencyMs)} icon={<Gauge size={15} />} />
                   <StatCard
-                    label="Ready accounts"
-                    value={`${overview.accounts.initialized}/${overview.accounts.total}`}
-                    icon={<ServerCog size={15} />}
+                    label="24h success"
+                    value={
+                      <span
+                        className={kpis?.success.isCritical ? "text-destructive" : undefined}
+                        title={`${overview.successes24h.toLocaleString()} successful of ${overview.requests24h.toLocaleString()} requests`}
+                      >
+                        {kpis?.success.label}
+                      </span>
+                    }
+                    icon={<ShieldCheck size={15} className={kpis?.success.isCritical ? "text-destructive" : undefined} />}
+                  />
+                  <StatCard
+                    label="Average latency"
+                    value={
+                      kpis?.maskAverageLatency ? (
+                        <span title="all recent requests failed">—</span>
+                      ) : (
+                        formatLatency(overview.averageLatencyMs)
+                      )
+                    }
+                    icon={<Gauge size={15} />}
+                  />
+                  <StatCard
+                    label="Routable accounts"
+                    value={
+                      <span
+                        className={kpis?.routableAccounts.isCritical ? "text-destructive" : undefined}
+                        title={`${kpis?.routableAccounts.count ?? 0} routable of ${kpis?.routableAccounts.total ?? 0} total accounts`}
+                      >
+                        {kpis?.routableAccounts.count}/{kpis?.routableAccounts.total}
+                      </span>
+                    }
+                    icon={
+                      <ServerCog
+                        size={15}
+                        className={kpis?.routableAccounts.isCritical ? "text-destructive" : undefined}
+                      />
+                    }
                   />
                 </>
               )}
@@ -123,12 +209,14 @@ export default function App() {
               keyUsage={dashboard.keyUsage}
               isLoading={isLoading}
               isMutating={isMutating}
-              onCreate={createKey}
+              onCreate={() => setIsCreateKeyOpen(true)}
               onRevoke={(id) => void runAction(() => dashboardApi.revokeApiKey(id))}
             />
           </TabsContent>
         </Tabs>
       </main>
+
+      <CreateKeyDialog open={isCreateKeyOpen} onOpenChange={setIsCreateKeyOpen} onCreate={createKey} />
     </div>
   );
 }
