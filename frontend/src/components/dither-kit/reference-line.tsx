@@ -22,8 +22,10 @@ export function ReferenceLine({
   const ctx = useChartPart("ReferenceLine")
   if (!ctx.ready) return null
 
-  const { width } = ctx.plot
+  const { width, height } = ctx.plot
   const py = ctx.y(y)
+  const labelY = Math.max(10, py - 3)
+  const showLabel = label && py < height - 12
 
   return (
     <g>
@@ -35,10 +37,10 @@ export function ReferenceLine({
         className={className}
         strokeDasharray={strokeDasharray}
       />
-      {label ? (
+      {showLabel ? (
         <text
           x={width - 2}
-          y={py - 3}
+          y={labelY}
           textAnchor="end"
           className="fill-muted-foreground font-mono text-[10px]"
         >

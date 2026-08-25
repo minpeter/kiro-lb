@@ -57,9 +57,11 @@ export function BarCanvas() {
   // mid-render tears under Strict Mode / concurrent rendering.
   const state = useRef(ctx)
   const targetsRef = useRef(targets)
+  const wakeRef = useRef<(() => void) | null>(null)
   useEffect(() => {
     state.current = ctx
     targetsRef.current = targets
+    wakeRef.current?.()
   })
 
   useEffect(() => {
@@ -137,8 +139,16 @@ export function BarCanvas() {
     let lastSelected: string | null | undefined = Symbol() as never
     let lastHover: number | null | undefined = Symbol() as never
 
-    const draw = (now: number) => {
+    const requestDraw = () => {
+      if (raf || document.visibilityState === "hidden") return
       raf = requestAnimationFrame(draw)
+    }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") requestDraw()
+    }
+
+    const draw = (now: number) => {
+      raf = 0
       const s = state.current
       if (!s.ready) return
       if (bloomCtx) {
@@ -186,13 +196,26 @@ export function BarCanvas() {
         needsFill = true
       }
 
-      if (!needsFill) return
-      paint(prog)
-      needsFill = false
+      const keepAlive =
+        prog < 1 ||
+        Math.abs(intensity - itTarget) > 0.001 ||
+        s.isMouseInChart ||
+        s.hovered
+      if (needsFill) {
+        paint(prog)
+        needsFill = false
+      }
+      if (keepAlive) requestDraw()
     }
 
-    raf = requestAnimationFrame(draw)
-    return () => cancelAnimationFrame(raf)
+    wakeRef.current = requestDraw
+    document.addEventListener("visibilitychange", onVisibilityChange)
+    requestDraw()
+    return () => {
+      wakeRef.current = null
+      document.removeEventListener("visibilitychange", onVisibilityChange)
+      cancelAnimationFrame(raf)
+    }
   }, [cols, rows, width])
 
   const bloomActive = ctx.bloomOnHover

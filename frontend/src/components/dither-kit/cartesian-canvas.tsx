@@ -23,6 +23,7 @@ type LoopArgs = {
   state: RefObject<ChartContextValue>
   targets: RefObject<Record<string, Surface>>
   stars: RefObject<Star[]>
+  installWake: (wake: (() => void) | null) => void
 }
 
 /**
@@ -40,6 +41,7 @@ function startCartesianLoop({
   state,
   targets,
   stars,
+  installWake,
 }: LoopArgs): (() => void) | undefined {
   const c = canvas.getContext("2d")
   if (!c || cols <= 0 || rows <= 0) return undefined
@@ -114,8 +116,16 @@ function startCartesianLoop({
   let lastPaintSig = ""
   let lastSelected: string | null | undefined = Symbol() as never
 
-  const draw = (now: number) => {
+  const requestDraw = () => {
+    if (raf || document.visibilityState === "hidden") return
     raf = requestAnimationFrame(draw)
+  }
+  const onVisibilityChange = () => {
+    if (document.visibilityState === "visible") requestDraw()
+  }
+
+  const draw = (now: number) => {
+    raf = 0
     const s = state.current
     if (!s.ready) return
     // Keep the bloom layer in sync with the crisp canvas while it's active.
@@ -190,7 +200,8 @@ function startCartesianLoop({
     // Live hover wins; the controlled markerIndex (e.g. a committed point)
     // is the fallback shown when nothing is hovered.
     const marker = s.hoverIndex != null ? s.hoverIndex : s.markerIndex
-    const winkDue = !reduce && now - last >= 100
+    const hoverActive = s.isMouseInChart || s.hovered
+    const winkDue = hoverActive && !reduce && now - last >= 100
     // Repaint when a tweak-driven paint input changes (variant, stacking) so
     // the panel updates the fill live — without resetting the entrance reveal.
     const paintSig = `${s.stackType}|${s.configKeys
@@ -210,8 +221,10 @@ function startCartesianLoop({
         progChanged ||
         sigChanged
       )
-    )
+    ) {
+      if (hoverActive) requestDraw()
       return
+    }
     if (progChanged) {
       lastProg = prog
       needsFill = true
@@ -280,10 +293,18 @@ function startCartesianLoop({
         c.fillRect(sx, sy + 1, 1, 1)
       }
     }
+
+    if (moving || settling || prog < 1 || hoverActive) requestDraw()
   }
 
-  raf = requestAnimationFrame(draw)
-  return () => cancelAnimationFrame(raf)
+  installWake(requestDraw)
+  document.addEventListener("visibilitychange", onVisibilityChange)
+  requestDraw()
+  return () => {
+    installWake(null)
+    document.removeEventListener("visibilitychange", onVisibilityChange)
+    cancelAnimationFrame(raf)
+  }
 }
 
 /**
@@ -351,10 +372,12 @@ export function CartesianCanvas() {
   const stateRef = useRef(ctx)
   const targetsRef = useRef(targets)
   const starsRef = useRef(stars)
+  const wakeRef = useRef<(() => void) | null>(null)
   useEffect(() => {
     stateRef.current = ctx
     targetsRef.current = targets
     starsRef.current = stars
+    wakeRef.current?.()
   })
 
   useEffect(() => {
@@ -368,6 +391,9 @@ export function CartesianCanvas() {
       state: stateRef,
       targets: targetsRef,
       stars: starsRef,
+      installWake: (wake) => {
+        wakeRef.current = wake
+      },
     })
   }, [cols, rows])
 
