@@ -197,6 +197,29 @@ def _over_limit(payload: Dict[str, Any], max_bytes: Optional[int], max_tokens: O
     return False
 
 
+def _over_limit_with_history(
+    payload: Dict[str, Any],
+    conversation_state: Dict[str, Any],
+    remaining: list,
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+) -> bool:
+    """Measure the payload as if history were ``remaining``, then restore it."""
+    original = conversation_state.get("history")
+    present = "history" in conversation_state
+    if remaining:
+        conversation_state["history"] = remaining
+    else:
+        conversation_state.pop("history", None)
+    try:
+        return _over_limit(payload, max_bytes, max_tokens)
+    finally:
+        if present:
+            conversation_state["history"] = original
+        else:
+            conversation_state.pop("history", None)
+
+
 def trim_payload_to_limit(
     payload: Dict[str, Any],
     max_bytes: Optional[int] = None,
@@ -229,9 +252,20 @@ def trim_payload_to_limit(
     # Strip empty toolUses before measuring
     _strip_empty_tool_uses(history)
 
-    # Trim pairs from the beginning until under limit or no history remains.
-    while history and _over_limit(payload, max_bytes, max_tokens):
-        del history[:2]
+    # Drop oldest user/assistant pairs. Binary search the same cut points the
+    # old linear loop used (0, 2, 4, ... entries) so we tokenize O(log n)
+    # times instead of once per dropped pair.
+    if history and _over_limit(payload, max_bytes, max_tokens):
+        entry_count = len(history)
+        low, high = 1, (entry_count + 1) // 2
+        while low < high:
+            mid = (low + high) // 2
+            remaining = history[min(mid * 2, entry_count) :]
+            if _over_limit_with_history(payload, conversation_state, remaining, max_bytes, max_tokens):
+                low = mid + 1
+            else:
+                high = mid
+        del history[: min(low * 2, entry_count)]
 
     # Align to userInputMessage boundary
     _align_to_user_message(history)

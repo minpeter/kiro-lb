@@ -114,6 +114,25 @@ class TestTrimPayloadToLimit:
         assert "history" not in payload["conversationState"]
         assert stats.final_entries == 0
 
+    def test_trim_does_not_retokenize_once_per_dropped_pair(self, monkeypatch):
+        """Dropping N pairs must not encode the whole payload N times."""
+        import kiro.payload_guards as guards
+
+        payload = _make_payload(num_pairs=64, content_size=80)
+        calls = {"n": 0}
+        real = guards.check_payload_tokens
+
+        def counting(payload_arg):
+            calls["n"] += 1
+            return real(payload_arg)
+
+        monkeypatch.setattr(guards, "check_payload_tokens", counting)
+        stats = trim_payload_to_limit(payload, max_tokens=200)
+
+        assert stats.trimmed
+        assert stats.final_entries < stats.original_entries
+        assert calls["n"] <= 20
+
     def test_trim_repairs_current_tool_result_after_removing_its_tool_use(self):
         """Converts a current tool result to text when trimming removes its tool use."""
         payload = {
