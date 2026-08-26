@@ -30,6 +30,7 @@ from kiro.models_openai import (
     ModelList,
     OpenAIModel,
 )
+from kiro.offload import run_in_worker
 from kiro.payload_guards import PayloadTooLargeError
 from kiro.streaming_openai import collect_stream_response, stream_with_first_token_retry
 from kiro.usage_tracking import current_account_id, current_api_key_id
@@ -363,7 +364,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             profile_arn_for_payload = auth_manager.request_profile_arn or ""
 
             try:
-                kiro_payload = build_kiro_payload(request_data, conversation_id, profile_arn_for_payload)
+                kiro_payload = await run_in_worker(
+                    build_kiro_payload, request_data, conversation_id, profile_arn_for_payload
+                )
             except PayloadTooLargeError as e:
                 raise HTTPException(status_code=400, detail=str(e))
             except ValueError as e:

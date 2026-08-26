@@ -105,15 +105,54 @@ class TestTrimPayloadToLimit:
         assert len(history) > 0
         assert "userInputMessage" in history[0]
 
-    def test_trim_preserves_minimum_history(self):
-        """Never trims below 2 entries."""
+    def test_trim_removes_last_oversized_history_pair(self):
+        """Drops the final history pair when it alone exceeds the limit."""
         payload = _make_payload(num_pairs=5, content_size=1000)
         # Set an impossibly low limit
         stats = trim_payload_to_limit(payload, max_bytes=100)
 
-        history = payload["conversationState"]["history"]
-        assert len(history) >= 2
-        assert stats.final_entries >= 2
+        assert "history" not in payload["conversationState"]
+        assert stats.final_entries == 0
+
+    def test_trim_repairs_current_tool_result_after_removing_its_tool_use(self):
+        """Converts a current tool result to text when trimming removes its tool use."""
+        payload = {
+            "conversationState": {
+                "conversationId": "test",
+                "chatTriggerType": "MANUAL",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "",
+                        "modelId": "m",
+                        "userInputMessageContext": {
+                            "toolResults": [
+                                {
+                                    "toolUseId": "tool-A",
+                                    "content": [{"text": "result from tool-A"}],
+                                }
+                            ]
+                        },
+                    }
+                },
+                "history": [
+                    {"userInputMessage": {"content": "x" * 3000}},
+                    {
+                        "assistantResponseMessage": {
+                            "content": "using tool",
+                            "toolUses": [{"toolUseId": "tool-A", "name": "read", "input": {}}],
+                        }
+                    },
+                ],
+            }
+        }
+
+        stats = trim_payload_to_limit(payload, max_bytes=1000)
+
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert stats.final_entries == 0
+        assert "history" not in payload["conversationState"]
+        assert "toolResults" not in current.get("userInputMessageContext", {})
+        assert "[trimmed tool result] result from tool-A" in current["content"]
 
     def test_trim_repairs_orphaned_tool_results(self):
         """Orphaned toolResults removed, text preserved inline."""
@@ -287,6 +326,23 @@ class TestOversizedPayloadWithoutAutoTrim:
         assert len(history) == 2
         assert history[0]["userInputMessage"]["content"] == "recent question"
         assert result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"] == "current"
+
+    def test_last_oversized_history_pair_is_removed_by_builder(self, monkeypatch):
+        import kiro.converters_core as cc
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", True)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1000)
+        messages = [
+            cc.UnifiedMessage(role="user", content="old " + "x" * 3000),
+            cc.UnifiedMessage(role="assistant", content="old answer"),
+            cc.UnifiedMessage(role="user", content="current"),
+        ]
+
+        result = cc.build_kiro_payload(messages, "", "auto", None, "conv-full-trim", None)
+
+        conversation_state = result.payload["conversationState"]
+        assert "history" not in conversation_state
+        assert conversation_state["currentMessage"]["userInputMessage"]["content"] == "current"
 
     def test_under_limit_payload_is_untouched_when_trim_disabled(self, monkeypatch):
         import kiro.converters_core as cc
