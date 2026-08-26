@@ -27,6 +27,7 @@ from kiro.models_anthropic import (
     ToolResultContentBlock,
     ToolUseContentBlock,
 )
+from kiro.offload import run_in_worker
 from kiro.payload_guards import PayloadTooLargeError
 from kiro.streaming_anthropic import (
     collect_anthropic_response,
@@ -255,7 +256,9 @@ async def messages(
             profile_arn_for_payload = auth_manager.request_profile_arn or ""
 
             try:
-                kiro_payload = anthropic_to_kiro(request_data, conversation_id, profile_arn_for_payload)
+                kiro_payload = await run_in_worker(
+                    anthropic_to_kiro, request_data, conversation_id, profile_arn_for_payload
+                )
             except PayloadTooLargeError as e:
                 logger.error(f"Payload too large: {e}")
                 return JSONResponse(
@@ -310,7 +313,9 @@ async def messages(
                         ),
                     ]
                 )
-                followup_payload = anthropic_to_kiro(followup_request, conversation_id, profile_arn_for_payload)
+                followup_payload = await run_in_worker(
+                    anthropic_to_kiro, followup_request, conversation_id, profile_arn_for_payload
+                )
                 return await http_client.request_with_retry(
                     "POST", url, followup_payload, stream=True, retry_rate_limits=False
                 )
