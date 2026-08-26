@@ -11,6 +11,12 @@ Tests the classify_error() function that determines whether an error is:
 from kiro.account_errors import ErrorType, classify_error
 
 
+def test_transient_gateway_statuses_are_recoverable():
+    """Transient gateway responses should fail over after local retries."""
+    for status_code in (502, 503, 504):
+        assert classify_error(status_code, None) is ErrorType.RECOVERABLE
+
+
 class TestClassifyErrorRecoverable:
     """
     Tests for RECOVERABLE errors (account-specific issues).
@@ -170,21 +176,21 @@ class TestClassifyErrorFatal:
         print(f"Classification result: {result}")
         assert result == ErrorType.FATAL, "500 should be FATAL (server error)"
 
-    def test_classify_error_503_fatal(self):
+    def test_classify_error_501_fatal(self):
         """
-        Test that 503 (service unavailable) is FATAL.
+        Test that 501 (not implemented) is FATAL.
 
-        What it does: Verifies 503 status code classification
-        Purpose: Service unavailable affects all accounts
+        What it does: Verifies non-gateway 5xx classification
+        Purpose: Non-transient server errors should not replay across accounts
         """
-        print("\n=== Test: 503 Service Unavailable → FATAL ===")
+        print("\n=== Test: 501 Not Implemented → FATAL ===")
 
         # Act
-        result = classify_error(status_code=503, reason=None)
+        result = classify_error(status_code=501, reason=None)
 
         # Assert
         print(f"Classification result: {result}")
-        assert result == ErrorType.FATAL, "503 should be FATAL (service unavailable)"
+        assert result == ErrorType.FATAL, "501 should be FATAL (not implemented)"
 
 
 class TestClassifyErrorEdgeCases:
@@ -270,16 +276,16 @@ class TestClassifyErrorComprehensive:
             print(f"Status {code}: {result}")
             assert result == ErrorType.RECOVERABLE, f"{code} should be RECOVERABLE"
 
-    def test_all_fatal_5xx_codes(self):
+    def test_non_gateway_5xx_codes_fatal(self):
         """
-        Test that all 5xx codes are FATAL.
+        Test that non-gateway 5xx codes are FATAL.
 
-        What it does: Batch verification of server error codes
-        Purpose: Ensure all server errors are classified as FATAL
+        What it does: Batch verification of non-transient server error codes
+        Purpose: Ensure unrelated server errors are not replayed across accounts
         """
-        print("\n=== Test: All 5xx codes → FATAL ===")
+        print("\n=== Test: Non-gateway 5xx codes → FATAL ===")
 
-        server_error_codes = [500, 501, 502, 503, 504, 505]
+        server_error_codes = [500, 501, 505]
 
         for code in server_error_codes:
             result = classify_error(code, None)
