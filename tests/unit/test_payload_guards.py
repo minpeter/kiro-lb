@@ -114,6 +114,84 @@ class TestTrimPayloadToLimit:
         assert "history" not in payload["conversationState"]
         assert stats.final_entries == 0
 
+    def test_trim_drops_oldest_current_images_after_history_is_gone(self):
+        """Image turns overflow the current message; history trim alone cannot recover."""
+        big = "A" * 20000
+        payload = {
+            "conversationState": {
+                "conversationId": "test",
+                "chatTriggerType": "MANUAL",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "look",
+                        "modelId": "m",
+                        "images": [
+                            {"format": "png", "source": {"bytes": big}},
+                            {"format": "png", "source": {"bytes": big}},
+                            {"format": "png", "source": {"bytes": "keep-me"}},
+                        ],
+                    }
+                },
+                "history": [
+                    {"userInputMessage": {"content": "old " + "x" * 8000}},
+                    {"assistantResponseMessage": {"content": "ok"}},
+                ],
+            }
+        }
+        only_latest = {
+            "conversationState": {
+                "conversationId": "test",
+                "chatTriggerType": "MANUAL",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "look",
+                        "modelId": "m",
+                        "images": [{"format": "png", "source": {"bytes": "keep-me"}}],
+                    }
+                },
+            }
+        }
+        limit = check_payload_size(only_latest) + 80
+        stats = trim_payload_to_limit(payload, max_bytes=limit)
+
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert stats.trimmed
+        assert "history" not in payload["conversationState"]
+        assert current["images"] == [{"format": "png", "source": {"bytes": "keep-me"}}]
+        assert check_payload_size(payload) <= limit
+
+    def test_trim_shrinks_a_current_screenshot_when_it_alone_is_over(self):
+        """A single UI PNG can exceed the cap after history is already gone."""
+        import base64
+        import io
+
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (1800, 1800), color=(30, 30, 30)).save(buffer, format="PNG")
+        png_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+        payload = {
+            "conversationState": {
+                "conversationId": "test",
+                "chatTriggerType": "MANUAL",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "look",
+                        "modelId": "m",
+                        "images": [{"format": "png", "source": {"bytes": png_b64}}],
+                    }
+                },
+            }
+        }
+        original = check_payload_size(payload)
+        limit = original - 3000
+        stats = trim_payload_to_limit(payload, max_bytes=limit)
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert original > limit
+        assert stats.final_bytes <= limit
+        assert current["images"][0]["format"] == "jpeg"
+        assert len(current["images"][0]["source"]["bytes"]) < len(png_b64)
+
     def test_trim_does_not_retokenize_once_per_dropped_pair(self, monkeypatch):
         """Dropping N pairs must not encode the whole payload N times."""
         import kiro.payload_guards as guards

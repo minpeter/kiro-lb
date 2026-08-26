@@ -12,6 +12,9 @@ pass, 1_000_000 fail. This module provides:
 - Auto-trimming of oldest history entries to fit under the limit
 """
 
+import base64
+import binascii
+import io
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -197,6 +200,102 @@ def _over_limit(payload: Dict[str, Any], max_bytes: Optional[int], max_tokens: O
     return False
 
 
+def _current_user_input(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    conversation_state = payload.get("conversationState")
+    if not isinstance(conversation_state, dict):
+        return None
+    current_message = conversation_state.get("currentMessage")
+    if not isinstance(current_message, dict):
+        return None
+    user_input = current_message.get("userInputMessage")
+    if not isinstance(user_input, dict):
+        return None
+    return user_input
+
+
+def _drop_oldest_current_images_until_fit(
+    payload: Dict[str, Any],
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+) -> None:
+    """Remove oldest current-turn images until the payload fits."""
+    user_input = _current_user_input(payload)
+    if user_input is None:
+        return
+    images = user_input.get("images")
+    if not isinstance(images, list) or not images:
+        return
+    while images and _over_limit(payload, max_bytes, max_tokens):
+        images.pop(0)
+    if not images:
+        user_input.pop("images", None)
+
+
+def _shrink_kiro_image(image: Dict[str, Any], max_edge: int = 1280, quality: int = 70) -> bool:
+    """Re-encode one Kiro image as a smaller JPEG. Returns True if it shrank."""
+    source = image.get("source")
+    if not isinstance(source, dict):
+        return False
+    raw_b64 = source.get("bytes")
+    if not isinstance(raw_b64, str) or not raw_b64:
+        return False
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        original = base64.b64decode(raw_b64, validate=True)
+        with Image.open(io.BytesIO(original)) as decoded:
+            rgb = decoded.convert("RGB")
+            width, height = rgb.size
+            longest = max(width, height)
+            if longest > max_edge:
+                scale = max_edge / longest
+                rgb = rgb.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+            buffer = io.BytesIO()
+            rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
+    except (OSError, ValueError, binascii.Error):
+        return False
+    shrunk = base64.b64encode(buffer.getvalue()).decode("ascii")
+    if len(shrunk) >= len(raw_b64):
+        return False
+    image["format"] = "jpeg"
+    source["bytes"] = shrunk
+    return True
+
+
+def _shrink_current_images_until_fit(
+    payload: Dict[str, Any],
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+) -> None:
+    """Downscale remaining current-turn images when history trim is not enough."""
+    user_input = _current_user_input(payload)
+    if user_input is None:
+        return
+    images = user_input.get("images")
+    if not isinstance(images, list) or not images:
+        return
+    for max_edge, quality in ((1280, 70), (720, 50)):
+        for image in images:
+            if not _over_limit(payload, max_bytes, max_tokens):
+                return
+            if isinstance(image, dict):
+                _shrink_kiro_image(image, max_edge=max_edge, quality=quality)
+
+
+def _fit_current_images(
+    payload: Dict[str, Any],
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+) -> None:
+    if not _over_limit(payload, max_bytes, max_tokens):
+        return
+    _shrink_current_images_until_fit(payload, max_bytes, max_tokens)
+    if _over_limit(payload, max_bytes, max_tokens):
+        _drop_oldest_current_images_until_fit(payload, max_bytes, max_tokens)
+
+
 def _over_limit_with_history(
     payload: Dict[str, Any],
     conversation_state: Dict[str, Any],
@@ -237,14 +336,17 @@ def trim_payload_to_limit(
     history = conversation_state.get("history")
 
     if not history:
+        _fit_current_images(payload, max_bytes, max_tokens)
+        final_bytes = check_payload_size(payload)
+        final_tokens = check_payload_tokens(payload)
         return PayloadTrimStats(
             original_bytes=original_bytes,
-            final_bytes=original_bytes,
+            final_bytes=final_bytes,
             original_entries=0,
             final_entries=0,
-            trimmed=False,
+            trimmed=final_bytes < original_bytes,
             original_tokens=original_tokens,
-            final_tokens=original_tokens,
+            final_tokens=final_tokens,
         )
 
     original_entries = len(history)
@@ -275,6 +377,8 @@ def trim_payload_to_limit(
 
     if not history:
         del conversation_state["history"]
+
+    _fit_current_images(payload, max_bytes, max_tokens)
 
     final_bytes = check_payload_size(payload)
     final_tokens = check_payload_tokens(payload)
