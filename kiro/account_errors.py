@@ -82,12 +82,13 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
     - 402: Payment required (monthly quota exceeded, billing issues)
     - 403: Token expired/invalid
     - 429: Rate limit exceeded
+    - 502/503/504: Transient upstream gateway failures
 
     FATAL errors (return to client immediately):
     - 400 + CONTENT_LENGTH_EXCEEDS_THRESHOLD: Context overflow
     - 400 + other/null reason: Malformed request
     - 422: Validation error
-    - 5xx: Kiro API server error
+    - Other 5xx: Kiro API server error
 
     Args:
         status_code: HTTP status code from Kiro API
@@ -152,9 +153,13 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
     if status_code == 422:
         return ErrorType.FATAL
 
-    # FATAL: Server errors (5xx)
-    # Note: 503 could be temporary, but we classify as FATAL for simplicity
-    # Retrying on different accounts won't help if Kiro API is down
+    # RECOVERABLE: Transient upstream gateway failures. The HTTP client has
+    # already exhausted bounded same-account retries, so let the route try a
+    # different account before returning the gateway error to the caller.
+    if status_code in (502, 503, 504):
+        return ErrorType.RECOVERABLE
+
+    # FATAL: Other server errors (5xx)
     if 500 <= status_code < 600:
         return ErrorType.FATAL
 

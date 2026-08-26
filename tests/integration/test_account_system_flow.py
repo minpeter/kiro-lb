@@ -14,6 +14,7 @@ Tests cover:
 
 import json
 import time
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +23,7 @@ from fastapi import HTTPException
 from kiro.account_errors import ErrorType
 from kiro.account_manager import Account, AccountManager, account_label
 from kiro.config import ACCOUNT_RECOVERY_TIMEOUT
+from kiro.usage_tracking import current_account_id
 
 # =============================================================================
 # Integration Tests: Full Failover Flow
@@ -849,3 +851,113 @@ class TestFailoverAttributionThroughTheRoute:
         finally:
             drain_pending_usage()
             current_account_id.set(None)
+
+
+def _transient_gateway_manager(account_a, account_b):
+    manager = MagicMock()
+    manager._accounts = {account_a.id: account_a, account_b.id: account_b}
+    manager.get_next_account = AsyncMock(side_effect=[account_a, account_b])
+    manager.report_failure = AsyncMock()
+    manager.report_success = AsyncMock()
+    return manager
+
+
+def _transient_gateway_responses(mock_httpx_response):
+    from tests.conftest import create_kiro_content_chunk, create_kiro_context_usage_chunk
+
+    failure = mock_httpx_response(status_code=502, text='{"message":"transient bad gateway"}')
+    success = mock_httpx_response(
+        status_code=200,
+        stream_chunks=[
+            create_kiro_content_chunk("recovered"),
+            create_kiro_context_usage_chunk(0.01),
+        ],
+    )
+    return failure, success
+
+
+def test_openai_502_fails_over_to_next_account(monkeypatch, mock_account, mock_httpx_response):
+    """A bodyless upstream 502 should fail over before OpenAI output starts."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kiro import routes_openai
+
+    account_a = replace(mock_account, id="account-a")
+    account_b = replace(mock_account, id="account-b")
+    manager = _transient_gateway_manager(account_a, account_b)
+    failure, success = _transient_gateway_responses(mock_httpx_response)
+    attempts: list[str] = []
+
+    async def request_with_retry(self, *args, **kwargs):
+        account_id = current_account_id.get()
+        assert account_id is not None
+        attempts.append(account_id)
+        return failure if len(attempts) == 1 else success
+
+    monkeypatch.setattr(routes_openai.KiroHttpClient, "request_with_retry", request_with_retry)
+    app = FastAPI()
+    app.include_router(routes_openai.router)
+    app.state.account_manager = manager
+    app.state.http_client = MagicMock()
+    app.dependency_overrides[routes_openai.verify_api_key] = lambda: True
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "claude-sonnet-4.5",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": False,
+                },
+            )
+
+        assert (response.status_code, attempts) == (200, ["account-a", "account-b"])
+        assert response.json()["choices"][0]["message"]["content"] == "recovered"
+    finally:
+        current_account_id.set(None)
+
+
+def test_anthropic_502_fails_over_to_next_account(monkeypatch, mock_account, mock_httpx_response):
+    """A bodyless upstream 502 should fail over before Anthropic output starts."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kiro import routes_anthropic
+
+    account_a = replace(mock_account, id="account-a")
+    account_b = replace(mock_account, id="account-b")
+    manager = _transient_gateway_manager(account_a, account_b)
+    failure, success = _transient_gateway_responses(mock_httpx_response)
+    attempts: list[str] = []
+
+    async def request_with_retry(self, *args, **kwargs):
+        account_id = current_account_id.get()
+        assert account_id is not None
+        attempts.append(account_id)
+        return failure if len(attempts) == 1 else success
+
+    monkeypatch.setattr(routes_anthropic.KiroHttpClient, "request_with_retry", request_with_retry)
+    app = FastAPI()
+    app.include_router(routes_anthropic.router)
+    app.state.account_manager = manager
+    app.state.http_client = MagicMock()
+    app.dependency_overrides[routes_anthropic.verify_anthropic_api_key] = lambda: True
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-sonnet-4.5",
+                    "max_tokens": 32,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": False,
+                },
+            )
+
+        assert (response.status_code, attempts) == (200, ["account-a", "account-b"])
+        assert response.json()["content"] == [{"type": "text", "text": "recovered"}]
+    finally:
+        current_account_id.set(None)
