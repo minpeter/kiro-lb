@@ -21,7 +21,7 @@ all wrong; trust `vite.config.ts` and `package.json`.
 
 ## CONVENTIONS
 
-- Package manager is Bun 1.3.7 (`packageManager` in `package.json`). Do not
+- Package manager is Bun 1.4.0 (`packageManager` in `package.json`). Do not
   introduce npm or pnpm lockfiles.
 - `bun run build` runs `tsc -b` first; type errors block the build by design.
   CI also runs `bun run lint` and `bun run typecheck` in the `quality` job.

@@ -117,15 +117,14 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
         >>> print(error_info.user_message)
         "Something went wrong. (reason: UNKNOWN_REASON)"
     """
-    # Extract original message and reason from Kiro API response
-    # Handle None values explicitly (preserve empty strings)
-    original_message = error_json.get("message")
-    if original_message is None:
-        original_message = "Unknown error"
+    # Extract original message and reason from Kiro API response.
+    # Dict.get() is Any | None; coerce to str so KiroErrorInfo.reason stays str
+    # (mypy 1.20+ no longer treats Any | None as Any). Empty strings are kept.
+    extracted_message = error_json.get("message")
+    original_message: str = extracted_message if isinstance(extracted_message, str) else "Unknown error"
 
-    reason = error_json.get("reason")
-    if reason is None:
-        reason = "UNKNOWN"
+    extracted_reason = error_json.get("reason")
+    reason: str = extracted_reason if isinstance(extracted_reason, str) else "UNKNOWN"
 
     # A suspension may arrive with no reason code (legacy host), so it has to be
     # recognized from the message too before the generic branches collapse it

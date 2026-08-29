@@ -4,7 +4,7 @@ This frontend is built with Bun, Vite, React, TypeScript, and SWC.
 
 ## Prerequisites
 
-- Bun 1.3+
+- Bun 1.4+
 
 ## Setup
 

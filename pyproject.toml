@@ -2,8 +2,8 @@
 # requirements.txt, quality-gate deps in requirements-dev.txt.
 
 [tool.ruff]
-# CI and the Docker image run 3.10, which is older than a typical dev machine.
-target-version = "py310"
+# CI and the Docker image run 3.12.
+target-version = "py312"
 line-length = 120
 extend-exclude = ["kiro/static", "frontend"]
 
@@ -18,7 +18,7 @@ select = ["E4", "E7", "E9", "F", "I", "W"]
 "kiro/__init__.py" = ["F401"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 files = ["kiro", "main.py"]
 ignore_missing_imports = true
 warn_redundant_casts = true
