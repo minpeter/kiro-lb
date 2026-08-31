@@ -17,7 +17,7 @@ from fastapi.security import APIKeyHeader
 from loguru import logger
 
 from kiro.config import WEB_SEARCH_ENABLED
-from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.converters_anthropic import anthropic_to_kiro, anthropic_to_kiro_with_stats
 from kiro.dashboard import identify_data_api_key
 from kiro.http_client import KiroHttpClient
 from kiro.models_anthropic import (
@@ -256,9 +256,11 @@ async def messages(
             profile_arn_for_payload = auth_manager.request_profile_arn or ""
 
             try:
-                kiro_payload = await run_in_worker(
-                    anthropic_to_kiro, request_data, conversation_id, profile_arn_for_payload
+                payload_result = await run_in_worker(
+                    anthropic_to_kiro_with_stats, request_data, conversation_id, profile_arn_for_payload
                 )
+                kiro_payload = payload_result.payload
+                measured_input_tokens = payload_result.input_tokens
             except PayloadTooLargeError as e:
                 logger.error(f"Payload too large: {e}")
                 return JSONResponse(
@@ -349,6 +351,7 @@ async def messages(
                                     request_tools=tools_for_tokenizer,
                                     request_system=system_for_tokenizer,
                                     make_search_request=make_search_request,
+                                    known_input_tokens=measured_input_tokens,
                                 ):
                                     yield chunk
                                 await account_manager.report_success(account.id, request_data.model)

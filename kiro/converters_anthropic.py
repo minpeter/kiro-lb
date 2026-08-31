@@ -12,6 +12,7 @@ from loguru import logger
 
 from kiro.config import HIDDEN_MODELS, MODEL_ALIASES
 from kiro.converters_core import (
+    KiroPayloadResult,
     UnifiedMessage,
     UnifiedTool,
     build_kiro_payload,
@@ -430,7 +431,9 @@ def split_inline_system_messages(messages: List[Any]) -> tuple[List[Any], List[s
     return conversation, system_fragments
 
 
-def anthropic_to_kiro(request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str) -> dict:
+def anthropic_to_kiro_with_stats(
+    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
+) -> KiroPayloadResult:
     """
     Converts Anthropic Messages API request to Kiro API payload.
 
@@ -493,4 +496,9 @@ def anthropic_to_kiro(request: AnthropicMessagesRequest, conversation_id: str, p
         effort_from_anthropic(request.thinking, request.output_config, request.max_tokens),
     )
 
-    return result.payload
+    return result
+
+
+def anthropic_to_kiro(request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str) -> dict:
+    """Return only the payload, preserving the original signature."""
+    return anthropic_to_kiro_with_stats(request, conversation_id, profile_arn).payload
