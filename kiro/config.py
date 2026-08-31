@@ -297,6 +297,26 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 
 # ==================================================================================================
+# Endpoint Rotation
+# ==================================================================================================
+
+# Rotate to alternate generation endpoints when the primary one keeps failing.
+# Disabled by default: only runtime.{region}.kiro.dev is verified for every
+# credential type, and the alternates may reject some accounts. Enable it to get
+# failover instead of a hard failure when the runtime host degrades.
+KIRO_ENDPOINT_ROTATION: bool = os.getenv("KIRO_ENDPOINT_ROTATION", "false").lower() in ("true", "1", "yes")
+
+# Comma-separated attempt order. Unknown keys are ignored.
+# Available: runtime, codewhisperer, amazonq
+KIRO_ENDPOINT_ORDER: list[str] = [
+    part.strip() for part in os.getenv("KIRO_ENDPOINT_ORDER", "runtime,codewhisperer,amazonq").split(",") if part.strip()
+]
+
+# How long a failing endpoint is pushed to the back of the queue, in seconds.
+# It is never removed: a cooldown must not turn a request into a hard failure.
+KIRO_ENDPOINT_COOLDOWN_SECONDS: float = float(os.getenv("KIRO_ENDPOINT_COOLDOWN_SECONDS", "30"))
+
+# ==================================================================================================
 # Debug Settings
 # ==================================================================================================
 

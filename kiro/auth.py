@@ -211,6 +211,7 @@ class KiroAuthManager:
         is_builder_id = self._auth_type == AuthType.AWS_SSO_OIDC and not self._profile_arn
         sso_region_for_oidc = self._sso_region or region
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
+        self._api_region = final_api_region
         self._api_host = get_kiro_api_host(final_api_region, is_builder_id)
         self._q_host = get_kiro_q_host(final_api_region, is_builder_id)
 
@@ -1002,6 +1003,11 @@ class KiroAuthManager:
     def api_host(self) -> str:
         """API host for the current region."""
         return self._api_host
+
+    @property
+    def api_region(self) -> str:
+        """Region whose generation endpoint this account uses."""
+        return self._api_region
 
     @property
     def generation_url(self) -> str:

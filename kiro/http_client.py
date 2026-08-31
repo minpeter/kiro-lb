@@ -15,14 +15,23 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
-from typing import Optional, TypedDict
+from typing import Dict, Optional, TypedDict
 
 import httpx
 from fastapi import HTTPException
 from loguru import logger
 
 from kiro.auth import KiroAuthManager
-from kiro.config import BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    BASE_RETRY_DELAY,
+    FIRST_TOKEN_MAX_RETRIES,
+    KIRO_ENDPOINT_COOLDOWN_SECONDS,
+    KIRO_ENDPOINT_ORDER,
+    KIRO_ENDPOINT_ROTATION,
+    MAX_RETRIES,
+    STREAMING_READ_TIMEOUT,
+)
+from kiro.endpoints import ENDPOINTS_BY_KEY, attempt_order, record_failure, record_success
 from kiro.kiro_errors import is_suspension_error
 from kiro.network_errors import NetworkErrorInfo, classify_network_error, get_short_error_message
 from kiro.utils import get_kiro_headers
@@ -34,6 +43,16 @@ class RequestKwargs(TypedDict, total=False):
     headers: dict
     content: bytes
     params: dict
+
+
+def _payload_model_id(json_data: Optional[dict]) -> Optional[str]:
+    """Extract modelId from a Kiro generation payload, for endpoint affinity."""
+    if not json_data:
+        return None
+    try:
+        return json_data["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+    except (KeyError, TypeError):
+        return None
 
 
 class KiroHttpClient:
@@ -154,7 +173,7 @@ class KiroHttpClient:
                 # Propagating here could mask the original exception
                 logger.warning(f"Error closing HTTP client: {e}")
 
-    async def request_with_retry(
+    async def _attempt_endpoint(
         self,
         method: str,
         url: str,
@@ -162,6 +181,7 @@ class KiroHttpClient:
         params: Optional[dict] = None,
         stream: bool = False,
         retry_rate_limits: Optional[bool] = None,
+        header_overrides: Optional[Dict[str, str]] = None,
     ) -> httpx.Response:
         """
         Executes an HTTP request with retry logic.
@@ -203,6 +223,8 @@ class KiroHttpClient:
                 # Get current token
                 token = await self.auth_manager.get_access_token()
                 headers = get_kiro_headers(self.auth_manager, token)
+                if header_overrides:
+                    headers.update(header_overrides)
 
                 # Build request kwargs based on parameters
                 request_kwargs: RequestKwargs = {"headers": headers}
@@ -354,6 +376,84 @@ class KiroHttpClient:
                 raise HTTPException(
                     status_code=502, detail=f"Request failed after {max_retries} attempts. Unknown error."
                 )
+
+    async def request_with_retry(
+        self,
+        method: str,
+        url: str,
+        json_data: Optional[dict] = None,
+        params: Optional[dict] = None,
+        stream: bool = False,
+        retry_rate_limits: Optional[bool] = None,
+    ) -> httpx.Response:
+        """Execute the request, rotating between generation endpoints as needed.
+
+        Rotation applies only to the account's generation URL: a management call
+        such as ``/ListAvailableModels`` still goes to its own host. With
+        ``KIRO_ENDPOINT_ROTATION`` disabled the behavior is unchanged.
+
+        Only an endpoint-attributable failure rotates: a 5xx or a transport
+        error. A 429 or a suspension 403 belongs to the account and returns
+        immediately so the caller can fail over accounts; a request-level 4xx
+        such as CONTENT_LENGTH_EXCEEDS_THRESHOLD would fail the same everywhere.
+        """
+        is_generation = url == getattr(self.auth_manager, "generation_url", None)
+        if not (KIRO_ENDPOINT_ROTATION and is_generation):
+            return await self._attempt_endpoint(
+                method, url, json_data=json_data, params=params, stream=stream, retry_rate_limits=retry_rate_limits
+            )
+
+        region = self.auth_manager.api_region
+        affinity_key = self.auth_manager.profile_arn or region
+        model = _payload_model_id(json_data) or "unknown"
+        endpoints = attempt_order(
+            affinity_key, model, order=KIRO_ENDPOINT_ORDER, cooldown_seconds=KIRO_ENDPOINT_COOLDOWN_SECONDS
+        )
+
+        last_response: Optional[httpx.Response] = None
+        last_exception: Optional[Exception] = None
+
+        for position, endpoint in enumerate(endpoints):
+            endpoint_url = endpoint.url(region)
+            if position > 0:
+                logger.warning(f"[Endpoints] Rotating to {endpoint.name} ({endpoint_url})")
+            try:
+                response = await self._attempt_endpoint(
+                    method,
+                    endpoint_url,
+                    json_data=json_data,
+                    params=params,
+                    stream=stream,
+                    retry_rate_limits=retry_rate_limits,
+                    header_overrides=endpoint.header_overrides(),
+                )
+            except Exception as exc:
+                last_exception = exc
+                record_failure(endpoint.key, KIRO_ENDPOINT_COOLDOWN_SECONDS)
+                logger.warning(f"[Endpoints] {endpoint.name} transport failure: {type(exc).__name__}")
+                continue
+
+            if response.status_code == 200:
+                record_success(affinity_key, model, endpoint.key)
+                if position > 0:
+                    logger.info(f"[Endpoints] {endpoint.name} answered after rotation")
+                return response
+
+            if 500 <= response.status_code < 600:
+                last_response = response
+                record_failure(endpoint.key, KIRO_ENDPOINT_COOLDOWN_SECONDS)
+                logger.warning(f"[Endpoints] {endpoint.name} returned {response.status_code}")
+                if stream:
+                    await response.aclose()
+                continue
+
+            return response
+
+        if last_response is not None:
+            return last_response
+        if last_exception is not None:
+            raise last_exception
+        raise HTTPException(status_code=502, detail="No generation endpoint answered.")
 
     async def __aenter__(self) -> "KiroHttpClient":
         """Async context manager support."""
