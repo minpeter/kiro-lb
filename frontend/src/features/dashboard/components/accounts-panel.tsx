@@ -159,14 +159,23 @@ function UsageErrorCell({ message }: { message: string }) {
 
 function UsageCell({ account }: { account: Account }) {
   const usage = account.usage;
-  if (usage?.error) return <UsageErrorCell message={usage.error} />;
-  if (!usage || usage.usagePercent == null) return <span className="text-muted-foreground">—</span>;
+  // A failed poll keeps the previous figures, so showing the error instead of
+  // them hides information that is still useful. The error becomes a warning
+  // above the bar, and only replaces it when there is nothing to show.
+  const percent = usage?.usagePercent;
+  if (usage?.error && percent == null) return <UsageErrorCell message={usage.error} />;
+  if (!usage || percent == null) return <span className="text-muted-foreground">—</span>;
   return (
     <div className="min-w-40 space-y-1.5">
+      {usage.error && (
+        <p title={usage.error} className="line-clamp-1 text-xs text-warning">
+          last check failed
+        </p>
+      )}
       <Progress
-        value={Math.min(usage.usagePercent, 100)}
+        value={Math.min(percent, 100)}
         className="h-1.5"
-        indicatorClassName={usageIndicatorClass(usage.usagePercent)}
+        indicatorClassName={usageIndicatorClass(percent)}
       />
       <p className="text-xs tabular-nums text-muted-foreground">{formatUsage(usage)}</p>
     </div>
