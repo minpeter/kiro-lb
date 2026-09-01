@@ -22,7 +22,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FIRST_TOKEN_TIMEOUT,
 )
-from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls
+from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls, split_bracket_call_text
 from kiro.sse_validation import (
     StreamProtocolError,
     begin_openai_stream,
@@ -154,6 +154,8 @@ async def stream_kiro_to_openai_internal(
     upstream_stop_reason = None
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    # Text held back while it may still turn out to be a bracket-style call.
+    bracket_held = ""
     received_upstream_event = False
 
     begin_openai_stream()
@@ -182,8 +184,14 @@ async def stream_kiro_to_openai_internal(
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
 
+                # A bracket-style call is turned into a tool call below, so its
+                # text is withheld instead of also being sent as content.
+                visible_content, bracket_held = split_bracket_call_text(bracket_held + event.content)
+                if not visible_content:
+                    continue
+
                 # Format as OpenAI chunk
-                delta = {"content": event.content}
+                delta = {"content": visible_content}
                 if first_chunk:
                     delta["role"] = "assistant"
                     first_chunk = False
@@ -309,6 +317,30 @@ async def stream_kiro_to_openai_internal(
 
         # Check bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
+        if bracket_tool_calls and tool_calls_from_stream:
+            # The structured calls were already streamed out and cannot be taken
+            # back, so honouring the text echo as well would publish each call
+            # twice and a client acting on both would run it twice.
+            logger.warning(
+                f"[OpenAI Streaming] Ignoring {len(bracket_tool_calls)} bracket tool call(s): "
+                f"{len(tool_calls_from_stream)} native call(s) already emitted"
+            )
+            bracket_tool_calls = []
+
+        if bracket_held:
+            # Held text that never became a call is ordinary content and must not
+            # be dropped.
+            if not parse_bracket_tool_calls(bracket_held):
+                leftover_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": bracket_held}, "finish_reason": None}],
+                }
+                yield _openai_sse(leftover_chunk)
+            bracket_held = ""
+
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
         if not parallel_tool_calls and len(all_tool_calls) > 1:

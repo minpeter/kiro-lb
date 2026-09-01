@@ -28,6 +28,7 @@ from kiro.parsers import (
     MalformedToolInputError,
     deduplicate_tool_calls,
     parse_bracket_tool_calls,
+    split_bracket_call_text,
 )
 from kiro.sse_validation import StreamProtocolError
 
@@ -317,6 +318,18 @@ async def collect_stream_to_result(
     # Recovery is intentionally limited to client-visible text. Reasoning can
     # discuss bracket syntax without actually invoking a tool.
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
+    if bracket_tool_calls and result.tool_calls:
+        # Upstream already reported this turn's calls as structured events, and the
+        # text only echoes them. Keeping both would hand the caller the same call
+        # twice, which deduplication cannot always catch because the echoed
+        # arguments are re-serialized and no longer compare equal.
+        logger.warning(
+            "Ignoring {} bracket tool call(s): {} native call(s) already collected",
+            len(bracket_tool_calls),
+            len(result.tool_calls),
+        )
+        bracket_tool_calls = []
+
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
         timeline_tool_ids = {block["tool"].get("id") for block in result.content_blocks if block["type"] == "tool_use"}
@@ -328,6 +341,16 @@ async def collect_stream_to_result(
                         "tool": tool_call,
                     }
                 )
+
+    # The call is delivered as a tool block, so its text must not remain in the
+    # reply as well. Stripping here rather than while accumulating keeps the
+    # bracket text available for the detection above.
+    if parse_bracket_tool_calls(full_content_for_bracket_tools):
+        result.content, _ = split_bracket_call_text(result.content)
+        for block in result.content_blocks:
+            if block["type"] == "text":
+                block["text"], _ = split_bracket_call_text(block["text"])
+        result.content_blocks = [block for block in result.content_blocks if block["type"] != "text" or block["text"]]
 
     return result
 
