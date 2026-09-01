@@ -37,7 +37,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
-from kiro.usage_tracking import GenerationTimer, record_token_usage
+from kiro.usage_tracking import GenerationTimer, record_token_usage, report_credits
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -572,6 +572,8 @@ async def stream_kiro_to_anthropic(
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
+                # Kiro puts the credit cost of the request in this frame.
+                report_credits(event.usage)
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
 
             elif event.type == "stop_reason" and event.stop_reason:

@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from loguru import logger
+
 DB_FILENAME = "dashboard.sqlite3"
 LEGACY_MIGRATION = "gateway-json-v1"
 
@@ -69,6 +71,46 @@ def initialize() -> None:
                 owner TEXT NOT NULL,
                 expires_at REAL NOT NULL
             )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL
+            )"""
+        )
+
+
+def load_setting(key: str) -> Any | None:
+    """Return a persisted setting, or None when absent or unreadable.
+
+    Never raises: a corrupt row must fall back to the environment default
+    rather than block startup.
+    """
+    try:
+        initialize()
+        with connection() as conn:
+            row = conn.execute("SELECT value_json FROM settings WHERE key = ?", (key,)).fetchone()
+    except Exception as exc:
+        logger.warning(f"[Store] Could not read setting {key!r}: {exc}")
+        return None
+    if not row:
+        return None
+    try:
+        return json.loads(row["value_json"])
+    except (TypeError, ValueError) as exc:
+        logger.warning(f"[Store] Discarding malformed setting {key!r}: {exc}")
+        return None
+
+
+def save_setting(key: str, value: Any) -> None:
+    """Persist a setting. Raises so the caller can report the failure."""
+    initialize()
+    payload = json.dumps(value)
+    with connection() as conn:
+        conn.execute(
+            "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            (key, payload),
         )
 
 

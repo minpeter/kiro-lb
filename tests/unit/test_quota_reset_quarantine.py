@@ -190,18 +190,24 @@ class TestDepletedIsReportedNotHidden:
         assert state == "available"
 
     @pytest.mark.parametrize(
-        "field,value",
+        "field,offset",
         [
-            ("quota_exhausted_until", time.time() + 3600),
-            ("suspended_until", time.time() + 3600),
-            ("rate_limited_until", time.time() + 30),
+            ("quota_exhausted_until", 3600),
+            ("suspended_until", 3600),
+            ("rate_limited_until", 30),
         ],
         ids=["quota_exhausted", "suspended", "rate_limited"],
     )
-    def test_real_exclusions_outrank_the_report_state(self, field, value):
+    def test_real_exclusions_outrank_the_report_state(self, field, offset):
         # quota_depleted is the weakest classification: it must never mask a
         # condition that actually removes the account from rotation.
-        account = _depleted_account(**{field: value})
+        #
+        # The deadline is computed here, not in the parametrize list: those
+        # arguments are evaluated at collection time, so a 30 second window had
+        # already elapsed by the time a full suite run reached this test, the
+        # account was no longer rate limited, and the assertion failed on a clock
+        # rather than on the behaviour under test.
+        account = _depleted_account(**{field: time.time() + offset})
 
         state, _ = account_routing_state(account)
 

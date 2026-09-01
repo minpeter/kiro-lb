@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from kiro import agent_mode
 from kiro.config import (
     AUTO_TRIM_PAYLOAD,
     KIRO_MAX_PAYLOAD_BYTES,
@@ -1392,6 +1393,13 @@ def build_kiro_payload(
             "currentMessage": {"userInputMessage": user_input_message},
         }
     }
+
+    # agentTaskType mirrors the official Kiro CLI, which sends "vibe" for
+    # free-form chat; "spec" and "task" are its other modes. An empty setting
+    # omits the field, restoring the previous payload shape.
+    task_type = agent_mode.current()
+    if task_type:
+        payload["conversationState"]["agentTaskType"] = task_type
 
     # Add history only if not empty
     if history:

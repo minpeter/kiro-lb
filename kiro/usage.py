@@ -40,6 +40,21 @@ def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _stored_profile_arn(account: Any) -> str | None:
+    """The ARN from the persisted credential, when the manager has none loaded."""
+    account_id = getattr(account.auth_manager, "_internal_account_id", None) or getattr(account, "id", None)
+    if not account_id:
+        return None
+    try:
+        from kiro.store import load_internal_credential
+
+        document = load_internal_credential(account_id) or {}
+    except Exception:
+        return None
+    value = document.get("profileArn")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 async def fetch_account_usage(account: Account) -> dict[str, Any]:
     """Fetch and normalize the live Kiro subscription usage for one account."""
     if account.auth_manager is None:
@@ -56,9 +71,18 @@ async def fetch_account_usage(account: Account) -> dict[str, Any]:
         "isEmailRequired": True,
     }
     profile_arn = auth.request_profile_arn
-    if profile_arn:
-        params["profileArn"] = profile_arn
-        body["profileArn"] = profile_arn
+    if not profile_arn:
+        # get_access_token returns a cached token without touching the store, so a
+        # manager that never had to refresh can hold a valid token and no ARN. The
+        # upstream answers that with a bare "Invalid profileArn", which reads as a
+        # broken account, so the stored document is consulted first.
+        profile_arn = _stored_profile_arn(account)
+        if profile_arn:
+            auth._profile_arn = profile_arn
+    if not profile_arn:
+        raise RuntimeError("profile ARN is not available yet for this account")
+    params["profileArn"] = profile_arn
+    body["profileArn"] = profile_arn
     # Kiro CLI 2.19.1 duplicates these modeled fields in the query and AWS JSON
     # body. Preserve that observed wire contract rather than "simplifying" it.
     url = f"https://management.{_usage_region(account)}.kiro.dev/"

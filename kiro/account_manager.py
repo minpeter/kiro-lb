@@ -54,8 +54,10 @@ from kiro.config import (
     RATE_WINDOW_SECONDS,
     STATE_SAVE_INTERVAL_SECONDS,
 )
+from kiro.gateway_tunables import LOAD_BALANCING
 from kiro.http_client import KiroHttpClient
 from kiro.kiro_errors import is_suspension_error
+from kiro.model_catalog import fetch_available_models
 from kiro.model_resolver import ModelResolver, normalize_model_name
 
 
@@ -798,10 +800,16 @@ class AccountManager:
 
             # Determine if we should fetch models or use static list
             if _is_runtime_endpoint(auth_manager):
-                # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
-                # Use static list without attempting request
-                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
-                models_list = FALLBACK_MODELS
+                # The runtime host has no /ListAvailableModels, but the operation
+                # exists on the management host as an AWS JSON call, which is what
+                # the official CLI uses. Falling straight to the static list left
+                # the catalogue frozen and without the presentable model names.
+                fetched = await fetch_available_models(auth_manager)
+                if fetched:
+                    models_list = fetched
+                else:
+                    logger.debug(f"Account {account_id}: model list unavailable, using the static one")
+                    models_list = FALLBACK_MODELS
             else:
                 # Old endpoint - attempt to fetch dynamic model list
                 # Fetch models list with retry + fallback
@@ -1018,15 +1026,13 @@ class AccountManager:
 
         # Check if using runtime endpoint (no dynamic model list available)
         if _is_runtime_endpoint(auth_manager):
-            # Runtime endpoint does not provide /ListAvailableModels
-            # Use static list and update cache timestamp
-            logger.debug(
-                f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)"
-            )
+            # The runtime host has no /ListAvailableModels; the management host
+            # serves it. Refreshing from there keeps names and limits current.
+            refreshed = await fetch_available_models(auth_manager)
             async with self._lock:
                 if self._accounts.get(account_id) is not account or account.auth_manager is not auth_manager:
                     return
-                await model_cache.update(FALLBACK_MODELS)
+                await model_cache.update(refreshed or FALLBACK_MODELS)
                 account.models_cached_at = time.time()
                 self._dirty = True
             return
@@ -1193,6 +1199,24 @@ class AccountManager:
         if not ACCOUNT_QUOTA_WEIGHTED_ROUTING:
             start = self._current_account_index
             return [account_ids[(start + offset) % len(account_ids)] for offset in range(len(account_ids))]
+
+        strategy = LOAD_BALANCING.value()
+
+        if strategy == "sticky":
+            start = self._current_account_index
+            return [account_ids[(start + offset) % len(account_ids)] for offset in range(len(account_ids))]
+
+        if strategy == "most_credits":
+            # Deterministic: the account with the most remaining quota leads.
+            # Ties keep their existing order rather than being shuffled, so the
+            # ordering is reproducible when quotas are equal.
+            def most_credits_key(account_id: str) -> float:
+                account = self._accounts.get(account_id)
+                if account is None:
+                    return -MINIMUM_ROUTING_WEIGHT
+                return -self._routing_weight(account)
+
+            return sorted(account_ids, key=most_credits_key)
 
         keyed: List[Tuple[float, str]] = []
         for account_id in account_ids:

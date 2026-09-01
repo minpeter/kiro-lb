@@ -98,8 +98,9 @@ KIRO_BUILDER_ID_PROFILE_ARN: str = "arn:aws:codewhisperer:us-east-1:638616132270
 # ==================================================================================================
 
 # Time before token expiration when refresh is needed (in seconds)
-# Default 10 minutes - refresh token in advance to avoid errors
-TOKEN_REFRESH_THRESHOLD: int = 600
+# Default 10 minutes - refresh token in advance to avoid errors.
+# The dashboard can override this at runtime; see kiro/gateway_tunables.py.
+TOKEN_REFRESH_THRESHOLD: int = int(os.getenv("TOKEN_REFRESH_THRESHOLD", "600"))
 
 # ==================================================================================================
 # Retry Configuration
@@ -295,6 +296,39 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 # After exhausting all attempts, an error will be returned.
 # Default: 3 attempts
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
+
+# ==================================================================================================
+# Endpoint Rotation
+# ==================================================================================================
+
+# Rotate to alternate generation endpoints when the primary one keeps failing.
+# Disabled by default: only runtime.{region}.kiro.dev is verified for every
+# credential type, and the alternates may reject some accounts. Enable it to get
+# failover instead of a hard failure when the runtime host degrades.
+KIRO_ENDPOINT_ROTATION: bool = os.getenv("KIRO_ENDPOINT_ROTATION", "false").lower() in ("true", "1", "yes")
+
+# Comma-separated attempt order. Unknown keys are ignored.
+# Available: runtime, codewhisperer, amazonq
+KIRO_ENDPOINT_ORDER: list[str] = [
+    part.strip()
+    for part in os.getenv("KIRO_ENDPOINT_ORDER", "amazonq,codewhisperer,runtime").split(",")
+    if part.strip()
+]
+
+# How long a failing endpoint is pushed to the back of the queue, in seconds.
+# It is never removed: a cooldown must not turn a request into a hard failure.
+KIRO_ENDPOINT_COOLDOWN_SECONDS: float = float(os.getenv("KIRO_ENDPOINT_COOLDOWN_SECONDS", "30"))
+
+# Replace the generic sections of Anthropic's built-in Claude Code system prompt
+# with a compact Kiro-identified preamble. The per-machine sections the client
+# depends on - memory path, environment, language, skills - are preserved, as is
+# anything the user supplied. Off by default: it changes agent behaviour.
+CONDENSE_CLAUDE_PROMPT: bool = os.getenv("CONDENSE_CLAUDE_PROMPT", "false").lower() in ("true", "1", "yes")
+
+# Task mode announced in conversationState, matching the official Kiro CLI.
+# It sends "vibe" for free-form chat; "spec" and "task" are its other modes.
+# Set to an empty value to omit the field entirely.
+KIRO_AGENT_TASK_TYPE: str = os.getenv("KIRO_AGENT_TASK_TYPE", "vibe").strip()
 
 # ==================================================================================================
 # Debug Settings

@@ -167,9 +167,33 @@ def _model_owner(model_id: str) -> str:
     return "kiro"
 
 
-def _display_name(model_id: str) -> str:
-    """Human label for the Anthropic display_name field."""
+def _display_name(model_id: str, friendly: Optional[str] = None) -> str:
+    """Human label for the Anthropic display_name field.
+
+    The upstream model list already carries a presentable name - "Claude Opus 5"
+    rather than "claude-opus-5" - so it is passed through when known. The id is
+    only formatted by hand when no account has cached a name for it.
+    """
+    if friendly:
+        return friendly
     return f"{model_id} (Kiro)"
+
+
+def _friendly_names(request: Request, model_ids: List[str]) -> Dict[str, str]:
+    """Map model id to the name the upstream reports, across every account cache."""
+    names: Dict[str, str] = {}
+    for account in request.app.state.account_manager._accounts.values():
+        cache = getattr(account, "model_cache", None)
+        if cache is None:
+            continue
+        for model_id in model_ids:
+            if model_id in names:
+                continue
+            entry = cache.get(model_id)
+            label = entry.get("modelName") if isinstance(entry, dict) else None
+            if isinstance(label, str) and label.strip():
+                names[model_id] = label.strip()
+    return names
 
 
 def _resolve_model_limits(request: Request, model_ids: List[str]) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
@@ -221,6 +245,7 @@ async def get_models(request: Request):
     available_model_ids = request.app.state.account_manager.get_all_available_models()
 
     limits = _resolve_model_limits(request, available_model_ids)
+    friendly = _friendly_names(request, available_model_ids)
     created = int(time.time())
     created_at = datetime.fromtimestamp(created, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -228,12 +253,13 @@ async def get_models(request: Request):
     for model_id in available_model_ids:
         owner = _model_owner(model_id)
         max_input, max_output = limits.get(model_id, (None, None))
+        label = friendly.get(model_id)
         openai_models.append(
             OpenAIModel(
                 id=model_id,
                 owned_by=owner,
-                description=f"{model_id} via Kiro API",
-                display_name=_display_name(model_id),
+                description=label or f"{model_id} via Kiro API",
+                display_name=_display_name(model_id, label),
                 created=created,
                 created_at=created_at,
                 context_window=max_input,

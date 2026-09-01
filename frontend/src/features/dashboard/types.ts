@@ -53,6 +53,7 @@ export type Account = {
   failures: number;
   cooldownSeconds: number;
   deletable: boolean;
+  enabled?: boolean;
   usage?: AccountUsage | null;
 };
 
@@ -88,11 +89,64 @@ export type RequestRate = {
 };
 
 export type RequestLog = {
+  id?: number;
   created_at: number;
   route: string;
   model?: string | null;
   status_code: number;
   latency_ms: number;
+  client_ip?: string | null;
+  credits?: number | null;
+};
+
+export type RequestLogOrder = "newest" | "oldest";
+
+export type RequestLogDetail = {
+  id: number;
+  createdAt: number;
+  route: string;
+  model: string | null;
+  statusCode: number;
+  latencyMs: number;
+  clientIp: string | null;
+  userAgent: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  creditsSpent: number | null;
+  modelMultiplier: number | null;
+};
+
+export type DataOverview = {
+  requestLogs: number;
+  oldestLogAt: number | null;
+  retentionDays: number;
+  databaseBytes: number;
+};
+
+export type GatewayTunables = {
+  tokenRefreshSeconds: number;
+  loadBalancing: string;
+  loadBalancingOptions: string[];
+  maxConcurrency: number;
+  maxAccountConcurrency: number;
+  queueTimeoutSeconds: number;
+};
+
+export type ProxyStatus = {
+  url: string;
+  cooling: boolean;
+};
+
+export type ProxyChain = {
+  proxies: ProxyStatus[];
+  schemes: string[];
+  cooldownSeconds: number;
+};
+
+export type ModelCostRow = {
+  model: string;
+  multiplier: number;
+  contextTokens: number | null;
 };
 
 export type RequestLogPage = {
@@ -101,6 +155,8 @@ export type RequestLogPage = {
   limit: number;
   offset: number;
   hasMore: boolean;
+  models?: string[];
+  order?: RequestLogOrder;
 };
 
 export type ApiKey = {
@@ -157,5 +213,73 @@ export type DeviceLoginFlow = {
   expiresInSeconds: number;
 };
 
-export const TAB_IDS = ["overview", "accounts", "keys"] as const;
+export const TAB_IDS = ["overview", "accounts", "keys", "settings", "info"] as const;
 export type TabId = (typeof TAB_IDS)[number];
+
+export interface EndpointOption {
+  key: string;
+  name: string;
+  url: string;
+}
+
+export interface EndpointSettings {
+  rotation: boolean;
+  order: string[];
+  cooldownSeconds: number;
+}
+
+export interface EndpointsResponse {
+  available: EndpointOption[];
+  settings: EndpointSettings;
+  pingRepsMax: number;
+  pingRepsDefault: number;
+}
+
+export interface EndpointTestResult {
+  key: string;
+  name: string;
+  ok: boolean;
+  statusCode: number | null;
+  ttfbMs: number | null;
+  error: string | null;
+}
+
+export interface EndpointTestResponse {
+  model: string;
+  requestsSpent: number;
+  results: EndpointTestResult[];
+}
+
+export interface EndpointPingResult {
+  key: string;
+  name: string;
+  samples: number;
+  medianMs: number | null;
+  minMs: number | null;
+  maxMs: number | null;
+  failures: string[];
+}
+
+export interface EndpointPingResponse {
+  model: string;
+  reps: number;
+  requestsSpent: number;
+  results: EndpointPingResult[];
+  fastest: string | null;
+  conclusive: boolean;
+  betweenSpreadMs?: number;
+  withinSpreadMs?: number;
+  verdict: string;
+}
+
+export interface PromptFilterSettings {
+  enabled: boolean;
+  identity: string;
+  preservedNote: string;
+  droppedSections: string[];
+}
+
+export interface AgentModeSettings {
+  mode: string;
+  allowed: string[];
+}

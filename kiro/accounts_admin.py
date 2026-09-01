@@ -162,6 +162,101 @@ def _restore_manager_state(manager: Any, snapshot: dict[str, Any]) -> None:
     manager._dirty = snapshot["dirty"]
 
 
+def _resolve_direct_entry(manager: Any, entries: list[dict[str, Any]], label: str) -> tuple[str, int]:
+    """Map a public label to its account id and its index in the entry list.
+
+    Shared by remove and enable/disable so both agree on what a label means and
+    both refuse the ambiguous cases the same way.
+    """
+    from kiro.account_manager import account_label
+
+    direct_entries: dict[str, list[int]] = {}
+    directory_paths: list[Path] = []
+
+    for index, entry in enumerate(entries):
+        source_type = entry.get("type")
+        if source_type in {"refresh_token", "internal"}:
+            direct_entries.setdefault(account_id_for_entry(entry), []).append(index)
+            continue
+        if source_type not in {"json", "sqlite"}:
+            continue
+        source_path = Path(str(entry.get("path", ""))).expanduser()
+        if source_path.is_dir():
+            directory_paths.append(source_path.resolve())
+        else:
+            direct_entries.setdefault(account_id_for_entry(entry), []).append(index)
+
+    candidate_ids = set(manager._accounts) | set(direct_entries)
+    matching_ids = [account_id for account_id in candidate_ids if account_label(account_id) == label]
+    if len(label) != 12 or any(character not in "0123456789abcdef" for character in label) or len(matching_ids) != 1:
+        raise AccountNotFoundError("Unknown account label")
+
+    account_id = matching_ids[0]
+    if any(Path(account_id).parent == directory_path for directory_path in directory_paths):
+        raise DirectoryBackedAccountError("Directory-backed accounts cannot be changed individually")
+
+    matching_entries = direct_entries.get(account_id, [])
+    if not matching_entries:
+        raise AccountNotFoundError("Unknown account label")
+    if len(matching_entries) != 1:
+        raise AccountConflictError("Account has multiple direct credentials entries")
+
+    return account_id, matching_entries[0]
+
+
+async def set_account_enabled(manager: Any, label: str, enabled: bool) -> dict[str, Any]:
+    """Enable or disable an account without discarding its credentials.
+
+    A disabled entry stays in the store and keeps its usage history; the pool
+    simply skips it, which ``load_credentials`` already honours. Disabling the
+    last enabled account is refused, because it would leave nothing to route to
+    while looking like a reversible toggle.
+    """
+    async with manager._lock:
+        entries = _load_entries(manager)
+        account_id, entry_index = _resolve_direct_entry(manager, entries, label)
+
+        target = dict(entries[entry_index])
+        if bool(target.get("enabled", True)) == enabled:
+            return {"accountId": account_id, "enabled": enabled, "changed": False}
+
+        if not enabled:
+            still_enabled = [
+                index
+                for index, entry in enumerate(entries)
+                if index != entry_index and bool(entry.get("enabled", True))
+            ]
+            if not still_enabled:
+                raise LastAccountError("Cannot disable the last enabled account")
+
+        target["enabled"] = enabled
+        updated = [dict(entry) for entry in entries]
+        updated[entry_index] = target
+
+        snapshot = _snapshot_manager_state(manager)
+        try:
+            from kiro.store import connection, replace_account_sources, save_runtime_state
+
+            manager._credentials_config = updated
+            if not enabled:
+                manager._remove_account_state(account_id)
+            state_data = manager._state_document()
+            with connection() as conn:
+                replace_account_sources(updated, conn)
+                save_runtime_state(state_data, conn, require_write=True)
+        except Exception:
+            _restore_manager_state(manager, snapshot)
+            raise
+
+        manager._dirty = False
+
+    if enabled:
+        # Outside the lock: load_credentials takes it to rebuild the pool.
+        await manager.load_credentials()
+
+    return {"accountId": account_id, "enabled": enabled, "changed": True}
+
+
 async def remove_account(
     manager: Any,
     label: str,

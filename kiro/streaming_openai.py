@@ -41,7 +41,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 from kiro.tokenizer import count_message_tokens, count_tokens, count_tools_tokens
-from kiro.usage_tracking import GenerationTimer, record_token_usage
+from kiro.usage_tracking import GenerationTimer, record_token_usage, report_credits
 from kiro.utils import generate_completion_id
 
 if TYPE_CHECKING:
@@ -289,6 +289,8 @@ async def stream_kiro_to_openai_internal(
                 tool_calls_from_stream.append(event.tool_use)
 
             elif event.type == "usage" and event.usage:
+                # Kiro puts the credit cost of the request in this frame.
+                report_credits(event.usage)
                 metering_data = event.usage
 
             elif event.type == "context_usage" and event.context_usage_percentage is not None:

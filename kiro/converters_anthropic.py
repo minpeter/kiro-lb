@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from kiro import prompt_filter
 from kiro.config import HIDDEN_MODELS, MODEL_ALIASES
 from kiro.converters_core import (
     KiroPayloadResult,
@@ -123,7 +124,7 @@ def extract_system_prompt(system: Any) -> str:
         return ""
 
     if isinstance(system, str):
-        return system
+        return _condense([system])[0] if system else system
 
     if isinstance(system, list):
         text_parts = []
@@ -135,9 +136,31 @@ def extract_system_prompt(system: Any) -> str:
             elif hasattr(block, "type") and block.type == "text":
                 # Handle Pydantic model
                 text_parts.append(getattr(block, "text", ""))
-        return "\n".join(text_parts)
+        return "\n".join(_condense(text_parts))
 
     return str(system)
+
+
+def _condense(texts: List[str]) -> List[str]:
+    """Condense Anthropic's built-in prompt when the operator enabled it.
+
+    Applied per block so the user's own instructions and the per-machine
+    sections survive. A failure here must not fail the request: the original
+    text is returned untouched.
+    """
+    if not prompt_filter.enabled():
+        return texts
+    try:
+        filtered, stats = prompt_filter.filter_blocks(texts)
+    except Exception as exc:
+        logger.warning(f"[PromptFilter] Leaving the prompt untouched: {exc}")
+        return texts
+    if stats["blocksCondensed"]:
+        logger.debug(
+            f"[PromptFilter] Condensed {stats['blocksCondensed']} block(s): "
+            f"{stats['charsBefore']} -> {stats['charsAfter']} chars"
+        )
+    return filtered
 
 
 def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:

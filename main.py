@@ -39,7 +39,9 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
+from kiro import proxy_chain
 from kiro.account_manager import AccountManager
+from kiro.agent_mode import load_from_store as load_agent_mode_setting
 from kiro.config import (
     APP_DESCRIPTION,
     APP_TITLE,
@@ -69,9 +71,13 @@ from kiro.dashboard import (
     router as dashboard_router,
 )
 from kiro.debug_middleware import DebugLoggerMiddleware
+from kiro.endpoint_settings import load_from_store as load_endpoint_settings
 from kiro.exceptions import validation_exception_handler
+from kiro.gateway_tunables import load_all as load_gateway_tunables
+from kiro.prompt_filter import load_from_store as load_prompt_filter_setting
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.routes_openai import router as openai_router
+from kiro.usage_tracking import current_request_usage
 
 # --- Loguru Configuration ---
 logger.remove()
@@ -268,6 +274,10 @@ async def lifespan(app: FastAPI):
     logger.info("Starting application... Creating state managers.")
     app.state.started_at = time.time()
     initialize_dashboard_store()
+    load_endpoint_settings()
+    load_prompt_filter_setting()
+    load_agent_mode_setting()
+    load_gateway_tunables()
     app.state.handoff_condition = asyncio.Condition()
     app.state.handoff_inflight = 0
     from kiro.store import can_write_runtime_state
@@ -291,6 +301,10 @@ async def lifespan(app: FastAPI):
     )
     app.state.http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
     logger.info("Shared HTTP client created with connection pooling")
+
+    # Per-proxy clients mirror the shared client's limits and timeouts.
+    proxy_chain.configure_clients(limits, timeout)
+    proxy_chain.load_from_store()
 
     # ==============================================================================
     # Create AccountManager (accounts live in the private SQLite store)
@@ -427,6 +441,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing shared HTTP client: {e}")
 
+    try:
+        await proxy_chain.close_clients()
+    except Exception as e:
+        logger.warning(f"Error closing proxy clients: {e}")
+
 
 # --- FastAPI Application ---
 app = FastAPI(title=APP_TITLE, description=APP_DESCRIPTION, version=APP_VERSION, lifespan=lifespan)
@@ -531,22 +550,88 @@ async def dashboard_favicon():
 
 @app.middleware("http")
 async def dashboard_request_metrics(request, call_next):
-    """Record only non-sensitive /v1 request metadata for the dashboard."""
+    """Record /v1 request metadata. Request and response text never touch disk."""
     started = time.perf_counter()
     model = None
-    if request.url.path.startswith("/v1/") and request.headers.get("content-type", "").startswith("application/json"):
+    is_data_plane = request.url.path.startswith("/v1/")
+
+    if is_data_plane and request.headers.get("content-type", "").startswith("application/json"):
         try:
             payload = json.loads((await request.body()).decode("utf-8"))
-            model = payload.get("model") if isinstance(payload, dict) else None
+            if isinstance(payload, dict):
+                model = payload.get("model")
         except Exception:
             pass
+
+    if not is_data_plane:
+        return await call_next(request)
+
+    # Seeded before the request runs so the streaming layer, which executes in
+    # its own task, mutates this same dict.
+    usage_holder: dict = {}
+    current_request_usage.set(usage_holder)
+
+    response = None
     try:
         response = await call_next(request)
+        if hasattr(response, "body_iterator"):
+            response = _defer_until_stream_end(response)
         return response
     finally:
-        if request.url.path.startswith("/v1/"):
-            status = locals().get("response").status_code if "response" in locals() else 500
-            record_request(request.url.path, model, status, int((time.perf_counter() - started) * 1000))
+        # A stream's usage frame arrives with the end of the body, after this
+        # returns, so its recording is deferred to the relay's completion; a
+        # non-streamed response records here.
+        if response is None or not hasattr(response, "body_iterator"):
+            _persist(request, model, response, started, usage_holder)
+        else:
+            _pending.append((request, model, response, started, usage_holder))
+
+
+# Streamed requests are recorded when their body finishes, not when the
+# middleware returns. One entry per in-flight streamed response.
+_pending: list = []
+
+
+def _persist(request, model, response, started, usage_holder=None):
+    status = getattr(response, "status_code", None) or 500
+    # What the streaming layer reported for this request. Nothing is derived
+    # from response text: Kiro publishes no token-to-credit rate, and the body
+    # itself is never retained.
+    usage = usage_holder or {}
+    record_request(
+        request.url.path,
+        model,
+        status,
+        int((time.perf_counter() - started) * 1000),
+        client_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        input_tokens=usage.get("input_tokens"),
+        output_tokens=usage.get("output_tokens"),
+        credits_spent=usage.get("credits"),
+    )
+
+
+def _defer_until_stream_end(response):
+    """Pass every chunk through untouched and record the entry when the body ends.
+
+    A stream's token counts and credit figure only exist once its final usage
+    frame has been serialized, which happens after the middleware has already
+    returned. Nothing is buffered; each chunk is yielded exactly as received.
+    """
+    original = response.body_iterator
+
+    async def relay():
+        try:
+            async for chunk in original:
+                yield chunk
+        finally:
+            entry = next((item for item in _pending if item[2] is response), None)
+            if entry is not None:
+                _pending.remove(entry)
+                _persist(*entry)
+
+    response.body_iterator = relay()
+    return response
 
 
 # --- Uvicorn log config ---

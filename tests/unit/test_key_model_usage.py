@@ -84,11 +84,21 @@ def test_root_key_is_hidden_when_no_legacy_key_is_set(dashboard, monkeypatch):
     assert all(key["id"] != ROOT_KEY_ID for key in _list_keys(dashboard))
 
 
-def test_root_key_cannot_be_revoked(dashboard):
+def test_root_key_cannot_be_deleted(dashboard):
     dashboard._authenticated = lambda _request: True
 
     with pytest.raises(Exception) as exc_info:
-        asyncio.run(dashboard.dashboard_revoke_key(ROOT_KEY_ID, MagicMock()))
+        asyncio.run(dashboard.dashboard_delete_key(ROOT_KEY_ID, MagicMock()))
+
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_root_key_cannot_be_renamed(dashboard):
+    dashboard._authenticated = lambda _request: True
+
+    request = MagicMock()
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(dashboard.dashboard_rename_key(ROOT_KEY_ID, request))
 
     assert getattr(exc_info.value, "status_code", None) == 400
 
