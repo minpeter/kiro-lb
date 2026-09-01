@@ -1,30 +1,30 @@
 # -*- coding: utf-8 -*-
 """The request log middleware must not break the data plane.
 
-A missing import in the tee reached production as a 500 on every streamed
-request, so the streaming path is exercised here with capture enabled.
+A missing import in the stream relay once reached production as a 500 on every
+streamed request, so the streaming path is exercised end to end. The log holds
+metadata only: token counts and credits arrive through the usage ContextVar
+that the streaming layer fills, never by reading the response body.
 """
 
 from __future__ import annotations
 
 import pytest
-from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
+
+from kiro.usage_tracking import current_api_key_id, record_token_usage, report_credits
 
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("LOG_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
-    from kiro import dashboard, gateway_tunables, log_crypto
+    from kiro import dashboard, gateway_tunables
 
-    log_crypto.reset_cache()
     dashboard.initialize_dashboard_store()
     gateway_tunables.reset_all()
-    gateway_tunables.CAPTURE_TEXT.set(True)
 
     import main
 
@@ -33,10 +33,23 @@ def app(tmp_path, monkeypatch):
 
     @probe.post("/v1/messages")
     async def messages():
+        # Emulates the streaming layer: the usage frame arrives at the end of
+        # the body, long after the middleware has returned.
         async def body():
-            yield b'data: {"type":"message_start","message":{"usage":{"input_tokens":11}}}\n\n'
+            yield b'data: {"type":"message_start"}\n\n'
             yield b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}\n\n'
-            yield b'data: {"type":"message_delta","usage":{"output_tokens":2},"creditUsage":0.03}\n\n'
+            current_api_key_id.set("test-key")
+            record_token_usage("claude-opus-5", 11, 2)
+            report_credits(0.03)
+            yield b'data: {"type":"message_stop"}\n\n'
+
+        return StreamingResponse(body(), media_type="text/event-stream")
+
+    @probe.post("/v1/wrapped-credits")
+    async def wrapped_credits():
+        async def body():
+            report_credits({"creditUsage": 0.05})
+            yield b"data: ok\n\n"
 
         return StreamingResponse(body(), media_type="text/event-stream")
 
@@ -46,17 +59,16 @@ def app(tmp_path, monkeypatch):
 
     yield probe, dashboard
     gateway_tunables.reset_all()
-    log_crypto.reset_cache()
 
 
 def _logs(dashboard):
     with dashboard._db() as conn:
         return conn.execute(
-            "SELECT status_code, input_tokens, output_tokens, credits, response_enc FROM request_logs ORDER BY id"
+            "SELECT status_code, input_tokens, output_tokens, credits FROM request_logs ORDER BY id"
         ).fetchall()
 
 
-class TestStreamingCapture:
+class TestStreamingRequestLog:
     def test_streamed_body_reaches_the_client_intact(self, app):
         probe, _ = app
         with TestClient(probe) as client:
@@ -76,16 +88,11 @@ class TestStreamingCapture:
         assert rows[0]["output_tokens"] == 2
         assert rows[0]["credits"] == pytest.approx(0.03)
 
-    def test_response_text_is_stored_encrypted(self, app):
+    def test_wrapped_credit_frame_is_unwrapped(self, app):
         probe, dashboard = app
-        from kiro import log_crypto
-
         with TestClient(probe) as client:
-            client.post("/v1/messages", json={"model": "claude-opus-5", "messages": []})
-        blob = _logs(dashboard)[0]["response_enc"]
-        assert blob is not None
-        assert b"text_delta" not in bytes(blob), "stored text must not be readable in the database"
-        assert log_crypto.decrypt(blob) == "ok"
+            client.post("/v1/wrapped-credits", json={"model": "auto", "messages": []})
+        assert _logs(dashboard)[0]["credits"] == pytest.approx(0.05)
 
     def test_non_streamed_response_still_records(self, app):
         probe, dashboard = app
@@ -93,11 +100,10 @@ class TestStreamingCapture:
             assert client.post("/v1/plain", json={"model": "auto", "messages": []}).status_code == 200
         assert len(_logs(dashboard)) == 1
 
-    def test_capture_off_stores_no_text(self, app, monkeypatch):
-        probe, dashboard = app
-        from kiro import gateway_tunables
-
-        gateway_tunables.CAPTURE_TEXT.set(False)
-        with TestClient(probe) as client:
-            assert client.post("/v1/messages", json={"model": "auto", "messages": []}).status_code == 200
-        assert _logs(dashboard)[0]["response_enc"] is None
+    def test_store_has_no_text_columns(self, app):
+        _, dashboard = app
+        with dashboard._db() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(request_logs)")}
+        assert not columns & {"prompt_enc", "system_enc", "response_enc"}, (
+            "the request log must never grow a column that holds request or response text"
+        )

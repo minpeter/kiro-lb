@@ -21,6 +21,7 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
+from kiro import concurrency, proxy_chain
 from kiro.auth import KiroAuthManager
 from kiro.config import (
     BASE_RETRY_DELAY,
@@ -29,8 +30,7 @@ from kiro.config import (
     STREAMING_READ_TIMEOUT,
 )
 from kiro.endpoint_settings import current as current_endpoint_settings
-from kiro import concurrency, proxy_chain
-from kiro.endpoints import ENDPOINTS_BY_KEY, attempt_order, record_failure, record_success
+from kiro.endpoints import attempt_order, record_failure, record_success
 from kiro.kiro_errors import is_suspension_error
 from kiro.network_errors import NetworkErrorInfo, classify_network_error, get_short_error_message
 from kiro.utils import get_kiro_headers
@@ -52,6 +52,17 @@ def _payload_model_id(json_data: Optional[dict]) -> Optional[str]:
         return json_data["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
     except (KeyError, TypeError):
         return None
+
+
+def _network_error_detail(error_info: NetworkErrorInfo) -> str:
+    """Build the client-facing message for an exhausted network error."""
+    error_message = error_info.user_message
+    if error_info.troubleshooting_steps:
+        error_message += "\n\nTroubleshooting:\n"
+        for i, step in enumerate(error_info.troubleshooting_steps, 1):
+            error_message += f"{i}. {step}\n"
+    error_message += f"\nTechnical details: {error_info.technical_details}"
+    return error_message.strip()
 
 
 class KiroHttpClient:
@@ -223,6 +234,7 @@ class KiroHttpClient:
 
         client = await self._get_client(stream=stream)
         last_error_info: Optional[NetworkErrorInfo] = None
+        last_raw_error: Optional[httpx.RequestError] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
 
         for attempt in range(max_retries):
@@ -319,6 +331,7 @@ class KiroHttpClient:
                 # Classify timeout error for user-friendly messaging
                 error_info = classify_network_error(e)
                 last_error_info = error_info
+                last_raw_error = e
 
                 # Log with user-friendly message
                 short_msg = get_short_error_message(error_info)
@@ -336,6 +349,7 @@ class KiroHttpClient:
                 # Classify the error for user-friendly messaging
                 error_info = classify_network_error(e)
                 last_error_info = error_info
+                last_raw_error = e
 
                 # Log with user-friendly message
                 short_msg = get_short_error_message(error_info)
@@ -358,21 +372,17 @@ class KiroHttpClient:
             )
             return last_response
 
-        # All attempts exhausted - provide detailed, user-friendly error message
+        # All attempts exhausted. The raw transport error must propagate: the
+        # proxy and endpoint fallback layers rotate on httpx.TransportError, and
+        # converting it into HTTPException here would exhaust the request on the
+        # first route without ever trying the next proxy or endpoint. The
+        # client-facing HTTPException is built once, in request_with_retry.
+        if last_raw_error is not None:
+            raise last_raw_error
         if last_error_info:
-            # Use classified error information
-            error_message = last_error_info.user_message
-
-            # Add troubleshooting steps
-            if last_error_info.troubleshooting_steps:
-                error_message += "\n\nTroubleshooting:\n"
-                for i, step in enumerate(last_error_info.troubleshooting_steps, 1):
-                    error_message += f"{i}. {step}\n"
-
-            # Add technical details for debugging
-            error_message += f"\nTechnical details: {last_error_info.technical_details}"
-
-            raise HTTPException(status_code=last_error_info.suggested_http_code, detail=error_message.strip())
+            raise HTTPException(
+                status_code=last_error_info.suggested_http_code, detail=_network_error_detail(last_error_info)
+            )
         else:
             # Fallback if no error was captured (shouldn't happen)
             if stream:
@@ -463,28 +473,41 @@ class KiroHttpClient:
         settings = current_endpoint_settings()
         is_generation = url == getattr(self.auth_manager, "generation_url", None)
 
-        # Only generation is capped: management calls are cheap and must not be
-        # blocked behind a full queue.
-        if not is_generation:
-            return await self._attempt_through_proxies(
-                method, url, json_data=json_data, params=params, stream=stream, retry_rate_limits=retry_rate_limits
-            )
-
-        account_key = self.auth_manager.profile_arn or "default"
         try:
-            async with concurrency.slot(account_key):
-                return await self._dispatch_generation(
+            # Only generation is capped: management calls are cheap and must not
+            # be blocked behind a full queue.
+            if not is_generation:
+                return await self._attempt_through_proxies(
                     method,
                     url,
-                    settings,
                     json_data=json_data,
                     params=params,
                     stream=stream,
                     retry_rate_limits=retry_rate_limits,
                 )
-        except concurrency.QueueTimeout as exc:
-            logger.warning(f"[Concurrency] Rejected a request: {exc}")
-            raise HTTPException(status_code=503, detail=f"Gateway is at capacity: {exc}") from exc
+
+            account_key = self.auth_manager.profile_arn or "default"
+            try:
+                async with concurrency.slot(account_key):
+                    return await self._dispatch_generation(
+                        method,
+                        url,
+                        settings,
+                        json_data=json_data,
+                        params=params,
+                        stream=stream,
+                        retry_rate_limits=retry_rate_limits,
+                    )
+            except concurrency.QueueTimeout as exc:
+                logger.warning(f"[Concurrency] Rejected a request: {exc}")
+                raise HTTPException(status_code=503, detail=f"Gateway is at capacity: {exc}") from exc
+        except httpx.RequestError as exc:
+            # Every proxy and endpoint had its chance below; only now does the
+            # raw transport error become the client-facing HTTPException.
+            error_info = classify_network_error(exc)
+            raise HTTPException(
+                status_code=error_info.suggested_http_code, detail=_network_error_detail(error_info)
+            ) from exc
 
     async def _dispatch_generation(
         self,

@@ -41,7 +41,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 from kiro.tokenizer import count_message_tokens, count_tokens, count_tools_tokens
-from kiro.usage_tracking import report_credits, GenerationTimer, record_token_usage
+from kiro.usage_tracking import GenerationTimer, record_token_usage, report_credits
 from kiro.utils import generate_completion_id
 
 if TYPE_CHECKING:

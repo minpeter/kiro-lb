@@ -33,23 +33,36 @@ ROOT_KEY_ID = "root"
 current_api_key_id: ContextVar[str | None] = ContextVar("current_api_key_id", default=None)
 
 
-# Filled by the streaming layer with what Kiro reported for the request.
-# A dict rather than a value: the middleware sets it before the request runs,
-# and the stream mutates the same object from its own task.
-current_request_credits: ContextVar[Optional[dict]] = ContextVar("current_request_credits", default=None)
+# Filled by the streaming layer with what Kiro reported for the request: the
+# credit figure and the final token counts. A dict rather than a value: the
+# middleware sets it before the request runs, and the stream mutates the same
+# object from its own task.
+current_request_usage: ContextVar[Optional[dict]] = ContextVar("current_request_usage", default=None)
+
+# Field names a metering frame has been observed to wrap the credit figure in.
+# The frame is usually a bare number; nothing here derives credits from tokens.
+_CREDIT_FIELDS = ("creditUsage", "credit_usage", "creditsConsumed", "credits")
 
 
 def report_credits(amount) -> None:
-    """Record the credit figure from an upstream usage frame."""
-    holder = current_request_credits.get()
+    """Record the credit figure from an upstream usage frame.
+
+    The frame's shape varies by stream version: usually a bare number, but an
+    object keyed by one of the known credit field names also occurs. Anything
+    unrecognizable is dropped rather than guessed at.
+    """
+    holder = current_request_usage.get()
     if holder is None:
         return
+    if isinstance(amount, dict):
+        amount = next((amount[field] for field in _CREDIT_FIELDS if field in amount), None)
     try:
         value = float(amount)
     except (TypeError, ValueError):
         return
     if value > 0:
         holder["credits"] = holder.get("credits", 0.0) + value
+
 
 # Account that produced the current response. Set when an attempt is about to be
 # made and overwritten on failover, so at completion it names the account that
@@ -92,6 +105,14 @@ def record_token_usage(
     rows predating this column hold tokens with no time at all, and dividing the
     full total by a partial duration produced 82,752 tok/s on the live store.
     """
+    # The request log wants the same final counts, keyed per request rather
+    # than per (key, model); the middleware persists the holder when the
+    # response body completes.
+    holder = current_request_usage.get()
+    if holder is not None:
+        holder["input_tokens"] = max(0, int(prompt_tokens or 0))
+        holder["output_tokens"] = max(0, int(completion_tokens or 0))
+
     key_id = current_api_key_id.get()
     if key_id is None or not model:
         return

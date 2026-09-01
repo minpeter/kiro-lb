@@ -111,7 +111,9 @@ class TestConcurrencyGate:
         async def worker(name: str):
             async with concurrency.slot():
                 order.append(f"{name}-in")
-                await asyncio.sleep(0.05)
+                # Yield the loop so the other worker gets its chance to enter
+                # while this slot is held; the gate is what must prevent it.
+                await asyncio.sleep(0)
                 order.append(f"{name}-out")
 
         await asyncio.gather(worker("a"), worker("b"))
@@ -126,18 +128,21 @@ class TestConcurrencyGate:
         QUEUE_TIMEOUT_SECONDS.set(1)
         concurrency.reset()
 
+        held = asyncio.Event()
+        release = asyncio.Event()
+
         async def hold():
             async with concurrency.slot():
-                await asyncio.sleep(2.0)
+                held.set()
+                await release.wait()
 
         holder = asyncio.create_task(hold())
-        await asyncio.sleep(0.1)
+        await held.wait()
         with pytest.raises(concurrency.QueueTimeout):
             async with concurrency.slot():
                 pass
-        holder.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await holder
+        release.set()
+        await holder
 
     async def test_per_account_limit_is_independent(self):
         MAX_CONCURRENCY.set(0)
@@ -152,7 +157,7 @@ class TestConcurrencyGate:
             async with concurrency.slot(account):
                 running[account] += 1
                 peak[account] = max(peak[account], running[account])
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0)
                 running[account] -= 1
 
         await asyncio.gather(worker("a"), worker("a"), worker("b"), worker("b"))

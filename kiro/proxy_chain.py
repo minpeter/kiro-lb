@@ -208,7 +208,4 @@ async def close_clients() -> None:
 
 
 def status() -> list[dict[str, Any]]:
-    return [
-        {"url": entry.masked, "cooling": is_cooling(entry.url)}
-        for entry in chain()
-    ]
+    return [{"url": entry.masked, "cooling": is_cooling(entry.url)} for entry in chain()]

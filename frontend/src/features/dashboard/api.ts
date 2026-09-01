@@ -91,7 +91,7 @@ export const dashboardApi = {
   },
   requestLogDetail: (id: number) => request<RequestLogDetail>(`/api/dashboard/request-logs/${id}`),
   dataOverview: () => request<DataOverview>("/api/dashboard/data"),
-  clearData: (scope: "text" | "logs" | "usage") =>
+  clearData: (scope: "logs" | "usage") =>
     request<{ scope: string; affected: number }>("/api/dashboard/data/clear", {
       method: "POST",
       body: JSON.stringify({ scope }),
@@ -103,7 +103,6 @@ export const dashboardApi = {
         GatewayTunables,
         | "tokenRefreshSeconds"
         | "loadBalancing"
-        | "captureRequestText"
         | "maxConcurrency"
         | "maxAccountConcurrency"
         | "queueTimeoutSeconds"

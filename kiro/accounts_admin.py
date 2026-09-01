@@ -188,11 +188,7 @@ def _resolve_direct_entry(manager: Any, entries: list[dict[str, Any]], label: st
 
     candidate_ids = set(manager._accounts) | set(direct_entries)
     matching_ids = [account_id for account_id in candidate_ids if account_label(account_id) == label]
-    if (
-        len(label) != 12
-        or any(character not in "0123456789abcdef" for character in label)
-        or len(matching_ids) != 1
-    ):
+    if len(label) != 12 or any(character not in "0123456789abcdef" for character in label) or len(matching_ids) != 1:
         raise AccountNotFoundError("Unknown account label")
 
     account_id = matching_ids[0]

@@ -24,7 +24,6 @@ def isolated(tmp_path, monkeypatch):
     yield
 
 
-
 def _persist_arn(account_id: str, arn: str) -> None:
     """save_internal_credential needs a registered row, so seed one directly."""
     with store.connection() as conn:

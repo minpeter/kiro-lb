@@ -56,8 +56,8 @@ from kiro.config import (
 )
 from kiro.gateway_tunables import LOAD_BALANCING
 from kiro.http_client import KiroHttpClient
-from kiro.model_catalog import fetch_available_models
 from kiro.kiro_errors import is_suspension_error
+from kiro.model_catalog import fetch_available_models
 from kiro.model_resolver import ModelResolver, normalize_model_name
 
 
@@ -1210,12 +1210,13 @@ class AccountManager:
             # Deterministic: the account with the most remaining quota leads.
             # Ties keep their existing order rather than being shuffled, so the
             # ordering is reproducible when quotas are equal.
-            return sorted(
-                account_ids,
-                key=lambda account_id: -self._routing_weight(self._accounts.get(account_id))
-                if self._accounts.get(account_id) is not None
-                else -MINIMUM_ROUTING_WEIGHT,
-            )
+            def most_credits_key(account_id: str) -> float:
+                account = self._accounts.get(account_id)
+                if account is None:
+                    return -MINIMUM_ROUTING_WEIGHT
+                return -self._routing_weight(account)
+
+            return sorted(account_ids, key=most_credits_key)
 
         keyed: List[Tuple[float, str]] = []
         for account_id in account_ids:

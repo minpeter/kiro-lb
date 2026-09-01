@@ -114,22 +114,12 @@ export type RequestLogDetail = {
   outputTokens: number | null;
   creditsSpent: number | null;
   modelMultiplier: number | null;
-  prompt: string | null;
-  systemPrompt: string | null;
-  response: string | null;
-  textStored: boolean;
-  textReadable: boolean;
-  captureEnabled: boolean;
 };
 
 export type DataOverview = {
   requestLogs: number;
-  requestLogsWithText: number;
   oldestLogAt: number | null;
   retentionDays: number;
-  captureEnabled: boolean;
-  captureMaxChars: number;
-  encryptionReady: boolean;
   databaseBytes: number;
 };
 
@@ -137,7 +127,6 @@ export type GatewayTunables = {
   tokenRefreshSeconds: number;
   loadBalancing: string;
   loadBalancingOptions: string[];
-  captureRequestText: boolean;
   maxConcurrency: number;
   maxAccountConcurrency: number;
   queueTimeoutSeconds: number;

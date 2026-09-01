@@ -106,9 +106,7 @@ class TestFetchAvailableModels:
 
     async def test_transport_failure_is_swallowed(self, monkeypatch):
         captured: dict = {}
-        monkeypatch.setattr(
-            model_catalog.httpx, "AsyncClient", _client_returning(RuntimeError("down"), captured)
-        )
+        monkeypatch.setattr(model_catalog.httpx, "AsyncClient", _client_returning(RuntimeError("down"), captured))
         assert await model_catalog.fetch_available_models(_auth()) is None
 
     async def test_empty_list_is_not_adopted(self, monkeypatch):

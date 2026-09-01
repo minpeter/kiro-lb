@@ -20,8 +20,6 @@ import asyncio
 import contextlib
 from typing import AsyncIterator, Optional
 
-from loguru import logger
-
 from kiro.gateway_tunables import MAX_ACCOUNT_CONCURRENCY, MAX_CONCURRENCY, QUEUE_TIMEOUT_SECONDS
 
 
@@ -120,6 +118,10 @@ async def slot(account_id: Optional[str] = None) -> AsyncIterator[None]:
 def status() -> dict[str, object]:
     return {
         "global": _global_gate.stats,
-        "accounts": {account_id: gate.stats for account_id, gate in _account_gates.items() if gate.stats["held"] or gate.stats["waiting"]},
+        "accounts": {
+            account_id: gate.stats
+            for account_id, gate in _account_gates.items()
+            if gate.stats["held"] or gate.stats["waiting"]
+        },
         "queueTimeoutSeconds": QUEUE_TIMEOUT_SECONDS.value(),
     }

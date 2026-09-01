@@ -190,19 +190,6 @@ function Field({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
-function TextBlock({ label, text }: { label: string; text: string }) {
-  return (
-    <div className="space-y-1">
-      <p className="text-xs text-muted-foreground">
-        {label} <span className="tabular-nums">({text.length.toLocaleString()} chars)</span>
-      </p>
-      <pre className="max-h-72 overflow-auto rounded-md border bg-muted/40 p-3 text-xs whitespace-pre-wrap">
-        {text}
-      </pre>
-    </div>
-  );
-}
-
 function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | null; onClose: () => void }) {
   return (
     <Dialog open={detail !== null} onOpenChange={(open) => !open && onClose()}>
@@ -231,22 +218,9 @@ function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | n
               />
             </div>
 
-            {detail.prompt ? <TextBlock label="Prompt" text={detail.prompt} /> : null}
-            {detail.systemPrompt ? <TextBlock label="System prompt" text={detail.systemPrompt} /> : null}
-            {detail.response ? <TextBlock label="Response" text={detail.response} /> : null}
-
-            {!detail.textStored && (
-              <p className="text-xs text-muted-foreground">
-                {detail.captureEnabled
-                  ? "No text was stored for this request; it predates capture being enabled."
-                  : "Prompt capture is off, so no text was stored. Enable it in Settings."}
-              </p>
-            )}
-            {detail.textStored && !detail.textReadable && (
-              <p className="text-xs text-destructive">
-                Text was stored but cannot be decrypted. LOG_ENCRYPTION_KEY is missing or has changed.
-              </p>
-            )}
+            <p className="text-xs text-muted-foreground">
+              The gateway records metadata only; request and response text is never stored.
+            </p>
           </div>
         )}
       </DialogContent>

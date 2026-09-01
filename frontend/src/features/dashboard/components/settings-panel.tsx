@@ -133,9 +133,6 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
   }, []);
 
   useEffect(() => {
-    // Initial fetch on mount: state is set after the await, not synchronously,
-    // and this mirrors how use-dashboard loads its own panels.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
   }, [load]);
 
@@ -230,7 +227,6 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
         GatewayTunables,
         | "tokenRefreshSeconds"
         | "loadBalancing"
-        | "captureRequestText"
         | "maxConcurrency"
         | "maxAccountConcurrency"
         | "queueTimeoutSeconds"
@@ -257,16 +253,14 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
       onNotice(entries.length ? `Chain saved with ${entries.length} proxy(ies).` : "Chain cleared: direct connections.");
     });
 
-  const clear = (scope: "text" | "logs" | "usage") =>
-    run(scope === "text" ? "clear-text" : scope === "usage" ? "clear-usage" : "clear-logs", async () => {
+  const clear = (scope: "logs" | "usage") =>
+    run(scope === "usage" ? "clear-usage" : "clear-logs", async () => {
       const result = await dashboardApi.clearData(scope);
       setData(await dashboardApi.dataOverview());
       onNotice(
-        scope === "text"
-          ? `Cleared stored prompts from ${result.affected} request(s).`
-          : scope === "usage"
-            ? `Cleared ${result.affected} token usage row(s).`
-            : `Deleted ${result.affected} request log(s).`,
+        scope === "usage"
+          ? `Cleared ${result.affected} token usage row(s).`
+          : `Deleted ${result.affected} request log(s).`,
       );
     });
 
@@ -678,51 +672,20 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
             <Database size={16} aria-hidden /> Data
           </CardTitle>
           <CardDescription>
-            What the gateway keeps on disk. Prompt text is encrypted with the key in your .env, so a copy of
-            the database alone does not expose it.
+            What the gateway keeps on disk. The request log holds metadata only; request and response text is
+            never stored.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <label className="flex items-start gap-2 text-sm">
-            <input
-              type="checkbox"
-              className="mt-0.5"
-              checked={tunables?.captureRequestText ?? false}
-              disabled={isBusy || !tunables}
-              onChange={(event) => saveTunables({ captureRequestText: event.target.checked })}
-            />
-            <span>
-              Store the prompt and system prompt with each request
-              <span className="block text-xs text-muted-foreground">
-                Encrypted before it is written. Off by default.
-              </span>
-            </span>
-          </label>
-
-          {data && !data.encryptionReady && data.captureEnabled && (
-            <p className="text-xs text-destructive">
-              Capture is on but no usable encryption key was found, so text is not being stored. Check
-              LOG_ENCRYPTION_KEY in .env.
-            </p>
-          )}
-
           {data && (
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <Field label="Request logs" value={data.requestLogs.toLocaleString()} />
-              <Field label="With stored text" value={data.requestLogsWithText.toLocaleString()} />
               <Field label="Retention" value={`${data.retentionDays} days`} />
               <Field label="Database" value={`${(data.databaseBytes / 1048576).toFixed(1)} MB`} />
             </div>
           )}
 
           <div className="flex flex-wrap gap-2">
-            <Button
-              variant="secondary"
-              disabled={isBusy || !data || data.requestLogsWithText === 0}
-              onClick={() => clear("text")}
-            >
-              {busy === "clear-text" ? "Clearing..." : "Clear stored prompts"}
-            </Button>
             <Button variant="secondary" disabled={isBusy} onClick={() => clear("usage")}>
               {busy === "clear-usage" ? "Clearing..." : "Clear token usage"}
             </Button>
@@ -735,7 +698,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            Clearing prompts keeps the metrics. Clearing logs removes the request history too.
+            Clearing logs also resets the request metrics derived from them.
           </p>
         </CardContent>
       </Card>

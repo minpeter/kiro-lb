@@ -24,6 +24,16 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from loguru import logger
 
+from kiro import (
+    agent_mode,
+    concurrency,
+    endpoint_probe,
+    endpoint_settings,
+    gateway_tunables,
+    model_costs,
+    prompt_filter,
+    proxy_chain,
+)
 from kiro.account_manager import account_label, account_routing_state
 from kiro.accounts_admin import (
     AccountConflictError,
@@ -38,7 +48,6 @@ from kiro.accounts_admin import (
 )
 from kiro.config import (
     APP_VERSION,
-    CAPTURE_REQUEST_TEXT_MAX_CHARS,
     FALLBACK_MODELS,
     HIDDEN_MODELS,
     MODEL_ALIASES,
@@ -53,25 +62,14 @@ from kiro.device_login import (
     resolve_provider,
     start_device_login,
 )
+from kiro.endpoints import KIRO_ENDPOINTS
 from kiro.metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from kiro.metrics import render_metrics
 from kiro.model_resolver import normalize_model_name
-from kiro import (
-    agent_mode,
-    concurrency,
-    endpoint_probe,
-    endpoint_settings,
-    gateway_tunables,
-    log_crypto,
-    model_costs,
-    prompt_filter,
-    proxy_chain,
-)
-from kiro.endpoints import KIRO_ENDPOINTS
-from kiro.tunables import InvalidSetting
 from kiro.store import connection as _db
 from kiro.store import database_path
 from kiro.store import initialize as initialize_shared_store
+from kiro.tunables import InvalidSetting
 from kiro.usage import fetch_account_usage
 from kiro.usage_tracking import (
     ROOT_KEY_ID,
@@ -211,9 +209,6 @@ def initialize_dashboard_store() -> None:
             ("input_tokens", "INTEGER"),
             ("output_tokens", "INTEGER"),
             ("credits", "REAL"),
-            ("prompt_enc", "BLOB"),
-            ("system_enc", "BLOB"),
-            ("response_enc", "BLOB"),
         ):
             if column not in log_columns:
                 conn.execute(f"ALTER TABLE request_logs ADD COLUMN {column} {ddl}")
@@ -504,38 +499,24 @@ def record_request(
     *,
     client_ip: str | None = None,
     user_agent: str | None = None,
-    prompt: str | None = None,
-    system_prompt: str | None = None,
-    response_text: str | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     credits_spent: float | None = None,
 ) -> None:
-    """Persist request metadata, plus prompt text when capture is enabled.
-
-    Text is encrypted before it reaches the database. With capture off, or with
-    no key available, the text columns stay empty.
+    """Persist request metadata. The store never holds request or response text.
 
     ``credits`` holds what the upstream reported for this request. Kiro meters
     fractionally, in 0.01 increments, from input and output volume, and publishes
     no token-to-credit rate, so nothing is inferred: when the upstream reports
     nothing, the column stays empty and the dashboard says so.
     """
-    prompt_blob = system_blob = response_blob = None
-    if gateway_tunables.CAPTURE_TEXT.value():
-        limit = CAPTURE_REQUEST_TEXT_MAX_CHARS
-        prompt_blob = log_crypto.encrypt(prompt[:limit] if prompt else None)
-        system_blob = log_crypto.encrypt(system_prompt[:limit] if system_prompt else None)
-        response_blob = log_crypto.encrypt(response_text[:limit] if response_text else None)
-
     try:
         with _db() as conn:
             conn.execute(
                 "INSERT INTO request_logs("
                 "created_at, route, model, status_code, latency_ms, "
-                "client_ip, user_agent, credits, input_tokens, output_tokens, "
-                "prompt_enc, system_enc, response_enc"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "client_ip, user_agent, credits, input_tokens, output_tokens"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     int(time.time()),
                     route,
@@ -547,9 +528,6 @@ def record_request(
                     credits_spent,
                     input_tokens,
                     output_tokens,
-                    prompt_blob,
-                    system_blob,
-                    response_blob,
                 ),
             )
     except Exception:
@@ -1262,8 +1240,7 @@ async def dashboard_get_endpoints(request: Request) -> dict[str, Any]:
     settings = endpoint_settings.current()
     return {
         "available": [
-            {"key": item.key, "name": item.name, "url": item.url(_probe_region(request))}
-            for item in KIRO_ENDPOINTS
+            {"key": item.key, "name": item.name, "url": item.url(_probe_region(request))} for item in KIRO_ENDPOINTS
         ],
         "settings": settings.as_dict(),
         "pingRepsMax": endpoint_probe.PING_REPS_MAX,
@@ -1351,13 +1328,6 @@ async def dashboard_request_log_detail(log_id: int, request: Request) -> dict[st
         raise HTTPException(status_code=404, detail="Unknown request log")
 
     keys = row.keys()
-    prompt = log_crypto.decrypt(row["prompt_enc"]) if "prompt_enc" in keys else None
-    system_prompt = log_crypto.decrypt(row["system_enc"]) if "system_enc" in keys else None
-    response_text = log_crypto.decrypt(row["response_enc"]) if "response_enc" in keys else None
-    stored_text = (
-        bool(row["prompt_enc"] or row["system_enc"] or row["response_enc"]) if "prompt_enc" in keys else False
-    )
-
     return {
         "id": row["id"],
         "createdAt": row["created_at"],
@@ -1372,14 +1342,6 @@ async def dashboard_request_log_detail(log_id: int, request: Request) -> dict[st
         # What Kiro reported for this request, not a figure derived from tokens.
         "creditsSpent": row["credits"] if "credits" in keys else None,
         "modelMultiplier": model_costs.multiplier_for(row["model"]),
-        "prompt": prompt,
-        "systemPrompt": system_prompt,
-        "response": response_text,
-        # Tells the UI why text is missing: never stored, or stored but unreadable.
-        "textStored": stored_text,
-        "textReadable": stored_text
-        and (prompt is not None or system_prompt is not None or response_text is not None),
-        "captureEnabled": gateway_tunables.CAPTURE_TEXT.value(),
     }
 
 
@@ -1388,48 +1350,40 @@ async def dashboard_data_overview(request: Request) -> dict[str, Any]:
     _require_auth(request)
     with _db() as conn:
         logs = conn.execute("SELECT COUNT(*) FROM request_logs").fetchone()[0]
-        with_text = conn.execute(
-            "SELECT COUNT(*) FROM request_logs "
-            "WHERE prompt_enc IS NOT NULL OR system_enc IS NOT NULL OR response_enc IS NOT NULL"
-        ).fetchone()[0]
         oldest = conn.execute("SELECT MIN(created_at) FROM request_logs").fetchone()[0]
     path = database_path()
     return {
         "requestLogs": logs,
-        "requestLogsWithText": with_text,
         "oldestLogAt": oldest,
         "retentionDays": REQUEST_LOG_RETENTION_DAYS,
-        "captureEnabled": gateway_tunables.CAPTURE_TEXT.value(),
-        "captureMaxChars": CAPTURE_REQUEST_TEXT_MAX_CHARS,
-        "encryptionReady": log_crypto.available(),
         "databaseBytes": path.stat().st_size if path.exists() else 0,
     }
 
 
 @router.post("/api/dashboard/data/clear")
 async def dashboard_clear_data(request: Request) -> dict[str, Any]:
-    """Delete request logs, or only the stored prompt text."""
+    """Delete request logs or the token usage counters."""
     _require_auth(request)
     try:
         payload = await request.json()
     except Exception:
         payload = {}
-    scope = (payload or {}).get("scope", "text") if isinstance(payload, dict) else "text"
-    if scope not in ("text", "logs", "usage"):
-        raise HTTPException(status_code=400, detail='scope must be "text", "logs" or "usage"')
+    scope = (payload or {}).get("scope") if isinstance(payload, dict) else None
+    if scope not in ("logs", "usage"):
+        raise HTTPException(status_code=400, detail='scope must be "logs" or "usage"')
 
     with _db() as conn:
         if scope == "logs":
             affected = conn.execute("DELETE FROM request_logs").rowcount
-        elif scope == "usage":
+            # The rollups are fed insert-only by a trigger, so clearing the log
+            # without them would leave metrics reporting requests that no
+            # longer exist anywhere.
+            conn.execute("DELETE FROM request_metric_rollups")
+            conn.execute("DELETE FROM request_latency_rollups")
+        else:
             # Token counters only. Credentials, keys and the request log survive.
             affected = conn.execute("DELETE FROM key_model_usage").rowcount
             affected += conn.execute("DELETE FROM account_model_usage").rowcount
-        else:
-            affected = conn.execute(
-                "UPDATE request_logs SET prompt_enc = NULL, system_enc = NULL, response_enc = NULL "
-                "WHERE prompt_enc IS NOT NULL OR system_enc IS NOT NULL OR response_enc IS NOT NULL"
-            ).rowcount
     logger.info(f"[Data] Cleared {scope}: {affected} row(s)")
     return {"scope": scope, "affected": max(0, affected)}
 
@@ -1466,7 +1420,13 @@ async def dashboard_update_proxies(request: Request) -> dict[str, Any]:
 @router.get("/api/dashboard/concurrency")
 async def dashboard_concurrency(request: Request) -> dict[str, Any]:
     _require_auth(request)
-    return concurrency.status()
+    snapshot = concurrency.status()
+    # Slot keys are internal account identifiers (profile ARNs or credential
+    # paths); expose the same opaque digest the accounts view uses instead.
+    accounts = snapshot.get("accounts")
+    if isinstance(accounts, dict):
+        snapshot["accounts"] = {account_label(key): stats for key, stats in accounts.items()}
+    return snapshot
 
 
 @router.get("/api/dashboard/tunables")
@@ -1490,13 +1450,6 @@ async def dashboard_update_tunables(request: Request) -> dict[str, Any]:
             gateway_tunables.TOKEN_REFRESH_SECONDS.set(payload["tokenRefreshSeconds"])
         if "loadBalancing" in payload:
             gateway_tunables.LOAD_BALANCING.set(payload["loadBalancing"])
-        if "captureRequestText" in payload:
-            enabled = gateway_tunables.CAPTURE_TEXT.set(payload["captureRequestText"])
-            # Generate the key on enable, so the first captured request is
-            # already encryptable rather than silently skipped.
-            if enabled:
-                log_crypto.ensure_key()
-                log_crypto.reset_cache()
         for field, tunable in (
             ("maxConcurrency", gateway_tunables.MAX_CONCURRENCY),
             ("maxAccountConcurrency", gateway_tunables.MAX_ACCOUNT_CONCURRENCY),
@@ -1595,7 +1548,7 @@ async def dashboard_update_prompt_filter(request: Request) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Expected JSON body") from exc
     if not isinstance(payload, dict) or "enabled" not in payload:
-        raise HTTPException(status_code=400, detail="Expected {\"enabled\": true|false}")
+        raise HTTPException(status_code=400, detail='Expected {"enabled": true|false}')
     try:
         value = prompt_filter.set_enabled(payload["enabled"])
     except ValueError as exc:
@@ -1643,9 +1596,7 @@ async def dashboard_request_logs(
         ).fetchall()
         models = [
             row[0]
-            for row in conn.execute(
-                "SELECT DISTINCT model FROM request_logs WHERE model IS NOT NULL ORDER BY model"
-            )
+            for row in conn.execute("SELECT DISTINCT model FROM request_logs WHERE model IS NOT NULL ORDER BY model")
         ]
     return {
         "logs": [dict(row) for row in rows],

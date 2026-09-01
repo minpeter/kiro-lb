@@ -19,10 +19,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.12
         uses: actions/setup-python@v7
         with:
-          python-version: '3.10'
+          python-version: '3.12'
           cache: 'pip'
 
       - name: Install dependencies
@@ -42,7 +42,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: '1.3.7'
+          bun-version: '1.4.0'
 
       - name: Install frontend dependencies
         working-directory: frontend
@@ -68,10 +68,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
       
-      - name: Set up Python 3.10
+      - name: Set up Python 3.12
         uses: actions/setup-python@v7
         with:
-          python-version: '3.10'
+          python-version: '3.12'
           cache: 'pip'
       
       - name: Install dependencies

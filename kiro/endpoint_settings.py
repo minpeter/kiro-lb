@@ -109,10 +109,7 @@ def validate(
     if not isinstance(order, Sequence) or isinstance(order, (str, bytes)):
         raise InvalidEndpointSettings("order must be a list of endpoint keys")
 
-    unknown = [
-        key for key in order
-        if not isinstance(key, str) or key.strip() not in ENDPOINTS_BY_KEY
-    ]
+    unknown = [key for key in order if not isinstance(key, str) or key.strip() not in ENDPOINTS_BY_KEY]
     if unknown:
         known = ", ".join(sorted(ENDPOINTS_BY_KEY))
         raise InvalidEndpointSettings(f"unknown endpoint keys: {unknown!r}; known keys are {known}")

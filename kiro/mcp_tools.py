@@ -137,6 +137,11 @@ async def call_kiro_mcp_api(query: str, auth_manager) -> Tuple[Optional[str], Op
             "x-amzn-codewhisperer-optout": "false",
             "Content-Type": "application/json",
         }
+        # The runtime MCP host rejects a request without the account's profile
+        # ARN. Kiro CLI sends it as a header, not in the JSON-RPC body.
+        profile_arn = getattr(auth_manager, "request_profile_arn", None) or getattr(auth_manager, "profile_arn", None)
+        if profile_arn:
+            headers["x-amzn-kiro-profile-arn"] = profile_arn
 
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
@@ -145,7 +150,10 @@ async def call_kiro_mcp_api(query: str, auth_manager) -> Tuple[Optional[str], Op
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
 
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                # The body carries the only description of what was rejected;
+                # without it a 400 here is undiagnosable.
+                detail = response.text[:400].replace("\n", " ")
+                logger.error(f"MCP API error: {response.status_code} url={mcp_url} body={detail}")
                 return None, None
 
             mcp_response = response.json()

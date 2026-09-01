@@ -73,10 +73,40 @@ class _FakeAuth:
     generation_url = "https://runtime.us-east-1.kiro.dev/"
 
 
+class _LiveFakeAuth(_FakeAuth):
+    async def get_access_token(self):
+        return "token"
+
+
+def _wire_transport(monkeypatch, client, failing_markers):
+    """Drive the real _attempt_endpoint loop against a transport that refuses
+    connections for URLs containing any of ``failing_markers``."""
+    calls: list[str] = []
+
+    class _Transport:
+        def build_request(self, method, url, **kwargs):
+            return httpx.Request(method, url)
+
+        async def send(self, req, stream=False):
+            return await self.request(req.method, str(req.url))
+
+        async def request(self, method, url, **kwargs):
+            calls.append(url)
+            if any(marker in url for marker in failing_markers):
+                raise httpx.ConnectError("connection refused")
+            return _response(200)
+
+    async def fake_get_client(stream=False):
+        return _Transport()
+
+    monkeypatch.setattr(client, "_get_client", fake_get_client)
+    monkeypatch.setattr("kiro.http_client.BASE_RETRY_DELAY", 0)
+    monkeypatch.setattr("kiro.http_client.get_kiro_headers", lambda auth, token: {})
+    return calls
+
+
 _GENERATION_URL = _FakeAuth.generation_url
-_PAYLOAD = {
-    "conversationState": {"currentMessage": {"userInputMessage": {"modelId": "claude-opus-5"}}}
-}
+_PAYLOAD = {"conversationState": {"currentMessage": {"userInputMessage": {"modelId": "claude-opus-5"}}}}
 
 
 def _client(monkeypatch, rotation=True):
@@ -231,6 +261,34 @@ class TestRotationBehavior:
         client._attempt_endpoint = fake_attempt
         response = await client.request_with_retry("POST", _GENERATION_URL, _PAYLOAD)
         assert response.status_code == 503
+
+    async def test_exhausted_transport_error_reaches_the_rotation_layer(self, monkeypatch):
+        """Regression: _attempt_endpoint converted an exhausted transport error
+        into HTTPException, which neither the proxy nor the endpoint fallback
+        layer catches, so the request died on the first route with the others
+        never tried. The real retry loop must let the raw error propagate."""
+        client = _client(monkeypatch)
+        client.auth_manager = _LiveFakeAuth()
+        client.retry_rate_limits = False
+        calls = _wire_transport(monkeypatch, client, failing_markers=("runtime",))
+
+        response = await client.request_with_retry("POST", _GENERATION_URL, _PAYLOAD)
+
+        assert response.status_code == 200
+        assert any("runtime" in url for url in calls), "the first endpoint must actually be attempted"
+        assert any("runtime" not in url for url in calls), "a second endpoint must be attempted after exhaustion"
+
+    async def test_every_route_down_still_returns_an_http_exception(self, monkeypatch):
+        from fastapi import HTTPException
+
+        client = _client(monkeypatch)
+        client.auth_manager = _LiveFakeAuth()
+        client.retry_rate_limits = False
+        _wire_transport(monkeypatch, client, failing_markers=("https",))
+
+        with pytest.raises(HTTPException) as excinfo:
+            await client.request_with_retry("POST", _GENERATION_URL, _PAYLOAD)
+        assert excinfo.value.status_code in (502, 503, 504)
 
     async def test_per_endpoint_headers_are_passed_through(self, monkeypatch):
         client = _client(monkeypatch)

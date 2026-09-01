@@ -310,7 +310,9 @@ KIRO_ENDPOINT_ROTATION: bool = os.getenv("KIRO_ENDPOINT_ROTATION", "false").lowe
 # Comma-separated attempt order. Unknown keys are ignored.
 # Available: runtime, codewhisperer, amazonq
 KIRO_ENDPOINT_ORDER: list[str] = [
-    part.strip() for part in os.getenv("KIRO_ENDPOINT_ORDER", "amazonq,codewhisperer,runtime").split(",") if part.strip()
+    part.strip()
+    for part in os.getenv("KIRO_ENDPOINT_ORDER", "amazonq,codewhisperer,runtime").split(",")
+    if part.strip()
 ]
 
 # How long a failing endpoint is pushed to the back of the queue, in seconds.
@@ -546,11 +548,6 @@ RATE_OBSERVATION_RETENTION_DAYS: int = int(os.getenv("RATE_OBSERVATION_RETENTION
 # unbounded and the 24h overview aggregate degrades: measured 0.85ms at 10k
 # rows versus 19.8ms at 1M, which matters once the dashboard polls every second.
 REQUEST_LOG_RETENTION_DAYS: int = int(os.getenv("REQUEST_LOG_RETENTION_DAYS", "7"))
-
-# Store the prompt and system prompt with each request log so the dashboard can
-# show them. Off by default. Text is encrypted with LOG_ENCRYPTION_KEY.
-CAPTURE_REQUEST_TEXT: bool = os.getenv("CAPTURE_REQUEST_TEXT", "false").lower() in ("true", "1", "yes")
-CAPTURE_REQUEST_TEXT_MAX_CHARS: int = int(os.getenv("CAPTURE_REQUEST_TEXT_MAX_CHARS", "20000"))
 
 # ==================================================================================================
 # Account Cache Settings

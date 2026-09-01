@@ -79,6 +79,19 @@ def _payload_json(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+def measure_payload(payload: Dict[str, Any]) -> tuple[int, int]:
+    """Return (tokens, bytes) from a single serialization of the payload.
+
+    check_payload_tokens() and check_payload_size() each serialized the payload
+    independently, so the pre-flight guard paid the dump twice per request.
+    """
+    serialized = _payload_json(payload)
+    from kiro.tokenizer import count_tokens
+
+    tokens = count_tokens(serialized, apply_claude_correction=False, model="claude-haiku-4.5")
+    return tokens, len(serialized.encode("utf-8"))
+
+
 def check_payload_size(payload: Dict[str, Any]) -> int:
     """Return the serialized UTF-8 byte size of the compact JSON payload.
 
@@ -197,19 +210,79 @@ def _over_limit(payload: Dict[str, Any], max_bytes: Optional[int], max_tokens: O
     return False
 
 
+def _drop_pairs_by_estimate(
+    payload: Dict[str, Any],
+    history: list,
+    max_bytes: Optional[int],
+    max_tokens: Optional[int],
+    total_tokens: int,
+    total_bytes: int,
+) -> None:
+    """Drop old pairs using estimated cost, without any extra full pass.
+
+    The original loop called _over_limit() per iteration, and each call
+    serialized and tokenized the whole payload: 113 iterations on a 3 MB payload
+    cost ~44s before the request even left.
+
+    Each entry's byte cost comes from its own cheap serialization, and its token
+    share is prorated from the payload's real token total. Tokenizing every entry
+    would be more precise but costs another full pass; the proration is close
+    enough and the caller's exact check corrects the rest.
+
+    The 3% margin keeps a proration error from leaving the payload just above the
+    cap, which would force exact iterations - the expensive ones.
+    """
+    if not history:
+        return
+
+    entry_bytes = [len(_payload_json(entry).encode("utf-8")) + 1 for entry in history]
+    history_bytes = sum(entry_bytes)
+    if history_bytes <= 0:
+        return
+
+    tokens_per_byte = total_tokens / total_bytes if total_bytes else 0.0
+    remaining_tokens = float(total_tokens)
+    remaining_bytes = total_bytes
+
+    token_target = max_tokens * 0.97 if max_tokens is not None else None
+
+    index = 0
+    while index < len(history):
+        over_tokens = token_target is not None and remaining_tokens > token_target
+        over_bytes = max_bytes is not None and remaining_bytes > max_bytes
+        if not (over_tokens or over_bytes):
+            break
+        for _ in range(2):
+            if index < len(history):
+                remaining_tokens -= entry_bytes[index] * tokens_per_byte
+                remaining_bytes -= entry_bytes[index]
+                index += 1
+
+    if index:
+        del history[:index]
+
+
 def trim_payload_to_limit(
     payload: Dict[str, Any],
     max_bytes: Optional[int] = None,
     max_tokens: Optional[int] = None,
+    known_tokens: Optional[int] = None,
+    known_bytes: Optional[int] = None,
 ) -> PayloadTrimStats:
     """
     Trim oldest history entries so the payload fits under max_tokens and/or max_bytes.
 
     Trims in user/assistant pairs (2 entries at a time), aligns start to
     userInputMessage, and repairs orphaned toolResults after trimming.
+
+    ``known_tokens``/``known_bytes`` reuse the measurement the caller already did
+    in the pre-flight guard. Without them, measuring again costs a full
+    serialization and tokenization pass over the whole payload.
     """
-    original_bytes = check_payload_size(payload)
-    original_tokens = check_payload_tokens(payload)
+    if known_tokens is not None and known_bytes is not None:
+        original_tokens, original_bytes = known_tokens, known_bytes
+    else:
+        original_tokens, original_bytes = measure_payload(payload)
     conversation_state = payload.get("conversationState", {})
     history = conversation_state.get("history")
 
@@ -230,6 +303,10 @@ def trim_payload_to_limit(
     _strip_empty_tool_uses(history)
 
     # Trim pairs from the beginning until under limit or no history remains.
+    # The per-entry estimate handles the bulk without re-tokenizing the whole
+    # payload; the exact check below covers the tokenizer's boundary difference
+    # and normally needs no extra iteration.
+    _drop_pairs_by_estimate(payload, history, max_bytes, max_tokens, original_tokens, original_bytes)
     while history and _over_limit(payload, max_bytes, max_tokens):
         del history[:2]
 
@@ -242,8 +319,7 @@ def trim_payload_to_limit(
     if not history:
         del conversation_state["history"]
 
-    final_bytes = check_payload_size(payload)
-    final_tokens = check_payload_tokens(payload)
+    final_tokens, final_bytes = measure_payload(payload)
     return PayloadTrimStats(
         original_bytes=original_bytes,
         final_bytes=final_bytes,

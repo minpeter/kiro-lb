@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from kiro.config import ACCOUNT_QUOTA_WEIGHTED_ROUTING, CAPTURE_REQUEST_TEXT, TOKEN_REFRESH_THRESHOLD
-from kiro.tunables import Tunable, boolean, bounded_int, one_of
+from kiro.config import ACCOUNT_QUOTA_WEIGHTED_ROUTING, TOKEN_REFRESH_THRESHOLD
+from kiro.tunables import Tunable, bounded_int, one_of
 
 # How long before expiry a token is refreshed. Too low risks racing an expiry
 # mid-request; too high refreshes far more often than needed. Bounds keep both
@@ -27,14 +27,6 @@ LOAD_BALANCING = Tunable(
     coerce=one_of(LOAD_BALANCING_STRATEGIES),
 )
 
-# Whether the prompt and system prompt are stored with each request log.
-# Off by default: it puts conversation text on disk, encrypted but present.
-CAPTURE_TEXT = Tunable(
-    "capture_request_text",
-    default=CAPTURE_REQUEST_TEXT,
-    coerce=boolean(),
-)
-
 # Caps on generation requests in flight. 0 disables a cap. Holding a burst at
 # the door is cheaper than being rate limited and rotating accounts afterwards.
 MAX_CONCURRENCY = Tunable("max_concurrency", default=0, coerce=bounded_int(0, 512))
@@ -46,7 +38,6 @@ QUEUE_TIMEOUT_SECONDS = Tunable("queue_timeout_seconds", default=30, coerce=boun
 ALL: tuple[Tunable, ...] = (
     TOKEN_REFRESH_SECONDS,
     LOAD_BALANCING,
-    CAPTURE_TEXT,
     MAX_CONCURRENCY,
     MAX_ACCOUNT_CONCURRENCY,
     QUEUE_TIMEOUT_SECONDS,
@@ -70,7 +61,6 @@ def snapshot() -> dict[str, object]:
         "tokenRefreshSeconds": TOKEN_REFRESH_SECONDS.value(),
         "loadBalancing": LOAD_BALANCING.value(),
         "loadBalancingOptions": list(LOAD_BALANCING_STRATEGIES),
-        "captureRequestText": CAPTURE_TEXT.value(),
         "maxConcurrency": MAX_CONCURRENCY.value(),
         "maxAccountConcurrency": MAX_ACCOUNT_CONCURRENCY.value(),
         "queueTimeoutSeconds": QUEUE_TIMEOUT_SECONDS.value(),

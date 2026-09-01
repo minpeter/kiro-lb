@@ -19,6 +19,7 @@ from typing import Any, Optional
 import httpx
 from loguru import logger
 
+from kiro import proxy_chain
 from kiro.endpoints import KIRO_ENDPOINTS, KiroEndpoint
 from kiro.utils import get_kiro_headers
 
@@ -29,6 +30,15 @@ PING_REPS_MAX = 10
 PING_REPS_DEFAULT = 1
 
 _probe_lock = asyncio.Lock()
+
+
+def _probe_client() -> httpx.AsyncClient:
+    """Measure the path production requests actually take: when a proxy chain
+    is configured, a direct probe would report connectivity the data plane
+    does not have."""
+    order = proxy_chain.attempt_order()
+    proxy = order[0].url if order else None
+    return httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT, connect=10.0), proxy=proxy)
 
 
 class ProbeBusy(RuntimeError):
@@ -92,9 +102,7 @@ async def _single_attempt(
 
     started = time.perf_counter()
     try:
-        async with client.stream(
-            "POST", url, json=_payload(model, profile_arn), headers=headers
-        ) as response:
+        async with client.stream("POST", url, json=_payload(model, profile_arn), headers=headers) as response:
             ttfb_ms: Optional[float] = None
             received = 0
             async for chunk in response.aiter_raw():
@@ -143,13 +151,11 @@ async def test_endpoints(
         account = await _resolve_account(account_manager, resolved_model)
         results: list[dict[str, Any]] = []
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT, connect=10.0)) as client:
+        async with _probe_client() as client:
             for endpoint in targets:
                 outcome = await _single_attempt(client, endpoint, account, resolved_model)
                 results.append({"key": endpoint.key, "name": endpoint.name, **outcome})
-                logger.info(
-                    f"[Probe] {endpoint.key} test: status={outcome['statusCode']} ttfb={outcome['ttfbMs']}"
-                )
+                logger.info(f"[Probe] {endpoint.key} test: status={outcome['statusCode']} ttfb={outcome['ttfbMs']}")
 
         return {
             "model": resolved_model,
@@ -184,7 +190,7 @@ async def ping_endpoints(
         samples: dict[str, list[float]] = {e.key: [] for e in targets}
         failures: dict[str, list[str]] = {e.key: [] for e in targets}
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT, connect=10.0)) as client:
+        async with _probe_client() as client:
             for _ in range(reps):
                 for endpoint in targets:
                     outcome = await _single_attempt(client, endpoint, account, resolved_model)
@@ -224,7 +230,7 @@ def _verdict(samples: dict[str, list[float]]) -> dict[str, Any]:
         return {"fastest": None, "conclusive": False, "verdict": "No endpoint answered."}
 
     medians = {key: statistics.median(values) for key, values in usable.items()}
-    fastest = min(medians, key=medians.get)
+    fastest = min(medians, key=lambda key: medians[key])
     if len(usable) == 1:
         return {
             "fastest": fastest,
