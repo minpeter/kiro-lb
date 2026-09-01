@@ -12,7 +12,7 @@ Contains classes and functions for:
 import codecs
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -74,6 +74,91 @@ def find_matching_brace(text: str, start_pos: int) -> int:
                     return i
 
     return -1
+
+
+_BRACKET_MARKER = "[called"
+_BRACKET_PREFIX = re.compile(r"\[Called\s+(\w+)\s+with\s+args:\s*", re.IGNORECASE)
+# A marker that never resolves into a call must not hold text forever. The cap is
+# generous because a single call can carry a whole file as an argument.
+_BRACKET_HOLD_LIMIT = 2 * 1024 * 1024
+
+
+def _bracket_call_end(span: str) -> Optional[int]:
+    """Index just past a complete bracket call at the start of ``span``.
+
+    Returns None while the call is still arriving, and -1 when the text cannot
+    become one.
+    """
+    match = _BRACKET_PREFIX.match(span)
+    if not match:
+        # Enough text to have matched already means this is ordinary prose.
+        return -1 if len(span) > len("[Called  with args: ") + 64 else None
+
+    brace = span.find("{", match.end())
+    if brace == -1:
+        return None if len(span) < _BRACKET_HOLD_LIMIT else -1
+
+    close = find_matching_brace(span, brace)
+    if close == -1:
+        return None if len(span) < _BRACKET_HOLD_LIMIT else -1
+
+    end = close + 1
+    while end < len(span) and span[end].isspace():
+        end += 1
+    if end < len(span) and span[end] == "]":
+        return end + 1
+    if end >= len(span):
+        # The closing bracket may still be on its way; releasing the span now
+        # would forward a stray "]" once it arrives.
+        return None
+    return end
+
+
+def split_bracket_call_text(buffer: str) -> Tuple[str, str]:
+    """Split text into the part safe to forward and the part held back.
+
+    Bracket-style calls are converted into tool_use blocks, so their text must
+    not reach the client as prose as well. The marker can straddle a chunk
+    boundary, so a trailing partial marker is held instead of forwarded.
+    """
+    emit: List[str] = []
+    rest = buffer
+
+    while rest:
+        found = rest.lower().find(_BRACKET_MARKER)
+        if found == -1:
+            keep = _partial_marker_start(rest)
+            if keep is None:
+                emit.append(rest)
+                rest = ""
+            else:
+                emit.append(rest[:keep])
+                rest = rest[keep:]
+            break
+
+        emit.append(rest[:found])
+        span = rest[found:]
+        end = _bracket_call_end(span)
+        if end is None:
+            rest = span
+            break
+        if end == -1:
+            # Not a call after all: release the bracket and keep scanning.
+            emit.append(span[0])
+            rest = span[1:]
+            continue
+        rest = span[end:]
+
+    return "".join(emit), rest
+
+
+def _partial_marker_start(text: str) -> Optional[int]:
+    """Index where a truncated ``[Called`` marker begins, if the text ends in one."""
+    lowered = text.lower()
+    for size in range(min(len(_BRACKET_MARKER) - 1, len(text)), 0, -1):
+        if lowered.endswith(_BRACKET_MARKER[:size]):
+            return len(text) - size
+    return None
 
 
 def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:

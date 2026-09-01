@@ -21,7 +21,7 @@ import httpx
 from loguru import logger
 
 from kiro.config import FIRST_TOKEN_MAX_RETRIES, FIRST_TOKEN_TIMEOUT
-from kiro.parsers import parse_bracket_tool_calls
+from kiro.parsers import parse_bracket_tool_calls, split_bracket_call_text
 from kiro.sse_validation import (
     StreamProtocolError,
     begin_anthropic_stream,
@@ -186,6 +186,8 @@ async def stream_kiro_to_anthropic(
     text_block_started = False
     text_block_index: Optional[int] = None
     pending_content: List[str] = []
+    # Text held back while it may still turn out to be a bracket-style call.
+    bracket_held = ""
     tool_blocks: List[Dict[str, Any]] = []
     # Set while a tool_use block is open and its arguments are still arriving.
     streamed_tool_id: Optional[str] = None
@@ -374,6 +376,12 @@ async def stream_kiro_to_anthropic(
                 if not content:
                     continue
                 full_content += content
+
+                # A bracket-style call becomes a tool_use block below, so its text
+                # is withheld here instead of also being shown as prose.
+                content, bracket_held = split_bracket_call_text(bracket_held + content)
+                if not content:
+                    continue
 
                 if thinking_block_started:
                     pending_content.append(content)
@@ -675,9 +683,31 @@ async def stream_kiro_to_anthropic(
             streamed_tool_id = None
             streamed_tool_index = None
 
+        if bracket_held:
+            # What is still held either completes a call, which the handling below
+            # turns into a tool block, or was ordinary text that must not vanish.
+            if not parse_bracket_tool_calls(bracket_held):
+                pending_content.append(bracket_held)
+            bracket_held = ""
+
         # Check for bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
+        if bracket_tool_calls and tool_blocks:
+            # Upstream already sent this turn's calls as structured events. The
+            # text merely echoes them, and emitting both would run every call
+            # twice.
+            logger.warning(
+                f"[Anthropic Streaming] Ignoring {len(bracket_tool_calls)} bracket tool call(s): "
+                f"{len(tool_blocks)} native call(s) already emitted"
+            )
+            bracket_tool_calls = []
         if bracket_tool_calls:
+            # Text that arrived before the call keeps its place: flushing after
+            # the tool block would reorder the turn the model produced.
+            if pending_content:
+                for pending_chunk in flush_pending_content(False):
+                    yield pending_chunk
+
             # Close thinking block if open
             if thinking_block_started and thinking_block_index is not None:
                 yield format_sse_event(
