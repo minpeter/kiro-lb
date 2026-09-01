@@ -25,8 +25,7 @@ from kiro.config import (
 )
 from kiro.payload_guards import (
     PayloadTooLargeError,
-    check_payload_size,
-    check_payload_tokens,
+    measure_payload,
     payload_token_limit_for_model,
     trim_payload_to_limit,
 )
@@ -86,10 +85,15 @@ class KiroPayloadResult:
     Attributes:
         payload: The complete Kiro API payload
         tool_documentation: Documentation for tools with long descriptions (to add to system prompt)
+        input_tokens: cl100k tokens of the payload actually sent upstream, already
+            measured by the pre-flight guard. Reusing it avoids a second full
+            tokenization just to fill message_start, and it reflects the payload
+            after trimming instead of the client's pre-trim conversation.
     """
 
     payload: Dict[str, Any]
     tool_documentation: str = ""
+    input_tokens: int = 0
 
 
 # ==================================================================================================
@@ -1402,15 +1406,21 @@ def build_kiro_payload(
     # or fail here with the real numbers. The upstream counts cl100k tokens of
     # the JSON, not UTF-8 bytes; the byte cap is a legacy extra. Trimming is
     # opt-in because it silently discards the oldest turns.
-    payload_tokens = check_payload_tokens(payload)
-    payload_size = check_payload_size(payload)
+    payload_tokens, payload_size = measure_payload(payload)
     token_cap = payload_token_limit_for_model(model_id)
     byte_cap = KIRO_MAX_PAYLOAD_BYTES if KIRO_MAX_PAYLOAD_BYTES > 0 else None
     over_tokens = payload_tokens > token_cap
     over_bytes = byte_cap is not None and payload_size > byte_cap
+    sent_tokens = payload_tokens
     if over_tokens or over_bytes:
         if AUTO_TRIM_PAYLOAD:
-            stats = trim_payload_to_limit(payload, max_bytes=byte_cap, max_tokens=token_cap)
+            stats = trim_payload_to_limit(
+                payload,
+                max_bytes=byte_cap,
+                max_tokens=token_cap,
+                known_tokens=payload_tokens,
+                known_bytes=payload_size,
+            )
             logger.info(
                 f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
                 f"({stats.original_tokens} -> {stats.final_tokens} tokens, "
@@ -1418,6 +1428,7 @@ def build_kiro_payload(
             )
             final_tokens = stats.final_tokens
             final_bytes = stats.final_bytes
+            sent_tokens = final_tokens
             if final_tokens > token_cap:
                 raise PayloadTooLargeError(
                     final_tokens,
@@ -1447,4 +1458,4 @@ def build_kiro_payload(
                 payload_size, KIRO_MAX_PAYLOAD_BYTES, unit="bytes", payload_tokens=payload_tokens
             )
 
-    return KiroPayloadResult(payload=payload, tool_documentation=tool_documentation)
+    return KiroPayloadResult(payload=payload, tool_documentation=tool_documentation, input_tokens=sent_tokens)

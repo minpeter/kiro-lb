@@ -123,6 +123,7 @@ async def stream_kiro_to_anthropic(
     request_system: Optional[Any] = None,
     conversation_id: Optional[str] = None,
     make_search_request: Optional[Callable[[str, str, str], Awaitable[httpx.Response]]] = None,
+    known_input_tokens: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -162,8 +163,13 @@ async def stream_kiro_to_anthropic(
     # Accuracy: ~85-90% (acceptable trade-off for maintaining streaming capability).
     # See: https://docs.anthropic.com/en/api/messages-streaming
 
-    # Fallback estimation must cover messages/tools/system to avoid significant undercount
-    if request_messages or request_tools or request_system:
+    # Reusing the pre-flight measurement avoids a second full tokenization here,
+    # which runs before the first SSE event and delays time-to-first-byte by
+    # hundreds of ms on a large payload. It is also the better number: it
+    # reflects the payload actually sent, after trimming.
+    if known_input_tokens:
+        input_tokens = known_input_tokens
+    elif request_messages or request_tools or request_system:
         request_token_stats = estimate_request_tokens(
             messages=request_messages or [],
             tools=request_tools,
@@ -995,6 +1001,7 @@ async def stream_with_first_token_retry_anthropic(
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
     make_search_request: Optional[Callable[[str, str, str], Awaitable[httpx.Response]]] = None,
+    known_input_tokens: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -1059,6 +1066,7 @@ async def stream_with_first_token_retry_anthropic(
             request_tools=request_tools,
             request_system=request_system,
             make_search_request=make_search_request,
+            known_input_tokens=known_input_tokens,
         ):
             yield chunk
 

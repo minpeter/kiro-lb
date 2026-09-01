@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.converters_anthropic import anthropic_to_kiro_with_stats
 from kiro.converters_openai import build_kiro_payload
 from kiro.offload import run_in_worker
 from kiro.payload_guards import PayloadTooLargeError
@@ -69,7 +69,7 @@ class TestRoutesOffloadPayloadBuild:
                 "messages": [{"role": "user", "content": "hi"}],
             },
         )
-        assert seen.get("fn") is anthropic_to_kiro
+        assert seen.get("fn") is anthropic_to_kiro_with_stats
         assert response.status_code == 400
 
     def test_openai_chat_offloads_conversion(self, test_client, valid_proxy_api_key, monkeypatch) -> None:
