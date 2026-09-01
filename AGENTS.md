@@ -8,7 +8,7 @@
 `kiro-lb` is a FastAPI gateway that exposes Kiro (Amazon Q Developer /
 CodeWhisperer) through OpenAI- and Anthropic-compatible APIs, load balances
 across a pool of Kiro accounts, and ships a React operations dashboard.
-Python 3.10 (`Dockerfile`, CI), httpx, loguru, tiktoken. **AGPL-3.0** — based on
+Python 3.12 (`Dockerfile`, CI), httpx, loguru, tiktoken. **AGPL-3.0** — based on
 `jwadow/kiro-gateway`; see `LICENSE` and `NOTICE.md` (do not relicense).
 
 ## STRUCTURE

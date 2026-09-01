@@ -52,7 +52,7 @@ x-kiro-app: &kiro-app
 
 services:
   edge:
-    image: haproxy:3.2-alpine
+    image: haproxy:3.4-alpine
     container_name: kiro-lb-edge
     ports:
       - "10.10.10.10:8000:8000"

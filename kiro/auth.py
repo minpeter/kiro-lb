@@ -307,7 +307,7 @@ class KiroAuthManager:
                             # Handle various ISO 8601 formats
                             if expires_str.endswith("Z"):
                                 expires_str = expires_str.replace("Z", "+00:00")
-                            # Python 3.10 fromisoformat supports max 6 decimal places (microseconds)
+                            # fromisoformat supports max 6 decimal places (microseconds)
                             # kiro-cli writes nanoseconds (9 digits) — truncate to 6
                             expires_str = re.sub(r"(\.\d{6})\d+", r"\1", expires_str)
                             self._expires_at = datetime.fromisoformat(expires_str)
