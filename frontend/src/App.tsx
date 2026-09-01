@@ -161,25 +161,25 @@ export default function App() {
       <main className="mx-auto max-w-7xl 2xl:max-w-[100rem] p-4 sm:p-6">
         <Tabs value={tab} onValueChange={selectTab} className="space-y-6">
           <TabsList className="h-10 w-full">
-            <TabsTrigger value="overview" className="gap-2">
+            <TabsTrigger value="overview" className="gap-2 px-2 sm:px-3" title="Overview">
               <LayoutDashboard aria-hidden />
-              Overview
+              <span className="hidden sm:inline">Overview</span>
             </TabsTrigger>
-            <TabsTrigger value="accounts" className="gap-2">
+            <TabsTrigger value="accounts" className="gap-2 px-2 sm:px-3" title="Accounts">
               <Users aria-hidden />
-              Accounts
+              <span className="hidden sm:inline">Accounts</span>
             </TabsTrigger>
-            <TabsTrigger value="keys" className="gap-2">
+            <TabsTrigger value="keys" className="gap-2 px-2 sm:px-3" title="API keys">
               <KeyRound aria-hidden />
-              API keys
+              <span className="hidden sm:inline">API keys</span>
             </TabsTrigger>
-            <TabsTrigger value="settings" className="gap-2">
+            <TabsTrigger value="settings" className="gap-2 px-2 sm:px-3" title="Settings">
               <Settings aria-hidden />
-              Settings
+              <span className="hidden sm:inline">Settings</span>
             </TabsTrigger>
-            <TabsTrigger value="info" className="gap-2">
+            <TabsTrigger value="info" className="gap-2 px-2 sm:px-3" title="Info">
               <Info aria-hidden />
-              Info
+              <span className="hidden sm:inline">Info</span>
             </TabsTrigger>
           </TabsList>
 
