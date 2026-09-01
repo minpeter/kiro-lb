@@ -156,6 +156,9 @@ async def stream_kiro_to_openai_internal(
     tool_calls_from_stream = []
     # Text held back while it may still turn out to be a bracket-style call.
     bracket_held = ""
+    # Index assigned to each call already streamed, so the final chunk can skip it.
+    streamed_tool_indices: dict[str, int] = {}
+    next_streamed_tool_index = 0
     received_upstream_event = False
 
     begin_openai_stream()
@@ -296,6 +299,69 @@ async def stream_kiro_to_openai_internal(
                 # Collect tool calls from stream (normal tools, not web_search)
                 tool_calls_from_stream.append(event.tool_use)
 
+            elif event.type == "tool_use_start" and event.tool_use_id:
+                # web_search is intercepted below and replaced by its summary, so
+                # the call itself must not be announced to the client.
+                # Buffering is required when the client asked for a single call:
+                # extras are dropped at the end, which is impossible once sent.
+                if event.tool_use_name == "web_search" or not parallel_tool_calls:
+                    continue
+
+                received_upstream_event = True
+                streamed_tool_indices[event.tool_use_id] = next_streamed_tool_index
+                tool_delta: dict[str, Any] = {
+                    "tool_calls": [
+                        {
+                            "index": next_streamed_tool_index,
+                            "id": event.tool_use_id,
+                            "type": "function",
+                            "function": {"name": event.tool_use_name or "", "arguments": event.tool_input_delta or ""},
+                        }
+                    ]
+                }
+                if first_chunk:
+                    tool_delta["role"] = "assistant"
+                    first_chunk = False
+                next_streamed_tool_index += 1
+                yield _openai_sse(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": tool_delta, "finish_reason": None}],
+                    }
+                )
+
+            elif event.type == "tool_use_delta" and event.tool_input_delta:
+                # Forwarded verbatim: the client appends the fragments, so
+                # re-serializing one would corrupt the assembled arguments.
+                index = streamed_tool_indices.get(event.tool_use_id or "")
+                if index is not None:
+                    received_upstream_event = True
+                    yield _openai_sse(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": index,
+                                                "function": {"arguments": event.tool_input_delta},
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+
             elif event.type == "usage" and event.usage:
                 # Kiro puts the credit cost of the request in this frame.
                 report_credits(event.usage)
@@ -400,13 +466,20 @@ async def stream_kiro_to_openai_internal(
             # Add required index field to each tool_call
             # according to OpenAI API specification for streaming
             indexed_tool_calls = []
-            for idx, tc in enumerate(all_tool_calls):
+            next_index = next_streamed_tool_index
+            for tc in all_tool_calls:
+                if tc.get("id") in streamed_tool_indices:
+                    # Already sent fragment by fragment while it was arriving.
+                    continue
+
                 # Extract function with None protection
                 func = tc.get("function") or {}
                 # Use "or" for protection against explicit None in values
                 tool_name = func.get("name") or ""
                 tool_args = func.get("arguments") or "{}"
 
+                idx = next_index
+                next_index += 1
                 logger.debug(f"Tool call [{idx}] '{tool_name}': id={tc.get('id')}, args_length={len(tool_args)}")
 
                 indexed_tc = {
@@ -417,14 +490,15 @@ async def stream_kiro_to_openai_internal(
                 }
                 indexed_tool_calls.append(indexed_tc)
 
-            tool_calls_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "choices": [{"index": 0, "delta": {"tool_calls": indexed_tool_calls}, "finish_reason": None}],
-            }
-            yield _openai_sse(tool_calls_chunk)
+            if indexed_tool_calls:
+                tool_calls_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"tool_calls": indexed_tool_calls}, "finish_reason": None}],
+                }
+                yield _openai_sse(tool_calls_chunk)
 
         # Final chunk with usage
         final_chunk: dict[str, Any] = {
