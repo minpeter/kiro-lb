@@ -139,9 +139,7 @@ async def call_kiro_mcp_api(query: str, auth_manager) -> Tuple[Optional[str], Op
         }
         # The runtime MCP host rejects a request without the account's profile
         # ARN. Kiro CLI sends it as a header, not in the JSON-RPC body.
-        profile_arn = getattr(auth_manager, "request_profile_arn", None) or getattr(
-            auth_manager, "profile_arn", None
-        )
+        profile_arn = getattr(auth_manager, "request_profile_arn", None) or getattr(auth_manager, "profile_arn", None)
         if profile_arn:
             headers["x-amzn-kiro-profile-arn"] = profile_arn
 
