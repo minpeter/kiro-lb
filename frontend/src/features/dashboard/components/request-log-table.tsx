@@ -65,10 +65,7 @@ export function RequestLogTable({
     <Card>
       <CardHeader>
         <CardTitle>Recent proxy requests</CardTitle>
-        <CardDescription>
-          Open a row to see where it came from and what was sent. Prompt text appears only if capture is on
-          in Settings; it is encrypted at rest.
-        </CardDescription>
+        <CardDescription>Open a row to see where it came from and what it cost.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex flex-wrap items-center gap-2">

@@ -172,6 +172,51 @@ class TestConcurrencyGate:
         assert account_id not in keys
         assert not any("SECRET" in key for key in keys)
 
+    async def test_the_route_reports_one_layer_of_masking(self):
+        """Asserted through the route, not through concurrency.status(): the
+        digest was applied in both layers at once, and a test that called the
+        function directly could not see the route digesting a digest."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kiro import dashboard
+        from kiro.account_manager import account_label
+
+        MAX_CONCURRENCY.set(0)
+        MAX_ACCOUNT_CONCURRENCY.set(1)
+        concurrency.reset()
+
+        account_id = "arn:aws:codewhisperer:us-east-1:123456789012:profile/SECRET"
+        expected = account_label(account_id)
+
+        app = FastAPI()
+        app.include_router(dashboard.router)
+        original = dashboard._authenticated
+        dashboard._authenticated = lambda _request: True
+        try:
+            held = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold():
+                async with concurrency.slot(account_id):
+                    held.set()
+                    await release.wait()
+
+            holder = asyncio.create_task(hold())
+            await held.wait()
+            with TestClient(app) as client:
+                body = client.get("/api/dashboard/concurrency").json()
+            release.set()
+            await holder
+        finally:
+            dashboard._authenticated = original
+
+        keys = list(body["accounts"].keys())
+        assert keys == [expected], "the route must not mask an already masked key"
+        assert account_id not in keys
+        assert not any("SECRET" in key for key in keys)
+        assert account_label(expected) not in keys
+
     async def test_per_account_limit_is_independent(self):
         MAX_CONCURRENCY.set(0)
         MAX_ACCOUNT_CONCURRENCY.set(1)

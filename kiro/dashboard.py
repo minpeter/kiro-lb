@@ -199,8 +199,8 @@ def initialize_dashboard_store() -> None:
         for column in ("generation_ms", "timed_completion_tokens"):
             if column not in usage_columns:
                 conn.execute(f"ALTER TABLE key_model_usage ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
-        # Detail columns for the request log. All nullable: old rows have no
-        # detail, and text is only present when capture is enabled.
+        # Detail columns for the request log. All nullable: old rows predate the
+        # detail and carry none of it.
         log_columns = {row["name"] for row in conn.execute("PRAGMA table_info(request_logs)")}
         for column, ddl in (
             ("client_ip", "TEXT"),
@@ -1426,13 +1426,10 @@ async def dashboard_update_proxies(request: Request) -> dict[str, Any]:
 @router.get("/api/dashboard/concurrency")
 async def dashboard_concurrency(request: Request) -> dict[str, Any]:
     _require_auth(request)
-    snapshot = concurrency.status()
-    # Slot keys are internal account identifiers (profile ARNs or credential
-    # paths); expose the same opaque digest the accounts view uses instead.
-    accounts = snapshot.get("accounts")
-    if isinstance(accounts, dict):
-        snapshot["accounts"] = {account_label(key): stats for key, stats in accounts.items()}
-    return snapshot
+    # Keys are already the opaque digest: concurrency.status() applies
+    # account_label, so masking again here would digest a digest and stop
+    # matching the label the accounts view shows.
+    return concurrency.status()
 
 
 @router.get("/api/dashboard/tunables")
