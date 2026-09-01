@@ -3,8 +3,6 @@
 
 import time
 
-import pytest
-
 from kiro import payload_guards as pg
 
 CHUNK = "public void onDamage(EntityDamageEvent event) { if (event.getCause() == VOID) { cancel(); } } "

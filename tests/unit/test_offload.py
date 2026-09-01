@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from kiro.converters_anthropic import anthropic_to_kiro, anthropic_to_kiro_with_stats
+from kiro.converters_anthropic import anthropic_to_kiro_with_stats
 from kiro.converters_openai import build_kiro_payload
 from kiro.offload import run_in_worker
 from kiro.payload_guards import PayloadTooLargeError

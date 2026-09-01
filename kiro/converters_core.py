@@ -25,8 +25,6 @@ from kiro.config import (
 )
 from kiro.payload_guards import (
     PayloadTooLargeError,
-    check_payload_size,
-    check_payload_tokens,
     measure_payload,
     payload_token_limit_for_model,
     trim_payload_to_limit,
