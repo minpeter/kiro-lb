@@ -61,6 +61,9 @@ class KiroEvent:
         thinking_content: Thinking/reasoning content (for thinking events)
         thinking_signature: Opaque upstream signature for a thinking block
         tool_use: Tool use data (for tool_use events)
+        tool_use_id: Upstream id of the tool call being streamed
+        tool_use_name: Name of the tool call being streamed
+        tool_input_delta: One raw fragment of the tool arguments, as sent upstream
         usage: Usage/metering data (for usage events)
         context_usage_percentage: Context usage percentage (for context_usage events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
@@ -73,6 +76,9 @@ class KiroEvent:
     thinking_content: Optional[str] = None
     thinking_signature: Optional[str] = None
     tool_use: Optional[Dict[str, Any]] = None
+    tool_use_id: Optional[str] = None
+    tool_use_name: Optional[str] = None
+    tool_input_delta: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
@@ -210,6 +216,19 @@ async def _process_chunk(parser: AwsEventStreamParser, chunk: bytes) -> AsyncGen
                 type="thinking_signature",
                 thinking_signature=event["data"],
                 is_last_thinking_chunk=True,
+            )
+        elif event["type"] == "tool_use_start":
+            yield KiroEvent(
+                type="tool_use_start",
+                tool_use_id=event["data"]["id"],
+                tool_use_name=event["data"]["name"],
+                tool_input_delta=event["data"]["fragment"],
+            )
+        elif event["type"] == "tool_use_delta":
+            yield KiroEvent(
+                type="tool_use_delta",
+                tool_use_id=event["data"]["id"],
+                tool_input_delta=event["data"]["fragment"],
             )
         elif event["type"] == "tool_use":
             if event["data"].get("_parse_error"):

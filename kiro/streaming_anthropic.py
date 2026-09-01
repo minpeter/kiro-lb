@@ -187,6 +187,9 @@ async def stream_kiro_to_anthropic(
     text_block_index: Optional[int] = None
     pending_content: List[str] = []
     tool_blocks: List[Dict[str, Any]] = []
+    # Set while a tool_use block is open and its arguments are still arriving.
+    streamed_tool_id: Optional[str] = None
+    streamed_tool_index: Optional[int] = None
     upstream_stop_reason: Optional[str] = None
     received_upstream_event = False
 
@@ -400,6 +403,68 @@ async def stream_kiro_to_anthropic(
                         },
                     )
 
+            elif event.type == "tool_use_start" and event.tool_use_id:
+                # web_search is not forwarded: it is intercepted below and
+                # replaced with server_tool_use plus its results, so opening a
+                # block here would publish a call the client must not see.
+                if event.tool_use_name == "web_search":
+                    continue
+
+                received_upstream_event = True
+
+                if thinking_block_started and thinking_block_index is not None:
+                    yield format_sse_event(
+                        "content_block_stop", {"type": "content_block_stop", "index": thinking_block_index}
+                    )
+                    thinking_block_started = False
+                    current_block_index += 1
+
+                if text_block_started and text_block_index is not None:
+                    yield format_sse_event(
+                        "content_block_stop", {"type": "content_block_stop", "index": text_block_index}
+                    )
+                    text_block_started = False
+                    current_block_index += 1
+
+                streamed_tool_id = event.tool_use_id
+                streamed_tool_index = current_block_index
+                yield format_sse_event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": streamed_tool_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": event.tool_use_id,
+                            "name": event.tool_use_name or "",
+                            "input": {},
+                        },
+                    },
+                )
+                if event.tool_input_delta:
+                    yield format_sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": streamed_tool_index,
+                            "delta": {"type": "input_json_delta", "partial_json": event.tool_input_delta},
+                        },
+                    )
+
+            elif event.type == "tool_use_delta" and event.tool_input_delta:
+                # Forwarded verbatim: the client concatenates the fragments, so
+                # re-serializing them here would corrupt the assembled JSON.
+                if streamed_tool_id and streamed_tool_id == event.tool_use_id and streamed_tool_index is not None:
+                    received_upstream_event = True
+                    yield format_sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": streamed_tool_index,
+                            "delta": {"type": "input_json_delta", "partial_json": event.tool_input_delta},
+                        },
+                    )
+
             elif event.type == "tool_use" and event.tool_use:
                 # Close thinking block if open
                 if thinking_block_started and thinking_block_index is not None:
@@ -540,6 +605,19 @@ async def stream_kiro_to_anthropic(
                     except json.JSONDecodeError:
                         raise StreamProtocolError("Malformed upstream tool input")
 
+                if streamed_tool_id == tool_id and streamed_tool_index is not None:
+                    # The block is already open and the client has every fragment
+                    # upstream sent, so this only closes it. Re-sending the
+                    # assembled JSON here would duplicate the arguments.
+                    yield format_sse_event(
+                        "content_block_stop", {"type": "content_block_stop", "index": streamed_tool_index}
+                    )
+                    tool_blocks.append({"id": tool_id, "name": tool_name, "input": tool_input})
+                    current_block_index += 1
+                    streamed_tool_id = None
+                    streamed_tool_index = None
+                    continue
+
                 # Send tool_use block start
                 yield format_sse_event(
                     "content_block_start",
@@ -588,6 +666,14 @@ async def stream_kiro_to_anthropic(
         if not message_started:
             yield format_sse_event("message_start", message_start_data)
             message_started = True
+
+        if streamed_tool_id is not None and streamed_tool_index is not None:
+            # The stream ended without the frame that closes the call. Leaving the
+            # block open would hang the client waiting for a stop it never gets.
+            yield format_sse_event("content_block_stop", {"type": "content_block_stop", "index": streamed_tool_index})
+            current_block_index += 1
+            streamed_tool_id = None
+            streamed_tool_index = None
 
         # Check for bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)

@@ -248,6 +248,10 @@ class AwsEventStreamParser:
         self._emitted_tool_call_count = 0
         self._observed_frames: List[Dict[str, Any]] = []
         self.native_thinking_started = False
+        # A single upstream frame can produce two events: the last argument
+        # fragment and the stop that closes the call. _process_event returns one
+        # event, so the extra one waits here for feed to drain it.
+        self._pending_events: List[Dict[str, Any]] = []
 
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
         """
@@ -309,6 +313,9 @@ class AwsEventStreamParser:
             try:
                 data = json.loads(json_str)
                 event = self._process_event(data, earliest_type)
+                if self._pending_events:
+                    events.extend(self._pending_events)
+                    self._pending_events = []
                 if event:
                     events.append(event)
             except json.JSONDecodeError:
@@ -330,10 +337,17 @@ class AwsEventStreamParser:
         current_id = self.current_tool_call.get("id") if self.current_tool_call else None
         frame_tool_id = data.get("toolUseId")
         if "input" in data and self.current_tool_call and (not frame_tool_id or frame_tool_id == current_id):
-            self._process_tool_input_event(data)
+            delta = self._process_tool_input_event(data)
             if data.get("stop"):
-                return self._process_tool_stop_event(data)
-            return None
+                # The final fragment shares its frame with the stop. Emitting only
+                # the stop would leave the client one fragment short of the JSON.
+                stop_event = self._process_tool_stop_event(data)
+                if delta and stop_event:
+                    self._pending_events.append(delta)
+                    self._pending_events.append(stop_event)
+                    return None
+                return stop_event or delta
+            return delta
         if data.get("stop") and self.current_tool_call:
             return self._process_tool_stop_event(data)
         if event_type == "content":
@@ -416,9 +430,26 @@ class AwsEventStreamParser:
                 "data": self.tool_calls[-1],
             }
 
+        # Announce the call as soon as it opens so the client can render the
+        # arguments as they arrive. Upstream sends them in fragments, and
+        # withholding everything until the stop frame is what collapsed the
+        # whole call into a single delta.
+        start_event = {
+            "type": "tool_use_start",
+            "data": {
+                "id": self.current_tool_call["id"],
+                "name": self.current_tool_call["function"]["name"],
+                "fragment": input_str,
+            },
+        }
+
         if completed_tool_call is not None:
-            return {"type": "tool_use", "data": completed_tool_call}
-        return None
+            # The previous call closes before the new one opens.
+            self._pending_events.append({"type": "tool_use", "data": completed_tool_call})
+            self._pending_events.append(start_event)
+            return None
+
+        return start_event
 
     def _process_tool_input_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes input continuation for tool call."""
@@ -433,6 +464,11 @@ class AwsEventStreamParser:
             else:
                 input_str = str(input_data) if input_data else ""
             self.current_tool_call["function"]["arguments"] += input_str
+            if input_str:
+                return {
+                    "type": "tool_use_delta",
+                    "data": {"id": self.current_tool_call["id"], "fragment": input_str},
+                }
         return None
 
     def _process_tool_stop_event(self, data: dict) -> Optional[Dict[str, Any]]:
