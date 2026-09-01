@@ -217,10 +217,6 @@ function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | n
                 }
               />
             </div>
-
-            <p className="text-xs text-muted-foreground">
-              The gateway records metadata only; request and response text is never stored.
-            </p>
           </div>
         )}
       </DialogContent>

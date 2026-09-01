@@ -671,10 +671,7 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
           <CardTitle className="flex items-center gap-2">
             <Database size={16} aria-hidden /> Data
           </CardTitle>
-          <CardDescription>
-            What the gateway keeps on disk. The request log holds metadata only; request and response text is
-            never stored.
-          </CardDescription>
+          <CardDescription>What the gateway keeps on disk.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {data && (

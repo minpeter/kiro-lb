@@ -168,6 +168,35 @@ class TestRequestMetrics:
         assert series['kiro_lb_requests_total{model="claude-opus-5",protocol="openai",status_class="2xx"}'] == 2
         assert series['kiro_lb_requests_total{model="claude-opus-5",protocol="anthropic",status_class="4xx"}'] == 1
 
+    def test_pruning_the_log_does_not_lower_the_counter(self, dashboard):
+        """kiro_lb_requests_total is a counter, so retention pruning must not
+        reset it. The rollups exist precisely to outlive the pruned rows."""
+        dashboard.record_request("/v1/chat/completions", "claude-opus-5", 200, 1200)
+        dashboard.record_request("/v1/chat/completions", "claude-opus-5", 200, 800)
+        label = 'kiro_lb_requests_total{model="claude-opus-5",protocol="openai",status_class="2xx"}'
+        assert _series(_render(dashboard))[label] == 2
+
+        with dashboard._db() as conn:
+            conn.execute("UPDATE request_logs SET created_at = 0")
+        pruned = dashboard.prune_request_logs()
+
+        assert pruned == 2, "the rows must actually have been pruned"
+        assert _series(_render(dashboard))[label] == 2
+
+    def test_the_explicit_wipe_does_reset_the_counter(self, dashboard):
+        """data/clear is an operator asking for a clean slate, and Prometheus
+        detects a counter reset, so clearing the rollups there is intended."""
+        dashboard.record_request("/v1/chat/completions", "claude-opus-5", 200, 1200)
+        label = 'kiro_lb_requests_total{model="claude-opus-5",protocol="openai",status_class="2xx"}'
+        assert _series(_render(dashboard))[label] == 1
+
+        with dashboard._db() as conn:
+            conn.execute("DELETE FROM request_logs")
+            conn.execute("DELETE FROM request_metric_rollups")
+            conn.execute("DELETE FROM request_latency_rollups")
+
+        assert label not in _series(_render(dashboard))
+
     def test_latency_is_seconds_and_counts_only_successes(self, dashboard):
         dashboard.record_request("/v1/chat/completions", "m", 200, 1500)
         dashboard.record_request("/v1/chat/completions", "m", 200, 500)

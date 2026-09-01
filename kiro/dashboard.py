@@ -324,6 +324,12 @@ def prune_request_logs() -> int:
     The table is append-only on the data path, so without pruning the 24h
     overview aggregate slows as history accumulates: 0.85ms at 10k rows versus
     19.8ms at 1M measured on this deployment.
+
+    The rollups are deliberately left alone. They feed kiro_lb_requests_total,
+    a Prometheus counter, so they must only ever increase: deleting from them
+    here would make the counter fall on every retention pass and report a reset
+    that never happened. Surviving the pruning is why they exist, and the only
+    place they are cleared is the explicit operator wipe in data/clear.
     """
     cutoff = int(time.time()) - REQUEST_LOG_RETENTION_DAYS * 86400
     try:

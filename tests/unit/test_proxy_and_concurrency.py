@@ -144,6 +144,34 @@ class TestConcurrencyGate:
         release.set()
         await holder
 
+    async def test_status_reports_opaque_labels_not_raw_account_ids(self):
+        """The status payload reaches API clients, and an account ID is a
+        credential file path or a profile ARN, so the raw key must not appear."""
+        from kiro.account_manager import account_label
+
+        MAX_CONCURRENCY.set(0)
+        MAX_ACCOUNT_CONCURRENCY.set(1)
+        concurrency.reset()
+
+        account_id = "arn:aws:codewhisperer:us-east-1:123456789012:profile/SECRET"
+        held = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold():
+            async with concurrency.slot(account_id):
+                held.set()
+                await release.wait()
+
+        holder = asyncio.create_task(hold())
+        await held.wait()
+        keys = list(concurrency.status()["accounts"].keys())
+        release.set()
+        await holder
+
+        assert keys == [account_label(account_id)]
+        assert account_id not in keys
+        assert not any("SECRET" in key for key in keys)
+
     async def test_per_account_limit_is_independent(self):
         MAX_CONCURRENCY.set(0)
         MAX_ACCOUNT_CONCURRENCY.set(1)

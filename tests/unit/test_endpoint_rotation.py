@@ -39,7 +39,6 @@ class TestEndpointDefinitions:
         assert ep.selected_endpoints(["nope"])[0].key == ep.KIRO_ENDPOINTS[0].key
 
 
-@pytest.mark.asyncio
 class TestAttemptOrder:
     def test_affinity_puts_the_working_endpoint_first(self):
         ep.record_success("acc", "claude-opus-5", "amazonq")

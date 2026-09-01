@@ -116,10 +116,15 @@ async def slot(account_id: Optional[str] = None) -> AsyncIterator[None]:
 
 
 def status() -> dict[str, object]:
+    # Gate keys are internal account IDs, which are credential file paths or
+    # profile ARNs. This payload reaches API clients, so each key is reduced to
+    # the same short digest the accounts view shows.
+    from kiro.account_manager import account_label
+
     return {
         "global": _global_gate.stats,
         "accounts": {
-            account_id: gate.stats
+            account_label(account_id): gate.stats
             for account_id, gate in _account_gates.items()
             if gate.stats["held"] or gate.stats["waiting"]
         },
