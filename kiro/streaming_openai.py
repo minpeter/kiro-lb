@@ -730,6 +730,9 @@ async def collect_stream_response(
     full_reasoning_content = ""
     final_usage = None
     tool_calls = []
+    # Keyed by the index the chunks carry, so fragments of one call merge instead
+    # of each becoming a call of its own.
+    tool_calls_by_index: dict[int, dict[str, Any]] = {}
     finish_reason = "stop"  # Default fallback
     completion_id = generate_completion_id()
 
@@ -761,7 +764,25 @@ async def collect_stream_response(
             if "reasoning" in delta:
                 full_reasoning_content += delta["reasoning"]
             if "tool_calls" in delta:
-                tool_calls.extend(delta["tool_calls"])
+                # Fragments of one call arrive across chunks sharing an index, so
+                # they are merged by it. Appending each chunk instead would turn a
+                # single call into one entry per fragment, most of them nameless
+                # and holding a slice of the arguments.
+                for fragment in delta["tool_calls"]:
+                    index = fragment.get("index", 0)
+                    call = tool_calls_by_index.get(index)
+                    if call is None:
+                        call = {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+                        tool_calls_by_index[index] = call
+                    if fragment.get("id"):
+                        call["id"] = fragment["id"]
+                    if fragment.get("type"):
+                        call["type"] = fragment["type"]
+                    function = fragment.get("function") or {}
+                    if function.get("name"):
+                        call["function"]["name"] = function["name"]
+                    if function.get("arguments"):
+                        call["function"]["arguments"] += function["arguments"]
 
             # Extract finish_reason from chunk (streaming already calculated it correctly)
             finish_reason_from_chunk = chunk_data.get("choices", [{}])[0].get("finish_reason")
@@ -774,6 +795,9 @@ async def collect_stream_response(
 
         except (json.JSONDecodeError, IndexError):
             continue
+
+    # Merged calls, in the order the indices were assigned.
+    tool_calls = [tool_calls_by_index[index] for index in sorted(tool_calls_by_index)]
 
     # Form final response
     message: dict[str, Any] = {"role": "assistant", "content": full_content}

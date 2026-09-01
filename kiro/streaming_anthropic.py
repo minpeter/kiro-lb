@@ -704,8 +704,11 @@ async def stream_kiro_to_anthropic(
         if bracket_tool_calls:
             # Text that arrived before the call keeps its place: flushing after
             # the tool block would reorder the turn the model produced.
+            # close_thinking=True because the flush opens a text block, and
+            # starting one while the thinking block is still open is rejected as
+            # an out-of-order content event, which aborts the whole response.
             if pending_content:
-                for pending_chunk in flush_pending_content(False):
+                for pending_chunk in flush_pending_content(True):
                     yield pending_chunk
 
             # Close thinking block if open
