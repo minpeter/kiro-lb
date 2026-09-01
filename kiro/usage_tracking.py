@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import time
 from contextvars import ContextVar
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -31,6 +31,25 @@ from kiro.model_resolver import normalize_model_name
 ROOT_KEY_ID = "root"
 
 current_api_key_id: ContextVar[str | None] = ContextVar("current_api_key_id", default=None)
+
+
+# Filled by the streaming layer with what Kiro reported for the request.
+# A dict rather than a value: the middleware sets it before the request runs,
+# and the stream mutates the same object from its own task.
+current_request_credits: ContextVar[Optional[dict]] = ContextVar("current_request_credits", default=None)
+
+
+def report_credits(amount) -> None:
+    """Record the credit figure from an upstream usage frame."""
+    holder = current_request_credits.get()
+    if holder is None:
+        return
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return
+    if value > 0:
+        holder["credits"] = holder.get("credits", 0.0) + value
 
 # Account that produced the current response. Set when an attempt is about to be
 # made and overwritten on failover, so at completion it names the account that

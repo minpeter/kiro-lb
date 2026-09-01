@@ -98,8 +98,9 @@ KIRO_BUILDER_ID_PROFILE_ARN: str = "arn:aws:codewhisperer:us-east-1:638616132270
 # ==================================================================================================
 
 # Time before token expiration when refresh is needed (in seconds)
-# Default 10 minutes - refresh token in advance to avoid errors
-TOKEN_REFRESH_THRESHOLD: int = 600
+# Default 10 minutes - refresh token in advance to avoid errors.
+# The dashboard can override this at runtime; see kiro/gateway_tunables.py.
+TOKEN_REFRESH_THRESHOLD: int = int(os.getenv("TOKEN_REFRESH_THRESHOLD", "600"))
 
 # ==================================================================================================
 # Retry Configuration
@@ -309,12 +310,23 @@ KIRO_ENDPOINT_ROTATION: bool = os.getenv("KIRO_ENDPOINT_ROTATION", "false").lowe
 # Comma-separated attempt order. Unknown keys are ignored.
 # Available: runtime, codewhisperer, amazonq
 KIRO_ENDPOINT_ORDER: list[str] = [
-    part.strip() for part in os.getenv("KIRO_ENDPOINT_ORDER", "runtime,codewhisperer,amazonq").split(",") if part.strip()
+    part.strip() for part in os.getenv("KIRO_ENDPOINT_ORDER", "amazonq,codewhisperer,runtime").split(",") if part.strip()
 ]
 
 # How long a failing endpoint is pushed to the back of the queue, in seconds.
 # It is never removed: a cooldown must not turn a request into a hard failure.
 KIRO_ENDPOINT_COOLDOWN_SECONDS: float = float(os.getenv("KIRO_ENDPOINT_COOLDOWN_SECONDS", "30"))
+
+# Replace the generic sections of Anthropic's built-in Claude Code system prompt
+# with a compact Kiro-identified preamble. The per-machine sections the client
+# depends on - memory path, environment, language, skills - are preserved, as is
+# anything the user supplied. Off by default: it changes agent behaviour.
+CONDENSE_CLAUDE_PROMPT: bool = os.getenv("CONDENSE_CLAUDE_PROMPT", "false").lower() in ("true", "1", "yes")
+
+# Task mode announced in conversationState, matching the official Kiro CLI.
+# It sends "vibe" for free-form chat; "spec" and "task" are its other modes.
+# Set to an empty value to omit the field entirely.
+KIRO_AGENT_TASK_TYPE: str = os.getenv("KIRO_AGENT_TASK_TYPE", "vibe").strip()
 
 # ==================================================================================================
 # Debug Settings
@@ -534,6 +546,11 @@ RATE_OBSERVATION_RETENTION_DAYS: int = int(os.getenv("RATE_OBSERVATION_RETENTION
 # unbounded and the 24h overview aggregate degrades: measured 0.85ms at 10k
 # rows versus 19.8ms at 1M, which matters once the dashboard polls every second.
 REQUEST_LOG_RETENTION_DAYS: int = int(os.getenv("REQUEST_LOG_RETENTION_DAYS", "7"))
+
+# Store the prompt and system prompt with each request log so the dashboard can
+# show them. Off by default. Text is encrypted with LOG_ENCRYPTION_KEY.
+CAPTURE_REQUEST_TEXT: bool = os.getenv("CAPTURE_REQUEST_TEXT", "false").lower() in ("true", "1", "yes")
+CAPTURE_REQUEST_TEXT_MAX_CHARS: int = int(os.getenv("CAPTURE_REQUEST_TEXT_MAX_CHARS", "20000"))
 
 # ==================================================================================================
 # Account Cache Settings

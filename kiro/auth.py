@@ -23,12 +23,12 @@ from loguru import logger
 
 from kiro.config import (
     KIRO_BUILDER_ID_PROFILE_ARN,
-    TOKEN_REFRESH_THRESHOLD,
     get_aws_sso_oidc_url,
     get_kiro_api_host,
     get_kiro_q_host,
     get_kiro_refresh_url,
 )
+from kiro.gateway_tunables import TOKEN_REFRESH_SECONDS
 from kiro.utils import get_machine_fingerprint
 
 # Supported SQLite token keys (searched in priority order)
@@ -592,14 +592,14 @@ class KiroAuthManager:
         Checks if the token is expiring soon.
 
         Returns:
-            True if the token expires within TOKEN_REFRESH_THRESHOLD seconds
+            True if the token expires within the configured refresh window
             or if expiration time information is not available
         """
         if not self._expires_at:
             return True  # If no expiration info available, assume refresh is needed
 
         now = datetime.now(timezone.utc)
-        threshold = now.timestamp() + TOKEN_REFRESH_THRESHOLD
+        threshold = now.timestamp() + TOKEN_REFRESH_SECONDS.value()
 
         return self._expires_at.timestamp() <= threshold
 

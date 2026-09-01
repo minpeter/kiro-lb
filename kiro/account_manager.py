@@ -54,6 +54,7 @@ from kiro.config import (
     RATE_WINDOW_SECONDS,
     STATE_SAVE_INTERVAL_SECONDS,
 )
+from kiro.gateway_tunables import LOAD_BALANCING
 from kiro.http_client import KiroHttpClient
 from kiro.kiro_errors import is_suspension_error
 from kiro.model_resolver import ModelResolver, normalize_model_name
@@ -1193,6 +1194,23 @@ class AccountManager:
         if not ACCOUNT_QUOTA_WEIGHTED_ROUTING:
             start = self._current_account_index
             return [account_ids[(start + offset) % len(account_ids)] for offset in range(len(account_ids))]
+
+        strategy = LOAD_BALANCING.value()
+
+        if strategy == "sticky":
+            start = self._current_account_index
+            return [account_ids[(start + offset) % len(account_ids)] for offset in range(len(account_ids))]
+
+        if strategy == "most_credits":
+            # Deterministic: the account with the most remaining quota leads.
+            # Ties keep their existing order rather than being shuffled, so the
+            # ordering is reproducible when quotas are equal.
+            return sorted(
+                account_ids,
+                key=lambda account_id: -self._routing_weight(self._accounts.get(account_id))
+                if self._accounts.get(account_id) is not None
+                else -MINIMUM_ROUTING_WEIGHT,
+            )
 
         keyed: List[Tuple[float, str]] = []
         for account_id in account_ids:

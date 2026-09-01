@@ -1,8 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { AtSign, Ban, Check, Copy, KeyRound, ServerCog, Trash2 } from "lucide-react";
+import { AtSign, Ban, Check, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { EmptyState } from "@/components/empty-state";
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -170,10 +178,11 @@ export type AccountsPanelProps = {
   isLoading: boolean;
   isMutating?: boolean;
   onDeleteAccount?: (id: string) => void;
+  onToggleAccount?: (id: string, enabled: boolean) => void;
 };
 
-export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount }: AccountsPanelProps) {
-  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount, onToggleAccount }: AccountsPanelProps) {
+  const [deleting, setDeleting] = useState<Account | null>(null);
   return (
     <Card>
       <CardHeader>
@@ -232,44 +241,38 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                     {formatTimestamp(account.usage?.updatedAt)}
                   </TableCell>
                   <TableCell className="text-right">
-                    {account.deletable ? (
-                      confirmingId === account.id ? (
-                        <div className="flex items-center justify-end gap-1">
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            disabled={isMutating}
-                            aria-label={`Cancel deleting account ${account.id}`}
-                            onClick={() => setConfirmingId(null)}
-                          >
-                            Cancel
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="destructive"
-                            disabled={isMutating}
-                            aria-label={`Confirm delete account ${account.id}`}
-                            onClick={() => {
-                              setConfirmingId(null);
-                              onDeleteAccount?.(account.id);
-                            }}
-                          >
-                            Delete
-                          </Button>
-                        </div>
-                      ) : (
+                    <div className="flex items-center justify-end gap-1">
+                      {onToggleAccount && account.enabled !== undefined ? (
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          className="text-muted-foreground hover:text-foreground"
+                          disabled={isMutating}
+                          title={
+                            account.enabled
+                              ? "Stop routing to this account, keeping it and its history"
+                              : "Put this account back in the rotation"
+                          }
+                          aria-label={`${account.enabled ? "Disable" : "Enable"} account ${account.id}`}
+                          onClick={() => onToggleAccount(account.id, !account.enabled)}
+                        >
+                          {account.enabled ? <PauseCircle size={14} /> : <PlayCircle size={14} />}
+                        </Button>
+                      ) : null}
+                      {account.deletable ? (
                         <Button
                           size="xs"
                           variant="ghost"
                           className="text-muted-foreground hover:text-destructive"
                           disabled={isMutating}
+                          title="Delete"
                           aria-label={`Delete account ${account.id}`}
-                          onClick={() => setConfirmingId(account.id)}
+                          onClick={() => setDeleting(account)}
                         >
                           <Trash2 size={14} />
                         </Button>
-                      )
-                    ) : null}
+                      ) : null}
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
@@ -277,6 +280,37 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
           </Table>
         )}
       </CardContent>
+
+      <Dialog open={deleting !== null} onOpenChange={(open) => !open && setDeleting(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete this account?</DialogTitle>
+            <DialogDescription>
+              {deleting ? (
+                <>
+                  Account <span className="font-mono">{deleting.id}</span> and its usage history are removed.
+                  To stop using it without losing it, use the pause button instead.
+                </>
+              ) : null}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" disabled={isMutating} onClick={() => setDeleting(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={isMutating}
+              onClick={() => {
+                if (deleting) onDeleteAccount?.(deleting.id);
+                setDeleting(null);
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }

@@ -44,12 +44,14 @@ class KiroEndpoint:
         return overrides
 
 
-# Declared order is the attempt order when no affinity is recorded.
+# Declared order is the attempt order when nothing is configured. It mirrors the
+# KIRO_ENDPOINT_ORDER default so both paths agree on which host is tried first.
 KIRO_ENDPOINTS: Tuple[KiroEndpoint, ...] = (
     KiroEndpoint(
-        key="runtime",
-        name="Kiro Runtime",
-        url_template="https://runtime.{region}.kiro.dev/",
+        key="amazonq",
+        name="AmazonQ",
+        url_template="https://q.{region}.amazonaws.com/generateAssistantResponse",
+        amz_target="AmazonQDeveloperStreamingService.SendMessage",
     ),
     KiroEndpoint(
         key="codewhisperer",
@@ -57,10 +59,9 @@ KIRO_ENDPOINTS: Tuple[KiroEndpoint, ...] = (
         url_template="https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse",
     ),
     KiroEndpoint(
-        key="amazonq",
-        name="AmazonQ",
-        url_template="https://q.{region}.amazonaws.com/generateAssistantResponse",
-        amz_target="AmazonQDeveloperStreamingService.SendMessage",
+        key="runtime",
+        name="Kiro Runtime",
+        url_template="https://runtime.{region}.kiro.dev/",
     ),
 )
 

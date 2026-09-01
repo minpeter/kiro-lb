@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from kiro import endpoints as ep
+from kiro.endpoint_settings import EndpointSettings
 from kiro.http_client import KiroHttpClient
 
 
@@ -16,11 +17,16 @@ def clean_state():
 
 
 class TestEndpointDefinitions:
-    def test_runtime_is_first_and_keeps_the_generate_target(self):
-        order = ep.selected_endpoints()
-        assert order[0].key == "runtime"
-        assert order[0].url("us-east-1") == "https://runtime.us-east-1.kiro.dev/"
-        assert order[0].header_overrides()["x-amz-target"] == ep.GENERATE_TARGET
+    def test_declared_order_matches_the_configured_default(self):
+        """A mismatch would try a different host depending on how it was reached."""
+        from kiro.config import KIRO_ENDPOINT_ORDER
+
+        assert [item.key for item in ep.selected_endpoints()] == KIRO_ENDPOINT_ORDER
+
+    def test_runtime_keeps_the_generate_target(self):
+        runtime = ep.ENDPOINTS_BY_KEY["runtime"]
+        assert runtime.url("us-east-1") == "https://runtime.us-east-1.kiro.dev/"
+        assert runtime.header_overrides()["x-amz-target"] == ep.GENERATE_TARGET
 
     def test_amazonq_uses_its_own_target(self):
         amazonq = ep.ENDPOINTS_BY_KEY["amazonq"]
@@ -29,7 +35,8 @@ class TestEndpointDefinitions:
 
     def test_unknown_keys_are_ignored_and_never_empty(self):
         assert [e.key for e in ep.selected_endpoints(["amazonq", "nope", "runtime"])] == ["amazonq", "runtime"]
-        assert ep.selected_endpoints(["nope"])[0].key == "runtime"
+        # An all-unknown list falls back to the declared order rather than emptying.
+        assert ep.selected_endpoints(["nope"])[0].key == ep.KIRO_ENDPOINTS[0].key
 
 
 class TestAttemptOrder:
@@ -39,8 +46,8 @@ class TestAttemptOrder:
 
     def test_affinity_is_scoped_per_account_and_model(self):
         ep.record_success("acc", "claude-opus-5", "amazonq")
-        assert ep.attempt_order("acc", "claude-sonnet-5")[0].key == "runtime"
-        assert ep.attempt_order("other", "claude-opus-5")[0].key == "runtime"
+        assert ep.attempt_order("acc", "claude-sonnet-5")[0].key == ep.KIRO_ENDPOINTS[0].key
+        assert ep.attempt_order("other", "claude-opus-5")[0].key == ep.KIRO_ENDPOINTS[0].key
 
     def test_cooling_endpoint_goes_last_but_is_never_dropped(self):
         ep.record_failure("runtime", cooldown_seconds=60)
@@ -72,9 +79,12 @@ _PAYLOAD = {
 
 
 def _client(monkeypatch, rotation=True):
-    monkeypatch.setattr("kiro.http_client.KIRO_ENDPOINT_ROTATION", rotation)
-    monkeypatch.setattr("kiro.http_client.KIRO_ENDPOINT_ORDER", ["runtime", "codewhisperer", "amazonq"])
-    monkeypatch.setattr("kiro.http_client.KIRO_ENDPOINT_COOLDOWN_SECONDS", 30.0)
+    settings = EndpointSettings(
+        rotation=rotation,
+        order=("runtime", "codewhisperer", "amazonq"),
+        cooldown_seconds=30.0,
+    )
+    monkeypatch.setattr("kiro.http_client.current_endpoint_settings", lambda: settings)
     client = KiroHttpClient.__new__(KiroHttpClient)
     client.auth_manager = _FakeAuth()
     return client

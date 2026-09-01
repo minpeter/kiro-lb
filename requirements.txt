@@ -5,6 +5,7 @@ httpx
 loguru
 python-dotenv
 tiktoken
+cryptography==50.0.1
 
 # Testing dependencies
 pytest

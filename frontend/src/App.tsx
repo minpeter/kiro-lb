@@ -1,5 +1,19 @@
-import { Activity, Coins, Gauge, ServerCog, ShieldCheck, TriangleAlert, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import {
+  Activity,
+  CircleCheck,
+  Coins,
+  Gauge,
+  Info,
+  KeyRound,
+  LayoutDashboard,
+  ServerCog,
+  Settings,
+  ShieldCheck,
+  TriangleAlert,
+  Users,
+  X,
+} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { dashboardApi } from "@/features/dashboard/api";
@@ -9,6 +23,8 @@ import { useDashboard } from "@/features/dashboard/use-dashboard";
 import { useTabHash } from "@/features/dashboard/use-tab-hash";
 import { AccountsPanel } from "@/features/dashboard/components/accounts-panel";
 import { ApiKeysPanel } from "@/features/dashboard/components/api-keys-panel";
+import { InfoPanel } from "@/features/dashboard/components/info-panel";
+import { SettingsPanel } from "@/features/dashboard/components/settings-panel";
 import { CreateKeyDialog } from "@/features/dashboard/components/create-key-dialog";
 import { DeviceLoginCard } from "@/features/dashboard/components/device-login-card";
 import { LoginCard } from "@/features/dashboard/components/login-card";
@@ -20,11 +36,16 @@ import { TotalRateChart } from "@/features/dashboard/components/total-rate-chart
 import { AppHeader, KiroLogo, StatCard } from "@/features/dashboard/components/shell";
 import { StatCardSkeleton } from "@/features/dashboard/components/skeletons";
 
+// Quota moves slowly, so this is deliberately far apart: each tick is a real
+// call to Kiro for every account.
+const USAGE_REFRESH_MS = 5 * 60 * 1000;
+
 export default function App() {
   const dashboard = useDashboard();
   const [tab, selectTab] = useTabHash();
   const [isCreateKeyOpen, setIsCreateKeyOpen] = useState(false);
-  const { overview, isLoading, isMutating, runAction } = dashboard;
+  const { overview, isLoading, isMutating, runAction, isAuthenticated, isLive, refreshUsageQuietly } =
+    dashboard;
   // Totals are derived from the same per-key usage the API keys tab shows, so
   // the two views can never disagree.
   const totals = useMemo(() => summarizeUsage(dashboard.keyUsage), [dashboard.keyUsage]);
@@ -32,6 +53,22 @@ export default function App() {
     () => (overview ? deriveOverviewKpis(dashboard.accounts, overview) : undefined),
     [dashboard.accounts, overview],
   );
+
+  // Refresh quota on a timer, quietly: no spinner and no full reload, so panels
+  // do not repaint. The button animation stays reserved for a manual refresh.
+  const mutatingRef = useRef(isMutating);
+  useEffect(() => {
+    mutatingRef.current = isMutating;
+  }, [isMutating]);
+  useEffect(() => {
+    if (!isAuthenticated || !isLive) return;
+    const timer = window.setInterval(() => {
+      // Read through a ref so a mutation does not re-arm the timer, which is
+      // what turned one scheduled refresh into a burst of them.
+      if (!mutatingRef.current) void refreshUsageQuietly();
+    }, USAGE_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [isAuthenticated, isLive, refreshUsageQuietly]);
 
   if (!dashboard.isAuthenticated && isLoading) {
     return (
@@ -59,12 +96,9 @@ export default function App() {
   return (
     <div className="min-h-screen bg-background">
       <AppHeader
-        overview={overview}
-        isLoading={isLoading}
         isMutating={isMutating}
         isLive={dashboard.isLive}
         lastUpdatedAt={dashboard.lastUpdatedAt}
-        routableAccounts={kpis?.routableAccounts}
         onToggleLive={() => dashboard.setIsLive(!dashboard.isLive)}
         onRefresh={() => void runAction(dashboardApi.refreshUsage)}
         onSignOut={() => void dashboard.signOut()}
@@ -72,7 +106,7 @@ export default function App() {
 
       {dashboard.connectionError && (
         <div role="status" aria-live="polite" className="border-b border-warning/30 bg-warning/10 text-warning">
-          <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
+          <div className="mx-auto flex max-w-7xl 2xl:max-w-[100rem] items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
             <span className="flex items-center gap-2 font-medium">
               <TriangleAlert size={15} aria-hidden />
               Connection lost - retrying
@@ -86,7 +120,7 @@ export default function App() {
 
       {dashboard.actionError && (
         <div role="alert" className="border-b border-destructive/30 bg-destructive/10 text-destructive">
-          <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
+          <div className="mx-auto flex max-w-7xl 2xl:max-w-[100rem] items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
             <span className="flex items-center gap-2">
               <TriangleAlert size={15} aria-hidden />
               {dashboard.actionError}
@@ -104,12 +138,49 @@ export default function App() {
         </div>
       )}
 
-      <main className="mx-auto max-w-7xl p-4 sm:p-6">
+      {dashboard.actionNotice && (
+        <div role="status" aria-live="polite" className="border-b border-success/30 bg-success/10 text-success">
+          <div className="mx-auto flex max-w-7xl 2xl:max-w-[100rem] items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6">
+            <span className="flex items-center gap-2">
+              <CircleCheck size={15} aria-hidden />
+              {dashboard.actionNotice}
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 shrink-0"
+              aria-label="Dismiss notice"
+              onClick={dashboard.clearActionNotice}
+            >
+              <X aria-hidden />
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <main className="mx-auto max-w-7xl 2xl:max-w-[100rem] p-4 sm:p-6">
         <Tabs value={tab} onValueChange={selectTab} className="space-y-6">
-          <TabsList>
-            <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="accounts">Accounts</TabsTrigger>
-            <TabsTrigger value="keys">API keys</TabsTrigger>
+          <TabsList className="h-10 w-full">
+            <TabsTrigger value="overview" className="gap-2">
+              <LayoutDashboard aria-hidden />
+              Overview
+            </TabsTrigger>
+            <TabsTrigger value="accounts" className="gap-2">
+              <Users aria-hidden />
+              Accounts
+            </TabsTrigger>
+            <TabsTrigger value="keys" className="gap-2">
+              <KeyRound aria-hidden />
+              API keys
+            </TabsTrigger>
+            <TabsTrigger value="settings" className="gap-2">
+              <Settings aria-hidden />
+              Settings
+            </TabsTrigger>
+            <TabsTrigger value="info" className="gap-2">
+              <Info aria-hidden />
+              Info
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="overview" className="space-y-6">
@@ -182,8 +253,12 @@ export default function App() {
             <RequestLogTable
               page={dashboard.logs}
               isLoading={isLoading || dashboard.isLogsLoading}
+              model={dashboard.logModel}
+              order={dashboard.logOrder}
               onLimitChange={dashboard.setLogLimit}
               onOffsetChange={dashboard.setLogOffset}
+              onModelChange={dashboard.setLogModel}
+              onOrderChange={dashboard.setLogOrder}
             />
           </TabsContent>
 
@@ -193,6 +268,7 @@ export default function App() {
               isLoading={isLoading}
               isMutating={isMutating}
               onDeleteAccount={(id) => void runAction(() => dashboardApi.deleteAccount(id))}
+              onToggleAccount={(id, enabled) => void runAction(() => dashboardApi.setAccountEnabled(id, enabled))}
             />
             {/* Placed here rather than on Overview for the reason stated above:
                 Overview stays pool-wide, and this is a per-account breakdown. It
@@ -210,8 +286,23 @@ export default function App() {
               isLoading={isLoading}
               isMutating={isMutating}
               onCreate={() => setIsCreateKeyOpen(true)}
-              onRevoke={(id) => void runAction(() => dashboardApi.revokeApiKey(id))}
+              onDelete={(id) => void runAction(() => dashboardApi.deleteApiKey(id))}
+              onRename={(id, name) => void runAction(() => dashboardApi.renameApiKey(id, name))}
             />
+          </TabsContent>
+
+          <TabsContent value="info">
+            <InfoPanel
+              overview={overview}
+              accounts={dashboard.accounts}
+              routableAccounts={kpis?.routableAccounts?.count}
+              lastUpdatedAt={dashboard.lastUpdatedAt}
+              isLive={dashboard.isLive}
+            />
+          </TabsContent>
+
+          <TabsContent value="settings">
+            <SettingsPanel onNotice={dashboard.notify} />
           </TabsContent>
         </Tabs>
       </main>

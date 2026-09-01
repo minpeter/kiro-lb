@@ -23,9 +23,11 @@ Priority: CLI args > Environment variables > Default values
 
 import argparse
 import asyncio
+import codecs
 import json
 import logging
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -44,6 +46,7 @@ from kiro.config import (
     APP_DESCRIPTION,
     APP_TITLE,
     APP_VERSION,
+    CAPTURE_REQUEST_TEXT_MAX_CHARS,
     DEFAULT_SERVER_HOST,
     DEFAULT_SERVER_PORT,
     LOG_LEVEL,
@@ -65,6 +68,14 @@ from kiro.dashboard import (
     record_request,
     refresh_all_account_usage,
 )
+from kiro.endpoint_settings import load_from_store as load_endpoint_settings
+from kiro.agent_mode import load_from_store as load_agent_mode_setting
+from kiro import proxy_chain
+from kiro.gateway_tunables import CAPTURE_TEXT
+from kiro.gateway_tunables import load_all as load_gateway_tunables
+from kiro.log_crypto import ensure_key as ensure_log_key
+from kiro.usage_tracking import current_request_credits
+from kiro.prompt_filter import load_from_store as load_prompt_filter_setting
 from kiro.dashboard import (
     router as dashboard_router,
 )
@@ -268,6 +279,12 @@ async def lifespan(app: FastAPI):
     logger.info("Starting application... Creating state managers.")
     app.state.started_at = time.time()
     initialize_dashboard_store()
+    load_endpoint_settings()
+    load_prompt_filter_setting()
+    load_agent_mode_setting()
+    load_gateway_tunables()
+    if CAPTURE_TEXT.value():
+        ensure_log_key()
     app.state.handoff_condition = asyncio.Condition()
     app.state.handoff_inflight = 0
     from kiro.store import can_write_runtime_state
@@ -291,6 +308,10 @@ async def lifespan(app: FastAPI):
     )
     app.state.http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
     logger.info("Shared HTTP client created with connection pooling")
+
+    # Per-proxy clients mirror the shared client's limits and timeouts.
+    proxy_chain.configure_clients(limits, timeout)
+    proxy_chain.load_from_store()
 
     # ==============================================================================
     # Create AccountManager (accounts live in the private SQLite store)
@@ -427,6 +448,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing shared HTTP client: {e}")
 
+    try:
+        await proxy_chain.close_clients()
+    except Exception as e:
+        logger.warning(f"Error closing proxy clients: {e}")
+
 
 # --- FastAPI Application ---
 app = FastAPI(title=APP_TITLE, description=APP_DESCRIPTION, version=APP_VERSION, lifespan=lifespan)
@@ -531,22 +557,193 @@ async def dashboard_favicon():
 
 @app.middleware("http")
 async def dashboard_request_metrics(request, call_next):
-    """Record only non-sensitive /v1 request metadata for the dashboard."""
+    """Record /v1 request metadata, plus prompt text when capture is enabled."""
     started = time.perf_counter()
     model = None
-    if request.url.path.startswith("/v1/") and request.headers.get("content-type", "").startswith("application/json"):
+    prompt = None
+    system_prompt = None
+    is_data_plane = request.url.path.startswith("/v1/")
+    capture = is_data_plane and CAPTURE_TEXT.value()
+
+    if is_data_plane and request.headers.get("content-type", "").startswith("application/json"):
         try:
             payload = json.loads((await request.body()).decode("utf-8"))
-            model = payload.get("model") if isinstance(payload, dict) else None
+            if isinstance(payload, dict):
+                model = payload.get("model")
+                if capture:
+                    prompt = _last_user_text(payload.get("messages"))
+                    system_prompt = _system_text(payload.get("system"))
         except Exception:
             pass
+
+    if not is_data_plane:
+        return await call_next(request)
+
+    # Seeded before the request runs so the streaming layer, which executes in
+    # its own task, mutates this same dict.
+    credit_holder: dict = {}
+    current_request_credits.set(credit_holder)
+
+    response = None
+    collected: list[str] = []
     try:
         response = await call_next(request)
+        if capture and hasattr(response, "body_iterator"):
+            response = _tee_response(response, collected)
         return response
     finally:
-        if request.url.path.startswith("/v1/"):
-            status = locals().get("response").status_code if "response" in locals() else 500
-            record_request(request.url.path, model, status, int((time.perf_counter() - started) * 1000))
+        # Streaming responses finish after this returns, so the recording is
+        # deferred to the tee's completion; a non-streamed one records here.
+        if response is None or not (capture and hasattr(response, "body_iterator")):
+            _persist(request, model, response, started, prompt, system_prompt, None, credit_holder)
+        else:
+            _pending.append((request, model, response, started, prompt, system_prompt, collected, credit_holder))
+
+
+# Streamed requests are recorded when their body finishes, not when the
+# middleware returns. One entry per in-flight streamed response.
+_pending: list = []
+
+
+_USAGE_INPUT = re.compile(r'"input_tokens"\s*:\s*(\d+)')
+_USAGE_OUTPUT = re.compile(r'"output_tokens"\s*:\s*(\d+)')
+_USAGE_PROMPT = re.compile(r'"prompt_tokens"\s*:\s*(\d+)')
+_USAGE_COMPLETION = re.compile(r'"completion_tokens"\s*:\s*(\d+)')
+# Kiro reports what a request actually cost; the field name varies by stream
+# version. Nothing is derived from tokens: Kiro publishes no token-to-credit
+# rate, so a computed figure would be invented.
+_CREDITS = re.compile(r'"(?:creditUsage|credit_usage|creditsConsumed)"\s*:\s*([0-9]*\.?[0-9]+)')
+
+
+def _usage_from_response(raw: str) -> tuple[int | None, int | None, float | None]:
+    """Pull token counts and reported credits out of a captured response."""
+    if not raw:
+        return None, None, None
+
+    def last_int(pattern):
+        found = pattern.findall(raw)
+        return int(found[-1]) if found else None
+
+    # message_start carries the input count, message_delta the running output,
+    # so the last occurrence of each is the final figure.
+    input_tokens = last_int(_USAGE_INPUT) or last_int(_USAGE_PROMPT)
+    output_tokens = last_int(_USAGE_OUTPUT) or last_int(_USAGE_COMPLETION)
+
+    credits = None
+    reported = _CREDITS.findall(raw)
+    if reported:
+        try:
+            credits = sum(float(value) for value in reported)
+        except ValueError:
+            credits = None
+    return input_tokens, output_tokens, credits
+
+
+def _persist(request, model, response, started, prompt, system_prompt, collected, credit_holder=None):
+    status = getattr(response, "status_code", None) or 500
+    raw_response = "".join(collected) if collected else ""
+    input_tokens, output_tokens, credits = _usage_from_response(raw_response)
+    # What Kiro reported wins: the client-facing stream does not carry it.
+    reported = (credit_holder or {}).get("credits")
+    if reported:
+        credits = reported
+    record_request(
+        request.url.path,
+        model,
+        status,
+        int((time.perf_counter() - started) * 1000),
+        client_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        prompt=prompt,
+        system_prompt=system_prompt,
+        response_text=_readable_response(raw_response) if raw_response else None,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        credits_spent=credits,
+    )
+
+
+def _tee_response(response, collected: list[str]):
+    """Pass every chunk through untouched while keeping a bounded copy.
+
+    Buffering the whole body would defeat streaming and could hold a large
+    response in memory, so the copy stops at the configured cap.
+    """
+    original = response.body_iterator
+    cap = CAPTURE_REQUEST_TEXT_MAX_CHARS
+    # An emoji can straddle a chunk boundary, so decoding must carry state;
+    # decoding each chunk on its own corrupts whatever spans the split.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    kept = 0
+
+    async def relay():
+        nonlocal kept
+        try:
+            async for chunk in original:
+                if kept < cap:
+                    raw = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+                    text = decoder.decode(raw)
+                    if text:
+                        collected.append(text[: cap - kept])
+                        kept += len(text)
+                yield chunk
+        finally:
+            entry = next((item for item in _pending if item[2] is response), None)
+            if entry is not None:
+                _pending.remove(entry)
+                _persist(*entry)
+
+    response.body_iterator = relay()
+    return response
+
+
+_SSE_TEXT = re.compile(r'"(?:text|content|text_delta)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _readable_response(raw: str) -> str:
+    """Turn an SSE stream into the text the client would have shown.
+
+    A raw event stream is mostly framing, so the deltas are joined when the
+    body looks like SSE. Each delta is unescaped with the JSON decoder: a
+    unicode_escape round-trip mangles anything outside latin-1, which turned
+    emoji and accented characters into mojibake.
+    """
+    if "data:" not in raw:
+        return raw
+    parts: list[str] = []
+    for match in _SSE_TEXT.finditer(raw):
+        try:
+            parts.append(json.loads(f'"{match.group(1)}"'))
+        except ValueError:
+            parts.append(match.group(1))
+    return "".join(parts) if parts else raw
+
+
+def _block_text(content) -> str:
+    """Flatten a string or a list of content blocks into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [block.get("text", "") for block in content if isinstance(block, dict) and block.get("text")]
+        return "\n".join(parts)
+    return ""
+
+
+def _last_user_text(messages) -> str | None:
+    """The most recent user message, which is what the request is asking."""
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            text = _block_text(message.get("content"))
+            if text:
+                return text
+    return None
+
+
+def _system_text(system) -> str | None:
+    text = _block_text(system)
+    return text or None
 
 
 # --- Uvicorn log config ---

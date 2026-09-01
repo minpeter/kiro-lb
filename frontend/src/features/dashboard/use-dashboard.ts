@@ -6,6 +6,7 @@ import type {
   ApiKey,
   KeyUsage,
   Overview,
+  RequestLogOrder,
   RequestLogPage,
   RequestRate,
 } from "./types";
@@ -40,6 +41,10 @@ export type DashboardState = {
   /** Last failed mutation (revoke/delete/refresh); dismissed via clearActionError. */
   actionError: string | null;
   clearActionError: () => void;
+  actionNotice: string | null;
+  notify: (message: string) => void;
+  clearActionNotice: () => void;
+  refreshUsageQuietly: () => Promise<void>;
   reload: () => Promise<void>;
   setIsLive: (live: boolean) => void;
   runAction: (action: () => Promise<unknown>) => Promise<void>;
@@ -47,6 +52,10 @@ export type DashboardState = {
   signOut: () => Promise<void>;
   setLogLimit: (limit: number) => void;
   setLogOffset: (offset: number) => void;
+  logModel: string;
+  logOrder: RequestLogOrder;
+  setLogModel: (model: string) => void;
+  setLogOrder: (order: RequestLogOrder) => void;
 };
 
 export function useDashboard(): DashboardState {
@@ -70,6 +79,9 @@ export function useDashboard(): DashboardState {
   // useState calls by index, so new state must never shift existing indices.
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [logModel, setLogModel] = useState("");
+  const [logOrder, setLogOrder] = useState<RequestLogOrder>("newest");
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
   // Pagination reads must not resurrect a stale page after a newer request.
   const logRequestId = useRef(0);
   // Reloads and live polls share this generation so stale responses cannot overwrite current dashboard state.
@@ -108,11 +120,13 @@ export function useDashboard(): DashboardState {
     pollDelayRef.current = REFRESH_INTERVAL_MS;
   }, []);
 
-  const loadLogs = useCallback(async (nextLimit: number, nextOffset: number) => {
+  // ``quiet`` skips the loading flag: a background poll must not swap the table
+  // for skeletons every few seconds, which reads as flashing.
+  const loadLogs = useCallback(async (nextLimit: number, nextOffset: number, quiet = false) => {
     const requestId = ++logRequestId.current;
-    setIsLogsLoading(true);
+    if (!quiet) setIsLogsLoading(true);
     try {
-      const page = await dashboardApi.requestLogs(nextLimit, nextOffset);
+      const page = await dashboardApi.requestLogs(nextLimit, nextOffset, logModel, logOrder);
       if (requestId !== logRequestId.current) return;
       // Deleted or expired rows can leave the offset past the end of the table.
       if (page.logs.length === 0 && page.total > 0 && nextOffset > 0) {
@@ -121,9 +135,9 @@ export function useDashboard(): DashboardState {
       }
       setLogs(page);
     } finally {
-      if (requestId === logRequestId.current) setIsLogsLoading(false);
+      if (!quiet && requestId === logRequestId.current) setIsLogsLoading(false);
     }
-  }, []);
+  }, [logModel, logOrder]);
 
   const reload = useCallback(async () => {
     const requestId = ++dashboardRequestId.current;
@@ -173,10 +187,14 @@ export function useDashboard(): DashboardState {
       setKeyUsage(nextKeyUsage.usage);
       setAccountTokenUsage(nextAccountUsage.usage);
       noteSuccess();
+      // The log has its own paging and generation guard, so it is refreshed
+      // through loadLogs rather than folded into the batch above. Without this
+      // the charts moved on a new request while the table stayed stale.
+      await loadLogs(limit, offset, true);
     } catch (cause) {
       if (requestId === dashboardRequestId.current) handleFailure(cause);
     }
-  }, [handleFailure, noteSuccess]);
+  }, [handleFailure, limit, loadLogs, noteSuccess, offset]);
 
   useEffect(() => {
     void reload();
@@ -209,6 +227,18 @@ export function useDashboard(): DashboardState {
     if (!isAuthenticated) return;
     void loadLogs(limit, offset).catch(handleFailure);
   }, [handleFailure, isAuthenticated, limit, loadLogs, offset]);
+
+  // Used by the periodic quota refresh. runAction would flip isMutating and call
+  // reload(), which repaints every panel through its loading state.
+  const refreshUsageQuietly = useCallback(async () => {
+    try {
+      await dashboardApi.refreshUsage();
+      await refreshLive();
+    } catch {
+      // A background refresh that fails is retried on the next tick; surfacing
+      // it would put an error banner on screen the user did not ask for.
+    }
+  }, [refreshLive]);
 
   const runAction = useCallback(
     async (action: () => Promise<unknown>) => {
@@ -280,5 +310,21 @@ export function useDashboard(): DashboardState {
     signOut,
     setLogLimit,
     setLogOffset: setOffset,
+    actionNotice,
+    notify: setActionNotice,
+    clearActionNotice: () => setActionNotice(null),
+    refreshUsageQuietly,
+    logModel,
+    logOrder,
+    // Filtering or reordering changes which rows page 1 holds, so the offset
+    // resets; keeping it would land the user on an empty page.
+    setLogModel: (model: string) => {
+      setLogModel(model);
+      setOffset(0);
+    },
+    setLogOrder: (order: RequestLogOrder) => {
+      setLogOrder(order);
+      setOffset(0);
+    },
   };
 }

@@ -25,12 +25,11 @@ from kiro.auth import KiroAuthManager
 from kiro.config import (
     BASE_RETRY_DELAY,
     FIRST_TOKEN_MAX_RETRIES,
-    KIRO_ENDPOINT_COOLDOWN_SECONDS,
-    KIRO_ENDPOINT_ORDER,
-    KIRO_ENDPOINT_ROTATION,
     MAX_RETRIES,
     STREAMING_READ_TIMEOUT,
 )
+from kiro.endpoint_settings import current as current_endpoint_settings
+from kiro import concurrency, proxy_chain
 from kiro.endpoints import ENDPOINTS_BY_KEY, attempt_order, record_failure, record_success
 from kiro.kiro_errors import is_suspension_error
 from kiro.network_errors import NetworkErrorInfo, classify_network_error, get_short_error_message
@@ -100,6 +99,8 @@ class KiroHttpClient:
         self.auth_manager = auth_manager
         self._shared_client = shared_client
         self._owns_client = shared_client is None
+        # Set while a request is being attempted through a specific proxy.
+        self._active_proxy: Optional[str] = None
         self.client: Optional[httpx.AsyncClient] = shared_client
         # The account-pool routes opt out per request (see below) so a 429 can
         # rotate immediately instead of sleeping through retries on an account
@@ -129,6 +130,12 @@ class KiroHttpClient:
         Returns:
             Active HTTP client
         """
+        # A configured proxy chain overrides the shared client: the proxy is
+        # fixed when a client is built, so each entry needs its own.
+        active = self._active_proxy
+        if active is not None:
+            return await proxy_chain.client_for(active)
+
         # If using shared client, return it directly
         # Shared client should be pre-configured with appropriate timeouts
         if self._shared_client is not None:
@@ -377,6 +384,62 @@ class KiroHttpClient:
                     status_code=502, detail=f"Request failed after {max_retries} attempts. Unknown error."
                 )
 
+    async def _attempt_through_proxies(
+        self,
+        method: str,
+        url: str,
+        json_data: Optional[dict] = None,
+        params: Optional[dict] = None,
+        stream: bool = False,
+        retry_rate_limits: Optional[bool] = None,
+        header_overrides: Optional[Dict[str, str]] = None,
+    ) -> httpx.Response:
+        """Try each configured proxy in turn, moving on after a transport error.
+
+        Only transport errors move to the next proxy. An HTTP response means the
+        proxy worked, whatever the status: forwarding a 500 is not the proxy's
+        fault, and retrying it elsewhere would just spend another account hop.
+        """
+        order = proxy_chain.attempt_order()
+        if not order:
+            self._active_proxy = None
+            return await self._attempt_endpoint(
+                method,
+                url,
+                json_data=json_data,
+                params=params,
+                stream=stream,
+                retry_rate_limits=retry_rate_limits,
+                header_overrides=header_overrides,
+            )
+
+        last_exception: Optional[Exception] = None
+        for position, entry in enumerate(order):
+            self._active_proxy = entry.url
+            if position > 0:
+                logger.warning(f"[Proxy] Falling back to {entry.masked}")
+            try:
+                response = await self._attempt_endpoint(
+                    method,
+                    url,
+                    json_data=json_data,
+                    params=params,
+                    stream=stream,
+                    retry_rate_limits=retry_rate_limits,
+                    header_overrides=header_overrides,
+                )
+            except (httpx.TransportError, httpx.ProxyError) as exc:
+                last_exception = exc
+                proxy_chain.record_failure(entry.url)
+                continue
+            proxy_chain.record_success(entry.url)
+            return response
+
+        self._active_proxy = None
+        if last_exception is not None:
+            raise last_exception
+        raise HTTPException(status_code=502, detail="No proxy in the chain could be reached.")
+
     async def request_with_retry(
         self,
         method: str,
@@ -390,16 +453,52 @@ class KiroHttpClient:
 
         Rotation applies only to the account's generation URL: a management call
         such as ``/ListAvailableModels`` still goes to its own host. With
-        ``KIRO_ENDPOINT_ROTATION`` disabled the behavior is unchanged.
+        ``rotation`` disabled the behavior is unchanged.
 
         Only an endpoint-attributable failure rotates: a 5xx or a transport
         error. A 429 or a suspension 403 belongs to the account and returns
         immediately so the caller can fail over accounts; a request-level 4xx
         such as CONTENT_LENGTH_EXCEEDS_THRESHOLD would fail the same everywhere.
         """
+        settings = current_endpoint_settings()
         is_generation = url == getattr(self.auth_manager, "generation_url", None)
-        if not (KIRO_ENDPOINT_ROTATION and is_generation):
-            return await self._attempt_endpoint(
+
+        # Only generation is capped: management calls are cheap and must not be
+        # blocked behind a full queue.
+        if not is_generation:
+            return await self._attempt_through_proxies(
+                method, url, json_data=json_data, params=params, stream=stream, retry_rate_limits=retry_rate_limits
+            )
+
+        account_key = self.auth_manager.profile_arn or "default"
+        try:
+            async with concurrency.slot(account_key):
+                return await self._dispatch_generation(
+                    method,
+                    url,
+                    settings,
+                    json_data=json_data,
+                    params=params,
+                    stream=stream,
+                    retry_rate_limits=retry_rate_limits,
+                )
+        except concurrency.QueueTimeout as exc:
+            logger.warning(f"[Concurrency] Rejected a request: {exc}")
+            raise HTTPException(status_code=503, detail=f"Gateway is at capacity: {exc}") from exc
+
+    async def _dispatch_generation(
+        self,
+        method: str,
+        url: str,
+        settings,
+        json_data: Optional[dict] = None,
+        params: Optional[dict] = None,
+        stream: bool = False,
+        retry_rate_limits: Optional[bool] = None,
+    ) -> httpx.Response:
+        """Send a generation request, rotating endpoints when enabled."""
+        if not settings.rotation:
+            return await self._attempt_through_proxies(
                 method, url, json_data=json_data, params=params, stream=stream, retry_rate_limits=retry_rate_limits
             )
 
@@ -407,7 +506,7 @@ class KiroHttpClient:
         affinity_key = self.auth_manager.profile_arn or region
         model = _payload_model_id(json_data) or "unknown"
         endpoints = attempt_order(
-            affinity_key, model, order=KIRO_ENDPOINT_ORDER, cooldown_seconds=KIRO_ENDPOINT_COOLDOWN_SECONDS
+            affinity_key, model, order=list(settings.order), cooldown_seconds=settings.cooldown_seconds
         )
 
         last_response: Optional[httpx.Response] = None
@@ -418,7 +517,7 @@ class KiroHttpClient:
             if position > 0:
                 logger.warning(f"[Endpoints] Rotating to {endpoint.name} ({endpoint_url})")
             try:
-                response = await self._attempt_endpoint(
+                response = await self._attempt_through_proxies(
                     method,
                     endpoint_url,
                     json_data=json_data,
@@ -429,7 +528,7 @@ class KiroHttpClient:
                 )
             except Exception as exc:
                 last_exception = exc
-                record_failure(endpoint.key, KIRO_ENDPOINT_COOLDOWN_SECONDS)
+                record_failure(endpoint.key, settings.cooldown_seconds)
                 logger.warning(f"[Endpoints] {endpoint.name} transport failure: {type(exc).__name__}")
                 continue
 
@@ -441,7 +540,7 @@ class KiroHttpClient:
 
             if 500 <= response.status_code < 600:
                 last_response = response
-                record_failure(endpoint.key, KIRO_ENDPOINT_COOLDOWN_SECONDS)
+                record_failure(endpoint.key, settings.cooldown_seconds)
                 logger.warning(f"[Endpoints] {endpoint.name} returned {response.status_code}")
                 if stream:
                     await response.aclose()

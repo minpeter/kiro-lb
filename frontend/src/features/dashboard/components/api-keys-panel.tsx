@@ -1,8 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, ChevronRight, Copy, KeyRound, ShieldCheck } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Copy, KeyRound, Pencil, ShieldCheck, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { EmptyState } from "@/components/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatKeyPrefix } from "../api-key-display";
@@ -16,7 +26,8 @@ export type ApiKeysPanelProps = {
   isLoading: boolean;
   isMutating: boolean;
   onCreate: () => void;
-  onRevoke: (id: string) => void;
+  onDelete: (id: string) => void;
+  onRename: (id: string, name: string) => void;
 };
 
 function totals(rows: KeyModelUsage[]) {
@@ -69,9 +80,19 @@ function UsageBreakdown({ rows }: { rows: KeyModelUsage[] }) {
   );
 }
 
-export function ApiKeysPanel({ apiKeys, keyUsage, isLoading, isMutating, onCreate, onRevoke }: ApiKeysPanelProps) {
+export function ApiKeysPanel({
+  apiKeys,
+  keyUsage,
+  isLoading,
+  isMutating,
+  onCreate,
+  onDelete,
+  onRename,
+}: ApiKeysPanelProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [confirmingRevokeId, setConfirmingRevokeId] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<ApiKey | null>(null);
+  const [renaming, setRenaming] = useState<ApiKey | null>(null);
+  const [newName, setNewName] = useState("");
   const [copiedPrefixId, setCopiedPrefixId] = useState<string | null>(null);
   const copyTimer = useRef<number | null>(null);
 
@@ -207,47 +228,38 @@ export function ApiKeysPanel({ apiKeys, keyUsage, isLoading, isMutating, onCreat
                       {key.readOnly ? "—" : formatTimestamp(key.createdAt)}
                     </TableCell>
                     <TableCell className="text-right">
-                      {key.readOnly || key.revokedAt ? null : confirmingRevokeId === key.id ? (
+                      {key.readOnly ? null : (
                         <div className="flex items-center justify-end gap-1">
                           <Button
                             size="xs"
-                            variant="outline"
+                            variant="ghost"
+                            className="text-muted-foreground hover:text-foreground"
                             disabled={isMutating}
-                            aria-label={`Cancel revoking key ${key.name}`}
+                            aria-label={`Rename key ${key.name}`}
+                            title="Rename"
                             onClick={(event) => {
                               event.stopPropagation();
-                              setConfirmingRevokeId(null);
+                              setNewName(key.name);
+                              setRenaming(key);
                             }}
                           >
-                            Cancel
+                            <Pencil size={14} />
                           </Button>
                           <Button
                             size="xs"
-                            variant="destructive"
+                            variant="ghost"
+                            className="text-muted-foreground hover:text-destructive"
                             disabled={isMutating}
-                            aria-label={`Confirm revoke key ${key.name}`}
+                            aria-label={`Delete key ${key.name}`}
+                            title="Delete"
                             onClick={(event) => {
                               event.stopPropagation();
-                              setConfirmingRevokeId(null);
-                              onRevoke(key.id);
+                              setDeleting(key);
                             }}
                           >
-                            Revoke
+                            <Trash2 size={14} />
                           </Button>
                         </div>
-                      ) : (
-                        <Button
-                          size="xs"
-                          variant="outline"
-                          disabled={isMutating}
-                          aria-label={`Revoke key ${key.name}`}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setConfirmingRevokeId(key.id);
-                          }}
-                        >
-                          Revoke
-                        </Button>
                       )}
                     </TableCell>
                   </TableRow>,
@@ -264,6 +276,76 @@ export function ApiKeysPanel({ apiKeys, keyUsage, isLoading, isMutating, onCreat
           </Table>
         )}
       </CardContent>
+
+      <Dialog open={deleting !== null} onOpenChange={(open) => !open && setDeleting(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete this API key?</DialogTitle>
+            <DialogDescription>
+              {deleting ? (
+                <>
+                  <span className="font-medium">{deleting.name}</span> stops working immediately and its usage
+                  history is removed. This cannot be undone.
+                </>
+              ) : null}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" disabled={isMutating} onClick={() => setDeleting(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={isMutating}
+              onClick={() => {
+                if (deleting) onDelete(deleting.id);
+                setDeleting(null);
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={renaming !== null} onOpenChange={(open) => !open && setRenaming(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Rename API key</DialogTitle>
+            <DialogDescription>The key itself does not change, only its label.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1">
+            <Label htmlFor="key-name">Name</Label>
+            <Input
+              id="key-name"
+              value={newName}
+              maxLength={80}
+              disabled={isMutating}
+              onChange={(event) => setNewName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && newName.trim() && renaming) {
+                  onRename(renaming.id, newName.trim());
+                  setRenaming(null);
+                }
+              }}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={isMutating} onClick={() => setRenaming(null)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={isMutating || !newName.trim() || newName.trim() === renaming?.name}
+              onClick={() => {
+                if (renaming) onRename(renaming.id, newName.trim());
+                setRenaming(null);
+              }}
+            >
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }
