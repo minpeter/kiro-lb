@@ -39,6 +39,7 @@ class TestEndpointDefinitions:
         assert ep.selected_endpoints(["nope"])[0].key == ep.KIRO_ENDPOINTS[0].key
 
 
+@pytest.mark.asyncio
 class TestAttemptOrder:
     def test_affinity_puts_the_working_endpoint_first(self):
         ep.record_success("acc", "claude-opus-5", "amazonq")
@@ -96,6 +97,45 @@ def _response(status):
 
 @pytest.mark.asyncio
 class TestRotationBehavior:
+    async def test_account_errors_do_not_rotate(self, monkeypatch):
+        """A dead credential must not be retried on the other hosts.
+
+        Rotating on it re-enters the 403 refresh retry once per remaining
+        endpoint, which multiplies calls to the auth host and gets the gateway
+        rate limited there.
+        """
+        from kiro.account_errors import CredentialDeadError
+
+        client = _client(monkeypatch)
+        attempts = []
+
+        async def fake(method, url, **kwargs):
+            attempts.append(url)
+            raise CredentialDeadError("refresh rejected", 401)
+
+        monkeypatch.setattr(client, "_attempt_endpoint", fake)
+
+        with pytest.raises(CredentialDeadError):
+            await client.request_with_retry("POST", _FakeAuth().generation_url, json_data={})
+
+        assert len(attempts) == 1, "an account error must not be retried on another endpoint"
+
+    async def test_transport_errors_still_rotate(self, monkeypatch):
+        client = _client(monkeypatch)
+        attempts = []
+
+        async def fake(method, url, **kwargs):
+            attempts.append(url)
+            if len(attempts) < 3:
+                raise httpx.ConnectError("boom")
+            return _response(200)
+
+        monkeypatch.setattr(client, "_attempt_endpoint", fake)
+
+        response = await client.request_with_retry("POST", _FakeAuth().generation_url, json_data={})
+        assert response.status_code == 200
+        assert len(attempts) == 3, "a transport failure should still move to the next endpoint"
+
     async def test_rotates_past_a_5xx_and_records_the_winner(self, monkeypatch):
         client = _client(monkeypatch)
         seen = []

@@ -526,7 +526,13 @@ class KiroHttpClient:
                     retry_rate_limits=retry_rate_limits,
                     header_overrides=endpoint.header_overrides(),
                 )
-            except Exception as exc:
+            except (httpx.TransportError, httpx.ProxyError) as exc:
+                # Only a transport failure is the endpoint's fault. An account
+                # level error - a dead credential, a rejected refresh - must
+                # propagate so the caller fails over accounts instead. Rotating
+                # on it re-runs the 403 refresh retry on every remaining host,
+                # turning one request into several refresh calls and hitting the
+                # auth host's rate limit.
                 last_exception = exc
                 record_failure(endpoint.key, settings.cooldown_seconds)
                 logger.warning(f"[Endpoints] {endpoint.name} transport failure: {type(exc).__name__}")
