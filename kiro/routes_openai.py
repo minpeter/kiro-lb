@@ -529,7 +529,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         error_json = json.loads(error_text)
                         from kiro.kiro_errors import enhance_kiro_error
 
-                        error_info = enhance_kiro_error(error_json)
+                        error_info = enhance_kiro_error(error_json, status_code=response.status_code)
                         error_reason = error_info.reason
                         upstream_message = error_info.original_message or error_text
                         last_error_message = error_info.user_message

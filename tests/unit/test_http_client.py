@@ -1298,3 +1298,90 @@ class TestStreamRetryCleanup:
         first_response.aclose.assert_awaited_once()
         success_response.aclose.assert_not_awaited()
         assert events == ["send", "close-first", "send"]
+
+
+class _AsyncBytes(httpx.AsyncByteStream):
+    """Minimal async stream so a test can build an unread httpx streaming response."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    async def __aiter__(self):
+        yield self._payload
+
+
+class TestExhaustedRetriesReachTheCaller:
+    """What the caller receives once same-account retries are spent."""
+
+    @pytest.mark.asyncio
+    async def test_a_403_that_never_clears_is_returned_for_classification(self, mock_auth_manager_for_http):
+        """A 403 surviving every refresh must reach the route, not become a 502.
+
+        The 403 branch refreshed and continued without recording the response, so
+        an account answering 403 to every attempt left every `last_*` slot empty
+        and fell through to the generic "Unknown error" HTTPException.
+        `classify_error(403)` - which returns RECOVERABLE - never ran, so there
+        was no report_failure and no account rotation: one unlucky account failed
+        the whole request behind an opaque 502.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        forbidden = AsyncMock()
+        forbidden.status_code = 403
+        forbidden.aread = AsyncMock(return_value=b'{"message": "Forbidden", "reason": null}')
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(return_value=forbidden)
+
+        with patch.object(http_client, "_get_client", return_value=mock_client):
+            with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                response = await http_client.request_with_retry("POST", "https://api.example.com/test", {"a": 1})
+
+        assert response.status_code == 403
+        assert mock_auth_manager_for_http.force_refresh.await_count >= 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [503, 429])
+    async def test_an_exhausted_error_stream_still_carries_its_body(self, status_code, mock_auth_manager_for_http):
+        """The error body must survive the stream being discarded.
+
+        A streamed 429/5xx was stored as `last_response` and then closed, and
+        that same closed response was returned once retries ran out. The route's
+        `await response.aread()` then raised, its except branch substituted
+        "Unknown error", and the upstream's real reason - the thing that decides
+        whether to fail over - was lost.
+
+        Driven through a real httpx.Response rather than a mock, so the assertion
+        is that the body is genuinely decodable afterwards; a helper that read the
+        bytes and dropped them would satisfy a call-order check but not this.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        body = b'{"message":"upstream refused","reason":"MONTHLY_REQUEST_COUNT"}'
+        responses: list[httpx.Response] = []
+
+        def make_response():
+            response = httpx.Response(
+                status_code=status_code,
+                stream=_AsyncBytes(body),
+                request=httpx.Request("POST", "https://example.invalid"),
+            )
+            responses.append(response)
+            return response
+
+        mock_client = Mock()
+        mock_client.build_request.return_value = Mock()
+        mock_client.send = AsyncMock(side_effect=lambda *a, **k: make_response())
+
+        with (
+            patch.object(http_client, "_get_client", return_value=mock_client),
+            patch("kiro.http_client.get_kiro_headers", return_value={}),
+            patch("kiro.http_client.asyncio.sleep", new=AsyncMock()),
+        ):
+            response = await http_client.request_with_retry(
+                "POST", "https://example.invalid", stream=True, retry_rate_limits=True
+            )
+
+        assert response.status_code == status_code
+        # The whole point: readable after the stream was closed and discarded.
+        assert response.json()["reason"] == "MONTHLY_REQUEST_COUNT"

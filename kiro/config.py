@@ -113,6 +113,13 @@ MAX_RETRIES: int = 3
 # Uses exponential backoff: delay * (2 ** attempt)
 BASE_RETRY_DELAY: float = 1.0
 
+# How long to wait for the body of a failed streamed response before giving up.
+# Deliberately short and separate from STREAMING_READ_TIMEOUT: this reads an
+# error payload that is already on the wire, and the cost is paid once per
+# attempt and once per endpoint, so a hung upstream must not turn a refusal into
+# a stall.
+ERROR_BODY_READ_TIMEOUT: float = 5.0
+
 # ==================================================================================================
 # Hidden Models Configuration
 # ==================================================================================================

@@ -54,14 +54,17 @@ def is_credential_dead_status(status_code: int) -> bool:
 def is_suspension_error(status_code: int, message: Optional[str], reason: Optional[str] = None) -> bool:
     """Report whether an upstream refusal means the account itself is locked.
 
-    Only an authorization refusal carries this meaning. The same wording in a
-    validation error would be an echo of the payload, not a verdict about the
-    account, so the status code is part of the test.
+    The reason code is conclusive on its own: the upstream sets that field, so it
+    cannot be an echo of anything the client sent, whatever status accompanies it.
+
+    The wording heuristic is what needs the status. Only an authorization refusal
+    carries this verdict; the same sentence inside a validation error is the
+    payload being quoted back, not a statement about the account.
     """
-    if status_code != 403:
-        return False
     if reason == SUSPENSION_REASON:
         return True
+    if status_code != 403:
+        return False
     if not message:
         return False
     lowered = message.lower()
@@ -87,7 +90,7 @@ class KiroErrorInfo:
     original_message: str
 
 
-def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
+def enhance_kiro_error(error_json: Dict[str, Any], status_code: Optional[int] = None) -> KiroErrorInfo:
     """
     Enhances Kiro API error with user-friendly message.
 
@@ -99,6 +102,12 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
         error_json: Parsed JSON from Kiro API error response
                    Expected format: {"message": "...", "reason": "..."}
                    The "reason" field is optional.
+        status_code: HTTP status the upstream answered with. Required to reach
+                   the suspension verdict, because that verdict is only carried
+                   by an authorization refusal - the same wording inside a
+                   validation error is an echo of the payload. Omitted, no
+                   suspension is claimed: an unknown status is not evidence,
+                   and convicting a healthy account is the worse error.
 
     Returns:
         KiroErrorInfo with enhanced message and original details
@@ -128,8 +137,9 @@ def enhance_kiro_error(error_json: Dict[str, Any]) -> KiroErrorInfo:
 
     # A suspension may arrive with no reason code (legacy host), so it has to be
     # recognized from the message too before the generic branches collapse it
-    # into "unknown error".
-    if is_suspension_error(403, original_message, error_json.get("reason")):
+    # into "unknown error". The status is forwarded rather than hardcoded: it is
+    # what separates the verdict from an echo of the request payload.
+    if status_code is not None and is_suspension_error(status_code, original_message, error_json.get("reason")):
         return KiroErrorInfo(
             reason=SUSPENSION_REASON,
             user_message=(
