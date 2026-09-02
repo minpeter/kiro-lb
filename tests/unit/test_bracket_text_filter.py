@@ -66,3 +66,19 @@ class TestSplitBracketCallText:
         emitted, held = self._stream([text])
         assert emitted == text
         assert held == ""
+
+    def test_a_lowercase_marker_is_withheld_and_still_parsed(self):
+        """The splitter matches case-insensitively. parse_bracket_tool_calls used a
+        case-sensitive guard, so a lowercase marker was withheld from the reply and
+        then never became a call: the text simply vanished."""
+        from kiro.parsers import parse_bracket_tool_calls
+
+        lowered = self.CALL.replace("[Called", "[called")
+
+        emitted, held = self._stream([lowered])
+        assert emitted == ""
+        assert held == ""
+
+        calls = parse_bracket_tool_calls(lowered)
+        assert len(calls) == 1, "what the splitter withholds must be recoverable as a call"
+        assert calls[0]["function"]["name"] == "Write"

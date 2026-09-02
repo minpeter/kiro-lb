@@ -64,6 +64,101 @@ class TestCollector:
         assert "[Called" not in result.content
 
 
+class TestAnthropicStream:
+    async def _run(self, monkeypatch, events):
+        from unittest.mock import MagicMock
+
+        import kiro.streaming_anthropic as streaming_anthropic
+
+        _patch_stream(monkeypatch, streaming_anthropic, events)
+        cache = MagicMock()
+        cache.get_token_limits.return_value = {"maxInputTokens": 200000, "maxOutputTokens": 8192}
+
+        texts: list = []
+        names: list = []
+        async for raw in streaming_anthropic.stream_kiro_to_anthropic(
+            _FakeResponse(), "claude-opus-5", cache, MagicMock(), request_messages=[], known_input_tokens=10
+        ):
+            for line in raw.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                payload = json.loads(line[6:])
+                if payload.get("delta", {}).get("type") == "text_delta":
+                    texts.append(payload["delta"]["text"])
+                block = payload.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    names.append(block.get("name"))
+        return "".join(texts), names
+
+    @pytest.mark.asyncio
+    async def test_a_call_in_text_is_not_sent_as_prose(self, monkeypatch):
+        pieces = [CALL[i : i + 9] for i in range(0, len(CALL), 9)]
+        events = [KiroEvent(type="content", content="Vou criar.\n")]
+        events += [KiroEvent(type="content", content=piece) for piece in pieces]
+
+        text, names = await self._run(monkeypatch, events)
+
+        assert "[Called" not in text
+        assert text == "Vou criar.\n"
+        assert names == ["Write"]
+
+    @pytest.mark.asyncio
+    async def test_a_structured_call_echoed_in_text_is_emitted_once(self, monkeypatch):
+        events = [
+            KiroEvent(type="content", content="Criando.\n"),
+            KiroEvent(type="tool_use", tool_use=NATIVE),
+            KiroEvent(type="content", content=CALL),
+        ]
+
+        text, names = await self._run(monkeypatch, events)
+
+        assert names == ["Write"], "the echo must not become a second block"
+        assert "[Called" not in text
+
+
+class TestAMixOfStructuredAndTextCalls:
+    """Suppressing the echo must not suppress a genuinely different call written as
+    text: dropping every bracket call whenever a structured one exists lost it."""
+
+    OTHER = '[Called Write with args: {"file_path": "/tmp/b.py", "content": "y"}]'
+    READ = {
+        "id": "toolu_read",
+        "type": "function",
+        "function": {"name": "Read", "arguments": '{"path": "/tmp/x"}'},
+    }
+
+    @pytest.mark.asyncio
+    async def test_the_collector_keeps_both(self, monkeypatch):
+        _patch_stream(
+            monkeypatch,
+            streaming_core,
+            [
+                KiroEvent(type="content", content="Lendo.\n"),
+                KiroEvent(type="tool_use", tool_use=self.READ),
+                KiroEvent(type="content", content=self.OTHER),
+            ],
+        )
+
+        result = await collect_stream_to_result(_FakeResponse())
+
+        names = sorted(call.get("function", {}).get("name") for call in result.tool_calls)
+        assert names == ["Read", "Write"]
+
+    @pytest.mark.asyncio
+    async def test_a_held_marker_after_a_call_is_not_lost(self, monkeypatch):
+        _patch_stream(
+            monkeypatch,
+            streaming_core,
+            [KiroEvent(type="content", content="antes " + CALL + " depois [Cal")],
+        )
+
+        result = await collect_stream_to_result(_FakeResponse())
+
+        assert len(result.tool_calls) == 1
+        assert "[Called" not in result.content
+        assert result.content.endswith("[Cal"), "an unresolved marker is text, not a call"
+
+
 class TestOpenAiStream:
     async def _run(self, monkeypatch, events):
         from unittest.mock import MagicMock

@@ -27,6 +27,7 @@ from kiro.parsers import (
     AwsEventStreamParser,
     MalformedToolInputError,
     deduplicate_tool_calls,
+    drop_echoed_calls,
     parse_bracket_tool_calls,
     split_bracket_call_text,
 )
@@ -319,16 +320,16 @@ async def collect_stream_to_result(
     # discuss bracket syntax without actually invoking a tool.
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls and result.tool_calls:
-        # Upstream already reported this turn's calls as structured events, and the
-        # text only echoes them. Keeping both would hand the caller the same call
-        # twice, which deduplication cannot always catch because the echoed
-        # arguments are re-serialized and no longer compare equal.
-        logger.warning(
-            "Ignoring {} bracket tool call(s): {} native call(s) already collected",
-            len(bracket_tool_calls),
-            len(result.tool_calls),
-        )
-        bracket_tool_calls = []
+        # Only a restatement of a call already collected is dropped. A turn can mix
+        # a structured call with a different one written as text, and discarding
+        # both would lose the second.
+        kept = drop_echoed_calls(bracket_tool_calls, result.tool_calls)
+        if len(kept) != len(bracket_tool_calls):
+            logger.warning(
+                "Ignoring {} bracket tool call(s) already collected as structured events",
+                len(bracket_tool_calls) - len(kept),
+            )
+        bracket_tool_calls = kept
 
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
@@ -344,12 +345,16 @@ async def collect_stream_to_result(
 
     # The call is delivered as a tool block, so its text must not remain in the
     # reply as well. Stripping here rather than while accumulating keeps the
-    # bracket text available for the detection above.
+    # bracket text available for the detection above. The held remainder goes back:
+    # it is an unresolved marker rather than a call, and dropping it would lose
+    # text the model actually wrote.
     if parse_bracket_tool_calls(full_content_for_bracket_tools):
-        result.content, _ = split_bracket_call_text(result.content)
+        visible, held = split_bracket_call_text(result.content)
+        result.content = visible + held
         for block in result.content_blocks:
             if block["type"] == "text":
-                block["text"], _ = split_bracket_call_text(block["text"])
+                visible, held = split_bracket_call_text(block["text"])
+                block["text"] = visible + held
         result.content_blocks = [block for block in result.content_blocks if block["type"] != "text" or block["text"]]
 
     return result

@@ -161,6 +161,47 @@ def _partial_marker_start(text: str) -> Optional[int]:
     return None
 
 
+def _call_identity(tool_call: Dict[str, Any]) -> Tuple[str, str]:
+    """Name and normalized arguments, for comparing two spellings of one call."""
+    function = tool_call.get("function") or {}
+    name = str(function.get("name") or tool_call.get("name") or "")
+    raw = function.get("arguments")
+    if raw is None:
+        raw = tool_call.get("input")
+
+    parsed: Any = raw
+    if isinstance(raw, str):
+        if not raw.strip():
+            parsed = {}
+        else:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return name, raw
+
+    try:
+        # Re-serialized with sorted keys: the echoed spelling differs from the
+        # structured one only in formatting, so raw strings would not compare
+        # equal even for the same call.
+        return name, json.dumps(parsed, sort_keys=True)
+    except (TypeError, ValueError):
+        return name, str(parsed)
+
+
+def drop_echoed_calls(bracket_calls: List[Dict[str, Any]], emitted_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep the bracket calls that are not a restatement of an emitted call.
+
+    A turn can mix a structured call with a different call written as text, so
+    discarding every bracket call whenever a structured one exists would lose the
+    second one. Only an exact restatement is dropped.
+    """
+    if not bracket_calls or not emitted_calls:
+        return bracket_calls
+
+    seen = {_call_identity(call) for call in emitted_calls}
+    return [call for call in bracket_calls if _call_identity(call) not in seen]
+
+
 def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
     """
     Parses tool calls in [Called func_name with args: {...}] format.
@@ -180,7 +221,10 @@ def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
         >>> calls[0]["function"]["name"]
         'get_weather'
     """
-    if not response_text or "[Called" not in response_text:
+    # Case-insensitive to match the pattern below and split_bracket_call_text: a
+    # lowercase marker used to be withheld from the reply by the splitter and then
+    # rejected here, so the text vanished without a tool call taking its place.
+    if not response_text or _BRACKET_MARKER not in response_text.lower():
         return []
 
     tool_calls = []

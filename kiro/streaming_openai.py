@@ -22,7 +22,12 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FIRST_TOKEN_TIMEOUT,
 )
-from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls, split_bracket_call_text
+from kiro.parsers import (
+    deduplicate_tool_calls,
+    drop_echoed_calls,
+    parse_bracket_tool_calls,
+    split_bracket_call_text,
+)
 from kiro.sse_validation import (
     StreamProtocolError,
     begin_openai_stream,
@@ -384,14 +389,16 @@ async def stream_kiro_to_openai_internal(
         # Check bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         if bracket_tool_calls and tool_calls_from_stream:
-            # The structured calls were already streamed out and cannot be taken
-            # back, so honouring the text echo as well would publish each call
-            # twice and a client acting on both would run it twice.
-            logger.warning(
-                f"[OpenAI Streaming] Ignoring {len(bracket_tool_calls)} bracket tool call(s): "
-                f"{len(tool_calls_from_stream)} native call(s) already emitted"
-            )
-            bracket_tool_calls = []
+            # A structured call is already on the wire and cannot be recalled, so
+            # its restatement in text is dropped. A bracket call that is not a
+            # restatement is a real second call and is kept.
+            kept = drop_echoed_calls(bracket_tool_calls, tool_calls_from_stream)
+            if len(kept) != len(bracket_tool_calls):
+                logger.warning(
+                    f"[OpenAI Streaming] Ignoring {len(bracket_tool_calls) - len(kept)} bracket tool call(s) "
+                    f"already emitted as structured events"
+                )
+            bracket_tool_calls = kept
 
         if bracket_held:
             # Held text that never became a call is ordinary content and must not

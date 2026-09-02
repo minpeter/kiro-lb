@@ -21,7 +21,7 @@ import httpx
 from loguru import logger
 
 from kiro.config import FIRST_TOKEN_MAX_RETRIES, FIRST_TOKEN_TIMEOUT
-from kiro.parsers import parse_bracket_tool_calls, split_bracket_call_text
+from kiro.parsers import drop_echoed_calls, parse_bracket_tool_calls, split_bracket_call_text
 from kiro.sse_validation import (
     StreamProtocolError,
     begin_anthropic_stream,
@@ -693,14 +693,16 @@ async def stream_kiro_to_anthropic(
         # Check for bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         if bracket_tool_calls and tool_blocks:
-            # Upstream already sent this turn's calls as structured events. The
-            # text merely echoes them, and emitting both would run every call
-            # twice.
-            logger.warning(
-                f"[Anthropic Streaming] Ignoring {len(bracket_tool_calls)} bracket tool call(s): "
-                f"{len(tool_blocks)} native call(s) already emitted"
-            )
-            bracket_tool_calls = []
+            # Only a restatement of a call already emitted is dropped: a turn can
+            # mix a structured call with a different one written as text, and
+            # discarding both would lose the second.
+            kept = drop_echoed_calls(bracket_tool_calls, tool_blocks)
+            if len(kept) != len(bracket_tool_calls):
+                logger.warning(
+                    f"[Anthropic Streaming] Ignoring {len(bracket_tool_calls) - len(kept)} bracket tool call(s) "
+                    f"already emitted as structured events"
+                )
+            bracket_tool_calls = kept
         if bracket_tool_calls:
             # Text that arrived before the call keeps its place: flushing after
             # the tool block would reorder the turn the model produced.
