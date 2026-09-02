@@ -1269,6 +1269,34 @@ class TestMergeAdjacentMessages:
         assert len(result) == 1
         assert [image["data"] for image in result[0].images] == ["explicit", "in_content"]
 
+    def test_merges_content_block_images_without_duplicating_them(self):
+        """Content is merged before images are, so the fallback must not re-read it.
+
+        When neither message sets `images`, both lists come from content blocks -
+        and by the time the image merge runs, `last.content` already holds the
+        later message's blocks. Extracting from it there counts those blocks once
+        as the previous images and once as the current ones, so the model receives
+        the same picture twice and pays for it twice.
+        """
+        messages = [
+            UnifiedMessage(
+                role="user",
+                content=[{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "first"}}],
+            ),
+            UnifiedMessage(
+                role="user",
+                content=[
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "second"}},
+                    {"type": "text", "text": "e agora?"},
+                ],
+            ),
+        ]
+
+        result = merge_adjacent_messages(messages)
+
+        assert len(result) == 1
+        assert [image["data"] for image in result[0].images] == ["first", "second"]
+
     def test_merges_images_from_both_messages_in_order(self):
         """
         What it does: Verifies images from both merged messages are concatenated.

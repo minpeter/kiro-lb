@@ -927,6 +927,20 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
 
         last = merged[-1]
         if msg.role == last.role:
+            # Resolved before the content merge below, because that merge moves
+            # msg's blocks into last.content: reading last.content afterwards
+            # would count those blocks twice, once as the previous images and
+            # once as the current ones, and the model would be shown - and
+            # charged for - the same picture twice.
+            #
+            # Both representations are read, matching how build_kiro_payload
+            # resolves `msg.images or extract_images_from_content(...)`
+            # downstream: once the merged message holds any explicit image the
+            # content blocks stop being inspected there, so anything carried only
+            # in a block has to be lifted out here or it is lost.
+            current_images = msg.images or extract_images_from_content(msg.content)
+            previous_images = last.images or extract_images_from_content(last.content)
+
             # Merge content
             if isinstance(last.content, list) and isinstance(msg.content, list):
                 last.content = last.content + msg.content
@@ -969,14 +983,7 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
             # tell an absent image from one the client never sent. The OpenAI
             # adapter produces exactly this shape, since flushing pending tool
             # results emits a user turn that the next user turn merges into.
-            #
-            # Both representations are read, matching what build_kiro_payload
-            # does downstream. It resolves `msg.images or extract(content)`, so
-            # once the merged message holds any explicit image the content blocks
-            # stop being inspected - and anything they carried would be lost.
-            current_images = msg.images or extract_images_from_content(msg.content)
             if current_images:
-                previous_images = last.images or extract_images_from_content(last.content)
                 last.images = list(previous_images) + list(current_images)
                 total_images_merged += len(current_images)
 
