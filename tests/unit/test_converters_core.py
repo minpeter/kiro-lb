@@ -1216,6 +1216,52 @@ class TestMergeAdjacentMessages:
         assert result[0].tool_results is not None
         assert len(result[0].tool_results) == 2
 
+    def test_merges_images_from_the_later_message(self):
+        """
+        What it does: Verifies images on the second of two merged messages survive.
+        Purpose: The merge carried content, tool_calls, reasoning and tool_results
+        across but never images, so the later message's images were dropped with
+        no log. Every other function in the pipeline propagates them explicitly
+        (strip_all_tool_content, normalize_message_roles), which is what made the
+        omission invisible.
+        """
+        print("Setup: Two user messages, only the second carrying an image...")
+        messages = [
+            UnifiedMessage(role="user", content="look at this"),
+            UnifiedMessage(
+                role="user",
+                content="what is it?",
+                images=[{"media_type": "image/jpeg", "data": TEST_IMAGE_BASE64}],
+            ),
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        print(f"Result images: {result[0].images}")
+        assert len(result) == 1
+        assert result[0].images is not None
+        assert len(result[0].images) == 1
+        assert result[0].images[0]["data"] == TEST_IMAGE_BASE64
+
+    def test_merges_images_from_both_messages_in_order(self):
+        """
+        What it does: Verifies images from both merged messages are concatenated.
+        Purpose: Merging is a concatenation for content and tool lists; images
+        must follow the same rule rather than one side winning.
+        """
+        print("Setup: Two user messages, each carrying an image...")
+        messages = [
+            UnifiedMessage(role="user", content="first", images=[{"media_type": "image/jpeg", "data": "first_data"}]),
+            UnifiedMessage(role="user", content="second", images=[{"media_type": "image/png", "data": "second_data"}]),
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        assert len(result) == 1
+        assert [image["data"] for image in result[0].images] == ["first_data", "second_data"]
+
 
 # ==================================================================================================
 # Tests for ensure_first_message_is_user
@@ -2684,6 +2730,26 @@ class TestExtractToolResults:
         assert len(result) == 2
         assert result[0]["toolUseId"] == "call_1"
         assert result[1]["toolUseId"] == "call_2"
+
+    def test_reports_a_failed_tool_result_as_an_error(self):
+        """
+        What it does: Verifies is_error on the block becomes status="error".
+        Purpose: This function hardcoded status="success" while
+        convert_tool_results_to_kiro_format, thirty lines away, derived it from
+        is_error. Two functions filling the same Kiro field by different rules
+        meant a stack trace reached the model labelled as a successful result.
+        """
+        print("Setup: tool_result block flagged as an error...")
+        content = [
+            {"type": "tool_result", "tool_use_id": "call_boom", "content": "Traceback...", "is_error": True},
+            {"type": "tool_result", "tool_use_id": "call_ok", "content": "fine"},
+        ]
+
+        print("Action: Extracting tool results...")
+        result = extract_tool_results_from_content(content)
+
+        print(f"Result: {result}")
+        assert [item["status"] for item in result] == ["error", "success"]
 
 
 # ==================================================================================================
