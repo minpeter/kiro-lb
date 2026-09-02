@@ -159,6 +159,9 @@ async def stream_kiro_to_openai_internal(
     upstream_stop_reason = None
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    # Calls replaced by their own result instead of being forwarded. They are not
+    # published, so they are tracked separately purely to recognize their echo.
+    intercepted_tool_calls: list = []
     # Text held back while it may still turn out to be a bracket-style call.
     bracket_held = ""
     # Index assigned to each call already streamed, so the final chunk can skip it.
@@ -298,6 +301,12 @@ async def stream_kiro_to_openai_internal(
                             # Accumulate for token counting
                             full_content += summary
 
+                            # Recorded only so the echo filter below recognizes it.
+                            # The call itself is never forwarded: the client gets the
+                            # summary, and republishing the call would let it run a
+                            # search the gateway already performed.
+                            intercepted_tool_calls.append(event.tool_use)
+
                             # Skip normal tool_use processing
                             continue
 
@@ -388,15 +397,17 @@ async def stream_kiro_to_openai_internal(
 
         # Check bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
-        if bracket_tool_calls and tool_calls_from_stream:
+        already_handled = tool_calls_from_stream + intercepted_tool_calls
+        if bracket_tool_calls and already_handled:
             # A structured call is already on the wire and cannot be recalled, so
-            # its restatement in text is dropped. A bracket call that is not a
-            # restatement is a real second call and is kept.
-            kept = drop_echoed_calls(bracket_tool_calls, tool_calls_from_stream)
+            # its restatement in text is dropped. An intercepted call counts as
+            # handled even though it was never forwarded: it was answered with its
+            # own result, and republishing it would let the client run it again.
+            kept = drop_echoed_calls(bracket_tool_calls, already_handled)
             if len(kept) != len(bracket_tool_calls):
                 logger.warning(
                     f"[OpenAI Streaming] Ignoring {len(bracket_tool_calls) - len(kept)} bracket tool call(s) "
-                    f"already emitted as structured events"
+                    f"already handled as structured events"
                 )
             bracket_tool_calls = kept
 

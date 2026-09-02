@@ -29,6 +29,7 @@ from kiro.parsers import (
     deduplicate_tool_calls,
     drop_echoed_calls,
     parse_bracket_tool_calls,
+    parse_bracket_tool_calls_with_offsets,
     split_bracket_call_text,
 )
 from kiro.sse_validation import StreamProtocolError
@@ -243,6 +244,23 @@ async def _process_chunk(parser: AwsEventStreamParser, chunk: bytes) -> AsyncGen
 # ==================================================================================================
 
 
+def _block_position_for_text_offset(blocks: List[Dict[str, Any]], offset: int) -> int:
+    """Index at which a call found at ``offset`` of the collected text belongs.
+
+    Text blocks are walked in order, accumulating their length, so the call lands
+    right after the text block that spelled it and therefore before any structured
+    block that came later.
+    """
+    consumed = 0
+    for position, block in enumerate(blocks):
+        if block["type"] != "text":
+            continue
+        consumed += len(block.get("text") or "")
+        if offset < consumed:
+            return position + 1
+    return len(blocks)
+
+
 async def collect_stream_to_result(
     response: httpx.Response,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
@@ -318,7 +336,8 @@ async def collect_stream_to_result(
 
     # Recovery is intentionally limited to client-visible text. Reasoning can
     # discuss bracket syntax without actually invoking a tool.
-    bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
+    bracket_with_offsets = parse_bracket_tool_calls_with_offsets(full_content_for_bracket_tools)
+    bracket_tool_calls = [call for _, call in bracket_with_offsets]
     if bracket_tool_calls and result.tool_calls:
         # Only a restatement of a call already collected is dropped. A turn can mix
         # a structured call with a different one written as text, and discarding
@@ -329,19 +348,20 @@ async def collect_stream_to_result(
                 "Ignoring {} bracket tool call(s) already collected as structured events",
                 len(bracket_tool_calls) - len(kept),
             )
+        kept_ids = {id(call) for call in kept}
+        bracket_with_offsets = [(offset, call) for offset, call in bracket_with_offsets if id(call) in kept_ids]
         bracket_tool_calls = kept
 
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
         timeline_tool_ids = {block["tool"].get("id") for block in result.content_blocks if block["type"] == "tool_use"}
-        for tool_call in bracket_tool_calls:
-            if tool_call.get("id") not in timeline_tool_ids:
-                result.content_blocks.append(
-                    {
-                        "type": "tool_use",
-                        "tool": tool_call,
-                    }
-                )
+        # Placed where the model wrote it: appending every call at the end reports a
+        # call written before a structured one as if it came after.
+        for offset, tool_call in reversed(bracket_with_offsets):
+            if tool_call.get("id") in timeline_tool_ids:
+                continue
+            position = _block_position_for_text_offset(result.content_blocks, offset)
+            result.content_blocks.insert(position, {"type": "tool_use", "tool": tool_call})
 
     # The call is delivered as a tool block, so its text must not remain in the
     # reply as well. Stripping here rather than while accumulating keeps the

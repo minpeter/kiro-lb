@@ -189,6 +189,9 @@ async def stream_kiro_to_anthropic(
     # Text held back while it may still turn out to be a bracket-style call.
     bracket_held = ""
     tool_blocks: List[Dict[str, Any]] = []
+    # Calls answered with their own result instead of being forwarded. Tracked only
+    # so their echo in text can be recognized.
+    intercepted_tool_calls: List[Dict[str, Any]] = []
     # Set while a tool_use block is open and its arguments are still arriving.
     streamed_tool_id: Optional[str] = None
     streamed_tool_index: Optional[int] = None
@@ -598,6 +601,10 @@ async def stream_kiro_to_anthropic(
                         upstream_stop_reason = None
                         context_usage_percentage = None
                         upstream_cache_usage = {}
+                        # Recorded only so the echo filter recognizes it. The call is
+                        # answered with its own result rather than forwarded, so
+                        # republishing it would let the client run the search again.
+                        intercepted_tool_calls.append({"name": tool_name, "input": tool_input})
                         continue
 
                 # Check if this tool was truncated
@@ -692,15 +699,16 @@ async def stream_kiro_to_anthropic(
 
         # Check for bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
-        if bracket_tool_calls and tool_blocks:
-            # Only a restatement of a call already emitted is dropped: a turn can
+        already_handled = tool_blocks + intercepted_tool_calls
+        if bracket_tool_calls and already_handled:
+            # Only a restatement of a call already handled is dropped: a turn can
             # mix a structured call with a different one written as text, and
             # discarding both would lose the second.
-            kept = drop_echoed_calls(bracket_tool_calls, tool_blocks)
+            kept = drop_echoed_calls(bracket_tool_calls, already_handled)
             if len(kept) != len(bracket_tool_calls):
                 logger.warning(
                     f"[Anthropic Streaming] Ignoring {len(bracket_tool_calls) - len(kept)} bracket tool call(s) "
-                    f"already emitted as structured events"
+                    f"already handled as structured events"
                 )
             bracket_tool_calls = kept
         if bracket_tool_calls:

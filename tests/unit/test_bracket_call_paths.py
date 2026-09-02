@@ -206,3 +206,19 @@ class TestOpenAiStream:
 
         assert names == ["Write"], "a call already streamed must not be repeated"
         assert "[Called" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_unresolved_marker_is_still_delivered_as_content(self, monkeypatch):
+        """Text held back that never becomes a call is ordinary content. Dropping it
+        would silently swallow something the model wrote."""
+        events = [
+            KiroEvent(type="content", content="Vou criar.\n"),
+            KiroEvent(type="content", content=CALL),
+            KiroEvent(type="content", content=" e termina com [Cal"),
+        ]
+
+        text, names = await self._run(monkeypatch, events)
+
+        assert names == ["Write"]
+        assert "[Called" not in text
+        assert text.endswith("[Cal"), "the unresolved marker is text, not a call"

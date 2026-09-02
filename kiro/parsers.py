@@ -202,24 +202,22 @@ def drop_echoed_calls(bracket_calls: List[Dict[str, Any]], emitted_calls: List[D
     return [call for call in bracket_calls if _call_identity(call) not in seen]
 
 
-def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
+def parse_bracket_tool_calls_with_offsets(response_text: str) -> List[Tuple[int, Dict[str, Any]]]:
     """
-    Parses tool calls in [Called func_name with args: {...}] format.
+    Parses tool calls in [Called func_name with args: {...}] format, with the
+    character offset where each one appeared.
 
     Some models return tool calls in text format instead of
     structured JSON. This function extracts them.
+
+    The offset lets a consumer place the call where the model wrote it: appending
+    them all at the end reorders a turn that wrote one call before making another.
 
     Args:
         response_text: Model response text
 
     Returns:
-        List of tool calls in OpenAI format
-
-    Example:
-        >>> text = "[Called get_weather with args: {\"city\": \"London\"}]"
-        >>> calls = parse_bracket_tool_calls(text)
-        >>> calls[0]["function"]["name"]
-        'get_weather'
+        List of (offset, tool call in OpenAI format)
     """
     # Case-insensitive to match the pattern below and split_bracket_call_text: a
     # lowercase marker used to be withheld from the reply by the splitter and then
@@ -227,7 +225,7 @@ def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
     if not response_text or _BRACKET_MARKER not in response_text.lower():
         return []
 
-    tool_calls = []
+    tool_calls: List[Tuple[int, Dict[str, Any]]] = []
     pattern = r"\[Called\s+(\w+)\s+with\s+args:\s*"
 
     for match in re.finditer(pattern, response_text, re.IGNORECASE):
@@ -251,12 +249,24 @@ def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
             tool_call_id = generate_tool_call_id()
             # index will be added later when forming the final response
             tool_calls.append(
-                {"id": tool_call_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(args)}}
+                (
+                    match.start(),
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {"name": func_name, "arguments": json.dumps(args)},
+                    },
+                )
             )
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse tool call arguments: {json_str[:100]}")
 
     return tool_calls
+
+
+def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
+    """Tool calls written as text, without their position. See the offset variant."""
+    return [call for _, call in parse_bracket_tool_calls_with_offsets(response_text)]
 
 
 def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
