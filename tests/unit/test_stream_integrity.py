@@ -63,6 +63,11 @@ def test_blank_stop_reason_is_ignored():
         ("TOOL_USE", "tool_calls", "tool_use"),
         ("CONTENT_FILTERED", "content_filter", "refusal"),
         ("end_turn", "stop", "end_turn"),
+        # Both are in the upstream StopReason enum and were absent from the maps,
+        # so a filtered or context-exhausted turn was reported as a clean finish -
+        # the single failure mode this module exists to prevent.
+        ("GUARDRAIL_INTERVENED", "content_filter", "refusal"),
+        ("MODEL_CONTEXT_WINDOW_EXCEEDED", "length", "max_tokens"),
     ],
 )
 def test_known_reasons_map_to_both_protocols(upstream, openai, anthropic):
@@ -77,10 +82,38 @@ def test_unknown_reason_does_not_invent_a_value():
     assert normalize(None) is None
 
 
+def test_malformed_output_reasons_stay_unmapped():
+    """Neither protocol has a value for "the model emitted garbage".
+
+    Mapping these onto max_tokens would tell the client to retry with a bigger
+    budget, and onto end_turn would call a broken turn complete. Both are wrong
+    in a different direction, so the caller keeps its own inference and the
+    absence is deliberate rather than an oversight.
+    """
+    for reason in ("MALFORMED_MODEL_OUTPUT", "MALFORMED_TOOL_USE"):
+        assert to_openai_finish_reason(reason) is None
+        assert to_anthropic_stop_reason(reason) is None
+
+
 def test_truncation_is_detected_from_upstream_reason():
     assert is_truncated("MAX_TOKENS")
     assert not is_truncated("END_TURN")
     assert not is_truncated(None)
+
+
+def test_only_output_truncation_outranks_a_delivered_tool_call():
+    """Membership in TRUNCATING_REASONS suppresses tool calls, so it stays narrow.
+
+    Both serializers test truncation before tool calls, so anything listed here
+    hides a tool_use block the model actually delivered. A guardrail block ends
+    the turn for content, not length, and a context-window refusal is not known
+    to describe cut-off output rather than an oversized input - so neither is
+    listed, and their mappings already tell the client the turn was not clean.
+    """
+    assert not is_truncated("GUARDRAIL_INTERVENED")
+    assert not is_truncated("MODEL_CONTEXT_WINDOW_EXCEEDED")
+    assert to_anthropic_stop_reason("MODEL_CONTEXT_WINDOW_EXCEEDED") == "max_tokens"
+    assert to_openai_finish_reason("GUARDRAIL_INTERVENED") == "content_filter"
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,7 @@ from kiro import concurrency, proxy_chain
 from kiro.auth import KiroAuthManager
 from kiro.config import (
     BASE_RETRY_DELAY,
+    ERROR_BODY_READ_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
     MAX_RETRIES,
     STREAMING_READ_TIMEOUT,
@@ -117,6 +118,28 @@ class KiroHttpClient:
         # rotate immediately instead of sleeping through retries on an account
         # already known to be rate-limited.
         self.retry_rate_limits = True
+
+    @staticmethod
+    async def _cache_error_body(response: httpx.Response) -> None:
+        """Read a failed streamed response so its body outlives the stream.
+
+        httpx caches what ``aread()`` returns, so a later read by the route still
+        works after the stream is closed. Failing here must not replace the real
+        status with a transport error: the status alone is still worth returning.
+
+        The read is bounded on its own rather than inheriting the stream client's
+        read timeout. That timeout exists for a model that pauses mid-generation
+        and is measured in minutes; spending it on an error body would be paid
+        once per attempt and once per endpoint before the caller sees anything,
+        turning a fast refusal into a hang.
+        """
+        try:
+            await asyncio.wait_for(response.aread(), timeout=ERROR_BODY_READ_TIMEOUT)
+        except Exception as read_error:
+            # Warning, not debug: the caller now has a response whose body cannot
+            # be decoded, which is exactly the opaque "Unknown error" this is
+            # meant to prevent, and it must not be silent.
+            logger.warning(f"Could not capture the upstream error body: {read_error}")
 
     async def _get_client(self, stream: bool = False) -> httpx.AsyncClient:
         """
@@ -287,7 +310,14 @@ class KiroHttpClient:
                     if is_suspension_error(403, text, reason):
                         logger.error("Received 403 account suspension; returning immediately for account failover")
                         return response
-                    logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
+                    # Kept as the fallback answer. Without it, an account that
+                    # answers 403 to every attempt left every last_* slot empty
+                    # and the caller received a generic "Unknown error" 502, so
+                    # classify_error never saw the 403 and no account rotation
+                    # happened. The body is already read above, so returning this
+                    # response after the stream is closed is still decodable.
+                    last_response = response
+                    logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{max_retries})")
                     if stream:
                         await response.aclose()
                     await self.auth_manager.force_refresh()
@@ -301,6 +331,12 @@ class KiroHttpClient:
                         logger.info("Received 429; returning immediately for account failover")
                         return response
                     last_response = response
+                    if stream:
+                        # Same reason as the 5xx branch below, and this is the
+                        # likelier path: rate limits are this gateway's most
+                        # common refusal, so losing the body here costs the
+                        # reason that decides the account failover most often.
+                        await self._cache_error_body(response)
                     if attempt >= max_retries - 1:
                         break
                     if stream:
@@ -313,6 +349,13 @@ class KiroHttpClient:
                 # 5xx - server error, wait and retry
                 if 500 <= response.status_code < 600:
                     last_response = response  # Сохраняем для возврата после exhaustion
+                    if stream:
+                        # Capture the body before discarding the stream. This
+                        # response is what gets returned once retries run out,
+                        # and reading a closed stream raises - which sent the
+                        # route down its "Unknown error" branch and threw away
+                        # the upstream reason that decides whether to fail over.
+                        await self._cache_error_body(response)
                     if attempt >= max_retries - 1:
                         break
                     if stream:
@@ -332,6 +375,11 @@ class KiroHttpClient:
                 error_info = classify_network_error(e)
                 last_error_info = error_info
                 last_raw_error = e
+                # The newest failure is the one that describes reality. A status
+                # recorded on an earlier attempt would otherwise be returned by
+                # the post-loop check ahead of this error, and the proxy and
+                # endpoint layers rotate on a transport error, not on a status.
+                last_response = None
 
                 # Log with user-friendly message
                 short_msg = get_short_error_message(error_info)
@@ -350,6 +398,9 @@ class KiroHttpClient:
                 error_info = classify_network_error(e)
                 last_error_info = error_info
                 last_raw_error = e
+                # See the timeout branch: a stale status must not outrank the
+                # transport failure that actually ended the attempt.
+                last_response = None
 
                 # Log with user-friendly message
                 short_msg = get_short_error_message(error_info)
@@ -572,6 +623,10 @@ class KiroHttpClient:
                 record_failure(endpoint.key, settings.cooldown_seconds)
                 logger.warning(f"[Endpoints] {endpoint.name} returned {response.status_code}")
                 if stream:
+                    # Same rule as the per-endpoint retry loop: this response is
+                    # returned when no endpoint answers, so its body has to be
+                    # captured before the stream goes away.
+                    await self._cache_error_body(response)
                     await response.aclose()
                 continue
 

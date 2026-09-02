@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Generation endpoint rotation tests."""
 
+from unittest.mock import AsyncMock, Mock
+
 import httpx
 import pytest
 
@@ -260,6 +262,37 @@ class TestRotationBehavior:
         client._attempt_endpoint = fake_attempt
         response = await client.request_with_retry("POST", _GENERATION_URL, _PAYLOAD)
         assert response.status_code == 503
+
+    async def test_exhausted_5xx_stream_is_returned_with_a_readable_body(self, monkeypatch):
+        """The rotation layer must capture the error body before closing the stream.
+
+        This is the same defect as in the per-endpoint retry loop: the 5xx was
+        stored as the fallback answer and then closed, so the route's
+        `await response.aread()` raised and its except branch replaced the
+        upstream reason with "Unknown error" - losing exactly the text that
+        decides whether the account should fail over.
+        """
+        client = _client(monkeypatch)
+        events: list[str] = []
+
+        def make_response():
+            response = Mock(status_code=503)
+            response.aread = AsyncMock(side_effect=lambda: (events.append("read"), b'{"message":"down"}')[1])
+            response.aclose = AsyncMock(side_effect=lambda: events.append("close"))
+            return response
+
+        async def fake_attempt(method, url, **kwargs):
+            return make_response()
+
+        client._attempt_endpoint = fake_attempt
+        response = await client.request_with_retry("POST", _GENERATION_URL, _PAYLOAD, stream=True)
+
+        assert response.status_code == 503
+        assert events, "the error body was never read"
+        assert events[0] == "read"
+        assert all(events[index] != "close" or events[index - 1] == "read" for index in range(1, len(events))), (
+            f"a response was closed before its body was read: {events}"
+        )
 
     async def test_exhausted_transport_error_reaches_the_rotation_layer(self, monkeypatch):
         """Regression: _attempt_endpoint converted an exhausted transport error

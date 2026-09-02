@@ -22,6 +22,8 @@ _OPENAI: dict[str, str] = {
     "TOOL_USE": "tool_calls",
     "CONTENT_FILTERED": "content_filter",
     "CONTENT_FILTER": "content_filter",
+    "GUARDRAIL_INTERVENED": "content_filter",
+    "MODEL_CONTEXT_WINDOW_EXCEEDED": "length",
 }
 
 # Upstream value (normalized to upper case) -> Anthropic stop_reason.
@@ -35,9 +37,28 @@ _ANTHROPIC: dict[str, str] = {
     "TOOL_USE": "tool_use",
     "CONTENT_FILTERED": "refusal",
     "CONTENT_FILTER": "refusal",
+    "GUARDRAIL_INTERVENED": "refusal",
+    "MODEL_CONTEXT_WINDOW_EXCEEDED": "max_tokens",
 }
 
+# Two members of the upstream StopReason enum are deliberately absent from both
+# maps: MALFORMED_MODEL_OUTPUT and MALFORMED_TOOL_USE. Neither protocol has a
+# value for "the model emitted garbage", and every candidate misleads in its own
+# direction - max_tokens sends the client to raise a budget that was never the
+# problem, end_turn calls a broken turn complete. An unmapped reason leaves the
+# caller's own inference in place, which is the honest option here.
+
 #: Upstream reasons that mean the turn ended early rather than naturally.
+#: Membership here is stronger than the maps above: both serializers let it
+#: outrank a delivered tool call, so a reason only belongs once it is known to
+#: mean the *output* was cut short.
+#: GUARDRAIL_INTERVENED is excluded because it ends the turn for content, not
+#: length, and already maps to content_filter/refusal.
+#: MODEL_CONTEXT_WINDOW_EXCEEDED is excluded because it is not established that
+#: it describes cut-off output rather than an oversized input; its mapping
+#: already reports the limit, and adding it here would additionally suppress a
+#: tool call the model did deliver and invite an auto-continue client to resend
+#: an even larger context.
 TRUNCATING_REASONS = frozenset({"MAX_TOKENS", "MAX_TOKEN", "LENGTH"})
 
 

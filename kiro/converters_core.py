@@ -579,7 +579,11 @@ def extract_tool_results_from_content(content: Any) -> List[Dict[str, Any]]:
                 tool_results.append(
                     {
                         "content": [{"text": extract_text_content(item.get("content", "")) or "(empty result)"}],
-                        "status": "success",
+                        # Same rule as convert_tool_results_to_kiro_format. This
+                        # hardcoded "success", so a failed tool reaching the
+                        # payload through this path was presented to the model as
+                        # a working one and it carried on from a stack trace.
+                        "status": "error" if item.get("is_error") else "success",
                         "toolUseId": item.get("tool_use_id", ""),
                     }
                 )
@@ -914,6 +918,7 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
     merge_counts = {"user": 0, "assistant": 0}
     total_tool_calls_merged = 0
     total_tool_results_merged = 0
+    total_images_merged = 0
 
     for msg in messages:
         if not merged:
@@ -922,6 +927,20 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
 
         last = merged[-1]
         if msg.role == last.role:
+            # Resolved before the content merge below, because that merge moves
+            # msg's blocks into last.content: reading last.content afterwards
+            # would count those blocks twice, once as the previous images and
+            # once as the current ones, and the model would be shown - and
+            # charged for - the same picture twice.
+            #
+            # Both representations are read, matching how build_kiro_payload
+            # resolves `msg.images or extract_images_from_content(...)`
+            # downstream: once the merged message holds any explicit image the
+            # content blocks stop being inspected there, so anything carried only
+            # in a block has to be lifted out here or it is lost.
+            current_images = msg.images or extract_images_from_content(msg.content)
+            previous_images = last.images or extract_images_from_content(last.content)
+
             # Merge content
             if isinstance(last.content, list) and isinstance(msg.content, list):
                 last.content = last.content + msg.content
@@ -958,6 +977,16 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 last.tool_results = list(last.tool_results) + list(msg.tool_results)
                 total_tool_results_merged += len(msg.tool_results)
 
+            # Merge images, on the same concatenation rule as content and the
+            # tool lists above. Leaving them out dropped every image on the
+            # second of two merged messages, silently: nothing downstream can
+            # tell an absent image from one the client never sent. The OpenAI
+            # adapter produces exactly this shape, since flushing pending tool
+            # results emits a user turn that the next user turn merges into.
+            if current_images:
+                last.images = list(previous_images) + list(current_images)
+                total_images_merged += len(current_images)
+
             # Count merges by role
             if msg.role in merge_counts:
                 merge_counts[msg.role] += 1
@@ -978,6 +1007,8 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
             extras.append(f"{total_tool_calls_merged} tool_calls")
         if total_tool_results_merged > 0:
             extras.append(f"{total_tool_results_merged} tool_results")
+        if total_images_merged > 0:
+            extras.append(f"{total_images_merged} images")
 
         if extras:
             logger.debug(f"Merged {total_merges} adjacent messages ({merge_summary}), including {', '.join(extras)}")

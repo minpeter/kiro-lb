@@ -1216,6 +1216,105 @@ class TestMergeAdjacentMessages:
         assert result[0].tool_results is not None
         assert len(result[0].tool_results) == 2
 
+    def test_merges_images_from_the_later_message(self):
+        """
+        What it does: Verifies images on the second of two merged messages survive.
+        Purpose: The merge carried content, tool_calls, reasoning and tool_results
+        across but never images, so the later message's images were dropped with
+        no log. Every other function in the pipeline propagates them explicitly
+        (strip_all_tool_content, normalize_message_roles), which is what made the
+        omission invisible.
+        """
+        print("Setup: Two user messages, only the second carrying an image...")
+        messages = [
+            UnifiedMessage(role="user", content="look at this"),
+            UnifiedMessage(
+                role="user",
+                content="what is it?",
+                images=[{"media_type": "image/jpeg", "data": TEST_IMAGE_BASE64}],
+            ),
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        print(f"Result images: {result[0].images}")
+        assert len(result) == 1
+        assert result[0].images is not None
+        assert len(result[0].images) == 1
+        assert result[0].images[0]["data"] == TEST_IMAGE_BASE64
+
+    def test_merges_images_across_mixed_representations(self):
+        """An image can live in `images` or inside a content block; both must survive.
+
+        `build_kiro_payload` reads `msg.images or extract_images_from_content(...)`,
+        so once the merged message has any explicit image the content blocks are
+        never inspected and whatever they carried is dropped. Neither adapter
+        produces this mix today - both populate `images` whenever content holds
+        one - but the merge is reachable from the core directly, and losing an
+        image silently is the failure this whole area exists to prevent.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="", images=[{"media_type": "image/png", "data": "explicit"}]),
+            UnifiedMessage(
+                role="user",
+                content=[
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "in_content"}}
+                ],
+            ),
+        ]
+
+        result = merge_adjacent_messages(messages)
+
+        assert len(result) == 1
+        assert [image["data"] for image in result[0].images] == ["explicit", "in_content"]
+
+    def test_merges_content_block_images_without_duplicating_them(self):
+        """Content is merged before images are, so the fallback must not re-read it.
+
+        When neither message sets `images`, both lists come from content blocks -
+        and by the time the image merge runs, `last.content` already holds the
+        later message's blocks. Extracting from it there counts those blocks once
+        as the previous images and once as the current ones, so the model receives
+        the same picture twice and pays for it twice.
+        """
+        messages = [
+            UnifiedMessage(
+                role="user",
+                content=[{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "first"}}],
+            ),
+            UnifiedMessage(
+                role="user",
+                content=[
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "second"}},
+                    {"type": "text", "text": "e agora?"},
+                ],
+            ),
+        ]
+
+        result = merge_adjacent_messages(messages)
+
+        assert len(result) == 1
+        assert [image["data"] for image in result[0].images] == ["first", "second"]
+
+    def test_merges_images_from_both_messages_in_order(self):
+        """
+        What it does: Verifies images from both merged messages are concatenated.
+        Purpose: Merging is a concatenation for content and tool lists; images
+        must follow the same rule rather than one side winning.
+        """
+        print("Setup: Two user messages, each carrying an image...")
+        messages = [
+            UnifiedMessage(role="user", content="first", images=[{"media_type": "image/jpeg", "data": "first_data"}]),
+            UnifiedMessage(role="user", content="second", images=[{"media_type": "image/png", "data": "second_data"}]),
+        ]
+
+        print("Action: Merging messages...")
+        result = merge_adjacent_messages(messages)
+
+        assert len(result) == 1
+        assert [image["data"] for image in result[0].images] == ["first_data", "second_data"]
+
 
 # ==================================================================================================
 # Tests for ensure_first_message_is_user
@@ -2684,6 +2783,26 @@ class TestExtractToolResults:
         assert len(result) == 2
         assert result[0]["toolUseId"] == "call_1"
         assert result[1]["toolUseId"] == "call_2"
+
+    def test_reports_a_failed_tool_result_as_an_error(self):
+        """
+        What it does: Verifies is_error on the block becomes status="error".
+        Purpose: This function hardcoded status="success" while
+        convert_tool_results_to_kiro_format, thirty lines away, derived it from
+        is_error. Two functions filling the same Kiro field by different rules
+        meant a stack trace reached the model labelled as a successful result.
+        """
+        print("Setup: tool_result block flagged as an error...")
+        content = [
+            {"type": "tool_result", "tool_use_id": "call_boom", "content": "Traceback...", "is_error": True},
+            {"type": "tool_result", "tool_use_id": "call_ok", "content": "fine"},
+        ]
+
+        print("Action: Extracting tool results...")
+        result = extract_tool_results_from_content(content)
+
+        print(f"Result: {result}")
+        assert [item["status"] for item in result] == ["error", "success"]
 
 
 # ==================================================================================================

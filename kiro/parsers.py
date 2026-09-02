@@ -121,8 +121,18 @@ def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
             args = json.loads(json_str)
             tool_call_id = generate_tool_call_id()
             # index will be added later when forming the final response
+            # `_bracket` records provenance, not content. Recovery exists only to
+            # rescue a call the native channel missed, so a recovered call that
+            # the native channel did report is redundant by construction. The id
+            # here is minted locally and can never match the upstream one, so
+            # provenance is the only way to tell the echo from a real call.
             tool_calls.append(
-                {"id": tool_call_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(args)}}
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "_bracket": True,
+                    "function": {"name": func_name, "arguments": json.dumps(args)},
+                }
             )
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse tool call arguments: {json_str[:100]}")
@@ -130,14 +140,47 @@ def parse_bracket_tool_calls(response_text: str) -> List[Dict[str, Any]]:
     return tool_calls
 
 
+def tool_call_signature(tool_call: Dict[str, Any]) -> str:
+    """Identify a call by what it does, independent of how it was spelled.
+
+    The native channel re-serializes arguments compactly while bracket recovery
+    reads them out of prose, so the same call routinely arrives as two different
+    strings. Comparing the raw text would miss the match; unparseable arguments
+    fall back to it because there is nothing better to compare.
+    """
+    function = tool_call.get("function") or {}
+    name = function.get("name") or ""
+    raw_arguments = function.get("arguments")
+    if not isinstance(raw_arguments, str):
+        # Only a missing value becomes the empty object. Collapsing every falsy
+        # value would make 0, [] and False share a signature with a genuinely
+        # argument-less call of the same name. `default=str` keeps an
+        # unserializable value from raising inside a live stream, where the
+        # exception would truncate the response.
+        raw_arguments = json.dumps({} if raw_arguments is None else raw_arguments, sort_keys=True, default=str)
+    try:
+        canonical = json.dumps(json.loads(raw_arguments), sort_keys=True)
+    except (TypeError, ValueError):
+        canonical = raw_arguments
+    return f"{name}-{canonical}"
+
+
 def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Removes duplicate tool calls.
 
-    Deduplication occurs by two criteria:
-    1. By id - if there are multiple tool calls with the same id, keep the one with
-       more arguments (not empty "{}")
-    2. By name+arguments - remove complete duplicates
+    Deduplication occurs by three criteria:
+    1. By id - if there are multiple tool calls with the same id, keep the one
+       whose arguments actually parse, then the one with more arguments
+    2. By name+arguments - remove complete duplicates among calls without an id
+    3. By provenance - drop a bracket-recovered call the native channel already
+       reported, matched on name and canonical arguments
+
+    Criterion 3 is deliberately narrow. Two native calls with identical payloads
+    are a legitimate parallel invocation and both survive (see
+    test_preserves_distinct_ids_with_identical_payloads); suppressing every
+    recovered call whenever a native one exists is the wider guard that once
+    discarded a genuinely different call.
 
     Args:
         tool_calls: List of tool calls
@@ -160,9 +203,19 @@ def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, A
             # Duplicate by id exists - keep the one with more arguments
             existing_args = existing.get("function", {}).get("arguments", "{}")
             current_args = tc.get("function", {}).get("arguments", "{}")
+            existing_broken = bool(existing.get("_parse_error"))
+            current_broken = bool(tc.get("_parse_error"))
 
+            # Whether the arguments parse outranks how many there are. A
+            # truncated copy keeps its raw text while a good one is re-serialized
+            # compactly, so the broken copy is usually the longer of the two and
+            # won on size alone - handing the client arguments it cannot decode.
+            if existing_broken != current_broken:
+                if existing_broken:
+                    logger.debug(f"Replacing unparseable tool call {tc_id} with a decodable copy")
+                    by_id[tc_id] = tc
             # Prefer non-empty arguments
-            if current_args != "{}" and (existing_args == "{}" or len(current_args) > len(existing_args)):
+            elif current_args != "{}" and (existing_args == "{}" or len(current_args) > len(existing_args)):
                 logger.debug(
                     f"Replacing tool call {tc_id} with better arguments: {len(existing_args)} -> {len(current_args)}"
                 )
@@ -176,14 +229,20 @@ def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, A
     unique = list(result_with_id)
 
     for tc in result_without_id:
-        # Protection against None in function
-        func = tc.get("function") or {}
-        func_name = func.get("name") or ""
-        func_args = func.get("arguments") or "{}"
-        key = f"{func_name}-{func_args}"
+        key = tool_call_signature(tc)
         if key not in seen:
             seen.add(key)
             unique.append(tc)
+
+    # Drop recovered echoes of calls the native channel already delivered.
+    native_signatures = {tool_call_signature(tc) for tc in unique if not tc.get("_bracket")}
+    if native_signatures:
+        deduplicated = [
+            tc for tc in unique if not (tc.get("_bracket") and tool_call_signature(tc) in native_signatures)
+        ]
+        if len(deduplicated) != len(unique):
+            logger.debug(f"Dropped {len(unique) - len(deduplicated)} bracket echo(es) of native tool call(s)")
+            unique = deduplicated
 
     if len(tool_calls) != len(unique):
         logger.debug(f"Deduplicated tool calls: {len(tool_calls)} -> {len(unique)}")

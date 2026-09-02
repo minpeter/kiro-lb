@@ -81,6 +81,12 @@ class ChatMessage(BaseModel):
         name: Optional sender name
         tool_calls: List of tool calls (for assistant)
         tool_call_id: Tool call ID (for tool)
+        is_error: Whether a tool message reports a failure. Not part of OpenAI's
+            schema, but Kiro's toolResult carries a status and the Anthropic
+            protocol does define this flag, so a client that sends it is honoured.
+            Declared rather than read off the extra-allow bag so pydantic
+            validates it: `bool("false")` is True, which would have reported a
+            successful tool as failed.
     """
 
     role: str
@@ -90,6 +96,7 @@ class ChatMessage(BaseModel):
     tool_call_id: Optional[str] = None
     reasoning: Optional[str] = None
     reasoning_content: Optional[str] = None
+    is_error: Optional[bool] = None
 
     model_config = {"extra": "allow"}
 

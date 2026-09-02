@@ -51,19 +51,54 @@ class TestSuspensionDetection:
         assert is_suspension_error(403, _SUSPENDED_BODY_RUNTIME["message"]) is True
 
     def test_enhance_kiro_error_labels_the_runtime_suspension(self):
-        info = enhance_kiro_error(_SUSPENDED_BODY_RUNTIME)
+        info = enhance_kiro_error(_SUSPENDED_BODY_RUNTIME, status_code=403)
 
         assert info.reason == SUSPENSION_REASON
         assert "suspended" in info.user_message.lower()
 
     def test_enhance_kiro_error_labels_the_suspension(self):
-        info = enhance_kiro_error(_SUSPENDED_BODY)
+        info = enhance_kiro_error(_SUSPENDED_BODY, status_code=403)
 
         assert info.reason == SUSPENSION_REASON
         assert "suspended" in info.user_message.lower()
 
+    def test_enhance_kiro_error_does_not_label_a_400_echo_as_a_suspension(self):
+        """The status guard must survive the trip through enhance_kiro_error.
+
+        `is_suspension_error` takes the status precisely so payload wording cannot
+        be mistaken for a verdict about the account, but this function used to
+        pass a hardcoded 403 and defeated that guard. A validation error whose
+        message echoes prompt text containing the suspension wording then made
+        the gateway report a healthy account as locked, and hand back
+        reason=TEMPORARILY_SUSPENDED.
+        """
+        echoed = {"message": _SUSPENDED_BODY["message"], "reason": None}
+
+        info = enhance_kiro_error(echoed, status_code=400)
+
+        assert info.reason != SUSPENSION_REASON
+        assert "suspended by kiro" not in info.user_message.lower()
+
+    def test_enhance_kiro_error_without_a_status_does_not_claim_suspension(self):
+        """An unknown status is not evidence, so it must not convict the account."""
+        info = enhance_kiro_error(_SUSPENDED_BODY)
+
+        assert info.reason != SUSPENSION_REASON
+
     def test_plain_403_is_not_a_suspension(self):
         assert is_suspension_error(403, "Improperly formed request.") is False
+
+    def test_reason_code_is_conclusive_on_any_status(self):
+        """The reason field is set by the upstream, so it cannot be a payload echo.
+
+        Gating it on 403 like the wording heuristic would let a suspension
+        arriving with any other status slip through, leaving the account in
+        rotation burning attempts on a verdict it already reported.
+        """
+        assert is_suspension_error(500, None, SUSPENSION_REASON) is True
+        assert enhance_kiro_error({"message": "nope", "reason": SUSPENSION_REASON}, status_code=500).reason == (
+            SUSPENSION_REASON
+        )
 
     def test_suspension_wording_on_another_status_is_not_a_suspension(self):
         # Only an authorization refusal carries this meaning; the same words in a

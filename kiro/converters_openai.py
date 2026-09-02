@@ -56,6 +56,15 @@ def _extract_tool_results_from_openai(content: Any) -> List[Dict[str, Any]]:
                         "type": "tool_result",
                         "tool_use_id": item.get("tool_use_id", ""),
                         "content": extract_text_content(item.get("content", "")) or "(empty result)",
+                        # Kiro's toolResult has a status field and the Anthropic
+                        # adapter fills it from here. Omitting the key made every
+                        # failed tool read as a successful one downstream.
+                        #
+                        # Compared against True rather than coerced: this block
+                        # lives inside `content`, which is typed loosely and never
+                        # validated, so bool() would read the string "false" as a
+                        # failure and report a working tool as broken.
+                        "is_error": item.get("is_error") is True,
                     }
                 )
 
@@ -168,6 +177,11 @@ def convert_openai_messages_to_unified(messages: List[ChatMessage]) -> Tuple[str
                 "type": "tool_result",
                 "tool_use_id": msg.tool_call_id or "",
                 "content": extract_text_content(msg.content) or "(empty result)",
+                # OpenAI's schema has no failure flag on a tool message, but
+                # Kiro's toolResult does carry a status. The field is declared on
+                # ChatMessage so pydantic validates it; absent, False keeps the
+                # previous meaning.
+                "is_error": bool(msg.is_error),
             }
             pending_tool_results.append(tool_result)
             total_tool_results += 1

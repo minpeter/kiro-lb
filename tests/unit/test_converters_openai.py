@@ -82,6 +82,69 @@ class TestConvertOpenAIMessagesToUnified:
         assert len(unified[0].tool_results) == 1
         assert unified[0].tool_results[0]["tool_use_id"] == "call_123"
 
+    def test_marks_a_failed_tool_message_as_an_error(self):
+        """
+        What it does: Verifies is_error on a tool message survives conversion.
+        Purpose: Kiro's toolResult carries a status field and the Anthropic
+        adapter fills it, but this path never set is_error at all, so
+        convert_tool_results_to_kiro_format always reported "success". A tool
+        that failed was handed to the model as one that worked.
+        """
+        print("Setup: Tool message flagged as an error...")
+        messages = [
+            ChatMessage(role="tool", content="Traceback...", tool_call_id="call_boom", is_error=True),
+            ChatMessage(role="tool", content="fine", tool_call_id="call_ok"),
+        ]
+
+        print("Action: Converting messages...")
+        _system_prompt, unified = convert_openai_messages_to_unified(messages)
+
+        print(f"Unified tool_results: {unified[0].tool_results}")
+        assert [result.get("is_error") for result in unified[0].tool_results] == [True, False]
+
+    def test_marks_a_failed_tool_result_block_as_an_error(self):
+        """
+        What it does: Verifies is_error on an inline tool_result block survives.
+        Purpose: Some clients send Anthropic-shaped tool_result blocks inside an
+        OpenAI user message; those blocks do define is_error, and dropping it
+        loses the same fact as the tool-message path above.
+        """
+        print("Setup: User message carrying a failed tool_result block...")
+        messages = [
+            ChatMessage(
+                role="user",
+                content=[{"type": "tool_result", "tool_use_id": "call_boom", "content": "boom", "is_error": True}],
+            )
+        ]
+
+        print("Action: Converting messages...")
+        _system_prompt, unified = convert_openai_messages_to_unified(messages)
+
+        print(f"Unified tool_results: {unified[0].tool_results}")
+        assert unified[0].tool_results[0]["is_error"] is True
+
+    def test_a_non_boolean_is_error_does_not_mark_a_result_as_failed(self):
+        """Only a real boolean may flip the Kiro status.
+
+        An inline tool_result block lives inside `content`, which is typed
+        loosely and never validated, so `bool()` on it turned the string "false"
+        - and any other non-empty value - into a failure, reporting a working
+        tool as broken. The tool-message path is validated by pydantic instead.
+        """
+        messages = [
+            ChatMessage(
+                role="user",
+                content=[
+                    {"type": "tool_result", "tool_use_id": "c1", "content": "tudo certo", "is_error": "false"},
+                    {"type": "tool_result", "tool_use_id": "c2", "content": "falhou", "is_error": True},
+                ],
+            )
+        ]
+
+        _system_prompt, unified = convert_openai_messages_to_unified(messages)
+
+        assert [result["is_error"] for result in unified[0].tool_results] == [False, True]
+
     def test_converts_multiple_tool_messages(self):
         """
         What it does: Verifies conversion of multiple consecutive tool messages.
@@ -208,6 +271,7 @@ class TestConvertOpenAIMessagesToUnified:
                 "type": "tool_result",
                 "tool_use_id": "call_echo",
                 "content": "MULTITURN_ALPHA",
+                "is_error": False,
             }
         ]
         assert unified[3].content == "Reply with TOOL_CONTINUATION_OK"
