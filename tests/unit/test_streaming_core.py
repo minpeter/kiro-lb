@@ -23,6 +23,7 @@ from kiro.streaming_core import (
     KiroEvent,
     StreamResult,
     calculate_tokens_from_context_usage,
+    collect_stream_to_result,
     parse_kiro_stream,
     stream_with_first_token_retry,
 )
@@ -1083,3 +1084,57 @@ async def test_parse_stream_rejects_malformed_tool_input():
     ):
         async for _ in parse_kiro_stream(response):
             pass
+
+
+class TestCollectStreamToResultBracketRecovery:
+    """Bracket recovery in the non-streaming collector, driven by real frames."""
+
+    @staticmethod
+    def _response(chunks):
+        async def byte_stream():
+            for chunk in chunks:
+                yield chunk
+
+        response = MagicMock()
+        response.aiter_bytes.return_value = byte_stream()
+        return response
+
+    @pytest.mark.asyncio
+    async def test_bracket_echo_of_a_native_call_is_collected_once(self):
+        """The collector must not turn an echo into a second call or a second block.
+
+        Recovered calls were appended to the timeline whenever their id was absent
+        from it, and a recovered id is minted locally so it never matches. The
+        echo became a second tool_use block even after deduplication had removed
+        it from ``tool_calls``, leaving the two views of the same turn disagreeing.
+        """
+        chunks = [
+            b'{"name":"Edit","toolUseId":"toolu_native"}',
+            json.dumps({"input": '{"file_path":"a.py"}'}).encode(),
+            b'{"stop":true}',
+            json.dumps({"content": '[Called Edit with args: {"file_path": "a.py"}]'}).encode(),
+            b'{"contextUsagePercentage":5.0}',
+        ]
+
+        result = await collect_stream_to_result(self._response(chunks))
+
+        assert [call["id"] for call in result.tool_calls] == ["toolu_native"]
+        tool_blocks = [block for block in result.content_blocks if block["type"] == "tool_use"]
+        assert [block["tool"]["id"] for block in tool_blocks] == ["toolu_native"]
+
+    @pytest.mark.asyncio
+    async def test_bracket_call_the_native_channel_missed_is_still_collected(self):
+        """A recovered call with different arguments is a real call, not an echo."""
+        chunks = [
+            b'{"name":"Edit","toolUseId":"toolu_native"}',
+            json.dumps({"input": '{"file_path":"a.py"}'}).encode(),
+            b'{"stop":true}',
+            json.dumps({"content": '[Called Bash with args: {"command": "ls"}]'}).encode(),
+            b'{"contextUsagePercentage":5.0}',
+        ]
+
+        result = await collect_stream_to_result(self._response(chunks))
+
+        assert [(call.get("function") or {}).get("name") for call in result.tool_calls] == ["Edit", "Bash"]
+        tool_blocks = [block for block in result.content_blocks if block["type"] == "tool_use"]
+        assert len(tool_blocks) == 2

@@ -645,6 +645,163 @@ class TestStreamKiroToAnthropic:
         print("✓ Bracket tool calls handled correctly")
 
     @pytest.mark.asyncio
+    async def test_bracket_tool_call_emits_buffered_prose_before_the_tool_block(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Prose buffered behind an open thinking block must precede the tool it introduces.
+
+        Prose that arrives while a thinking block is open is held in a buffer, so
+        the only thing that can emit it is a flush. The bracket-recovery path ran
+        before that flush, which put the narration after the tool_use block - an
+        order the real API never produces for a `stop_reason: tool_use` turn.
+        Without thinking the same upstream stream came out in the right order,
+        which is what made this specific to a reasoning turn.
+        """
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="the user wants an edit")
+            yield KiroEvent(type="content", content="Vou editar o arquivo. ")
+            yield KiroEvent(type="content", content='[Called Edit with args: {"file_path": "a.py"}]')
+
+        bracket_tool_calls = [
+            {"id": "call_bracket", "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'}}
+        ]
+
+        chunks: list[str] = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=bracket_tool_calls):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-opus-5", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        assert_valid_content_event_order(events)
+        starts = [event for event in events if event["type"] == "content_block_start"]
+        assert [event["content_block"]["type"] for event in starts] == ["thinking", "text", "tool_use"]
+        assert [event["index"] for event in starts] == [0, 1, 2]
+        # The buffered narration must survive the reordering, not just move.
+        assert "".join(
+            event["delta"]["text"]
+            for event in events
+            if event["type"] == "content_block_delta" and event["delta"]["type"] == "text_delta"
+        ) == ('Vou editar o arquivo. [Called Edit with args: {"file_path": "a.py"}]')
+
+    @pytest.mark.asyncio
+    async def test_bracket_echo_of_a_native_tool_call_is_not_emitted_twice(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """A model that calls a tool natively and also echoes it must not run it twice.
+
+        This path never ran the recovered calls through deduplication at all, so
+        an echo became a second tool_use block with its own id. The client has no
+        way to tell it apart from a real parallel call and executes the same edit
+        again.
+        """
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={"id": "toolu_native", "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'}},
+            )
+            yield KiroEvent(type="content", content='[Called Edit with args: {"file_path": "a.py"}]')
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        echo = [
+            {
+                "id": "call_bracket",
+                "_bracket": True,
+                "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'},
+            }
+        ]
+
+        chunks: list[str] = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=echo):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-opus-5", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        assert_valid_content_event_order(events)
+        tool_starts = [
+            event
+            for event in events
+            if event["type"] == "content_block_start" and event["content_block"]["type"] == "tool_use"
+        ]
+        assert [event["content_block"]["id"] for event in tool_starts] == ["toolu_native"]
+
+    @pytest.mark.asyncio
+    async def test_bracket_call_absent_from_the_native_channel_is_still_recovered(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Suppression must be limited to the echo, never to a different call."""
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={"id": "toolu_native", "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'}},
+            )
+            yield KiroEvent(type="content", content='[Called Bash with args: {"command": "ls"}]')
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        recovered = [
+            {"id": "call_bracket", "_bracket": True, "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}
+        ]
+
+        chunks: list[str] = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=recovered):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-opus-5", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        assert_valid_content_event_order(events)
+        tool_starts = [
+            event
+            for event in events
+            if event["type"] == "content_block_start" and event["content_block"]["type"] == "tool_use"
+        ]
+        assert [event["content_block"]["name"] for event in tool_starts] == ["Edit", "Bash"]
+
+    @pytest.mark.asyncio
+    async def test_upstream_truncation_outranks_a_delivered_tool_call(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """An explicit upstream MAX_TOKENS stays `max_tokens`, even with a tool block sent.
+
+        This pins a deliberate asymmetry that reads like a bug. `content_was_truncated`
+        is inferred locally from missing completion signals, so it defers to a
+        delivered tool call; `is_truncated(upstream_stop_reason)` is the upstream
+        stating why it stopped, so it does not. Reporting `tool_use` here would
+        claim the turn finished by calling a tool when generation was actually cut
+        off mid-turn, hiding the calls the model never got to emit.
+        """
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={"id": "toolu_edit", "function": {"name": "Edit", "arguments": "{}"}},
+            )
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+            yield KiroEvent(type="stop_reason", stop_reason="MAX_TOKENS")
+
+        chunks: list[str] = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-opus-5", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        message_delta = next(event for event in events if event["type"] == "message_delta")
+        assert message_delta["delta"]["stop_reason"] == "max_tokens"
+
+    @pytest.mark.asyncio
     async def test_closes_response_on_completion(self, mock_response, mock_model_cache, mock_auth_manager):
         """
         What it does: Closes response on completion.

@@ -381,6 +381,80 @@ class TestDeduplicateToolCalls:
         call_1 = next(tc for tc in result if tc["id"] == "call_1")
         assert call_1["function"]["arguments"] == '{"x": 1}'
 
+    def test_bracket_recovery_of_an_already_native_call_is_dropped(self):
+        """A bracket echo of a call the native channel already reported must not double.
+
+        Bracket recovery mints a fresh id, so the id pass can never match the
+        native call, and the name+arguments pass only ever looked at id-less
+        entries. The echo therefore survived as a second call and the client
+        executed the same edit twice.
+        """
+        tool_calls = [
+            {"id": "toolu_native", "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'}},
+            {
+                "id": "call_bracket",
+                "_bracket": True,
+                "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'},
+            },
+        ]
+
+        result = deduplicate_tool_calls(tool_calls)
+
+        assert [call["id"] for call in result] == ["toolu_native"]
+
+    def test_bracket_call_the_native_channel_missed_survives(self):
+        """Only a provably redundant echo is suppressed, never a different call.
+
+        Dropping every bracket call whenever any native call exists is the wider
+        guard this project has already shipped once: it discarded a genuinely
+        different call. Redundancy has to be proven by name and arguments.
+        """
+        tool_calls = [
+            {"id": "toolu_native", "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'}},
+            {"id": "call_bracket", "_bracket": True, "function": {"name": "Bash", "arguments": '{"command": "ls"}'}},
+        ]
+
+        result = deduplicate_tool_calls(tool_calls)
+
+        assert [call["id"] for call in result] == ["toolu_native", "call_bracket"]
+
+    def test_bracket_duplicate_is_matched_despite_key_order_and_spacing(self):
+        """The native channel compacts its arguments; the echo comes from raw text.
+
+        Comparing the JSON strings verbatim would let the same call through twice
+        purely because the model spelled the object differently in prose.
+        """
+        tool_calls = [
+            {"id": "toolu_native", "function": {"name": "Edit", "arguments": '{"a":1,"b":2}'}},
+            {"id": "call_bracket", "_bracket": True, "function": {"name": "Edit", "arguments": '{"b": 2, "a": 1}'}},
+        ]
+
+        result = deduplicate_tool_calls(tool_calls)
+
+        assert [call["id"] for call in result] == ["toolu_native"]
+
+    def test_prefers_the_parseable_argument_over_the_longer_truncated_one(self):
+        """Length is the wrong tiebreaker when one copy failed to parse.
+
+        The parser compacts arguments that parse and leaves the truncated ones
+        raw, so the broken copy is routinely the longer one and won on size
+        alone - handing the client the arguments that cannot be decoded.
+        """
+        tool_calls = [
+            {
+                "id": "toolu_cut",
+                "function": {"name": "Write", "arguments": '{"path":"/tmp/x","content":"a very long unterminated'},
+                "_parse_error": {"type": "invalid_tool_arguments", "message": "boom"},
+            },
+            {"id": "toolu_cut", "function": {"name": "Write", "arguments": '{"path":"/tmp/x"}'}},
+        ]
+
+        result = deduplicate_tool_calls(tool_calls)
+
+        assert len(result) == 1
+        assert result[0]["function"]["arguments"] == '{"path":"/tmp/x"}'
+        assert "_parse_error" not in result[0]
+
 
 class TestAwsEventStreamParserInitialization:
     """Tests for AwsEventStreamParser initialization."""

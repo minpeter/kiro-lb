@@ -21,7 +21,7 @@ import httpx
 from loguru import logger
 
 from kiro.config import FIRST_TOKEN_MAX_RETRIES, FIRST_TOKEN_TIMEOUT
-from kiro.parsers import parse_bracket_tool_calls
+from kiro.parsers import parse_bracket_tool_calls, tool_call_signature
 from kiro.sse_validation import (
     StreamProtocolError,
     begin_anthropic_stream,
@@ -589,8 +589,33 @@ async def stream_kiro_to_anthropic(
             yield format_sse_event("message_start", message_start_data)
             message_started = True
 
-        # Check for bracket-style tool calls in full content
-        bracket_tool_calls = parse_bracket_tool_calls(full_content)
+        # Flush buffered prose before recovering any bracket call. Prose that
+        # arrived while a thinking block was open was never emitted, and the
+        # narration introduces the tool call, so emitting the tool first puts
+        # text after a `stop_reason: tool_use` block - an order the real API
+        # never produces. Only a reasoning turn buffers, which is why the
+        # inversion appeared exclusively with thinking enabled.
+        if pending_content:
+            for pending_chunk in flush_pending_content(True):
+                yield pending_chunk
+
+        # Check for bracket-style tool calls in full content. Recovery exists to
+        # rescue a call the native channel missed, so an echo of one it already
+        # delivered has to be dropped: this path ran no deduplication at all, and
+        # the recovered id is minted locally, so the echo became a second
+        # tool_use block that the client executes as a separate call.
+        # Redundancy is matched on name and canonical arguments, never on the
+        # mere presence of a native call - that wider rule has already discarded
+        # a genuinely different call once.
+        native_signatures = {
+            tool_call_signature({"function": {"name": block["name"], "arguments": json.dumps(block["input"])}})
+            for block in tool_blocks
+        }
+        bracket_tool_calls = [
+            tool_call
+            for tool_call in parse_bracket_tool_calls(full_content)
+            if tool_call_signature(tool_call) not in native_signatures
+        ]
         if bracket_tool_calls:
             # Close thinking block if open
             if thinking_block_started and thinking_block_index is not None:
@@ -642,10 +667,6 @@ async def stream_kiro_to_anthropic(
 
                 tool_blocks.append({"id": tool_id, "name": tool_name, "input": tool_input})
                 current_block_index += 1
-
-        if pending_content:
-            for pending_chunk in flush_pending_content(True):
-                yield pending_chunk
 
         # Close thinking block if still open
         if thinking_block_started and thinking_block_index is not None:

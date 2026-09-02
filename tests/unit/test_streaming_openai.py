@@ -1147,6 +1147,61 @@ class TestStreamingOpenaiBracketToolCalls:
 
         print("✓ Tool calls deduplicated")
 
+    @pytest.mark.asyncio
+    async def test_bracket_echo_of_a_native_call_reaches_the_client_once(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Real deduplication, not a mocked one: the echo must not become a second call.
+
+        The sibling test above patches ``deduplicate_tool_calls`` and therefore
+        asserts only that it was called. This one lets it run, because the defect
+        lived inside it: a recovered call carries a locally minted id, so the id
+        pass never matched and the name+arguments pass only ever inspected
+        id-less entries.
+        """
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_native",
+                    "type": "function",
+                    "function": {"name": "Edit", "arguments": '{"file_path":"a.py"}'},
+                },
+            )
+            yield KiroEvent(type="content", content='[Called Edit with args: {"file_path": "a.py"}]')
+            yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        echo = [
+            {
+                "id": "call_bracket",
+                "type": "function",
+                "_bracket": True,
+                "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'},
+            }
+        ]
+
+        chunks: list[str] = []
+        with patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream):
+            with patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=echo):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        emitted = [
+            call
+            for chunk in chunks
+            if chunk.startswith("data: ") and chunk[len("data: ") :].strip() != "[DONE]"
+            for choice in json.loads(chunk[len("data: ") :].strip()).get("choices", [])
+            for call in (choice.get("delta") or {}).get("tool_calls") or []
+        ]
+
+        assert [call["id"] for call in emitted] == ["toolu_native"]
+        # Provenance is internal bookkeeping and must never reach a client.
+        assert all("_bracket" not in call for call in emitted)
+        assert all("_bracket" not in chunk for chunk in chunks)
+
 
 # ==================================================================================================
 # Tests for metering data

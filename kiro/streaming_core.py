@@ -300,9 +300,16 @@ async def collect_stream_to_result(
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
+        # Only calls that survived deduplication may join the timeline. Keying
+        # this on the id alone let an echo through every time: a recovered id is
+        # minted locally, so it is never present in the native timeline, and the
+        # block was appended even after deduplication had already dropped the
+        # call - leaving content_blocks and tool_calls describing different turns.
+        surviving_ids = {tool_call.get("id") for tool_call in result.tool_calls}
         timeline_tool_ids = {block["tool"].get("id") for block in result.content_blocks if block["type"] == "tool_use"}
         for tool_call in bracket_tool_calls:
-            if tool_call.get("id") not in timeline_tool_ids:
+            tool_call_id = tool_call.get("id")
+            if tool_call_id in surviving_ids and tool_call_id not in timeline_tool_ids:
                 result.content_blocks.append(
                     {
                         "type": "tool_use",
