@@ -1244,6 +1244,31 @@ class TestMergeAdjacentMessages:
         assert len(result[0].images) == 1
         assert result[0].images[0]["data"] == TEST_IMAGE_BASE64
 
+    def test_merges_images_across_mixed_representations(self):
+        """An image can live in `images` or inside a content block; both must survive.
+
+        `build_kiro_payload` reads `msg.images or extract_images_from_content(...)`,
+        so once the merged message has any explicit image the content blocks are
+        never inspected and whatever they carried is dropped. Neither adapter
+        produces this mix today - both populate `images` whenever content holds
+        one - but the merge is reachable from the core directly, and losing an
+        image silently is the failure this whole area exists to prevent.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="", images=[{"media_type": "image/png", "data": "explicit"}]),
+            UnifiedMessage(
+                role="user",
+                content=[
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "in_content"}}
+                ],
+            ),
+        ]
+
+        result = merge_adjacent_messages(messages)
+
+        assert len(result) == 1
+        assert [image["data"] for image in result[0].images] == ["explicit", "in_content"]
+
     def test_merges_images_from_both_messages_in_order(self):
         """
         What it does: Verifies images from both merged messages are concatenated.

@@ -123,6 +123,28 @@ class TestConvertOpenAIMessagesToUnified:
         print(f"Unified tool_results: {unified[0].tool_results}")
         assert unified[0].tool_results[0]["is_error"] is True
 
+    def test_a_non_boolean_is_error_does_not_mark_a_result_as_failed(self):
+        """Only a real boolean may flip the Kiro status.
+
+        An inline tool_result block lives inside `content`, which is typed
+        loosely and never validated, so `bool()` on it turned the string "false"
+        - and any other non-empty value - into a failure, reporting a working
+        tool as broken. The tool-message path is validated by pydantic instead.
+        """
+        messages = [
+            ChatMessage(
+                role="user",
+                content=[
+                    {"type": "tool_result", "tool_use_id": "c1", "content": "tudo certo", "is_error": "false"},
+                    {"type": "tool_result", "tool_use_id": "c2", "content": "falhou", "is_error": True},
+                ],
+            )
+        ]
+
+        _system_prompt, unified = convert_openai_messages_to_unified(messages)
+
+        assert [result["is_error"] for result in unified[0].tool_results] == [False, True]
+
     def test_converts_multiple_tool_messages(self):
         """
         What it does: Verifies conversion of multiple consecutive tool messages.

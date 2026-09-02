@@ -187,6 +187,9 @@ async def stream_kiro_to_anthropic(
     text_block_index: Optional[int] = None
     pending_content: List[str] = []
     tool_blocks: List[Dict[str, Any]] = []
+    # Signatures of calls the gateway answered itself, which therefore never
+    # appear in tool_blocks but are just as delivered as the ones that do.
+    intercepted_signatures: set[str] = set()
     upstream_stop_reason: Optional[str] = None
     received_upstream_event = False
 
@@ -520,6 +523,14 @@ async def stream_kiro_to_anthropic(
                         )
                         current_block_index += 1
 
+                        # This call was answered here, so it never joins
+                        # tool_blocks. Record its signature anyway: bracket
+                        # recovery has to see it as already delivered, or an echo
+                        # of it becomes a tool_use block the client runs itself,
+                        # performing the same search a second time.
+                        intercepted_signatures.add(
+                            tool_call_signature({"function": {"name": tool_name, "arguments": json.dumps(tool_input)}})
+                        )
                         summary = generate_search_summary(query, results)
                         pending_response = await make_search_request(tool_id, query, summary)
                         upstream_stop_reason = None
@@ -610,7 +621,7 @@ async def stream_kiro_to_anthropic(
         native_signatures = {
             tool_call_signature({"function": {"name": block["name"], "arguments": json.dumps(block["input"])}})
             for block in tool_blocks
-        }
+        } | intercepted_signatures
         bracket_tool_calls = [
             tool_call
             for tool_call in parse_bracket_tool_calls(full_content)

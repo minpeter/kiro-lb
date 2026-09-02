@@ -969,9 +969,16 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
             # tell an absent image from one the client never sent. The OpenAI
             # adapter produces exactly this shape, since flushing pending tool
             # results emits a user turn that the next user turn merges into.
-            if msg.images:
-                last.images = list(last.images or []) + list(msg.images)
-                total_images_merged += len(msg.images)
+            #
+            # Both representations are read, matching what build_kiro_payload
+            # does downstream. It resolves `msg.images or extract(content)`, so
+            # once the merged message holds any explicit image the content blocks
+            # stop being inspected - and anything they carried would be lost.
+            current_images = msg.images or extract_images_from_content(msg.content)
+            if current_images:
+                previous_images = last.images or extract_images_from_content(last.content)
+                last.images = list(previous_images) + list(current_images)
+                total_images_merged += len(current_images)
 
             # Count merges by role
             if msg.role in merge_counts:

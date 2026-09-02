@@ -733,6 +733,75 @@ class TestStreamKiroToAnthropic:
         assert [event["content_block"]["id"] for event in tool_starts] == ["toolu_native"]
 
     @pytest.mark.asyncio
+    async def test_bracket_echo_of_an_intercepted_web_search_is_not_re_emitted(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """An intercepted web_search is served locally and never joins tool_blocks.
+
+        The redundancy check reads the native signatures out of `tool_blocks`, and
+        the interception path returns before appending to it, so an echo of the
+        very call that was just answered looked unseen and became a `tool_use`
+        block the client would execute itself - a second, real search.
+        """
+
+        async def first_then_followup(*args, **kwargs):
+            if first_then_followup.calls == 0:
+                first_then_followup.calls += 1
+                yield KiroEvent(
+                    type="tool_use",
+                    tool_use={
+                        "id": "toolu_ws",
+                        "function": {"name": "web_search", "arguments": '{"query": "kiro news"}'},
+                    },
+                )
+                yield KiroEvent(type="content", content='[Called web_search with args: {"query": "kiro news"}]')
+                yield KiroEvent(type="context_usage", context_usage_percentage=4.0)
+            else:
+                yield KiroEvent(type="content", content="here is what I found")
+                yield KiroEvent(type="context_usage", context_usage_percentage=5.0)
+
+        first_then_followup.calls = 0
+
+        echo = [
+            {
+                "id": "call_bracket_ws",
+                "_bracket": True,
+                "function": {"name": "web_search", "arguments": '{"query": "kiro news"}'},
+            }
+        ]
+
+        async def make_search_request(tool_use_id, query, result_content):
+            followup = AsyncMock()
+            followup.status_code = 200
+            return followup
+
+        chunks: list[str] = []
+        with (
+            patch("kiro.streaming_anthropic.parse_kiro_stream", first_then_followup),
+            patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=echo),
+            patch(
+                "kiro.mcp_tools.call_kiro_mcp_api",
+                AsyncMock(return_value=("srvtoolu_1", {"results": [{"title": "t", "url": "u", "snippet": "s"}]})),
+            ),
+        ):
+            async for chunk in stream_kiro_to_anthropic(
+                mock_response,
+                "claude-opus-5",
+                mock_model_cache,
+                mock_auth_manager,
+                make_search_request=make_search_request,
+            ):
+                chunks.append(chunk)
+
+        events = parse_sse_events(chunks)
+        assert_valid_content_event_order(events)
+        starts = [event["content_block"] for event in events if event["type"] == "content_block_start"]
+        # server_tool_use is the gateway answering the search itself; a plain
+        # tool_use block would be the client running it a second time.
+        assert [block["type"] for block in starts].count("tool_use") == 0, [block["type"] for block in starts]
+        assert "server_tool_use" in [block["type"] for block in starts]
+
+    @pytest.mark.asyncio
     async def test_bracket_call_absent_from_the_native_channel_is_still_recovered(
         self, mock_response, mock_model_cache, mock_auth_manager
     ):

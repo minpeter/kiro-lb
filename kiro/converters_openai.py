@@ -59,7 +59,12 @@ def _extract_tool_results_from_openai(content: Any) -> List[Dict[str, Any]]:
                         # Kiro's toolResult has a status field and the Anthropic
                         # adapter fills it from here. Omitting the key made every
                         # failed tool read as a successful one downstream.
-                        "is_error": bool(item.get("is_error", False)),
+                        #
+                        # Compared against True rather than coerced: this block
+                        # lives inside `content`, which is typed loosely and never
+                        # validated, so bool() would read the string "false" as a
+                        # failure and report a working tool as broken.
+                        "is_error": item.get("is_error") is True,
                     }
                 )
 

@@ -375,6 +375,11 @@ class KiroHttpClient:
                 error_info = classify_network_error(e)
                 last_error_info = error_info
                 last_raw_error = e
+                # The newest failure is the one that describes reality. A status
+                # recorded on an earlier attempt would otherwise be returned by
+                # the post-loop check ahead of this error, and the proxy and
+                # endpoint layers rotate on a transport error, not on a status.
+                last_response = None
 
                 # Log with user-friendly message
                 short_msg = get_short_error_message(error_info)
@@ -393,6 +398,9 @@ class KiroHttpClient:
                 error_info = classify_network_error(e)
                 last_error_info = error_info
                 last_raw_error = e
+                # See the timeout branch: a stale status must not outrank the
+                # transport failure that actually ended the attempt.
+                last_response = None
 
                 # Log with user-friendly message
                 short_msg = get_short_error_message(error_info)

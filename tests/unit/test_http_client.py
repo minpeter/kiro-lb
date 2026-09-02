@@ -1342,6 +1342,42 @@ class TestExhaustedRetriesReachTheCaller:
         assert mock_auth_manager_for_http.force_refresh.await_count >= 1
 
     @pytest.mark.asyncio
+    async def test_a_later_transport_failure_outranks_an_earlier_http_refusal(self, mock_auth_manager_for_http):
+        """The last thing that happened is what the caller must act on.
+
+        Recording the 403 so it can be classified made it linger: a transport
+        failure on a later attempt left the stale 403 in `last_response`, and the
+        post-loop check returns a response before it raises, so the proxy and
+        endpoint layers - which rotate on a transport error and not on a status -
+        were handed a 403 that no longer described reality and never rotated.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+
+        forbidden = AsyncMock()
+        forbidden.status_code = 403
+        forbidden.aread = AsyncMock(return_value=b'{"message": "Forbidden", "reason": null}')
+
+        attempts = {"count": 0}
+
+        async def request(*args, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                return forbidden
+            raise httpx.ConnectError("connection refused")
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.request = AsyncMock(side_effect=request)
+
+        with (
+            patch.object(http_client, "_get_client", return_value=mock_client),
+            patch("kiro.http_client.get_kiro_headers", return_value={}),
+            patch("kiro.http_client.asyncio.sleep", new=AsyncMock()),
+        ):
+            with pytest.raises(httpx.ConnectError):
+                await http_client._attempt_endpoint("POST", "https://api.example.com/test", {"a": 1})
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("status_code", [503, 429])
     async def test_an_exhausted_error_stream_still_carries_its_body(self, status_code, mock_auth_manager_for_http):
         """The error body must survive the stream being discarded.
