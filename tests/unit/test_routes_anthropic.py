@@ -904,12 +904,12 @@ class TestMessagesErrorFormat:
         print(f"Response: {response.json()}")
         assert response.status_code == 401
 
-        # Check Anthropic error format
+        # Check Anthropic error format: the spec envelope IS the response body,
+        # with no FastAPI {"detail"} wrapper around it.
         data = response.json()
-        assert "detail" in data
-        detail = data["detail"]
-        assert "type" in detail
-        assert "error" in detail
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "authentication_error"
+        assert data["error"]["message"]
 
 
 # =============================================================================
@@ -1673,10 +1673,8 @@ class TestCountTokensEndpoint:
 
         print("Checking: Error format is Anthropic-style...")
         data = response.json()
-        assert "detail" in data
-        detail = data["detail"]
-        assert "error" in detail
-        assert detail["error"]["type"] == "authentication_error"
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "authentication_error"
 
         print("✅ Invalid API key rejected")
 

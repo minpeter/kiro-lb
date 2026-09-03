@@ -276,3 +276,150 @@ class TestValidationExceptionHandlerEdgeCases:
 
             body = json.loads(response.body.decode())
             assert "Привет мир" in body["body"]
+
+
+class TestDataPlaneErrorShapes:
+    """Tests that /v1/* errors carry the client-spec envelope."""
+
+    def test_openai_route_422_uses_openai_error_shape(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies a validation failure on an OpenAI route returns
+            {"error": {message, type, param, code}}.
+        Purpose: OpenAI SDKs read error.message; FastAPI's {"detail"} breaks them.
+        """
+        print("Action: POST /v1/chat/completions without messages...")
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={"model": "claude-sonnet-4-5"},
+        )
+
+        body = response.json()
+        print(f"Comparing body: Expected OpenAI error envelope, Got {body}")
+
+        assert response.status_code == 422
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["message"]
+        assert body["error"]["param"] == "body.messages"
+        assert body["error"]["code"] is None
+
+    def test_openai_route_401_uses_openai_error_shape(self, test_client):
+        """
+        What it does: Verifies an auth failure on /v1/models is OpenAI-shaped.
+        Purpose: The same envelope must cover HTTPException, not just 422.
+        """
+        print("Action: GET /v1/models without a key...")
+        response = test_client.get("/v1/models")
+
+        body = response.json()
+        print(f"Comparing body: Expected OpenAI error envelope, Got {body}")
+
+        assert response.status_code == 401
+        assert body["error"]["type"] == "authentication_error"
+        assert isinstance(body["error"]["message"], str)
+
+    def test_anthropic_route_422_uses_anthropic_error_shape(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies /v1/messages validation errors use the Anthropic
+            envelope {"type": "error", "error": {type, message}}.
+        Purpose: Anthropic SDKs parse the top-level error envelope.
+        """
+        print("Action: POST /v1/messages without messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={"model": "claude-sonnet-4-5", "max_tokens": 16},
+        )
+
+        body = response.json()
+        print(f"Comparing body: Expected Anthropic error envelope, Got {body}")
+
+        assert response.status_code == 422
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["message"]
+
+    def test_anthropic_route_401_uses_anthropic_error_shape(self, test_client):
+        """
+        What it does: Verifies /v1/messages auth failures use the Anthropic envelope.
+        Purpose: Auth errors are the first thing a client sees; shape must match.
+        """
+        print("Action: POST /v1/messages without a key...")
+        response = test_client.post(
+            "/v1/messages",
+            json={"model": "claude-sonnet-4-5", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        body = response.json()
+        print(f"Comparing body: Expected Anthropic error envelope, Got {body}")
+
+        assert response.status_code == 401
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "authentication_error"
+
+
+class TestControlPlaneBodiesUnchanged:
+    """Tests that non-/v1 routes keep their historical error bodies."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_error_body_is_not_reshaped(self):
+        """
+        What it does: Verifies a control-plane HTTPException keeps FastAPI's
+            {"detail": ...} body instead of the OpenAI envelope.
+        Purpose: The dashboard UI parses 'detail'; reshaping it would break it.
+
+        Driven through the handler directly rather than the TestClient: other
+        modules reload kiro.dashboard, so a live request's auth outcome depends
+        on collection order, while the handler's path routing is what this
+        guarantee actually rests on.
+        """
+        import json
+
+        from fastapi import HTTPException
+
+        from kiro.exceptions import http_exception_handler
+
+        print("Setup: Building a control-plane request for /api/dashboard/accounts...")
+        mock_request = MagicMock(spec=Request)
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/api/dashboard/accounts"
+
+        print("Action: Handling a 401 HTTPException...")
+        response = await http_exception_handler(
+            mock_request, HTTPException(status_code=401, detail="Dashboard authentication required")
+        )
+
+        body = json.loads(response.body.decode())
+        print(f"Comparing body: Expected FastAPI detail body, Got {body}")
+
+        assert response.status_code == 401
+        assert "error" not in body
+        assert body["detail"] == "Dashboard authentication required"
+
+    @pytest.mark.asyncio
+    async def test_internal_handoff_error_body_is_not_reshaped(self):
+        """
+        What it does: Verifies /_internal/* HTTPException bodies keep 'detail'.
+        Purpose: The blue/green deploy script parses the control-plane body.
+        """
+        import json
+
+        from fastapi import HTTPException
+
+        from kiro.exceptions import http_exception_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/_internal/handoff/ready"
+
+        print("Action: Handling a 403 HTTPException on a handoff route...")
+        response = await http_exception_handler(
+            mock_request, HTTPException(status_code=403, detail="handoff control is direct-slot only")
+        )
+
+        body = json.loads(response.body.decode())
+        print(f"Comparing body: Expected FastAPI detail body, Got {body}")
+
+        assert response.status_code == 403
+        assert "error" not in body
+        assert body["detail"] == "handoff control is direct-slot only"

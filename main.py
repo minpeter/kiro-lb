@@ -72,7 +72,7 @@ from kiro.dashboard import (
 )
 from kiro.debug_middleware import DebugLoggerMiddleware
 from kiro.endpoint_settings import load_from_store as load_endpoint_settings
-from kiro.exceptions import validation_exception_handler
+from kiro.exceptions import http_exception_handler, validation_exception_handler
 from kiro.gateway_tunables import load_all as load_gateway_tunables
 from kiro.prompt_filter import load_from_store as load_prompt_filter_setting
 from kiro.routes_anthropic import router as anthropic_router
@@ -516,6 +516,14 @@ app.add_middleware(DebugLoggerMiddleware)
 app.add_exception_handler(
     RequestValidationError,
     validation_exception_handler,  # type: ignore[arg-type]  # Starlette types handlers invariantly as Exception.
+)
+
+# --- HTTP Exception Handler Registration ---
+# Shapes data-plane (/v1/*) error bodies per the OpenAI/Anthropic specs;
+# control-plane routes keep FastAPI's native {"detail": ...} body.
+app.add_exception_handler(
+    HTTPException,
+    http_exception_handler,  # type: ignore[arg-type]  # Starlette types handlers invariantly as Exception.
 )
 
 
