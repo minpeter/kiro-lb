@@ -121,9 +121,14 @@ export function useDashboard(): DashboardState {
   }, []);
 
   // ``quiet`` skips the loading flag: a background poll must not swap the table
-  // for skeletons every few seconds, which reads as flashing.
+  // for skeletons every few seconds, which reads as flashing. Only non-quiet
+  // calls advance the generation counter: a quiet tick superseding an
+  // operator-initiated load discarded its response while the `finally` below
+  // cleared the flag only for the latest id, leaving the table on skeletons
+  // forever. Concurrent quiet calls share a generation; the newest one wins
+  // because it awaits later.
   const loadLogs = useCallback(async (nextLimit: number, nextOffset: number, quiet = false) => {
-    const requestId = ++logRequestId.current;
+    const requestId = quiet ? logRequestId.current : ++logRequestId.current;
     if (!quiet) setIsLogsLoading(true);
     try {
       const page = await dashboardApi.requestLogs(nextLimit, nextOffset, logModel, logOrder);

@@ -16,6 +16,7 @@ interface Harness {
   latestAuth?: boolean;
   latestConnectionError?: string | null;
   latestActionError?: string | null;
+  latestLogsLoading?: boolean;
   timers: Timer[];
   timerDelays: number[];
   api: {
@@ -71,6 +72,7 @@ const STATE_RATE = 6;
 // polls once authenticated. Previously the literal 12, which the new
 // accountTokenUsage state shifted to 13.
 const STATE_IS_AUTHENTICATED = 13;
+const STATE_IS_LOGS_LOADING = 12;
 // New states are appended at the end of the hook precisely so the indices
 // above stay put.
 const STATE_CONNECTION_ERROR = 16;
@@ -91,6 +93,7 @@ vi.mock("react", () => {
       if (index === STATE_IS_AUTHENTICATED) harness.latestAuth = value as boolean;
       if (index === STATE_CONNECTION_ERROR) harness.latestConnectionError = value as string | null;
       if (index === STATE_ACTION_ERROR) harness.latestActionError = value as string | null;
+      if (index === STATE_IS_LOGS_LOADING) harness.latestLogsLoading = value as boolean;
     }];
   }
   return { useCallback: <T,>(callback: T) => callback, useEffect, useRef, useState };
@@ -300,6 +303,33 @@ describe("useDashboard", () => {
       actionError: harness.latestActionError,
       resynced: harness.api.overview.mock.calls.length > overviewCallsBefore,
     }).toEqual({ actionError: "delete rejected", resynced: true });
+  });
+
+  it("a quiet live tick cannot strand the table on its loading skeleton", async () => {
+    mockHealthyLoad();
+    const dashboard = useDashboard();
+    await awaitCompletion(dashboard.reload(), 1_000);
+
+    // Operator changes the log page: the non-quiet load starts and its response
+    // is slow.
+    const slowPage = deferred<RequestLogPage>();
+    harness.api.requestLogs.mockReturnValueOnce(slowPage.promise);
+    const pageLoad = dashboard.reload();
+    // Let the microtask chain reach loadLogs before asserting the flag.
+    await new Promise((resolve) => realSetTimeout(resolve, 0));
+    expect(harness.latestLogsLoading).toBe(true);
+
+    // The 1-second live tick fires while the page load is in flight; its quiet
+    // log fetch resolves immediately.
+    harness.api.requestLogs.mockResolvedValueOnce(logs);
+    harness.effects[1]!();
+    await awaitCompletion(harness.timers.at(-1)!(), 1_000);
+
+    // The operator's page load resolves; its response was superseded by the tick.
+    slowPage.resolve({ logs: [], total: 1, limit: 25, offset: 25, hasMore: false });
+    await awaitCompletion(pageLoad, 1_000);
+
+    expect(harness.latestLogsLoading).toBe(false);
   });
 
   it("backs off the live poll while failing and resets the cadence on recovery", async () => {
