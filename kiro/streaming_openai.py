@@ -22,7 +22,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FIRST_TOKEN_TIMEOUT,
 )
-from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls
+from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls, tool_call_signature
 from kiro.sse_validation import (
     StreamProtocolError,
     begin_openai_stream,
@@ -154,6 +154,7 @@ async def stream_kiro_to_openai_internal(
     upstream_stop_reason = None
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    intercepted_signatures: set[str] = set()
     received_upstream_event = False
 
     begin_openai_stream()
@@ -282,6 +283,17 @@ async def stream_kiro_to_openai_internal(
                             # Accumulate for token counting
                             full_content += summary
 
+                            # This call was answered here, so it never joins
+                            # tool_calls_from_stream. Record its signature anyway:
+                            # bracket recovery has to see it as already delivered,
+                            # or an echo of it becomes a tool_calls delta the
+                            # client executes itself, running the same search twice.
+                            intercepted_signatures.add(
+                                tool_call_signature(
+                                    {"function": {"name": tool_name, "arguments": json.dumps(tool_input)}}
+                                )
+                            )
+
                             # Skip normal tool_use processing
                             continue
 
@@ -311,6 +323,15 @@ async def stream_kiro_to_openai_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
+        # An intercepted web_search was answered above and never joined the
+        # stream list, so dedup's native signatures cannot see it; drop its
+        # bracket echo explicitly, mirroring the Anthropic path.
+        if intercepted_signatures:
+            all_tool_calls = [
+                tc
+                for tc in all_tool_calls
+                if not (tc.get("_bracket") and tool_call_signature(tc) in intercepted_signatures)
+            ]
         if not parallel_tool_calls and len(all_tool_calls) > 1:
             logger.info(f"parallel_tool_calls=false: forwarding the first of {len(all_tool_calls)} calls")
             all_tool_calls = all_tool_calls[:1]

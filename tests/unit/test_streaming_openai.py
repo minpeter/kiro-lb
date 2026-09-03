@@ -572,6 +572,98 @@ class TestStreamKiroToOpenai:
         mock_response.aclose.assert_called()
         print("✓ Response closed on error")
 
+    @pytest.mark.asyncio
+    async def test_bracket_echo_of_an_intercepted_web_search_is_not_re_emitted(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """An intercepted web_search is answered locally and never joins the stream list.
+
+        The deduplication reads native signatures from `tool_calls_from_stream`,
+        and the interception path `continue`s before appending to it, so an echo
+        of the very call that was just answered looked unseen and became a real
+        `tool_calls` delta the client executes itself - the same search twice.
+        """
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={
+                    "id": "toolu_ws",
+                    "function": {"name": "web_search", "arguments": '{"query": "kiro news"}'},
+                },
+            )
+            yield KiroEvent(type="content", content='[Called web_search with args: {"query": "kiro news"}]')
+            yield KiroEvent(type="context_usage", context_usage_percentage=4.0)
+
+        echo = [
+            {
+                "id": "call_bracket_ws",
+                "_bracket": True,
+                "function": {"name": "web_search", "arguments": '{"query": "kiro news"}'},
+            }
+        ]
+
+        chunks: list[str] = []
+        with (
+            patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream),
+            patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=echo),
+            patch(
+                "kiro.mcp_tools.call_kiro_mcp_api",
+                AsyncMock(return_value=("srvtoolu_1", {"results": [{"title": "t", "url": "u", "snippet": "s"}]})),
+            ),
+        ):
+            async for chunk in stream_kiro_to_openai(
+                mock_http_client, mock_response, "claude-opus-5", mock_model_cache, mock_auth_manager
+            ):
+                chunks.append(chunk)
+
+        tool_deltas = [
+            line for line in chunks if line.startswith("data: ") and "tool_calls" in line and "[DONE]" not in line
+        ]
+        assert tool_deltas == [], tool_deltas
+
+    @pytest.mark.asyncio
+    async def test_bracket_call_absent_from_the_native_channel_is_still_recovered(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """Suppression is limited to the echo, never to a genuinely different call."""
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(
+                type="tool_use",
+                tool_use={"id": "toolu_native", "function": {"name": "Edit", "arguments": '{"file_path": "a.py"}'}},
+            )
+            yield KiroEvent(type="content", content='[Called Bash with args: {"command": "ls"}]')
+            yield KiroEvent(type="context_usage", context_usage_percentage=4.0)
+
+        bracket = [
+            {
+                "id": "call_bracket_bash",
+                "_bracket": True,
+                "function": {"name": "Bash", "arguments": '{"command": "ls"}'},
+            }
+        ]
+
+        chunks: list[str] = []
+        with (
+            patch("kiro.streaming_openai.parse_kiro_stream", mock_parse_kiro_stream),
+            patch("kiro.streaming_openai.parse_bracket_tool_calls", return_value=bracket),
+        ):
+            async for chunk in stream_kiro_to_openai(
+                mock_http_client, mock_response, "claude-opus-5", mock_model_cache, mock_auth_manager
+            ):
+                chunks.append(chunk)
+
+        names = [json.loads(line[6:]) for line in chunks if line.startswith("data: ") and "[DONE]" not in line]
+        call_names = [
+            call["function"]["name"]
+            for event in names
+            for choice in event.get("choices", [])
+            for call in choice.get("delta", {}).get("tool_calls", [])
+        ]
+        assert "Edit" in call_names
+        assert "Bash" in call_names
+
 
 # ==================================================================================================
 # Tests for thinking content handling
