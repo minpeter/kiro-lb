@@ -34,6 +34,7 @@ const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
   cooling_down: "cooling down",
   suspended: "BANNED",
   auth_dead: "AUTH DEAD",
+  disabled: "disabled",
   uninitialized: "pending",
 };
 

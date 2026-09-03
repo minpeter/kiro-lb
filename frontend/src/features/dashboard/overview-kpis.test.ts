@@ -14,6 +14,25 @@ describe("deriveOverviewKpis", () => {
     expect(result.routableAccounts).toEqual({ count: 2, total: 4, isCritical: false });
   });
 
+  it("excludes disabled accounts from both the routable count and the total", () => {
+    const result = deriveOverviewKpis(
+      [
+        { routingState: "available" },
+        { routingState: "disabled" },
+        { routingState: "available" },
+      ],
+      { requests24h: 3, successes24h: 2 },
+    );
+
+    expect(result.routableAccounts).toEqual({ count: 2, total: 2, isCritical: false });
+  });
+
+  it("marks a pool where every account is disabled as critical", () => {
+    const result = deriveOverviewKpis(accounts("disabled", "disabled"), { requests24h: 0, successes24h: 0 });
+
+    expect(result.routableAccounts.isCritical).toBe(true);
+  });
+
   it("marks a non-empty pool with no routable accounts as critical", () => {
     const result = deriveOverviewKpis(accounts("quota_exhausted", "suspended"), {
       requests24h: 0,

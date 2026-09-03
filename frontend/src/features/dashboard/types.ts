@@ -37,6 +37,12 @@ export type AccountRoutingState =
    * re-login clears it.
    */
   | "auth_dead"
+  /**
+   * The operator turned the account off; it stays in the pool listing but can
+   * never serve. The KPIs exclude it from both the routable count and the
+   * total, matching the info panel's enabled filter.
+   */
+  | "disabled"
   | "uninitialized";
 
 export type Account = {

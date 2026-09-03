@@ -1,7 +1,7 @@
 import { isUnroutable } from "./routing-state";
 import type { Account, Overview } from "./types";
 
-type RoutingAccount = Pick<Account, "routingState">;
+type RoutingAccount = Pick<Account, "routingState" | "enabled">;
 type RequestOverview = Pick<Overview, "requests24h" | "successes24h">;
 
 export type OverviewKpis = {
@@ -21,8 +21,17 @@ export function deriveOverviewKpis(
   accounts: readonly RoutingAccount[],
   overview: RequestOverview,
 ): OverviewKpis {
-  const routableCount = accounts.filter((account) => !isUnroutable(account.routingState)).length;
-  const totalAccounts = accounts.length;
+  // Disabled accounts stay listed but cannot serve; counting them in either
+  // the numerator or the total desyncs this KPI from the info panel, which
+  // filters on `enabled` ("3 of 2" rows, an all-disabled pool reading healthy).
+  // The backend marks them twice (routingState "disabled", enabled false), so
+  // either signal excludes.
+  const enabledAccounts = accounts.filter(
+    (account) => account.enabled !== false && account.routingState !== "disabled",
+  );
+  const routableCount = enabledAccounts.filter((account) => !isUnroutable(account.routingState)).length;
+  const totalAccounts = enabledAccounts.length;
+  const hasAccounts = accounts.length > 0;
   const hasTraffic = overview.requests24h > 0;
   const successPercent = hasTraffic ? (overview.successes24h / overview.requests24h) * 100 : null;
 
@@ -30,7 +39,9 @@ export function deriveOverviewKpis(
     routableAccounts: {
       count: routableCount,
       total: totalAccounts,
-      isCritical: totalAccounts > 0 && routableCount === 0,
+      // A listed-but-empty pool (every account disabled) can serve nothing,
+      // so it is critical just like a non-empty pool with no routable account.
+      isCritical: hasAccounts && routableCount === 0,
     },
     success: {
       label:
