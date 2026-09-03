@@ -664,6 +664,8 @@ def rename_data_api_key(key_id: str, name: str) -> bool:
 
 
 def _authenticated(request: Request) -> bool:
+    if not _password():
+        return False
     token = request.cookies.get(_COOKIE)
     if not token:
         return False
