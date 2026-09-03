@@ -245,11 +245,19 @@ class TestModelsEndpointIntegration:
         # At minimum, hidden models should be available
         assert len(returned_ids) >= 1, "Expected at least one model (hidden models)"
 
-    def test_models_caching_behavior(self, test_client, valid_proxy_api_key):
+    def test_models_caching_behavior(self, test_client, valid_proxy_api_key, monkeypatch):
         """
         What it does: Checks models caching behavior.
         Goal: Ensure repeated requests work correctly.
         """
+        # /v1/models stamps `created` from the wall clock on every request, so
+        # two calls straddling a second boundary differ. Freeze the clock the
+        # route reads so the equality below asserts response shape, not timing.
+        import types
+
+        import kiro.routes_openai as routes_openai
+
+        monkeypatch.setattr(routes_openai, "time", types.SimpleNamespace(time=lambda: 1_700_000_000.0))
         print("First models request...")
         response1 = test_client.get("/v1/models", headers={"Authorization": f"Bearer {valid_proxy_api_key}"})
         assert response1.status_code == 200
