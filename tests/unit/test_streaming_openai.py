@@ -1470,3 +1470,24 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+
+class TestJsonFenceStripping:
+    """Tests for strip_json_code_fence (response_format emulation)."""
+
+    def test_strips_a_fully_wrapping_json_fence(self):
+        from kiro.streaming_openai import strip_json_code_fence
+
+        print("Action: Stripping a ```json wrapped body...")
+        assert strip_json_code_fence('```json\n{"color": "blue"}\n```') == '{"color": "blue"}'
+        assert strip_json_code_fence('```\n{"a": 1}\n```') == '{"a": 1}'
+
+    def test_leaves_unfenced_and_partially_fenced_text_alone(self):
+        from kiro.streaming_openai import strip_json_code_fence
+
+        print("Action: Stripping text that is not a full JSON wrap...")
+        assert strip_json_code_fence('{"color": "blue"}') == '{"color": "blue"}'
+        prose = 'Here you go:\n```json\n{"a": 1}\n```'
+        assert strip_json_code_fence(prose) == prose
+        python_block = "```python\nprint(1)\n```"
+        assert strip_json_code_fence(python_block) == python_block

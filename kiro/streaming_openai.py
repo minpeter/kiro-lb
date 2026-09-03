@@ -11,6 +11,7 @@ Uses streaming_core.py for parsing Kiro stream into unified KiroEvent objects.
 """
 
 import json
+import re
 import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Optional
 
@@ -612,6 +613,34 @@ async def stream_with_first_token_retry(
         yield chunk
 
 
+# (?!\w) after the optional language tag rejects ```python / ```jsonx: only a
+# bare fence or an explicit json tag counts as a JSON wrapper.
+_JSON_FENCE_RE = re.compile(r"\A```(?:json)?(?!\w)\s*(.*?)\s*```\Z", re.IGNORECASE | re.DOTALL)
+
+
+def strip_json_code_fence(text: str) -> str:
+    """
+    Removes one markdown code fence wrapping the entire content.
+
+    Only fires when the trimmed text is exactly one ```json ... ``` (or bare
+    ``` ... ```) block, which is what models emit when the response_format
+    prompt directive is only partially obeyed. Leading/trailing prose or a
+    mid-text fence leaves the content untouched: rewriting those would corrupt
+    legitimate markdown the caller asked for.
+
+    Args:
+        text: Full assistant content
+
+    Returns:
+        The unwrapped JSON, or the original text when no full-wrap fence exists
+    """
+    match = _JSON_FENCE_RE.match(text.strip())
+    if not match:
+        return text
+    inner = match.group(1).strip()
+    return inner or text
+
+
 async def collect_stream_response(
     client: httpx.AsyncClient,
     response: httpx.Response,
@@ -622,6 +651,7 @@ async def collect_stream_response(
     request_tools: Optional[list] = None,
     include_reasoning: bool = True,
     parallel_tool_calls: bool = True,
+    strip_json_fence: bool = False,
 ) -> dict:
     """
     Collect full response from streaming stream.
@@ -691,6 +721,11 @@ async def collect_stream_response(
             continue
 
     # Form final response
+    # Only when the caller asked for JSON output: a model that ignored the
+    # directive and fenced its JSON would otherwise fail the client's parse.
+    if strip_json_fence and full_content:
+        full_content = strip_json_code_fence(full_content)
+
     message: dict[str, Any] = {"role": "assistant", "content": full_content}
     if full_reasoning_content:
         message["reasoning"] = full_reasoning_content

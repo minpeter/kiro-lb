@@ -11,6 +11,7 @@ Contains functions for:
 - Building Kiro payload from OpenAI requests
 """
 
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -299,6 +300,66 @@ def convert_openai_tools_to_unified(tools: Optional[List[Tool]]) -> Optional[Lis
 
 
 # ==================================================================================================
+# response_format Emulation
+# ==================================================================================================
+
+# Stable sentinel phrase: tests and clients verifying the directive landed match
+# on "valid JSON object", so keep it verbatim.
+_RAW_JSON_DIRECTIVE = (
+    "Respond with ONLY a valid JSON object. Do not wrap the output in markdown "
+    "code fences and do not add any text before or after the JSON."
+)
+
+
+def response_format_requests_json(response_format: Optional[Dict[str, Any]]) -> bool:
+    """
+    Whether an OpenAI response_format asks for JSON output.
+
+    Args:
+        response_format: The response_format dict from the request, or None
+
+    Returns:
+        True for json_object or json_schema, False otherwise (text, malformed)
+    """
+    return isinstance(response_format, dict) and response_format.get("type") in ("json_object", "json_schema")
+
+
+def build_response_format_directive(response_format: Optional[Dict[str, Any]]) -> str:
+    """
+    Builds the system-prompt directive emulating OpenAI response_format.
+
+    Kiro's upstream has no first-class response-format field (verified against
+    the client binary: no responseFormat member exists in the
+    GenerateAssistantResponse schema), so structured output is requested through
+    the prompt instead. For json_schema the schema name and the schema JSON
+    itself are embedded, mirroring what OpenAI's native mode enforces.
+
+    Args:
+        response_format: The response_format dict from the request, or None
+
+    Returns:
+        Directive text to append to the system prompt, or "" when not requested
+    """
+    if not response_format_requests_json(response_format):
+        return ""
+    # response_format_requests_json guarantees a dict here.
+    spec_source = response_format if isinstance(response_format, dict) else {}
+
+    if spec_source.get("type") == "json_schema":
+        spec = spec_source.get("json_schema")
+        spec = spec if isinstance(spec, dict) else {}
+        name = spec.get("name") or "response"
+        schema = spec.get("schema")
+        schema_json = json.dumps(schema, ensure_ascii=False) if schema is not None else "{}"
+        return (
+            f"{_RAW_JSON_DIRECTIVE} The JSON object MUST conform to the following "
+            f'JSON schema named "{name}":\n{schema_json}'
+        )
+
+    return _RAW_JSON_DIRECTIVE
+
+
+# ==================================================================================================
 # Main Entry Point
 # ==================================================================================================
 
@@ -323,6 +384,16 @@ def build_kiro_payload(request_data: ChatCompletionRequest, conversation_id: str
     """
     # Convert messages to unified format
     system_prompt, unified_messages = convert_openai_messages_to_unified(request_data.messages)
+
+    # Kiro's upstream has no native response-format field, so JSON mode is
+    # emulated: the directive rides the system prompt that the core builder
+    # folds into the conversation. Streaming clients get the same directive;
+    # the non-streaming collector additionally strips a wrapping fence.
+    response_format_directive = build_response_format_directive(request_data.response_format)
+    if response_format_directive:
+        system_prompt = (
+            f"{system_prompt}\n\n{response_format_directive}" if system_prompt else response_format_directive
+        )
 
     # Convert tools to unified format
     unified_tools = convert_openai_tools_to_unified(request_data.tools)

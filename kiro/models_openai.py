@@ -193,6 +193,12 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict]] = None
 
+    # Structured output: emulated via a prompt directive, not ignored. Kiro's
+    # upstream has no first-class response-format field, so converters_openai
+    # folds a raw-JSON instruction into the system text when type is
+    # json_object or json_schema.
+    response_format: Optional[Dict[str, Any]] = None
+
     # Compatibility fields (ignored)
     stream_options: Optional[Dict[str, Any]] = None
     logit_bias: Optional[Dict[str, float]] = None

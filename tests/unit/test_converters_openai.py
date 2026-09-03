@@ -1397,3 +1397,77 @@ class TestConvertOpenAIMessagesWithToolImages:
 # ==================================================================================================
 # Tests for Client Thinking Budget Support (Issue #111)
 # ==================================================================================================
+
+
+class TestResponseFormatEmulation:
+    """Tests for response_format json_object/json_schema emulation."""
+
+    def test_json_object_injects_the_raw_json_directive(self):
+        """
+        What it does: Verifies response_format json_object adds the directive.
+        Purpose: Kiro has no native response-format field, so the prompt carries it.
+        """
+        from kiro.converters_openai import build_response_format_directive
+
+        print("Action: Building directive for json_object...")
+        directive = build_response_format_directive({"type": "json_object"})
+
+        print(f"Comparing: Expected 'valid JSON object' sentinel, Got {directive[:60]!r}")
+        assert "valid JSON object" in directive
+        assert "code fences" in directive
+
+    def test_json_schema_embeds_the_schema_and_name(self):
+        """
+        What it does: Verifies json_schema embeds the schema JSON and its name.
+        Purpose: The model cannot honor a schema it was never shown.
+        """
+        from kiro.converters_openai import build_response_format_directive
+
+        schema = {"type": "object", "properties": {"color": {"type": "string"}}}
+        print("Action: Building directive for json_schema...")
+        directive = build_response_format_directive(
+            {"type": "json_schema", "json_schema": {"name": "palette", "schema": schema}}
+        )
+
+        print(f"Comparing: Expected name+schema embedded, Got {directive[:80]!r}")
+        assert "palette" in directive
+        assert '"color"' in directive
+        assert "valid JSON object" in directive
+
+    def test_text_and_missing_format_add_nothing(self):
+        """
+        What it does: Verifies non-JSON response_format values inject no directive.
+        Purpose: A plain chat request must keep its prompt untouched.
+        """
+        from kiro.converters_openai import build_response_format_directive, response_format_requests_json
+
+        print("Action: Building directive for text/None/malformed...")
+        assert build_response_format_directive(None) == ""
+        assert build_response_format_directive({"type": "text"}) == ""
+        assert build_response_format_directive({"nope": 1}) == ""
+        assert response_format_requests_json(None) is False
+        assert response_format_requests_json({"type": "json_object"}) is True
+
+    def test_directive_rides_the_payload_system_prompt(self):
+        """
+        What it does: Verifies build_kiro_payload folds the directive into the
+            content the upstream actually receives.
+        Purpose: A directive that never reaches the payload changes nothing.
+        """
+        import json as _json
+
+        from kiro.converters_openai import build_kiro_payload
+        from kiro.models_openai import ChatCompletionRequest
+
+        request = ChatCompletionRequest(
+            model="minimax-m2.1",
+            messages=[{"role": "user", "content": "give me a color"}],
+            response_format={"type": "json_object"},
+        )
+
+        print("Action: Building the Kiro payload...")
+        payload = build_kiro_payload(request, "conv-1", "")
+
+        serialized = _json.dumps(payload, ensure_ascii=False)
+        print("Comparing: Expected directive inside the payload, Got presence check")
+        assert "valid JSON object" in serialized
