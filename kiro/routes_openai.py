@@ -22,7 +22,7 @@ from kiro.config import (
     APP_VERSION,
     WEB_SEARCH_ENABLED,
 )
-from kiro.converters_openai import build_kiro_payload
+from kiro.converters_openai import build_kiro_payload, response_format_requests_json
 from kiro.dashboard import identify_data_api_key
 from kiro.http_client import KiroHttpClient
 from kiro.models_openai import (
@@ -223,6 +223,29 @@ def _resolve_model_limits(request: Request, model_ids: List[str]) -> Dict[str, T
     return limits
 
 
+def _build_model_view(
+    model_id: str,
+    limits: Dict[str, Tuple[Optional[int], Optional[int]]],
+    friendly: Dict[str, str],
+    created: int,
+    created_at: str,
+) -> OpenAIModel:
+    """Builds the OpenAI model representation shared by both model routes."""
+    max_input, max_output = limits.get(model_id, (None, None))
+    label = friendly.get(model_id)
+    return OpenAIModel(
+        id=model_id,
+        owned_by=_model_owner(model_id),
+        description=label or f"{model_id} via Kiro API",
+        display_name=_display_name(model_id, label),
+        created=created,
+        created_at=created_at,
+        context_window=max_input,
+        max_input_tokens=max_input,
+        max_tokens=max_output,
+    )
+
+
 @router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_models_api_key)])
 async def get_models(request: Request):
     """
@@ -249,30 +272,34 @@ async def get_models(request: Request):
     created = int(time.time())
     created_at = datetime.fromtimestamp(created, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
-    openai_models = []
-    for model_id in available_model_ids:
-        owner = _model_owner(model_id)
-        max_input, max_output = limits.get(model_id, (None, None))
-        label = friendly.get(model_id)
-        openai_models.append(
-            OpenAIModel(
-                id=model_id,
-                owned_by=owner,
-                description=label or f"{model_id} via Kiro API",
-                display_name=_display_name(model_id, label),
-                created=created,
-                created_at=created_at,
-                context_window=max_input,
-                max_input_tokens=max_input,
-                max_tokens=max_output,
-            )
-        )
+    openai_models = [
+        _build_model_view(model_id, limits, friendly, created, created_at) for model_id in available_model_ids
+    ]
 
     return ModelList(
         data=openai_models,
         first_id=openai_models[0].id if openai_models else None,
         last_id=openai_models[-1].id if openai_models else None,
     )
+
+
+@router.get("/v1/models/{model_id}", response_model=OpenAIModel, dependencies=[Depends(verify_models_api_key)])
+async def get_model(request: Request, model_id: str):
+    """
+    Returns one available model by ID.
+
+    OpenAI clients probe this endpoint to confirm a model exists before
+    using it; the list route alone left them with a 404.
+    """
+    available_model_ids = request.app.state.account_manager.get_all_available_models()
+    if model_id not in available_model_ids:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    limits = _resolve_model_limits(request, available_model_ids)
+    friendly = _friendly_names(request, available_model_ids)
+    created = int(time.time())
+    created_at = datetime.fromtimestamp(created, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return _build_model_view(model_id, limits, friendly, created, created_at)
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
@@ -497,6 +524,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             request_tools=tools_for_tokenizer,
                             include_reasoning=request_data.include_reasoning,
                             parallel_tool_calls=request_data.parallel_tool_calls is not False,
+                            strip_json_fence=response_format_requests_json(request_data.response_format),
                         )
                         await account_manager.report_success(account.id, request_data.model)
 

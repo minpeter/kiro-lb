@@ -1375,3 +1375,54 @@ class TestModelsEndpointMetadata:
 
         assert "Claude" not in by_id["gpt-5.6-sol"]["description"]
         assert "Claude" not in by_id["deepseek-3.2"]["description"]
+
+
+class TestGetSingleModel:
+    """Tests for GET /v1/models/{model_id}."""
+
+    def test_known_model_returns_the_model_object(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies a known model id returns one OpenAI model object.
+        Purpose: OpenAI clients probe this endpoint before using a model.
+        """
+        print("Action: GET /v1/models to pick a served id...")
+        listed = test_client.get("/v1/models", headers={"Authorization": f"Bearer {valid_proxy_api_key}"})
+        assert listed.status_code == 200
+        ids = [item["id"] for item in listed.json()["data"]]
+        assert ids, "expected at least one model in the list response"
+        target = ids[0]
+
+        print(f"Action: GET /v1/models/{target}...")
+        response = test_client.get(f"/v1/models/{target}", headers={"Authorization": f"Bearer {valid_proxy_api_key}"})
+
+        body = response.json()
+        print(f"Comparing: Expected id={target} object=model, Got {body.get('id')} {body.get('object')}")
+
+        assert response.status_code == 200
+        assert body["id"] == target
+        assert body["object"] == "model"
+        assert body["owned_by"]
+
+    def test_unknown_model_is_a_not_found(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies an unserved model id returns 404.
+        Purpose: A probe for a missing model must not report success.
+        """
+        print("Action: GET /v1/models/definitely-not-a-model...")
+        response = test_client.get(
+            "/v1/models/definitely-not-a-model", headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+        )
+
+        print(f"Comparing: Expected 404, Got {response.status_code}")
+        assert response.status_code == 404
+
+    def test_single_model_requires_a_key(self, test_client):
+        """
+        What it does: Verifies the single-model route is authenticated.
+        Purpose: It must not become an unauthenticated hole beside /v1/models.
+        """
+        print("Action: GET /v1/models/whatever without a key...")
+        response = test_client.get("/v1/models/whatever")
+
+        print(f"Comparing: Expected 401, Got {response.status_code}")
+        assert response.status_code == 401
