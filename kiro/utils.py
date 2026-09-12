@@ -19,9 +19,7 @@ if TYPE_CHECKING:
 
 # Kiro IDE build string observed on the wire (1.0.437). The trailing hash is the
 # build fingerprint the IDE ships; it is a constant, not per-machine.
-IDE_BUILD = (
-    "KiroIDE-1.0.437-ea11196bc54380ef285f87b7040026830a864d2a50bb872ea19a5bbbe732b407-KAS/0.54.0"
-)
+IDE_BUILD = "KiroIDE-1.0.437-ea11196bc54380ef285f87b7040026830a864d2a50bb872ea19a5bbbe732b407-KAS/0.54.0"
 IDE_SHORT_USER_AGENT = f"aws-sdk-js/1.0.0 {IDE_BUILD}"
 IDE_EXEC_ENV = "exec-env/AmazonQ-For-CLI-Version/2.21.1-acp-client/kiro-tui"
 
