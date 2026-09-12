@@ -17,6 +17,23 @@ if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
 
 
+# Kiro IDE build string observed on the wire (1.0.437). The trailing hash is the
+# build fingerprint the IDE ships; it is a constant, not per-machine.
+IDE_BUILD = (
+    "KiroIDE-1.0.437-ea11196bc54380ef285f87b7040026830a864d2a50bb872ea19a5bbbe732b407-KAS/0.54.0"
+)
+IDE_SHORT_USER_AGENT = f"aws-sdk-js/1.0.0 {IDE_BUILD}"
+IDE_EXEC_ENV = "exec-env/AmazonQ-For-CLI-Version/2.21.1-acp-client/kiro-tui"
+
+
+def ide_user_agent(api_label: str = "kiroruntime") -> str:
+    """Full aws-sdk-js User-Agent, with the api/ label the service expects."""
+    return (
+        f"aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.26200 lang/js md/nodejs#22.22.0 "
+        f"api/{api_label}#1.0.0 {IDE_EXEC_ENV} m/N {IDE_BUILD}"
+    )
+
+
 def get_machine_fingerprint() -> str:
     """
     Generates a unique machine fingerprint based on hostname and username.
@@ -44,10 +61,10 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
     """
     Builds headers for Kiro API requests.
 
-    Includes all necessary headers for authentication and identification:
-    - Authorization with Bearer token
-    - Kiro CLI-compatible User-Agent and retry metadata
-    - AWS CodeWhisperer specific headers
+    Mirrors what Kiro IDE 1.0.437 sends, captured on the wire 2026-09-12:
+    aws-sdk-js user agents, the kiro-ide attribution header and the
+    KiroRuntimeService target. Per-endpoint overrides replace the target and the
+    api/ label when the request goes to an amazonaws.com host instead.
 
     Args:
         auth_manager: Authentication manager associated with the request
@@ -59,15 +76,10 @@ def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/x-amz-json-1.0",
-        "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-        "User-Agent": (
-            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 "
-            "os/linux lang/rust/1.92.0 md/appVersion-2.19.1 app/AmazonQ-For-CLI"
-        ),
-        "x-amz-user-agent": (
-            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 "
-            "os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI"
-        ),
+        "x-amz-target": "KiroRuntimeService.GenerateAssistantResponse",
+        "x-amzn-kiro-client-attribution": "kiro-ide",
+        "User-Agent": ide_user_agent("kiroruntime"),
+        "x-amz-user-agent": IDE_SHORT_USER_AGENT,
         "x-amzn-codewhisperer-optout": "true",
         "x-kiro-attempt": "1;max=3",
         "amz-sdk-invocation-id": str(uuid.uuid4()),

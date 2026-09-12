@@ -13,6 +13,7 @@ to convert their formats to Kiro API format.
 """
 
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1431,6 +1432,13 @@ def build_kiro_payload(
     task_type = agent_mode.current()
     if task_type:
         payload["conversationState"]["agentTaskType"] = task_type
+        # Kiro IDE 1.0.437 repeats the mode at the top level as "agentMode" and
+        # tags every turn with a fresh continuation id, keeping the session's
+        # first conversation id as rootConversationId.
+        payload["agentMode"] = task_type
+
+    payload["conversationState"]["agentContinuationId"] = str(uuid.uuid4())
+    payload["conversationState"]["rootConversationId"] = conversation_id
 
     # Add history only if not empty
     if history:

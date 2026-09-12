@@ -20,7 +20,13 @@ from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from kiro.utils import IDE_SHORT_USER_AGENT, ide_user_agent
+
 GENERATE_TARGET = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+
+# What Kiro IDE 1.0.437 sends to runtime.{region}.kiro.dev. Captured on the wire
+# 2026-09-12; the legacy CodeWhisperer target is kept for the amazonaws.com hosts.
+RUNTIME_GENERATE_TARGET = "KiroRuntimeService.GenerateAssistantResponse"
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,8 @@ class KiroEndpoint:
     amz_target: Optional[str] = GENERATE_TARGET
     content_type: str = "application/x-amz-json-1.0"
     regional: bool = True
+    api_label: Optional[str] = None
+    client_attribution: Optional[str] = None
 
     def url(self, region: str) -> str:
         return self.url_template.format(region=region) if self.regional else self.url_template
@@ -41,6 +49,11 @@ class KiroEndpoint:
         overrides: Dict[str, str] = {"Content-Type": self.content_type}
         if self.amz_target:
             overrides["x-amz-target"] = self.amz_target
+        if self.client_attribution:
+            overrides["x-amzn-kiro-client-attribution"] = self.client_attribution
+        if self.api_label:
+            overrides["User-Agent"] = ide_user_agent(self.api_label)
+            overrides["x-amz-user-agent"] = IDE_SHORT_USER_AGENT
         return overrides
 
 
@@ -48,10 +61,12 @@ class KiroEndpoint:
 # KIRO_ENDPOINT_ORDER default so both paths agree on which host is tried first.
 KIRO_ENDPOINTS: Tuple[KiroEndpoint, ...] = (
     KiroEndpoint(
-        key="amazonq",
-        name="AmazonQ",
-        url_template="https://q.{region}.amazonaws.com/generateAssistantResponse",
-        amz_target="AmazonQDeveloperStreamingService.SendMessage",
+        key="runtime",
+        name="Kiro Runtime",
+        url_template="https://runtime.{region}.kiro.dev/",
+        amz_target=RUNTIME_GENERATE_TARGET,
+        api_label="kiroruntime",
+        client_attribution="kiro-ide",
     ),
     KiroEndpoint(
         key="codewhisperer",
@@ -59,9 +74,10 @@ KIRO_ENDPOINTS: Tuple[KiroEndpoint, ...] = (
         url_template="https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse",
     ),
     KiroEndpoint(
-        key="runtime",
-        name="Kiro Runtime",
-        url_template="https://runtime.{region}.kiro.dev/",
+        key="amazonq",
+        name="AmazonQ",
+        url_template="https://q.{region}.amazonaws.com/generateAssistantResponse",
+        amz_target="AmazonQDeveloperStreamingService.SendMessage",
     ),
 )
 

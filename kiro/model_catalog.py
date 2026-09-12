@@ -20,9 +20,9 @@ from typing import Any, Optional
 import httpx
 from loguru import logger
 
-from kiro.utils import get_kiro_headers
+from kiro.utils import get_kiro_headers, ide_user_agent
 
-TARGET = "AmazonCodeWhispererService.ListAvailableModels"
+TARGET = "KiroControlPlaneBearerService.ListAvailableModels"
 TIMEOUT = 20.0
 
 
@@ -58,6 +58,7 @@ async def fetch_available_models(auth_manager: Any) -> Optional[list[dict[str, A
 
     headers = get_kiro_headers(auth_manager, token)
     headers["x-amz-target"] = TARGET
+    headers["User-Agent"] = ide_user_agent("kirocontrolplanebearer")
     headers["Accept"] = "application/json"
     url = f"https://management.{_region(auth_manager)}.kiro.dev/"
 
