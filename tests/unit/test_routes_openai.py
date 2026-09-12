@@ -807,18 +807,18 @@ class TestHTTPClientSelection:
     """
     Tests for HTTP client selection in routes (issue #54).
 
-    Verifies that streaming requests use per-request clients to avoid CLOSE_WAIT leak
-    when network interface changes (VPN disconnect/reconnect), while non-streaming
-    requests use shared client for connection pooling.
+    Both streaming and non-streaming share the pooled client. A private client per
+    streaming request cost ~215 ms of SSL context setup and a fresh TCP+TLS
+    handshake on every message, which dominated the gateway's added latency.
     """
 
     @patch("kiro.routes_openai.KiroHttpClient")
-    def test_streaming_uses_per_request_client(self, mock_kiro_http_client_class, test_client, valid_proxy_api_key):
+    def test_streaming_uses_the_shared_client(self, mock_kiro_http_client_class, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies streaming requests create per-request HTTP client.
-        Purpose: Prevent CLOSE_WAIT leak on VPN disconnect (issue #54).
+        What it does: Verifies streaming requests reuse the pooled HTTP client.
+        Purpose: Avoid per-request SSL context construction and TLS handshakes.
         """
-        print("\n--- Test: Streaming uses per-request client ---")
+        print("\n--- Test: Streaming uses the shared client ---")
 
         # Setup mock
         mock_client_instance = AsyncMock()
@@ -836,12 +836,11 @@ class TestHTTPClientSelection:
         except Exception:
             pass
 
-        print("Checking: KiroHttpClient(shared_client=None)...")
+        print("Checking: KiroHttpClient(shared_client=<pooled>)...")
         assert mock_kiro_http_client_class.called
         call_args = mock_kiro_http_client_class.call_args
         print(f"Call args: {call_args}")
-        assert call_args[1]["shared_client"] is None, "Streaming should use per-request client"
-        print("✅ Streaming correctly uses per-request client")
+        assert call_args[1]["shared_client"] is not None, "Streaming should reuse the pooled client"
 
     @patch("kiro.routes_openai.KiroHttpClient")
     def test_non_streaming_uses_shared_client(self, mock_kiro_http_client_class, test_client, valid_proxy_api_key):

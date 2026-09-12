@@ -1000,13 +1000,14 @@ class TestKiroHttpClientGracefulClose:
 
 
 class TestKiroHttpClientConnectionCloseHeader:
-    """Tests for Connection: close header on streaming requests (issue #38)."""
+    """Streaming must not force Connection: close (see issue #38 and the latency fix)."""
 
     @pytest.mark.asyncio
-    async def test_streaming_request_includes_connection_close_header(self, mock_auth_manager_for_http):
+    async def test_streaming_request_keeps_the_connection_alive(self, mock_auth_manager_for_http):
         """
-        What it does: Verifies that streaming requests include Connection: close header.
-        Purpose: Prevent CLOSE_WAIT connection leak by disabling connection reuse for streaming.
+        What it does: Verifies that streaming requests do NOT force Connection: close.
+        Purpose: Closing the connection cost a full TCP+TLS handshake per message. The
+        CLOSE_WAIT leak it once papered over is handled by aclose()ing the response.
         """
         print("Setup: Creating KiroHttpClient...")
         http_client = KiroHttpClient(mock_auth_manager_for_http)
@@ -1033,11 +1034,9 @@ class TestKiroHttpClientConnectionCloseHeader:
                     "POST", "https://api.example.com/test", {"data": "value"}, stream=True
                 )
 
-        print("Verification: Connection: close header is present...")
+        print("Verification: no Connection header was forced...")
         print(f"Captured headers: {captured_headers}")
-        assert "Connection" in captured_headers, f"Connection header not found in: {captured_headers}"
-        print(f"Comparing Connection: Expected 'close', Got '{captured_headers['Connection']}'")
-        assert captured_headers["Connection"] == "close"
+        assert "Connection" not in captured_headers, f"streaming must reuse pooled connections, got: {captured_headers}"
         assert response.status_code == 200
 
     @pytest.mark.asyncio
@@ -1077,9 +1076,9 @@ class TestKiroHttpClientConnectionCloseHeader:
         assert response.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_streaming_connection_close_preserves_other_headers(self, mock_auth_manager_for_http):
+    async def test_streaming_connection_keeps_other_headers_untouched(self, mock_auth_manager_for_http):
         """
-        What it does: Verifies that adding Connection: close doesn't remove other headers.
+        What it does: Verifies the streaming branch does not rewrite the header set.
         Purpose: Ensure Authorization and other headers are preserved.
         """
         print("Setup: Creating KiroHttpClient...")
@@ -1113,12 +1112,12 @@ class TestKiroHttpClientConnectionCloseHeader:
                     "POST", "https://api.example.com/test", {"data": "value"}, stream=True
                 )
 
-        print("Verification: All original headers preserved plus Connection: close...")
+        print("Verification: All original headers preserved and none added...")
         print(f"Captured headers: {captured_headers}")
         assert captured_headers["Authorization"] == "Bearer test_token"
         assert captured_headers["Content-Type"] == "application/json"
         assert captured_headers["X-Custom-Header"] == "custom_value"
-        assert captured_headers["Connection"] == "close"
+        assert "Connection" not in captured_headers
         assert response.status_code == 200
 
 

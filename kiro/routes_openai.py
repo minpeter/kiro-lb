@@ -437,11 +437,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             url = auth_manager.generation_url
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
 
-            if request_data.stream:
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
-            else:
-                shared_client = request.app.state.http_client
-                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+            # Streaming shares the pooled client with everything else. Building a
+            # private httpx.AsyncClient per request cost ~215 ms of SSL context
+            # setup and threw away the connection afterwards, paying a fresh
+            # TCP+TLS handshake on the next message.
+            shared_client = request.app.state.http_client
+            http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
 
             try:
                 # Make request to Kiro API

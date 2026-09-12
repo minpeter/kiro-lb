@@ -278,8 +278,12 @@ class KiroHttpClient:
                     request_kwargs["params"] = params
 
                 if stream:
-                    # Prevent CLOSE_WAIT connection leak (issue #38)
-                    headers["Connection"] = "close"
+                    # Keep-alive is left in place. Forcing "Connection: close"
+                    # here used to hide a CLOSE_WAIT leak (issue #38), but the
+                    # leak was the streamed response never being released, and
+                    # every streaming path now aclose()s it. Closing the
+                    # connection instead cost a full TCP+TLS handshake on every
+                    # message, which is the bulk of the gateway's added latency.
                     req = client.build_request(method, url, **request_kwargs)
                     logger.debug("Sending request to Kiro API...")
                     response = await client.send(req, stream=True)
