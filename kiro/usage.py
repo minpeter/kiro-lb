@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from kiro.account_manager import Account
-from kiro.utils import get_kiro_headers
+from kiro.utils import get_kiro_headers, ide_user_agent
 
 
 def _usage_region(account: Account) -> str:
@@ -83,11 +83,14 @@ async def fetch_account_usage(account: Account) -> dict[str, Any]:
         raise RuntimeError("profile ARN is not available yet for this account")
     params["profileArn"] = profile_arn
     body["profileArn"] = profile_arn
-    # Kiro CLI 2.19.1 duplicates these modeled fields in the query and AWS JSON
-    # body. Preserve that observed wire contract rather than "simplifying" it.
+    # Kiro IDE 1.0.437 uses GET /getUsageLimits?resourceType=AGENTIC_REQUEST here,
+    # but that variant answers with userInfo.email = null. The AWS JSON target
+    # below is kept because the dashboard identifies accounts by that email; only
+    # the user agent is aligned with the IDE.
     url = f"https://management.{_usage_region(account)}.kiro.dev/"
     headers = get_kiro_headers(auth, token)
     headers["x-amz-target"] = "AmazonCodeWhispererService.GetUsageLimits"
+    headers["User-Agent"] = ide_user_agent("codewhispererruntime")
     headers["Accept"] = "application/json"
 
     async with httpx.AsyncClient(timeout=20) as client:

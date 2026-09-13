@@ -27,8 +27,15 @@ class TestEndpointDefinitions:
 
     def test_runtime_keeps_the_generate_target(self):
         runtime = ep.ENDPOINTS_BY_KEY["runtime"]
+        overrides = runtime.header_overrides()
         assert runtime.url("us-east-1") == "https://runtime.us-east-1.kiro.dev/"
-        assert runtime.header_overrides()["x-amz-target"] == ep.GENERATE_TARGET
+        assert overrides["x-amz-target"] == ep.RUNTIME_GENERATE_TARGET
+        assert overrides["x-amzn-kiro-client-attribution"] == "kiro-ide"
+        assert "api/kiroruntime" in overrides["User-Agent"]
+
+    def test_codewhisperer_keeps_the_legacy_target(self):
+        codewhisperer = ep.ENDPOINTS_BY_KEY["codewhisperer"]
+        assert codewhisperer.header_overrides()["x-amz-target"] == ep.GENERATE_TARGET
 
     def test_amazonq_uses_its_own_target(self):
         amazonq = ep.ENDPOINTS_BY_KEY["amazonq"]

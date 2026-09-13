@@ -175,8 +175,9 @@ def test_generation_headers_carry_the_cli_retry_contract(capture_generation_requ
     )
     headers = call["headers"]
 
-    assert headers["x-amz-target"] == "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+    assert headers["x-amz-target"] == "KiroRuntimeService.GenerateAssistantResponse"
+    assert headers["x-amzn-kiro-client-attribution"] == "kiro-ide"
     assert headers["x-kiro-attempt"] == "1;max=3"
     assert "x-amzn-kiro-agent-mode" not in headers
-    assert "app/AmazonQ-For-CLI" in headers["User-Agent"]
-    assert "KiroIDE" not in headers["User-Agent"]
+    assert "api/kiroruntime#1.0.0" in headers["User-Agent"]
+    assert "KiroIDE-1.0.437" in headers["User-Agent"]

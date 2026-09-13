@@ -316,9 +316,10 @@ KIRO_ENDPOINT_ROTATION: bool = os.getenv("KIRO_ENDPOINT_ROTATION", "false").lowe
 
 # Comma-separated attempt order. Unknown keys are ignored.
 # Available: runtime, codewhisperer, amazonq
+# Default puts runtime first: it is the host Kiro IDE itself talks to.
 KIRO_ENDPOINT_ORDER: list[str] = [
     part.strip()
-    for part in os.getenv("KIRO_ENDPOINT_ORDER", "amazonq,codewhisperer,runtime").split(",")
+    for part in os.getenv("KIRO_ENDPOINT_ORDER", "runtime,codewhisperer,amazonq").split(",")
     if part.strip()
 ]
 

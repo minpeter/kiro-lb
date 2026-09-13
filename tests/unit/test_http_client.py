@@ -1128,11 +1128,13 @@ def test_generation_headers_match_latest_cli_retry_contract():
     auth_manager = Mock(fingerprint="test-fingerprint")
     headers = get_kiro_headers(auth_manager, "test-token")
 
-    assert headers["x-amz-target"] == "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+    assert headers["x-amz-target"] == "KiroRuntimeService.GenerateAssistantResponse"
+    assert headers["x-amzn-kiro-client-attribution"] == "kiro-ide"
     assert headers["x-kiro-attempt"] == "1;max=3"
     assert "x-amzn-kiro-agent-mode" not in headers
-    assert "app/AmazonQ-For-CLI" in headers["User-Agent"]
-    assert "api/codewhispererstreaming" in headers["x-amz-user-agent"]
+    assert "api/kiroruntime#1.0.0" in headers["User-Agent"]
+    assert "aws-sdk-js/1.0.0" in headers["User-Agent"]
+    assert "KiroIDE-1.0.437" in headers["x-amz-user-agent"]
 
 
 class TestKiroHttpClientRequestParameters:
