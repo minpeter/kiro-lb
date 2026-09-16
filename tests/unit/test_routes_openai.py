@@ -1356,7 +1356,7 @@ class TestModelsEndpointMetadata:
         assert by_id["claude-opus-5"]["context_window"] == 666667
         assert by_id["claude-opus-5"]["max_input_tokens"] == 666667
         assert by_id["claude-opus-4.6"]["context_window"] == 1000000
-        assert by_id["gpt-5.6-sol"]["context_window"] == 272000
+        assert by_id["gpt-5.6-sol"]["context_window"] == 1000000
 
     def test_owner_reflects_the_real_vendor(self, test_client, valid_proxy_api_key):
         """Every entry claimed owned_by=anthropic, including the GPT and Qwen
