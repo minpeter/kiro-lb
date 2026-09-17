@@ -36,9 +36,9 @@ BASELINE_MODEL = "auto"
 
 # Keys are normalized model ids. Source: Kiro's model comparison table.
 MODEL_COSTS: dict[str, ModelCost] = {
-    "gpt-5.6-sol": ModelCost(2.4, 272_000),
-    "gpt-5.6-terra": ModelCost(1.0, 272_000),
-    "gpt-5.6-luna": ModelCost(0.1, 272_000),
+    "gpt-5.6-sol": ModelCost(4.4, 1_000_000),
+    "gpt-5.6-terra": ModelCost(2.2, 1_000_000),
+    "gpt-5.6-luna": ModelCost(1.1, 1_000_000),
     "claude-opus-5": ModelCost(2.2, 1_000_000),
     "claude-opus-4.8": ModelCost(2.2, 1_000_000),
     "claude-opus-4.7": ModelCost(2.2, 1_000_000),

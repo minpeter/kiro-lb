@@ -230,9 +230,9 @@ FALLBACK_MODELS: List[Dict[str, Any]] = [
     {"modelId": "minimax-m2.1", "tokenLimits": {"maxInputTokens": 196000, "maxOutputTokens": 64000}},
     {"modelId": "minimax-m2.5", "tokenLimits": {"maxInputTokens": 196000, "maxOutputTokens": 64000}},
     {"modelId": "qwen3-coder-next", "tokenLimits": {"maxInputTokens": 256000, "maxOutputTokens": 64000}},
-    {"modelId": "gpt-5.6-sol", "tokenLimits": {"maxInputTokens": 272000, "maxOutputTokens": 128000}},
-    {"modelId": "gpt-5.6-terra", "tokenLimits": {"maxInputTokens": 272000, "maxOutputTokens": 128000}},
-    {"modelId": "gpt-5.6-luna", "tokenLimits": {"maxInputTokens": 272000, "maxOutputTokens": 128000}},
+    {"modelId": "gpt-5.6-sol", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 128000}},
+    {"modelId": "gpt-5.6-terra", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 128000}},
+    {"modelId": "gpt-5.6-luna", "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 128000}},
 ]
 
 # ==================================================================================================
