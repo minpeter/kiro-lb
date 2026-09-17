@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Commit:** 474df2b
+**Commit:** f1c0db8
 **Branch:** main
 
 ## OVERVIEW
@@ -14,12 +14,12 @@ Python 3.12 (`Dockerfile`, CI), httpx, loguru, tiktoken. **AGPL-3.0** — based 
 ## STRUCTURE
 
 ```
-kiro-lb-python/
-├── main.py                  # App factory, lifespan, CLI, static mounts (822 lines)
-├── kiro/                    # Gateway package: 39 modules, 16.5k lines
+kiro-lb/
+├── main.py                  # App factory, lifespan, CLI, static mounts (824 lines)
+├── kiro/                    # Gateway package: 53 modules, 22.1k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 1837 tests; network-blocked by conftest
+├── tests/                   # pytest, 2247 tests; network-blocked by conftest
 ├── data/                    # Unified private dashboard.sqlite3 store (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
@@ -39,7 +39,7 @@ Operational detail lives in this file; do not relicense away from AGPL-3.0.
 | Task | Location | Notes |
 |---|---|---|
 | Add/modify a client endpoint | `kiro/routes_openai.py`, `kiro/routes_anthropic.py` | Only 4 + 2 public routes exist |
-| Request -> Kiro payload | `kiro/converters_core.py` | 1363 lines; both adapters delegate here |
+| Request -> Kiro payload | `kiro/converters_core.py` | 1508 lines; both adapters delegate here |
 | Kiro -> client stream | `kiro/streaming_openai.py`, `kiro/streaming_anthropic.py` | Shared event model in `kiro/streaming_core.py` |
 | AWS event-stream framing | `kiro/parsers.py` | Frame reassembly + bracket tool-call recovery |
 | Stream order invariants | `kiro/sse_validation.py` | Raises mid-stream instead of shipping bad order |
@@ -213,7 +213,7 @@ trusting a pin here.
 
 ```bash
 python main.py --host 127.0.0.1 --port 8000    # run gateway
-pytest -q                                      # full suite (1837 tests, ~6s, no network)
+pytest -q                                      # full suite (2247 tests, ~6s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
@@ -273,5 +273,5 @@ multi-arch images on non-PR runs. Tool versions are pinned in
 - Truncated upstream turns must not be reported as clean finishes
   (`kiro/stop_reasons.py`).
 - The homelab compose mounts the host `kiro-cli` store read-only at
-- 13 files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1363)
-  and `kiro/account_manager.py` (1252) are the highest-risk edit sites.
+- 15 files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1508)
+  and `kiro/account_manager.py` (1865) are the highest-risk edit sites.
