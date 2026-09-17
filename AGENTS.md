@@ -223,8 +223,9 @@ docker compose -p kiro-lb -f docker-compose.homelab.yml up -d --build
 ```
 
 The `-p kiro-lb` is required: the live container was created under that project
-name, so letting compose derive it from the directory (`kiro-lb-python`) fails on
-a `container_name` conflict instead of recreating.
+name, so a checkout directory that differs (for example an old `kiro-lb-python`
+clone) makes compose invent another project and hit a `container_name` conflict
+instead of recreating.
 
 CI (`.github/workflows/docker.yml`) has three jobs: `quality` (ruff format check,
 ruff check, mypy, frontend eslint + tsc + vitest), `test` (pytest, then coverage), and
