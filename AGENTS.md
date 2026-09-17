@@ -14,7 +14,7 @@ Python 3.12 (`Dockerfile`, CI), httpx, loguru, tiktoken. **AGPL-3.0** — based 
 ## STRUCTURE
 
 ```
-kiro-lb-python/
+kiro-lb/
 ├── main.py                  # App factory, lifespan, CLI, static mounts (824 lines)
 ├── kiro/                    # Gateway package: 53 modules, 22.1k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
