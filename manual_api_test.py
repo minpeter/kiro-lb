@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # kiro-lb (based on Kiro Gateway)
-# https://github.com/minpeter/kiro-lb-python
+# https://github.com/minpeter/kiro-lb
 # Copyright (C) 2025 Jwadow
 # Copyright (C) 2026 minpeter
 #
