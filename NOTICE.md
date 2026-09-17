@@ -12,7 +12,7 @@ Modifications and additions in this repository:
 
 The complete corresponding source for this work is available at:
 
-- https://github.com/minpeter/kiro-lb-python
+- https://github.com/minpeter/kiro-lb
 
 This program is free software under the AGPL-3.0. See the `LICENSE` file for
 the full license text.

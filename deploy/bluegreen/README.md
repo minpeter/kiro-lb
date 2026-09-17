@@ -12,7 +12,7 @@ nginx → 10.10.10.10:8000 (edge)
 ## Commands
 
 ```bash
-cd ~/github.com/minpeter/kiro-lb-python
+cd ~/github.com/minpeter/kiro-lb
 
 ./deploy/bluegreen/deploy.sh --status
 ./deploy/bluegreen/deploy.sh              # build idle slot → health → flip → stop old

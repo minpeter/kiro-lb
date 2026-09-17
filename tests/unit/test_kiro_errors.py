@@ -547,7 +547,7 @@ class TestEnhanceImproperlyFormedRequest:
         error_info = enhance_kiro_error(error_json)
 
         assert "problem persists" in error_info.user_message
-        assert "minpeter/kiro-lb-python" in error_info.user_message
+        assert "https://github.com/minpeter/kiro-lb/issues" in error_info.user_message
         assert error_info.original_message == "Improperly formed request."
 
     def test_enhance_improperly_formed_request_unknown_reason(self):
