@@ -32,4 +32,4 @@ docker compose up -d --build
 ```
 
 See `.env.example` and `AGENTS.md` for configuration details.
-Issues: https://github.com/minpeter/kiro-lb-python/issues
+Issues: https://github.com/minpeter/kiro-lb/issues
