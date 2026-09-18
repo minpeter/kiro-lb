@@ -16,10 +16,10 @@ Python 3.12 (`Dockerfile`, CI), httpx, loguru, tiktoken. **AGPL-3.0** — based 
 ```
 kiro-lb/
 ├── main.py                  # App factory, lifespan, CLI, static mounts (824 lines)
-├── kiro/                    # Gateway package: 53 modules, 22.1k lines
+├── kiro/                    # Gateway package: 56 modules, 23.2k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 2247 tests; network-blocked by conftest
+├── tests/                   # pytest, 2320 tests; network-blocked by conftest
 ├── data/                    # Unified private dashboard.sqlite3 store (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
@@ -38,7 +38,8 @@ Operational detail lives in this file; do not relicense away from AGPL-3.0.
 
 | Task | Location | Notes |
 |---|---|---|
-| Add/modify a client endpoint | `kiro/routes_openai.py`, `kiro/routes_anthropic.py` | Only 4 + 2 public routes exist |
+| Add/modify a client endpoint | `kiro/routes_openai.py`, `kiro/routes_anthropic.py` | Only 5 + 2 public routes exist |
+| Responses API (Codex CLI) | `kiro/routes_openai.py` `/v1/responses` | Facade over `chat_completions`; translation in `converters_responses.py`, `streaming_responses.py` |
 | Request -> Kiro payload | `kiro/converters_core.py` | 1508 lines; both adapters delegate here |
 | Kiro -> client stream | `kiro/streaming_openai.py`, `kiro/streaming_anthropic.py` | Shared event model in `kiro/streaming_core.py` |
 | AWS event-stream framing | `kiro/parsers.py` | Frame reassembly + bracket tool-call recovery |
@@ -93,6 +94,22 @@ trusting a pin here.
   streams leaks CLOSE_WAIT.
 - Any new client-visible behavior must land on OpenAI **and** Anthropic, in both
   streaming and non-streaming paths.
+- `/v1/responses` is a translation facade, not a third pipeline. It builds a
+  `ChatCompletionRequest` and calls `chat_completions()` directly, so failover,
+  payload building and token accounting are inherited. It translates the
+  *serialized* chat chunks rather than tapping the generator: the chunk-order
+  validator in `sse_validation.py` is keyed to `begin_openai_stream()` inside that
+  generator, and pushing Responses payloads through the same emitter would trip it
+  on every event. A route that calls a handler directly must declare its own
+  `Depends(verify_api_key)` - FastAPI's dependencies belong to the route, not the
+  function.
+- The Codex CLI declares its tools in an `additional_tools` *input item*, not in
+  `tools`, nested inside a `namespace` entry, and its shell is a `custom`
+  (grammar-constrained) tool. Kiro tool specs need a JSON schema, so a freeform
+  tool is bridged as a function with one string field and unwrapped back into a
+  `custom_tool_call` item (`converters_responses.FREEFORM_BODY_FIELD`). Dropping it
+  instead left the model with no tool, and it answered by inventing the command
+  output it could not go and fetch.
 - Each protocol's usage object carries only the fields that protocol defines.
   OpenAI adds `credits_used` as its one vendor extension; Anthropic's
   `message_delta` restates `input_tokens` only when the value came from upstream
@@ -213,7 +230,7 @@ trusting a pin here.
 
 ```bash
 python main.py --host 127.0.0.1 --port 8000    # run gateway
-pytest -q                                      # full suite (2247 tests, ~6s, no network)
+pytest -q                                      # full suite (2320 tests, ~6s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half

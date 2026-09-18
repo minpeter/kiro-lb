@@ -29,6 +29,7 @@ LOGGED_ENDPOINTS = frozenset(
     {
         "/v1/chat/completions",  # OpenAI-compatible endpoint
         "/v1/messages",  # Anthropic-compatible endpoint
+        "/v1/responses",  # OpenAI Responses API (Codex CLI)
     }
 )
 
