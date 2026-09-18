@@ -1165,16 +1165,15 @@ class TestChatCompletionsFailoverLoop:
         if len(all_accounts) == 1:
             error_response = {"status_code": 403, "detail": last_error_message}
         else:
-            detail = "No available accounts for this model."
-            if last_error_message:
-                detail += f" Error from last account: {last_error_message}"
+            detail = "Service temporarily unavailable"
             error_response = {"status_code": 503, "detail": detail}
 
         print(f"Error response: {error_response}")
         assert error_response["status_code"] == 503
-        assert "No available accounts" in error_response["detail"]
-        assert "Error from last account: Token expired" in error_response["detail"]
-        print("✅ Multi-account correctly returns generic error with context")
+        assert error_response["detail"] == "Service temporarily unavailable"
+        assert "Pool state" not in error_response["detail"]
+        assert last_error_message not in error_response["detail"]
+        print("✅ Multi-account correctly returns a client-safe 503")
 
     @pytest.mark.asyncio
     async def test_chat_completions_failover_all_unavailable(self):

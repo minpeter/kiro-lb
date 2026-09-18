@@ -19,10 +19,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from loguru import logger
 
 from kiro.account_errors import ErrorType
 from kiro.account_manager import Account, AccountManager, account_label
 from kiro.config import ACCOUNT_RECOVERY_TIMEOUT
+from kiro.exceptions import CLIENT_UNAVAILABLE_MESSAGE
 from kiro.usage_tracking import current_account_id
 
 # =============================================================================
@@ -497,12 +499,11 @@ class TestAccountSystemFullFlow:
 
 class TestAccountSystemExhaustedPoolDiagnostics:
     """
-    Verifies the client-visible 503 explains why no account was usable.
+    Verifies an exhausted pool stays operator-visible in logs, not in /v1 bodies.
 
-    A bare "No available accounts for this model." cannot be acted on: it does
-    not say whether the pool is rate-limited, cooling down, or unauthenticated.
-    These tests drive the real route handlers so a regression in the message
-    fails here rather than in production logs.
+    The pool dump is what tells cooling-down from unauthenticated, but that
+    inventory is for operators. These tests drive the real route handlers so a
+    leak into the client 503 fails here rather than in a Codex/SDK session.
     """
 
     def _exhausted_manager(self, tmp_path, account_count: int = 3) -> AccountManager:
@@ -536,9 +537,9 @@ class TestAccountSystemExhaustedPoolDiagnostics:
     async def test_openai_503_names_every_cooling_account(self, tmp_path):
         """
         What it does: Calls /v1/chat/completions logic with a fully cooling pool
-        Purpose: The 503 detail must name each account and its cooldown reason
+        Purpose: The 503 detail is client-safe; the dump stays in the server log
         """
-        print("\n=== Test: OpenAI 503 reports pool state ===")
+        print("\n=== Test: OpenAI 503 keeps pool state in logs ===")
 
         from kiro.models_openai import ChatCompletionRequest
         from kiro.routes_openai import chat_completions
@@ -548,28 +549,36 @@ class TestAccountSystemExhaustedPoolDiagnostics:
             model="claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}], stream=False
         )
 
-        with self._no_probabilistic_retry():
-            with pytest.raises(HTTPException) as exc_info:
-                await chat_completions(self._request(manager), request_data)
+        log_lines: list[str] = []
+        sink_id = logger.add(lambda message: log_lines.append(message.record["message"]), format="{message}")
+        try:
+            with self._no_probabilistic_retry():
+                with pytest.raises(HTTPException) as exc_info:
+                    await chat_completions(self._request(manager), request_data)
+        finally:
+            logger.remove(sink_id)
 
         detail = exc_info.value.detail
         print(f"Status: {exc_info.value.status_code}")
         print(f"Detail: {detail}")
 
         assert exc_info.value.status_code == 503
-        assert "No available accounts for this model." in detail
+        assert detail == CLIENT_UNAVAILABLE_MESSAGE
+        assert "Pool state" not in detail
         for account_id in manager._accounts:
-            assert f"{account_label(account_id)}: cooling down for" in detail
-        # Credential paths must not reach the client
+            assert f"{account_label(account_id)}: cooling down for" not in detail
         assert "/creds/" not in detail
+        assert any("Pool state" in line for line in log_lines)
+        for account_id in manager._accounts:
+            assert any(f"{account_label(account_id)}: cooling down for" in line for line in log_lines)
 
     @pytest.mark.asyncio
     async def test_anthropic_503_names_every_cooling_account(self, tmp_path):
         """
         What it does: Calls /v1/messages logic with a fully cooling pool
-        Purpose: Anthropic must carry the same diagnostics as OpenAI
+        Purpose: Anthropic must keep the same client-safe 503 as OpenAI
         """
-        print("\n=== Test: Anthropic 503 reports pool state ===")
+        print("\n=== Test: Anthropic 503 keeps pool state in logs ===")
 
         from kiro.models_anthropic import AnthropicMessagesRequest
         from kiro.routes_anthropic import messages
@@ -579,8 +588,13 @@ class TestAccountSystemExhaustedPoolDiagnostics:
             model="claude-sonnet-4-5", max_tokens=64, messages=[{"role": "user", "content": "hi"}], stream=False
         )
 
-        with self._no_probabilistic_retry():
-            response = await messages(self._request(manager), request_data)
+        log_lines: list[str] = []
+        sink_id = logger.add(lambda message: log_lines.append(message.record["message"]), format="{message}")
+        try:
+            with self._no_probabilistic_retry():
+                response = await messages(self._request(manager), request_data)
+        finally:
+            logger.remove(sink_id)
 
         body = json.loads(bytes(response.body))
         message = body["error"]["message"]
@@ -588,18 +602,20 @@ class TestAccountSystemExhaustedPoolDiagnostics:
         print(f"Message: {message}")
 
         assert response.status_code == 503
-        assert "No available accounts for this model." in message
+        assert message == CLIENT_UNAVAILABLE_MESSAGE
+        assert "Pool state" not in message
         for account_id in manager._accounts:
-            assert f"{account_label(account_id)}: cooling down for" in message
+            assert f"{account_label(account_id)}: cooling down for" not in message
         assert "/creds/" not in message
+        assert any("Pool state" in line for line in log_lines)
 
     @pytest.mark.asyncio
     async def test_503_distinguishes_uninitialized_from_cooling(self, tmp_path):
         """
         What it does: Mixes a cooling account with an account that fails to init
-        Purpose: The operator must be able to tell auth failures from rate limits
+        Purpose: The operator can tell those apart in logs, not the /v1 body
         """
-        print("\n=== Test: 503 distinguishes uninitialized accounts ===")
+        print("\n=== Test: 503 log distinguishes uninitialized accounts ===")
 
         from kiro.models_openai import ChatCompletionRequest
         from kiro.routes_openai import chat_completions
@@ -615,19 +631,27 @@ class TestAccountSystemExhaustedPoolDiagnostics:
         request_data = ChatCompletionRequest(
             model="claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}], stream=False
         )
-        with (
-            self._no_probabilistic_retry(),
-            patch.object(manager, "_initialize_account", AsyncMock(return_value=False)),
-        ):
-            with pytest.raises(HTTPException) as exc_info:
-                await chat_completions(self._request(manager), request_data)
+        log_lines: list[str] = []
+        sink_id = logger.add(lambda message: log_lines.append(message.record["message"]), format="{message}")
+        try:
+            with (
+                self._no_probabilistic_retry(),
+                patch.object(manager, "_initialize_account", AsyncMock(return_value=False)),
+            ):
+                with pytest.raises(HTTPException) as exc_info:
+                    await chat_completions(self._request(manager), request_data)
+        finally:
+            logger.remove(sink_id)
 
         detail = exc_info.value.detail
         print(f"Detail: {detail}")
 
         assert exc_info.value.status_code == 503
-        assert f"{account_label(cooling_id)}: cooling down for" in detail
-        assert f"{account_label(broken_id)}: not initialized" in detail
+        assert detail == CLIENT_UNAVAILABLE_MESSAGE
+        assert f"{account_label(cooling_id)}: cooling down for" not in detail
+        assert f"{account_label(broken_id)}: not initialized" not in detail
+        assert any(f"{account_label(cooling_id)}: cooling down for" in line for line in log_lines)
+        assert any(f"{account_label(broken_id)}: not initialized" in line for line in log_lines)
 
 
 class TestFailoverTokenAttribution:

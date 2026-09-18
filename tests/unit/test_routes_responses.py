@@ -1040,7 +1040,8 @@ class TestStreamTranslation:
 
         print(f"Result: {events[-1]}")
         assert events[-1]["type"] == "response.failed"
-        assert events[-1]["response"]["error"]["message"] == "upstream died"
+        assert events[-1]["response"]["error"]["message"] == "Internal server error"
+        assert "upstream died" not in events[-1]["response"]["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_rate_limit_failure_uses_the_retryable_code(self):
