@@ -1,6 +1,6 @@
 import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { RequestDetailDialog, RequestLogTable } from "./components/request-log-table";
+import { RequestLogDetailFields, RequestLogTable } from "./components/request-log-table";
 import type { RequestLogDetail, RequestLogPage } from "./types";
 
 const emptyHandlers = {
@@ -88,9 +88,9 @@ describe("RequestLogTable", () => {
   });
 });
 
-describe("RequestDetailDialog", () => {
+describe("RequestLogDetailFields", () => {
   it("renders credits spent and the tier-aware multiplier when present", () => {
-    const html = renderToString(<RequestDetailDialog detail={solLongContext} onClose={() => undefined} />);
+    const html = renderToString(<RequestLogDetailFields detail={solLongContext} />);
 
     expect(html).toContain("Credits spent");
     expect(html).toContain("8.8");
@@ -101,10 +101,7 @@ describe("RequestDetailDialog", () => {
 
   it("hides the cost fields when the payload has neither figure", () => {
     const html = renderToString(
-      <RequestDetailDialog
-        detail={{ ...solLongContext, creditsSpent: null, modelMultiplier: null }}
-        onClose={() => undefined}
-      />,
+      <RequestLogDetailFields detail={{ ...solLongContext, creditsSpent: null, modelMultiplier: null }} />,
     );
 
     expect(html).not.toContain("Credits spent");

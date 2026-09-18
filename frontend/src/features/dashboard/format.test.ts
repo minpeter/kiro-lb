@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   formatCredits,
+  formatCreditsLabel,
   formatMultiplier,
   formatRelativeTime,
   formatTimestamp,
@@ -151,6 +152,18 @@ describe("formatCredits", () => {
   it("renders an em dash for a missing value", () => {
     expect(formatCredits(null)).toBe("—");
     expect(formatCredits(undefined)).toBe("—");
+  });
+});
+
+describe("formatCreditsLabel", () => {
+  it("names the unit so spend cannot be read as a rate", () => {
+    expect(formatCreditsLabel(8.8)).toBe("8.8 credits");
+    expect(formatCreditsLabel(0.03)).toBe("0.03 credits");
+  });
+
+  it("returns null when there is no spend to show", () => {
+    expect(formatCreditsLabel(null)).toBeNull();
+    expect(formatCreditsLabel(undefined)).toBeNull();
   });
 });
 

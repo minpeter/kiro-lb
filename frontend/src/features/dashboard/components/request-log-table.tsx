@@ -8,7 +8,14 @@ import { EmptyState } from "@/components/empty-state";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { dashboardApi, DashboardApiError } from "../api";
-import { formatCredits, formatLatency, formatMultiplier, formatRelativeTime, formatTimestamp } from "../format";
+import {
+  formatCredits,
+  formatCreditsLabel,
+  formatLatency,
+  formatMultiplier,
+  formatRelativeTime,
+  formatTimestamp,
+} from "../format";
 import type { RequestLogDetail, RequestLogOrder, RequestLogPage } from "../types";
 import { PaginationControls } from "./pagination-controls";
 import { TableSkeleton } from "./skeletons";
@@ -116,54 +123,57 @@ export function RequestLogTable({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {page.logs.map((log, index) => (
-                <TableRow key={log.id ?? `${log.created_at}-${page.offset + index}`}>
-                  <TableCell title={formatTimestamp(log.created_at)}>
-                    {formatRelativeTime(now, log.created_at)}
-                  </TableCell>
-                  <TableCell className="max-w-[10rem] truncate font-mono text-xs md:max-w-none">{log.route}</TableCell>
-                  <TableCell>
-                    {log.model ?? "—"}
-                    {log.credits != null ? (
-                      <span className="ml-2 text-xs text-muted-foreground" title="Credits spent">
-                        {formatCredits(log.credits)} credits
-                      </span>
-                    ) : null}
-                    {log.modelMultiplier != null ? (
-                      <span className="ml-2 text-xs text-muted-foreground" title="Model multiplier">
-                        {formatMultiplier(log.modelMultiplier)}
-                      </span>
-                    ) : null}
-                  </TableCell>
-                  <TableCell>
-                    {/* Status is the point of the table, so both states must read at a
+              {page.logs.map((log, index) => {
+                const spendLabel = formatCreditsLabel(log.credits);
+                return (
+                  <TableRow key={log.id ?? `${log.created_at}-${page.offset + index}`}>
+                    <TableCell title={formatTimestamp(log.created_at)}>
+                      {formatRelativeTime(now, log.created_at)}
+                    </TableCell>
+                    <TableCell className="max-w-[10rem] truncate font-mono text-xs md:max-w-none">{log.route}</TableCell>
+                    <TableCell>
+                      {log.model ?? "—"}
+                      {spendLabel ? (
+                        <span className="ml-2 text-xs text-muted-foreground" title="Credits spent">
+                          {spendLabel}
+                        </span>
+                      ) : null}
+                      {log.modelMultiplier != null ? (
+                        <span className="ml-2 text-xs text-muted-foreground" title="Model multiplier">
+                          {formatMultiplier(log.modelMultiplier)}
+                        </span>
+                      ) : null}
+                    </TableCell>
+                    <TableCell>
+                      {/* Status is the point of the table, so both states must read at a
                         glance: a tinted outline for success against the loud destructive pill. */}
-                    <Badge
-                      variant={log.status_code < 400 ? "outline" : "destructive"}
-                      className={log.status_code < 400 ? "border-success/40 text-success" : undefined}
-                    >
-                      {log.status_code}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="hidden text-right tabular-nums md:table-cell">
-                    {formatLatency(log.latency_ms)}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    {log.id ? (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-7"
-                        aria-label="Show request details"
-                        disabled={loadingDetail !== null}
-                        onClick={() => void openDetail(log.id as number)}
+                      <Badge
+                        variant={log.status_code < 400 ? "outline" : "destructive"}
+                        className={log.status_code < 400 ? "border-success/40 text-success" : undefined}
                       >
-                        <Eye size={14} aria-hidden />
-                      </Button>
-                    ) : null}
-                  </TableCell>
-                </TableRow>
-              ))}
+                        {log.status_code}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="hidden text-right tabular-nums md:table-cell">
+                      {formatLatency(log.latency_ms)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {log.id ? (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-7"
+                          aria-label="Show request details"
+                          disabled={loadingDetail !== null}
+                          onClick={() => void openDetail(log.id as number)}
+                        >
+                          <Eye size={14} aria-hidden />
+                        </Button>
+                      ) : null}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         )}
@@ -194,7 +204,35 @@ function Field({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
-export function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | null; onClose: () => void }) {
+export function RequestLogDetailFields({ detail }: { detail: RequestLogDetail }) {
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
+        <Field label="Model" value={detail.model} />
+        <Field label="Status" value={detail.statusCode} />
+        <Field label="Latency" value={formatLatency(detail.latencyMs)} />
+        <Field label="Client" value={detail.clientIp} />
+        <Field label="User agent" value={detail.userAgent} />
+        <Field
+          label="Tokens in / out"
+          value={
+            detail.inputTokens !== null || detail.outputTokens !== null
+              ? `${(detail.inputTokens ?? 0).toLocaleString()} / ${(detail.outputTokens ?? 0).toLocaleString()}`
+              : "—"
+          }
+        />
+        {detail.creditsSpent != null ? (
+          <Field label="Credits spent" value={formatCredits(detail.creditsSpent)} />
+        ) : null}
+        {detail.modelMultiplier != null ? (
+          <Field label="Model multiplier" value={formatMultiplier(detail.modelMultiplier)} />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | null; onClose: () => void }) {
   return (
     <Dialog open={detail !== null} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-h-[85vh] overflow-auto sm:max-w-3xl">
@@ -204,31 +242,7 @@ export function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDet
             {detail ? `${detail.route} · ${formatTimestamp(detail.createdAt)}` : ""}
           </DialogDescription>
         </DialogHeader>
-        {detail && (
-          <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
-              <Field label="Model" value={detail.model} />
-              <Field label="Status" value={detail.statusCode} />
-              <Field label="Latency" value={formatLatency(detail.latencyMs)} />
-              <Field label="Client" value={detail.clientIp} />
-              <Field label="User agent" value={detail.userAgent} />
-              <Field
-                label="Tokens in / out"
-                value={
-                  detail.inputTokens !== null || detail.outputTokens !== null
-                    ? `${(detail.inputTokens ?? 0).toLocaleString()} / ${(detail.outputTokens ?? 0).toLocaleString()}`
-                    : "—"
-                }
-              />
-              {detail.creditsSpent != null ? (
-                <Field label="Credits spent" value={formatCredits(detail.creditsSpent)} />
-              ) : null}
-              {detail.modelMultiplier != null ? (
-                <Field label="Model multiplier" value={formatMultiplier(detail.modelMultiplier)} />
-              ) : null}
-            </div>
-          </div>
-        )}
+        {detail && <RequestLogDetailFields detail={detail} />}
       </DialogContent>
     </Dialog>
   );

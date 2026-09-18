@@ -75,6 +75,12 @@ export function formatMultiplier(value?: number | null): string {
   return `${value}x`;
 }
 
+/** Operator-facing spend label for the request-log list. */
+export function formatCreditsLabel(value?: number | null): string | null {
+  if (value == null) return null;
+  return `${formatCredits(value)} credits`;
+}
+
 // Pinned to en-US on purpose: the K/M/B units are what operators read these
 // tables for, and the browser locale would substitute its own scale (ko-KR
 // renders 991,600,000 as 9.9억).
