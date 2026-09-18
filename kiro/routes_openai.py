@@ -6,6 +6,7 @@ Contains all API endpoints:
 - / and /health: Health check
 - /v1/models: Models list
 - /v1/chat/completions: Chat completions
+- /v1/responses: OpenAI Responses API, translated onto the chat pipeline
 """
 
 import json
@@ -23,6 +24,12 @@ from kiro.config import (
     WEB_SEARCH_ENABLED,
 )
 from kiro.converters_openai import build_kiro_payload, response_format_requests_json
+from kiro.converters_responses import (
+    chat_completion_to_responses,
+    freeform_tool_names,
+    new_response_id,
+    responses_request_to_chat,
+)
 from kiro.dashboard import identify_data_api_key
 from kiro.http_client import KiroHttpClient
 from kiro.models_openai import (
@@ -30,9 +37,11 @@ from kiro.models_openai import (
     ModelList,
     OpenAIModel,
 )
+from kiro.models_responses import ResponsesRequest
 from kiro.offload import run_in_worker
 from kiro.payload_guards import PayloadTooLargeError
 from kiro.streaming_openai import collect_stream_response, stream_with_first_token_retry
+from kiro.streaming_responses import translate_chat_stream_to_responses
 from kiro.usage_tracking import current_account_id, current_api_key_id
 from kiro.utils import generate_conversation_id
 
@@ -689,3 +698,52 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             if last_error_message:
                 detail += f" Error from last account: {last_error_message}"
             raise HTTPException(status_code=503, detail=detail)
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_api_key)])
+async def responses(request: Request, request_data: ResponsesRequest):
+    """
+    Responses API endpoint - compatible with OpenAI's /v1/responses.
+
+    The Codex CLI dropped support for the chat wire API in 0.94, so this is the
+    only endpoint it will talk to. It is a translation facade, not a second
+    pipeline: the request becomes a ChatCompletionRequest and goes through
+    `chat_completions`, which already owns account failover, payload building,
+    token accounting and the first-token retry. Only the wire format differs.
+
+    The auth dependency is declared here explicitly. Calling `chat_completions`
+    as a function does not run the dependencies FastAPI attached to *its* route,
+    so without this the endpoint would be unauthenticated.
+
+    Args:
+        request: FastAPI Request, forwarded untouched to the chat handler
+        request_data: Request in OpenAI Responses format
+
+    Returns:
+        StreamingResponse of Responses events for streaming mode
+        JSONResponse holding a `response` object otherwise
+    """
+    logger.info(f"Request to /v1/responses (model={request_data.model}, stream={request_data.stream})")
+
+    chat_request = responses_request_to_chat(request_data)
+    # Which tools were declared freeform, so their calls come back as
+    # custom_tool_call items rather than function_call ones.
+    freeform_tools = freeform_tool_names(request_data)
+    result = await chat_completions(request, chat_request)
+
+    if isinstance(result, StreamingResponse) or hasattr(result, "body_iterator"):
+        response_id = new_response_id()
+        return StreamingResponse(
+            translate_chat_stream_to_responses(
+                result.body_iterator,
+                model=request_data.model,
+                response_id=response_id,
+                freeform_tools=freeform_tools,
+            ),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming: the chat handler already collected the whole turn, so the
+    # body is a complete `chat.completion` object to reshape.
+    body = json.loads(bytes(result.body).decode("utf-8"))
+    return JSONResponse(content=chat_completion_to_responses(body, request_data.model, freeform_tools))
