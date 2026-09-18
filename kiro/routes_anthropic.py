@@ -19,7 +19,7 @@ from loguru import logger
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.converters_anthropic import anthropic_to_kiro, anthropic_to_kiro_with_stats
 from kiro.dashboard import identify_data_api_key
-from kiro.exceptions import CLIENT_INTERNAL_ERROR_MESSAGE, log_pool_exhausted
+from kiro.exceptions import CLIENT_INTERNAL_ERROR_MESSAGE, client_safe_exception_message, log_pool_exhausted
 from kiro.http_client import KiroHttpClient
 from kiro.models_anthropic import (
     AnthropicCountTokensRequest,
@@ -369,7 +369,22 @@ async def messages(
                             except Exception as e:
                                 streaming_error = e
                                 try:
-                                    error_event = f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
+                                    # Same rule as the JSON 500 path and Responses
+                                    # `response.failed`: the client gets a short
+                                    # message, and `str(e)` stays in the logs below.
+                                    error_event = (
+                                        "event: error\ndata: "
+                                        + json.dumps(
+                                            {
+                                                "type": "error",
+                                                "error": {
+                                                    "type": "api_error",
+                                                    "message": client_safe_exception_message(e),
+                                                },
+                                            }
+                                        )
+                                        + "\n\n"
+                                    )
                                     yield error_event
                                 except Exception:
                                     pass

@@ -196,6 +196,46 @@ class TestInternalErrorClientBodies:
         assert body["error"]["message"] == CLIENT_INTERNAL_ERROR_MESSAGE
         _assert_client_safe(body["error"]["message"])
 
+    @pytest.mark.asyncio
+    async def test_anthropic_stream_error_omits_exception_text(self):
+        """
+        What it does: Raises RuntimeError after /v1/messages has already opened SSE.
+        Purpose: #54 sanitized the JSON 500; the mid-stream error event still
+                 forwarded str(exc) until this test.
+        """
+        manager, _account = self._serving_manager()
+        leak = "SecretBoom RuntimeError Pool state: leaked"
+        upstream = MagicMock()
+        upstream.status_code = 200
+        http_client = AsyncMock()
+        http_client.request_with_retry = AsyncMock(return_value=upstream)
+        http_client.close = AsyncMock()
+
+        async def exploding(**_kwargs):
+            raise RuntimeError(leak)
+            yield  # pragma: no cover - generator shape only
+
+        request_data = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=64,
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+        with (
+            patch("kiro.routes_anthropic.run_in_worker", AsyncMock(return_value=MagicMock(payload={}, input_tokens=1))),
+            patch("kiro.routes_anthropic.KiroHttpClient", return_value=http_client),
+            patch("kiro.routes_anthropic.stream_with_first_token_retry_anthropic", exploding),
+        ):
+            response = await messages(_request(manager), request_data)
+
+        chunks: list[str] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk if isinstance(chunk, str) else chunk.decode())
+        text = "".join(chunks)
+        assert "event: error" in text
+        assert CLIENT_INTERNAL_ERROR_MESSAGE in text
+        _assert_client_safe(text)
+
 
 class TestResponsesStreamErrorMessage:
     """response.failed must keep its code mapping and drop str(exc)."""
