@@ -31,6 +31,7 @@ from kiro.converters_responses import (
     responses_request_to_chat,
 )
 from kiro.dashboard import identify_data_api_key
+from kiro.exceptions import CLIENT_INTERNAL_ERROR_MESSAGE, log_pool_exhausted
 from kiro.http_client import KiroHttpClient
 from kiro.models_openai import (
     ChatCompletionRequest,
@@ -397,15 +398,17 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     )
                 else:
                     # Multiple accounts - no account is currently selectable.
-                    # Report the pool state so the operator can tell a rate-limit
-                    # burst apart from cooldowns or auth failures.
-                    detail = (
-                        "No available accounts for this model. "
-                        f"Pool state: {account_manager.describe_pool_state(tried_accounts)}."
+                    # Pool dumps stay in the server log; /v1 clients get a short
+                    # 503 so Codex/SDKs do not see account inventory.
+                    raise HTTPException(
+                        status_code=503,
+                        detail=log_pool_exhausted(
+                            account_manager,
+                            reason="No available accounts for this model.",
+                            tried_accounts=tried_accounts,
+                            last_error_message=last_error_message,
+                        ),
                     )
-                    if last_error_message:
-                        detail += f" Error from last account: {last_error_message}"
-                    raise HTTPException(status_code=503, detail=detail)
 
             # Mark account as tried in current failover loop
             tried_accounts.add(account.id)
@@ -681,7 +684,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
                 if debug_logger:
                     debug_logger.flush_on_error(500, str(e))
-                raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+                raise HTTPException(status_code=500, detail=CLIENT_INTERNAL_ERROR_MESSAGE)
 
         # All attempts exhausted
         if single_attempt:
@@ -691,13 +694,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             raise HTTPException(status_code=last_error_status, detail=last_error_message)
         else:
             # Multiple accounts - every account was tried and failed
-            detail = (
-                f"All {len(all_accounts)} accounts failed after full circle. "
-                f"Pool state: {account_manager.describe_pool_state()}."
+            raise HTTPException(
+                status_code=503,
+                detail=log_pool_exhausted(
+                    account_manager,
+                    reason=f"All {len(all_accounts)} accounts failed after full circle.",
+                    last_error_message=last_error_message,
+                ),
             )
-            if last_error_message:
-                detail += f" Error from last account: {last_error_message}"
-            raise HTTPException(status_code=503, detail=detail)
 
 
 @router.post("/v1/responses", dependencies=[Depends(verify_api_key)])

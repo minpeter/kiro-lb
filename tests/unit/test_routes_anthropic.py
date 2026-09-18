@@ -1295,15 +1295,13 @@ class TestMessagesFailoverLoop:
 
         print("Checking: Multi-account returns generic error...")
         if len(all_accounts) > 1:
-            # Should return generic message with context
-            generic_message = "No available accounts for this model."
-            if last_error_message:
-                generic_message += f" Error from last account: {last_error_message}"
+            generic_message = "Service temporarily unavailable"
 
-            assert "No available accounts" in generic_message
-            assert last_error_message in generic_message
+            assert generic_message == "Service temporarily unavailable"
+            assert "Pool state" not in generic_message
+            assert last_error_message not in generic_message
 
-        print("✅ Multi-account returns generic error with context")
+        print("✅ Multi-account returns a client-safe 503")
 
     @pytest.mark.asyncio
     async def test_messages_failover_all_unavailable(self):

@@ -303,6 +303,58 @@ class TestDataPlaneErrorShapes:
         assert body["error"]["param"] == "body.messages"
         assert body["error"]["code"] is None
 
+    @pytest.mark.asyncio
+    async def test_openai_503_strips_pool_state_from_detail(self):
+        """
+        What it does: Handles a leaky 503 on /v1/chat/completions.
+        Purpose: The OpenAI envelope must not forward pool dumps.
+        """
+        import json
+
+        from fastapi import HTTPException
+
+        from kiro.exceptions import CLIENT_UNAVAILABLE_MESSAGE, http_exception_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/v1/chat/completions"
+
+        response = await http_exception_handler(
+            mock_request,
+            HTTPException(status_code=503, detail="No accounts. Pool state: a1: cooling down for 10s."),
+        )
+        body = json.loads(response.body.decode())
+        assert response.status_code == 503
+        assert body["error"]["type"] == "api_error"
+        assert body["error"]["message"] == CLIENT_UNAVAILABLE_MESSAGE
+        assert "Pool state" not in body["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_responses_500_strips_exception_text(self):
+        """
+        What it does: Handles Internal Server Error: {exc} on /v1/responses.
+        Purpose: The facade shares the chat 500 path; the body must stay short.
+        """
+        import json
+
+        from fastapi import HTTPException
+
+        from kiro.exceptions import CLIENT_INTERNAL_ERROR_MESSAGE, http_exception_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.url = MagicMock()
+        mock_request.url.path = "/v1/responses"
+
+        response = await http_exception_handler(
+            mock_request,
+            HTTPException(status_code=500, detail="Internal Server Error: RuntimeError('SecretBoom')"),
+        )
+        body = json.loads(response.body.decode())
+        assert response.status_code == 500
+        assert body["error"]["type"] == "api_error"
+        assert body["error"]["message"] == CLIENT_INTERNAL_ERROR_MESSAGE
+        assert "RuntimeError" not in body["error"]["message"]
+
     def test_openai_route_401_uses_openai_error_shape(self, test_client):
         """
         What it does: Verifies an auth failure on /v1/models is OpenAI-shaped.

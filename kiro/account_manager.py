@@ -1776,10 +1776,12 @@ class AccountManager:
         """
         Describe why each account is or is not usable right now.
 
-        Used to explain a 503 to the caller: "no available accounts" alone does
-        not say whether the pool is rate-limited, cooling down after failures,
-        or failing to authenticate. Account IDs are reduced to short digests so
-        credential paths never reach a client.
+        Used in server logs (and operator-facing dashboards) when a request
+        cannot be served: "no available accounts" alone does not say whether
+        the pool is rate-limited, cooling down after failures, or failing to
+        authenticate. Account IDs are reduced to short digests so credential
+        paths never reach a log line or control-plane view. /v1 clients get a
+        short 503 instead of this dump.
 
         Args:
             exclude_accounts: Account IDs already tried in the current request

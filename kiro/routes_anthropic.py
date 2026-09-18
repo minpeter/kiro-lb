@@ -19,6 +19,7 @@ from loguru import logger
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.converters_anthropic import anthropic_to_kiro, anthropic_to_kiro_with_stats
 from kiro.dashboard import identify_data_api_key
+from kiro.exceptions import CLIENT_INTERNAL_ERROR_MESSAGE, log_pool_exhausted
 from kiro.http_client import KiroHttpClient
 from kiro.models_anthropic import (
     AnthropicCountTokensRequest,
@@ -225,16 +226,22 @@ async def messages(
                     )
                 else:
                     # Multiple accounts - no account is currently selectable.
-                    # Report the pool state so the operator can tell a rate-limit
-                    # burst apart from cooldowns or auth failures.
-                    detail = (
-                        "No available accounts for this model. "
-                        f"Pool state: {account_manager.describe_pool_state(tried_accounts)}."
-                    )
-                    if last_error_message:
-                        detail += f" Error from last account: {last_error_message}"
+                    # Pool dumps stay in the server log; /v1 clients get a short
+                    # 503 so SDKs do not see account inventory.
                     return JSONResponse(
-                        status_code=503, content={"type": "error", "error": {"type": "api_error", "message": detail}}
+                        status_code=503,
+                        content={
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": log_pool_exhausted(
+                                    account_manager,
+                                    reason="No available accounts for this model.",
+                                    tried_accounts=tried_accounts,
+                                    last_error_message=last_error_message,
+                                ),
+                            },
+                        },
                     )
 
             # Mark account as tried in current failover loop
@@ -546,7 +553,7 @@ async def messages(
                     status_code=500,
                     content={
                         "type": "error",
-                        "error": {"type": "api_error", "message": f"Internal Server Error: {str(e)}"},
+                        "error": {"type": "api_error", "message": CLIENT_INTERNAL_ERROR_MESSAGE},
                     },
                 )
 
@@ -561,14 +568,19 @@ async def messages(
             )
         else:
             # Multiple accounts - every account was tried and failed
-            detail = (
-                f"All {len(all_accounts)} accounts failed after full circle. "
-                f"Pool state: {account_manager.describe_pool_state()}."
-            )
-            if last_error_message:
-                detail += f" Error from last account: {last_error_message}"
             return JSONResponse(
-                status_code=503, content={"type": "error", "error": {"type": "api_error", "message": detail}}
+                status_code=503,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": log_pool_exhausted(
+                            account_manager,
+                            reason=f"All {len(all_accounts)} accounts failed after full circle.",
+                            last_error_message=last_error_message,
+                        ),
+                    },
+                },
             )
 
 

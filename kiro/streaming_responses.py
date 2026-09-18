@@ -50,6 +50,7 @@ from kiro.converters_responses import (
     response_envelope,
     usage_block,
 )
+from kiro.exceptions import client_safe_exception_message
 
 # Status codes whose failures a client should retry rather than surface. Codex reads
 # this code and backs off instead of ending the turn.
@@ -315,7 +316,7 @@ async def translate_chat_stream_to_responses(
                     model,
                     "failed",
                     [],
-                    error={"code": code, "message": str(exc) or type(exc).__name__},
+                    error={"code": code, "message": client_safe_exception_message(exc)},
                 ),
             },
         )

@@ -9,11 +9,13 @@ Data-plane routes (/v1/*) return client-spec error envelopes: the OpenAI
 shape ({"error": {message, type, param, code}}) for every /v1/* route
 except /v1/messages and /v1/messages/count_tokens, which use the
 Anthropic shape ({"type": "error", "error": {type, message}}).
-Control-plane routes keep FastAPI's native {"detail": ...} bodies.
+5xx/503 bodies on those routes are short client-safe strings; pool dumps
+and exception text stay in server logs. Control-plane routes keep
+FastAPI's native {"detail": ...} bodies.
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -21,6 +23,17 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 _ANTHROPIC_EXACT_PATHS = frozenset({"/v1/messages", "/v1/messages/count_tokens"})
+
+# Short /v1 client bodies. Pool dumps and exception text stay in server logs.
+CLIENT_UNAVAILABLE_MESSAGE = "Service temporarily unavailable"
+CLIENT_INTERNAL_ERROR_MESSAGE = "Internal server error"
+CLIENT_RATE_LIMIT_MESSAGE = "Rate limit exceeded"
+
+_LEAKY_CLIENT_MARKERS = (
+    "Pool state",
+    "Internal Server Error:",
+    "Traceback (most recent call last)",
+)
 
 
 def _request_path(request: Request) -> str:
@@ -67,16 +80,67 @@ def _shape_validation_error(path: str, errors: Sequence[Mapping[str, Any]]) -> d
     }
 
 
+def client_safe_message_for_status(status_code: int) -> str:
+    """Returns the short /v1 message that matches a 429/503/5xx status."""
+    if status_code == 429:
+        return CLIENT_RATE_LIMIT_MESSAGE
+    if status_code == 503:
+        return CLIENT_UNAVAILABLE_MESSAGE
+    return CLIENT_INTERNAL_ERROR_MESSAGE
+
+
+def client_safe_exception_message(exc: BaseException) -> str:
+    """Maps a mid-stream exception to a client-safe Responses error.message."""
+    status_code = getattr(exc, "status_code", 0)
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError):
+        status = 0
+    return client_safe_message_for_status(status)
+
+
+def looks_leaky_client_message(message: str) -> bool:
+    """True when a client body still carries pool dumps or exception text."""
+    return any(marker in message for marker in _LEAKY_CLIENT_MARKERS)
+
+
+def log_pool_exhausted(
+    account_manager: Any,
+    *,
+    reason: str,
+    tried_accounts: Optional[set[str]] = None,
+    last_error_message: Optional[str] = None,
+) -> str:
+    """Logs the operator-facing pool dump and returns the /v1 503 message."""
+    pool_state = account_manager.describe_pool_state(tried_accounts)
+    extra = f" Error from last account: {last_error_message}" if last_error_message else ""
+    logger.error(f"{reason} Pool state: {pool_state}.{extra}")
+    return CLIENT_UNAVAILABLE_MESSAGE
+
+
+def _sanitize_data_plane_message(status_code: int, message: str) -> str:
+    """Strips pool dumps / exception text from 5xx data-plane bodies."""
+    if status_code >= 500 and looks_leaky_client_message(message):
+        return client_safe_message_for_status(status_code)
+    return message
+
+
 def _shape_http_error(path: str, status_code: int, detail: Any) -> dict[str, Any]:
     """Builds the spec-shaped body for an HTTPException on a data-plane route."""
     # Routes may already nest a spec-shaped payload in 'detail'; unwrap it.
     if isinstance(detail, Mapping):
         nested = detail.get("error")
         if _is_anthropic_route(path) and detail.get("type") == "error" and isinstance(nested, Mapping):
+            nested_message = nested.get("message")
+            if isinstance(nested_message, str):
+                nested = {**nested, "message": _sanitize_data_plane_message(status_code, nested_message)}
             return {"type": "error", "error": dict(nested)}
         if isinstance(nested, Mapping):
             detail = nested
     message = detail if isinstance(detail, str) else str(detail)
+    if isinstance(detail, Mapping) and isinstance(detail.get("message"), str):
+        message = detail["message"]
+    message = _sanitize_data_plane_message(status_code, message)
     if _is_anthropic_route(path):
         return {
             "type": "error",
