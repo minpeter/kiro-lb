@@ -8,7 +8,7 @@ import { EmptyState } from "@/components/empty-state";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { dashboardApi, DashboardApiError } from "../api";
-import { formatLatency, formatRelativeTime, formatTimestamp } from "../format";
+import { formatCredits, formatLatency, formatMultiplier, formatRelativeTime, formatTimestamp } from "../format";
 import type { RequestLogDetail, RequestLogOrder, RequestLogPage } from "../types";
 import { PaginationControls } from "./pagination-controls";
 import { TableSkeleton } from "./skeletons";
@@ -124,8 +124,15 @@ export function RequestLogTable({
                   <TableCell className="max-w-[10rem] truncate font-mono text-xs md:max-w-none">{log.route}</TableCell>
                   <TableCell>
                     {log.model ?? "—"}
-                    {log.credits ? (
-                      <span className="ml-2 text-xs text-muted-foreground">{log.credits}x</span>
+                    {log.credits != null ? (
+                      <span className="ml-2 text-xs text-muted-foreground" title="Credits spent">
+                        {formatCredits(log.credits)} credits
+                      </span>
+                    ) : null}
+                    {log.modelMultiplier != null ? (
+                      <span className="ml-2 text-xs text-muted-foreground" title="Model multiplier">
+                        {formatMultiplier(log.modelMultiplier)}
+                      </span>
                     ) : null}
                   </TableCell>
                   <TableCell>
@@ -187,7 +194,7 @@ function Field({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
-function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | null; onClose: () => void }) {
+export function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | null; onClose: () => void }) {
   return (
     <Dialog open={detail !== null} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-h-[85vh] overflow-auto sm:max-w-3xl">
@@ -213,6 +220,12 @@ function RequestDetailDialog({ detail, onClose }: { detail: RequestLogDetail | n
                     : "—"
                 }
               />
+              {detail.creditsSpent != null ? (
+                <Field label="Credits spent" value={formatCredits(detail.creditsSpent)} />
+              ) : null}
+              {detail.modelMultiplier != null ? (
+                <Field label="Model multiplier" value={formatMultiplier(detail.modelMultiplier)} />
+              ) : null}
             </div>
           </div>
         )}

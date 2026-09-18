@@ -102,7 +102,14 @@ export type RequestLog = {
   status_code: number;
   latency_ms: number;
   client_ip?: string | null;
+  /** Upstream spend for this request, not a model multiplier. */
   credits?: number | null;
+  /**
+   * Published rate when the list payload includes it. The list endpoint today
+   * returns only `credits`; the detail dialog is where the tier-aware value
+   * always arrives.
+   */
+  modelMultiplier?: number | null;
 };
 
 export type RequestLogOrder = "newest" | "oldest";

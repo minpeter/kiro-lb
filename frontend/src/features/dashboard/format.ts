@@ -59,6 +59,22 @@ export function formatLatency(milliseconds?: number | null): string {
   return milliseconds == null ? "—" : `${milliseconds.toLocaleString()} ms`;
 }
 
+/**
+ * Upstream credit spend. Fractional, and must never grow an `x` suffix: that
+ * mark is reserved for the published model multiplier, and after two-tier
+ * GPT-5.6 pricing a spend of 8.8 is easy to misread as the long-context rate.
+ */
+export function formatCredits(value?: number | null): string {
+  if (value == null) return "—";
+  return value.toLocaleString("en-US", { maximumFractionDigits: 4 });
+}
+
+/** Published model multiplier. The `x` belongs only on this figure. */
+export function formatMultiplier(value?: number | null): string {
+  if (value == null) return "—";
+  return `${value}x`;
+}
+
 // Pinned to en-US on purpose: the K/M/B units are what operators read these
 // tables for, and the browser locale would substitute its own scale (ko-KR
 // renders 991,600,000 as 9.9억).
