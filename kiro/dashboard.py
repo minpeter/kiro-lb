@@ -1349,7 +1349,11 @@ async def dashboard_request_log_detail(log_id: int, request: Request) -> dict[st
         "outputTokens": row["output_tokens"] if "output_tokens" in keys else None,
         # What Kiro reported for this request, not a figure derived from tokens.
         "creditsSpent": row["credits"] if "credits" in keys else None,
-        "modelMultiplier": model_costs.multiplier_for(row["model"]),
+        # Tier-aware: a two-tier model charges its long-context rate above its
+        # threshold, and this request's own input count decides which applies.
+        "modelMultiplier": model_costs.multiplier_for(
+            row["model"], row["input_tokens"] if "input_tokens" in keys else None
+        ),
     }
 
 
@@ -1479,7 +1483,8 @@ async def dashboard_model_costs(request: Request) -> dict[str, Any]:
         "note": (
             "Multipliers are relative to auto at 1.0x. Models sharing a multiplier still "
             "differ in actual consumption: generated tokens, thinking depth and tokenizer "
-            "differences all change the credit count."
+            "differences all change the credit count. A second rate applies above the "
+            "threshold shown next to it."
         ),
     }
 

@@ -858,7 +858,16 @@ export function SettingsPanel({ onNotice }: SettingsPanelProps) {
                     {half.map((row) => (
                       <TableRow key={row.model}>
                         <TableCell className="font-medium">{row.model}</TableCell>
-                        <TableCell className="text-right tabular-nums">{row.multiplier}x</TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {row.multiplier}x
+                          {row.longMultiplier !== null && row.longThresholdTokens !== null && (
+                            <span className="text-muted-foreground">
+                              {" "}
+                              · {row.longMultiplier}x above{" "}
+                              {(row.longThresholdTokens / 1000).toFixed(0)}K
+                            </span>
+                          )}
+                        </TableCell>
                         <TableCell className="text-right tabular-nums text-muted-foreground">
                           {row.contextTokens ? `${(row.contextTokens / 1000).toFixed(0)}K` : "—"}
                         </TableCell>

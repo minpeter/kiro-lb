@@ -153,6 +153,8 @@ export type ModelCostRow = {
   model: string;
   multiplier: number;
   contextTokens: number | null;
+  longMultiplier: number | null;
+  longThresholdTokens: number | null;
 };
 
 export type RequestLogPage = {
