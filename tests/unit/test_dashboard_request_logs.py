@@ -141,3 +141,42 @@ def test_prune_rate_observations_respects_retention(dashboard, monkeypatch):
 
     assert removed == 1
     assert len(dashboard.load_rate_observations(0)) == 2
+
+
+@pytest.mark.asyncio
+async def test_detail_reports_the_short_multiplier_below_the_tier_threshold(dashboard, monkeypatch):
+    monkeypatch.setattr(dashboard, "_require_auth", lambda request: None)
+    dashboard.record_request("/v1/chat/completions", "gpt-5.6-sol", 200, 10, input_tokens=100_000)
+
+    with dashboard._db() as conn:
+        log_id = conn.execute("SELECT id FROM request_logs").fetchone()["id"]
+
+    detail = await dashboard.dashboard_request_log_detail(log_id, None)
+
+    assert detail["modelMultiplier"] == 4.4
+
+
+@pytest.mark.asyncio
+async def test_detail_reports_the_long_multiplier_above_the_tier_threshold(dashboard, monkeypatch):
+    monkeypatch.setattr(dashboard, "_require_auth", lambda request: None)
+    dashboard.record_request("/v1/chat/completions", "gpt-5.6-sol", 200, 10, input_tokens=400_000)
+
+    with dashboard._db() as conn:
+        log_id = conn.execute("SELECT id FROM request_logs").fetchone()["id"]
+
+    detail = await dashboard.dashboard_request_log_detail(log_id, None)
+
+    assert detail["modelMultiplier"] == 8.8
+
+
+@pytest.mark.asyncio
+async def test_detail_falls_back_to_the_short_multiplier_without_a_token_count(dashboard, monkeypatch):
+    monkeypatch.setattr(dashboard, "_require_auth", lambda request: None)
+    dashboard.record_request("/v1/chat/completions", "gpt-5.6-sol", 200, 10)
+
+    with dashboard._db() as conn:
+        log_id = conn.execute("SELECT id FROM request_logs").fetchone()["id"]
+
+    detail = await dashboard.dashboard_request_log_detail(log_id, None)
+
+    assert detail["modelMultiplier"] == 4.4
