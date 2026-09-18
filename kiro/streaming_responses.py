@@ -143,6 +143,9 @@ async def translate_chat_stream_to_responses(
     reasoning_open = False
     message_open = False
     buffer = ""
+    next_output_index = 0
+    reasoning_output_index = 0
+    message_output_index = 0
 
     yield _sse(
         "response.created",
@@ -161,12 +164,15 @@ async def translate_chat_stream_to_responses(
 
     def open_message() -> List[str]:
         """Emit the events that must precede the first text delta."""
+        nonlocal next_output_index, message_output_index
+        message_output_index = next_output_index
+        next_output_index += 1
         events = [
             _sse(
                 "response.output_item.added",
                 {
                     "sequence_number": seq.next(),
-                    "output_index": 0,
+                    "output_index": message_output_index,
                     "item": {
                         "id": message_id,
                         "type": "message",
@@ -181,7 +187,7 @@ async def translate_chat_stream_to_responses(
                 {
                     "sequence_number": seq.next(),
                     "item_id": message_id,
-                    "output_index": 0,
+                    "output_index": message_output_index,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": "", "annotations": []},
                 },
@@ -197,7 +203,7 @@ async def translate_chat_stream_to_responses(
                 {
                     "sequence_number": seq.next(),
                     "item_id": reasoning_id,
-                    "output_index": 0,
+                    "output_index": reasoning_output_index,
                     "summary_index": 0,
                     "text": text,
                 },
@@ -206,7 +212,7 @@ async def translate_chat_stream_to_responses(
                 "response.output_item.done",
                 {
                     "sequence_number": seq.next(),
-                    "output_index": 0,
+                    "output_index": reasoning_output_index,
                     "item": reasoning_item(text, reasoning_id),
                 },
             ),
@@ -228,11 +234,13 @@ async def translate_chat_stream_to_responses(
                     if reasoning:
                         if not reasoning_open:
                             reasoning_open = True
+                            reasoning_output_index = next_output_index
+                            next_output_index += 1
                             yield _sse(
                                 "response.output_item.added",
                                 {
                                     "sequence_number": seq.next(),
-                                    "output_index": 0,
+                                    "output_index": reasoning_output_index,
                                     "item": {
                                         "id": reasoning_id,
                                         "type": "reasoning",
@@ -245,7 +253,7 @@ async def translate_chat_stream_to_responses(
                                 {
                                     "sequence_number": seq.next(),
                                     "item_id": reasoning_id,
-                                    "output_index": 0,
+                                    "output_index": reasoning_output_index,
                                     "summary_index": 0,
                                     "part": {"type": "summary_text", "text": ""},
                                 },
@@ -256,7 +264,7 @@ async def translate_chat_stream_to_responses(
                             {
                                 "sequence_number": seq.next(),
                                 "item_id": reasoning_id,
-                                "output_index": 0,
+                                "output_index": reasoning_output_index,
                                 "summary_index": 0,
                                 "delta": str(reasoning),
                             },
@@ -281,7 +289,7 @@ async def translate_chat_stream_to_responses(
                             {
                                 "sequence_number": seq.next(),
                                 "item_id": message_id,
-                                "output_index": 0,
+                                "output_index": message_output_index,
                                 "content_index": 0,
                                 "delta": str(content),
                             },
@@ -330,7 +338,7 @@ async def translate_chat_stream_to_responses(
             {
                 "sequence_number": seq.next(),
                 "item_id": message_id,
-                "output_index": 0,
+                "output_index": message_output_index,
                 "content_index": 0,
                 "text": text,
             },
@@ -340,7 +348,7 @@ async def translate_chat_stream_to_responses(
             {
                 "sequence_number": seq.next(),
                 "item_id": message_id,
-                "output_index": 0,
+                "output_index": message_output_index,
                 "content_index": 0,
                 "part": {"type": "output_text", "text": text, "annotations": []},
             },
@@ -349,7 +357,7 @@ async def translate_chat_stream_to_responses(
             "response.output_item.done",
             {
                 "sequence_number": seq.next(),
-                "output_index": 0,
+                "output_index": message_output_index,
                 "item": message_item(text, message_id),
             },
         )
