@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { formatRelativeTime, formatTimestamp, formatTokens, shareOf, summarizeUsage } from "./format";
+import {
+  formatCredits,
+  formatCreditsLabel,
+  formatMultiplier,
+  formatRelativeTime,
+  formatTimestamp,
+  formatTokens,
+  shareOf,
+  summarizeUsage,
+} from "./format";
 import type { KeyUsage } from "./types";
 
 function row(model: string, promptTokens: number, completionTokens: number, requests = 1) {
@@ -129,6 +138,44 @@ describe("formatRelativeTime", () => {
   it("renders an em dash for a missing value", () => {
     expect(formatRelativeTime(Date.now(), null)).toBe("—");
     expect(formatRelativeTime(Date.now(), undefined)).toBe("—");
+  });
+});
+
+describe("formatCredits", () => {
+  it("renders spend without an x suffix", () => {
+    // 8.8 credits on sol is a real spend figure and must not look like 8.8x.
+    expect(formatCredits(8.8)).toBe("8.8");
+    expect(formatCredits(0.03)).toBe("0.03");
+    expect(formatCredits(0)).toBe("0");
+  });
+
+  it("renders an em dash for a missing value", () => {
+    expect(formatCredits(null)).toBe("—");
+    expect(formatCredits(undefined)).toBe("—");
+  });
+});
+
+describe("formatCreditsLabel", () => {
+  it("names the unit so spend cannot be read as a rate", () => {
+    expect(formatCreditsLabel(8.8)).toBe("8.8 credits");
+    expect(formatCreditsLabel(0.03)).toBe("0.03 credits");
+  });
+
+  it("returns null when there is no spend to show", () => {
+    expect(formatCreditsLabel(null)).toBeNull();
+    expect(formatCreditsLabel(undefined)).toBeNull();
+  });
+});
+
+describe("formatMultiplier", () => {
+  it("keeps the x suffix on the published rate only", () => {
+    expect(formatMultiplier(4.4)).toBe("4.4x");
+    expect(formatMultiplier(8.8)).toBe("8.8x");
+  });
+
+  it("renders an em dash for a missing value", () => {
+    expect(formatMultiplier(null)).toBe("—");
+    expect(formatMultiplier(undefined)).toBe("—");
   });
 });
 
