@@ -731,6 +731,12 @@ async def responses(request: Request, request_data: ResponsesRequest):
     freeform_tools = freeform_tool_names(request_data)
     result = await chat_completions(request, chat_request)
 
+    # FATAL / HTTP errors from chat_completions are already a finished
+    # JSONResponse (`{"error": ...}`, no `choices`). Reshaping that body
+    # as a Responses object would hide the status and report `completed`.
+    if getattr(result, "status_code", 200) >= 400:
+        return result
+
     if isinstance(result, StreamingResponse) or hasattr(result, "body_iterator"):
         response_id = new_response_id()
         return StreamingResponse(
@@ -746,4 +752,6 @@ async def responses(request: Request, request_data: ResponsesRequest):
     # Non-streaming: the chat handler already collected the whole turn, so the
     # body is a complete `chat.completion` object to reshape.
     body = json.loads(bytes(result.body).decode("utf-8"))
+    if body.get("error") and not body.get("choices"):
+        return result
     return JSONResponse(content=chat_completion_to_responses(body, request_data.model, freeform_tools))

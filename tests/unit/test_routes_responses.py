@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 
 from kiro.converters_responses import (
     chat_completion_to_responses,
@@ -1219,6 +1220,36 @@ class TestEndpoint:
         assert "response.created" in response.text
         assert "response.completed" in response.text
         assert "data: [DONE]" not in response.text
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @patch("kiro.routes_openai.chat_completions", new_callable=AsyncMock)
+    def test_fatal_error_is_returned_unchanged(self, mock_chat, test_client, valid_proxy_api_key, stream):
+        """
+        What it does: Verifies a FATAL chat JSONResponse is not reshaped.
+        Purpose: chat_completion_to_responses treats a body with no choices as
+                 a completed empty response, which would hide the 400.
+        """
+        error_body = {
+            "error": {
+                "message": "Input is too long.",
+                "type": "kiro_api_error",
+                "code": 400,
+            }
+        }
+        mock_chat.return_value = JSONResponse(status_code=400, content=error_body)
+
+        response = test_client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={"model": "gpt-5.6-luna", "input": "hi", "stream": stream},
+        )
+
+        body = response.json()
+        print(f"Result: {response.status_code} {body}")
+        assert response.status_code == 400
+        assert body == error_body
+        assert body.get("status") != "completed"
+        assert body.get("object") != "response"
 
     @patch("kiro.routes_openai.KiroHttpClient")
     def test_non_streaming_turn_returns_a_response_object(self, mock_client_class, test_client, valid_proxy_api_key):
