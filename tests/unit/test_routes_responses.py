@@ -230,6 +230,47 @@ class TestRequestTranslation:
         assert message.tool_call_id == "call_1"
         assert message.content == "file contents"
 
+    def test_id_pairs_a_call_to_its_output_when_call_id_is_absent(self):
+        """
+        What it does: Verifies `id` is used as the pairing key when `call_id` is omitted.
+        Purpose: Clients that only send the item id would otherwise get a generated
+                 call id on one side and an empty tool_call_id on the other, and the
+                 replayed tool history would not attach.
+        """
+        chat = responses_request_to_chat(
+            build_request(
+                input=[
+                    {"type": "function_call", "name": "read_file", "arguments": "{}", "id": "call_1"},
+                    {"type": "function_call_output", "id": "call_1", "output": "ok"},
+                ]
+            )
+        )
+
+        call, result = chat.messages
+        print(f"Result: {call.tool_calls[0]['id']} / {result.tool_call_id}")
+        assert call.tool_calls[0]["id"] == "call_1"
+        assert result.tool_call_id == "call_1"
+
+    def test_custom_tool_history_pairs_on_id_when_call_id_is_absent(self):
+        """
+        What it does: Verifies the same id fallback on a freeform call/output pair.
+        Purpose: Codex custom_tool_call_output marks call_id optional; pairing
+                 must still survive a replay that only carries id.
+        """
+        chat = responses_request_to_chat(
+            build_request(
+                input=[
+                    {"type": "custom_tool_call", "name": "exec", "id": "c1", "input": "ls"},
+                    {"type": "custom_tool_call_output", "id": "c1", "output": "a"},
+                ]
+            )
+        )
+
+        call, result = chat.messages
+        print(f"Result: {call.tool_calls[0]['id']} / {result.tool_call_id}")
+        assert call.tool_calls[0]["id"] == "c1"
+        assert result.tool_call_id == "c1"
+
     def test_structured_function_call_output_is_flattened(self):
         """
         What it does: Verifies a list-shaped output flattens to text.
@@ -338,8 +379,8 @@ class TestRequestTranslation:
 
     def test_non_function_tools_are_dropped(self):
         """
-        What it does: Verifies local_shell and custom tools do not cross over.
-        Purpose: Kiro has no equivalent, and declaring one invites a rejected payload.
+        What it does: Verifies local_shell does not cross over.
+        Purpose: Unlike a freeform custom tool there is nothing to bridge it to.
         """
         chat = responses_request_to_chat(
             build_request(tools=[{"type": "local_shell"}, {"type": "function", "name": "ok", "parameters": {}}])
@@ -725,6 +766,24 @@ class TestStreamTranslation:
         assert usage["total_tokens"] == 13
         assert usage["input_tokens_details"]["cached_tokens"] == 0
         assert usage["output_tokens_details"]["reasoning_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_reasoning_and_message_use_distinct_output_indexes(self):
+        """
+        What it does: Verifies the message is not emitted at output_index 0 when
+                      a reasoning item already occupies that slot.
+        Purpose: output_index is the position in response.output. Reusing 0 makes
+                 a client that assembles by index overwrite the reasoning item.
+        """
+        events = await collect([chat_chunk(reasoning="thinking"), chat_chunk(content="ok"), chat_final()])
+
+        indexes = [
+            (event["item"]["type"], event["output_index"])
+            for event in events
+            if event["type"] == "response.output_item.done"
+        ]
+        print(f"Result: {indexes}")
+        assert indexes == [("reasoning", 0), ("message", 1)]
 
     @pytest.mark.asyncio
     async def test_reasoning_becomes_summary_events_before_the_message(self):

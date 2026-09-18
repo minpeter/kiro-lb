@@ -111,6 +111,21 @@ def _message_from_item(item: ResponsesInputItem) -> Optional[ChatMessage]:
     return ChatMessage(role=role, content=text)
 
 
+def _item_call_id(item: ResponsesInputItem, *, generate: bool = True) -> str:
+    """Pairing id for a tool call or its result.
+
+    The Responses API has two identifiers: ``id`` (the item) and ``call_id``
+    (the key that joins a call to its output). Clients that only send ``id``
+    still expect the pair to match; inventing a new call id on one side and
+    leaving the other empty is how a replayed turn loses its tool history.
+    """
+    if item.call_id:
+        return item.call_id
+    if item.id:
+        return item.id
+    return new_item_id("call") if generate else ""
+
+
 def _assistant_tool_call(item: ResponsesInputItem) -> ChatMessage:
     """An assistant message whose only job is to carry one tool call.
 
@@ -134,7 +149,7 @@ def _assistant_tool_call(item: ResponsesInputItem) -> ChatMessage:
         content=None,
         tool_calls=[
             {
-                "id": item.call_id or new_item_id("call"),
+                "id": _item_call_id(item),
                 "type": "function",
                 "function": {"name": item.name or "", "arguments": arguments},
             }
@@ -160,7 +175,7 @@ def _tool_result(item: ResponsesInputItem) -> ChatMessage:
     else:
         content = "" if output is None else str(output)
 
-    return ChatMessage(role="tool", content=content, tool_call_id=item.call_id or "")
+    return ChatMessage(role="tool", content=content, tool_call_id=_item_call_id(item, generate=False))
 
 
 def _convert_input(
