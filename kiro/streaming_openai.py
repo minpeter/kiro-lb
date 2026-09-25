@@ -23,6 +23,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FIRST_TOKEN_TIMEOUT,
 )
+from kiro.offload import run_if_large, run_in_worker
 from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls, tool_call_signature
 from kiro.sse_validation import (
     StreamProtocolError,
@@ -69,7 +70,10 @@ __all__ = [
 
 def _openai_sse(payload: dict[str, Any]) -> str:
     chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-    if debug_logger:
+    # ``debug_logger`` is a singleton, so ``if debug_logger`` never gated this:
+    # every outbound chunk was re-encoded to UTF-8 and handed to a logger that
+    # discards it. The error path below keeps the plain check, since it runs once.
+    if debug_logger is not None and debug_logger.is_enabled():
         debug_logger.log_modified_chunk(chunk.encode("utf-8"))
     try:
         validate_live_openai_payload(payload)
@@ -82,7 +86,7 @@ def _openai_sse(payload: dict[str, Any]) -> str:
 
 def _openai_done() -> str:
     chunk = "data: [DONE]\n\n"
-    if debug_logger:
+    if debug_logger is not None and debug_logger.is_enabled():
         debug_logger.log_modified_chunk(chunk.encode("utf-8"))
     try:
         validate_live_openai_payload(None, done=True)
@@ -363,7 +367,8 @@ async def stream_kiro_to_openai_internal(
             finish_reason = "stop"
 
         # Count completion_tokens (output) using tiktoken
-        completion_tokens = count_tokens(full_content + full_thinking_content, model=model)
+        output_text = full_content + full_thinking_content
+        completion_tokens = await run_if_large(len(output_text), count_tokens, output_text, model=model)
 
         # Calculate total_tokens based on context_usage_percentage from Kiro API
         # context_usage shows TOTAL percentage of context usage (input + output)
@@ -376,7 +381,9 @@ async def stream_kiro_to_openai_internal(
         # IMPORTANT: Don't apply correction coefficient for prompt_tokens,
         # as it was calibrated for completion_tokens
         if prompt_source == "unknown" and request_messages:
-            prompt_tokens = count_message_tokens(request_messages, apply_claude_correction=False, model=model)
+            prompt_tokens = await run_in_worker(
+                count_message_tokens, request_messages, apply_claude_correction=False, model=model
+            )
             if request_tools:
                 prompt_tokens += count_tools_tokens(request_tools, apply_claude_correction=False, model=model)
             total_tokens = prompt_tokens + completion_tokens

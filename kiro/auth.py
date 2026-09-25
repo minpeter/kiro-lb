@@ -13,6 +13,7 @@ import asyncio
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -964,11 +965,21 @@ class KiroAuthManager:
         )
 
         previous_token = self._access_token
+        # A held lease expires after 60s, so a healthy store always yields one
+        # well inside this deadline. Past it the store itself is failing, and
+        # refreshing unleased beats hanging the request forever. The acquire is a
+        # sqlite write, so it runs off the event loop.
         owner = None
+        deadline = time.monotonic() + 75.0
         while owner is None:
-            owner = try_acquire_refresh_lease(account_id)
-            if owner is None:
-                await asyncio.sleep(0.05)
+            owner = await asyncio.to_thread(try_acquire_refresh_lease, account_id)
+            if owner is not None:
+                break
+            if time.monotonic() >= deadline:
+                logger.warning(f"Refresh lease for account {account_id} not acquired in 75s; refreshing without it")
+                await self._refresh_token_request()
+                return
+            await asyncio.sleep(0.05)
         try:
             latest = load_internal_credential(account_id)
             if latest:

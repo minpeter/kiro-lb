@@ -574,7 +574,7 @@ class TestServerPortConfig:
         Purpose: The whole point of the fallback limits is that they differ from
                  DEFAULT_MAX_INPUT_TOKENS. A regression that reset them to 200000 would
                  otherwise pass every other assertion in this file.
-        Note: the four 666667 values are measured, not reported. /ListAvailableModels
+        Note: the five 666667 values are measured, not reported. /ListAvailableModels
                  advertises 1000000 for them, but the runtime endpoint charges 1.5x per
                  token against that figure, which only resolves if the real window is
                  two thirds of it. See FALLBACK_MODELS for the measurement.
@@ -585,6 +585,7 @@ class TestServerPortConfig:
         expected = {
             "auto": 1000000,
             "claude-opus-5": 666667,
+            "claude-opus-5.5": 666667,
             "claude-sonnet-5": 666667,
             "claude-opus-4.8": 666667,
             "claude-opus-4.7": 666667,

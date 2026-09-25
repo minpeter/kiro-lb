@@ -260,6 +260,16 @@ class KiroHttpClient:
         last_raw_error: Optional[httpx.RequestError] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
 
+        # Serialized once, outside the retry loop, in the exact form the payload
+        # guard measured. The stdlib defaults (ensure_ascii=True, spaced
+        # separators) put roughly twice the guard's figure on the wire for CJK,
+        # and redid the dump on the event loop for every retry.
+        body = (
+            json.dumps(json_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            if json_data is not None
+            else None
+        )
+
         for attempt in range(max_retries):
             try:
                 # Get current token
@@ -271,8 +281,8 @@ class KiroHttpClient:
                 # Build request kwargs based on parameters
                 request_kwargs: RequestKwargs = {"headers": headers}
 
-                if json_data is not None:
-                    request_kwargs["content"] = json.dumps(json_data).encode()
+                if body is not None:
+                    request_kwargs["content"] = body
 
                 if params is not None:
                     request_kwargs["params"] = params

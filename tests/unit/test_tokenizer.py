@@ -12,10 +12,14 @@ Tests:
 - Fallback when tiktoken is unavailable
 """
 
+import unicodedata
 from unittest.mock import patch
+
+import pytest
 
 from kiro.tokenizer import (
     CLAUDE_CORRECTION_FACTOR,
+    _cjk_ratio,
     _get_encoding,
     count_message_tokens,
     count_system_tokens,
@@ -1090,3 +1094,61 @@ class TestFallbackHandlesCJK:
 
         ratio = estimated / real
         assert 0.65 <= ratio <= 1.35, f"Han fallback ratio out of bounds: {ratio} (est={estimated} real={real})"
+
+
+class TestCjkRatioAsciiFastPath:
+    """The ASCII short-circuit in _cjk_ratio must be exactly equivalent."""
+
+    @staticmethod
+    def _reference(text: str) -> float:
+        """The per-character scan the fast path replaces."""
+        cjk = 0
+        counted = 0
+        for char in text:
+            if char.isspace():
+                continue
+            counted += 1
+            if unicodedata.category(char) == "Lo":
+                cjk += 1
+        return cjk / counted if counted else 0.0
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "a",
+            "plain latin prose with punctuation, digits 123 and symbols !@#",
+            "\t\n   ",
+            "한국어 텍스트",
+            "中文文本",
+            "日本語のテキスト",
+            "mixed 한국 and latin words",
+            "umlaut ünicode éèê",
+            "emoji \U0001f389 test",
+        ],
+    )
+    def test_matches_the_per_character_scan(self, text):
+        """
+        What it does: Verifies the fast path returns what the scan returned.
+        Purpose: The short-circuit rests on no ASCII character carrying category
+                 "Lo"; if that ever stopped holding, the correction would be
+                 silently skipped for real CJK text.
+        """
+        expected = self._reference(text)
+        print(f"Comparing ratio for {text[:24]!r}: Expected {expected}, Got {_cjk_ratio(text)}")
+        assert _cjk_ratio(text) == expected
+
+    def test_ascii_text_is_reported_as_no_cjk(self):
+        """
+        What it does: Verifies Latin text yields 0.0.
+        Purpose: This is the case the fast path exists for - it cost 64ms on 1MB
+                 of Latin prose to arrive at exactly this answer.
+        """
+        assert _cjk_ratio("word " * 1000) == 0.0
+
+    def test_non_ascii_still_scans(self):
+        """
+        What it does: Verifies a non-ASCII text is still measured, not skipped.
+        Purpose: The fast path must not swallow the case the correction is for.
+        """
+        assert _cjk_ratio("한국어") == 1.0

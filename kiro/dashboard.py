@@ -15,6 +15,7 @@ import math
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -563,6 +564,62 @@ def _hash_api_key(value: str, salt: bytes) -> bytes:
     return hashlib.scrypt(value.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
 
 
+# Verification cache for identify_data_api_key.
+#
+# scrypt at n=2**14 reads 16 MiB and costs 50-100ms of CPU, and it ran on the
+# event loop for every single /v1 request: the whole gateway stalled that long
+# per call, health checks and concurrent streams included.
+#
+# Caching the verdict does not weaken the hash. scrypt is there to protect the
+# verifier at rest, so a leaked database cannot be turned back into keys; that
+# property is untouched. This cache only remembers that one exact secret was
+# already checked, and anyone who can read it out of process memory already
+# holds strictly more than it contains. The entry is keyed by SHA-256 of the
+# raw value so the key itself is not the dictionary key, and the SQLite
+# comparison still runs through hmac.compare_digest on a miss.
+#
+# Every mutation of the api_keys table clears the cache, so a revoked key stops
+# being accepted at once rather than after the TTL.
+_KEY_CACHE_TTL = 300.0
+_KEY_CACHE_NEGATIVE_TTL = 30.0
+_KEY_CACHE_MAX = 512
+_key_cache: dict[str, tuple[str | None, float]] = {}
+_key_cache_lock = threading.Lock()
+
+
+def _key_cache_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _key_cache_get(fingerprint: str) -> tuple[bool, str | None]:
+    """Return (hit, key_id). A cached miss is a hit carrying None."""
+    with _key_cache_lock:
+        entry = _key_cache.get(fingerprint)
+        if entry is None:
+            return False, None
+        key_id, expires_at = entry
+        if expires_at <= time.monotonic():
+            _key_cache.pop(fingerprint, None)
+            return False, None
+        return True, key_id
+
+
+def _key_cache_put(fingerprint: str, key_id: str | None) -> None:
+    ttl = _KEY_CACHE_TTL if key_id is not None else _KEY_CACHE_NEGATIVE_TTL
+    with _key_cache_lock:
+        if len(_key_cache) >= _KEY_CACHE_MAX:
+            # Unbounded growth would otherwise be a denial of service: a caller
+            # sending fresh garbage keys mints a new entry each time.
+            _key_cache.clear()
+        _key_cache[fingerprint] = (key_id, time.monotonic() + ttl)
+
+
+def invalidate_api_key_cache() -> None:
+    """Drop every cached verdict. Called on any api_keys mutation."""
+    with _key_cache_lock:
+        _key_cache.clear()
+
+
 def create_data_api_key(name: str) -> tuple[str, dict[str, Any]]:
     """Create a one-time-visible API key; only an scrypt verifier is persisted."""
     raw_key = "klb_" + secrets.token_urlsafe(32)
@@ -575,6 +632,7 @@ def create_data_api_key(name: str) -> tuple[str, dict[str, Any]]:
             "INSERT INTO api_keys(id, name, key_prefix, salt, key_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (key_id, name.strip() or "Unnamed key", key_prefix, salt, _hash_api_key(raw_key, salt), created_at),
         )
+    invalidate_api_key_cache()
     return raw_key, {
         "id": key_id,
         "name": name.strip() or "Unnamed key",
@@ -595,6 +653,12 @@ def identify_data_api_key(value: str) -> str | None:
         return ROOT_KEY_ID
     if not value.startswith("klb_"):
         return None
+
+    fingerprint = _key_cache_fingerprint(value)
+    hit, cached_id = _key_cache_get(fingerprint)
+    if hit:
+        return cached_id
+
     try:
         with _db() as conn:
             rows = conn.execute(
@@ -602,9 +666,13 @@ def identify_data_api_key(value: str) -> str | None:
             ).fetchall()
         for row in rows:
             if hmac.compare_digest(_hash_api_key(value, row["salt"]), row["key_hash"]):
+                _key_cache_put(fingerprint, row["id"])
                 return row["id"]
+        _key_cache_put(fingerprint, None)
         return None
     except Exception:
+        # A failed lookup is not cached: the next request must retry rather than
+        # inherit a verdict that came from a database error.
         return None
 
 
@@ -635,6 +703,7 @@ def revoke_data_api_key(key_id: str) -> bool:
         result = conn.execute(
             "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (int(time.time()), key_id)
         )
+    invalidate_api_key_cache()
     return result.rowcount > 0
 
 
@@ -649,6 +718,7 @@ def delete_data_api_key(key_id: str) -> bool:
         if result.rowcount:
             conn.execute("DELETE FROM key_model_usage WHERE key_id = ?", (key_id,))
             conn.execute("DELETE FROM account_model_usage WHERE key_id = ?", (key_id,))
+    invalidate_api_key_cache()
     return result.rowcount > 0
 
 

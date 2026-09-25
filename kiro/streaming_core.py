@@ -126,7 +126,13 @@ async def parse_kiro_stream(
     kiro-lb deliberately does not manufacture thinking/reasoning blocks from
     prompt tags or response text.  Content is passed through verbatim.
     """
-    parser = AwsEventStreamParser()
+    # ``debug_logger`` is a module-level singleton, so ``if debug_logger`` is
+    # always true: it gates nothing. The real gate is the capture mode, and it is
+    # read once per stream because everything below pays for itself before the
+    # logger gets a chance to drop it - asdict() deep-copies every event, and the
+    # parser's observation pass re-walks and re-parses every byte of the stream.
+    capture = debug_logger if (debug_logger is not None and debug_logger.is_enabled()) else None
+    parser = AwsEventStreamParser(observe_frames=capture is not None)
     received_event = False
     try:
         byte_iterator = response.aiter_bytes()
@@ -137,32 +143,32 @@ async def parse_kiro_stream(
         except StopAsyncIteration:
             raise StreamProtocolError("Upstream stream ended before any events were received")
 
-        if debug_logger:
-            debug_logger.log_raw_chunk(first_chunk)
+        if capture is not None:
+            capture.log_raw_chunk(first_chunk)
         async for event in _process_chunk(parser, first_chunk):
             received_event = True
-            if debug_logger:
-                debug_logger.log_parsed_event(asdict(event))
+            if capture is not None:
+                capture.log_parsed_event(asdict(event))
             yield event
-        if debug_logger:
+        if capture is not None:
             for frame in parser.drain_observed_frames():
-                debug_logger.log_parsed_event(
+                capture.log_parsed_event(
                     {
                         "type": "raw_upstream_frame",
                         "frame": frame,
                     }
                 )
         async for chunk in byte_iterator:
-            if debug_logger:
-                debug_logger.log_raw_chunk(chunk)
+            if capture is not None:
+                capture.log_raw_chunk(chunk)
             async for event in _process_chunk(parser, chunk):
                 received_event = True
-                if debug_logger:
-                    debug_logger.log_parsed_event(asdict(event))
+                if capture is not None:
+                    capture.log_parsed_event(asdict(event))
                 yield event
-            if debug_logger:
+            if capture is not None:
                 for frame in parser.drain_observed_frames():
-                    debug_logger.log_parsed_event(
+                    capture.log_parsed_event(
                         {
                             "type": "raw_upstream_frame",
                             "frame": frame,
@@ -173,8 +179,8 @@ async def parse_kiro_stream(
                 raise MalformedToolInputError("Malformed upstream tool input")
             event = KiroEvent(type="tool_use", tool_use=tool_call)
             received_event = True
-            if debug_logger:
-                debug_logger.log_parsed_event(asdict(event))
+            if capture is not None:
+                capture.log_parsed_event(asdict(event))
             yield event
         if not received_event:
             raise StreamProtocolError("Upstream stream ended before any events were received")

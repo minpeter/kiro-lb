@@ -35,7 +35,7 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.tokenizer import estimate_request_tokens
-from kiro.usage_tracking import current_account_id, current_api_key_id
+from kiro.usage_tracking import current_account_id, current_api_key_id, note_request_model
 from kiro.utils import generate_conversation_id
 
 if TYPE_CHECKING:
@@ -161,6 +161,7 @@ async def messages(
     Raises:
         HTTPException: On validation or API errors
     """
+    note_request_model(request_data.model)
     logger.info(f"Request to /v1/messages (model={request_data.model}, stream={request_data.stream})")
 
     if anthropic_version:
@@ -281,13 +282,17 @@ async def messages(
                     content={"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}},
                 )
 
-            # Log Kiro payload
-            try:
-                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode("utf-8")
-                if debug_logger:
-                    debug_logger.log_kiro_request_body(kiro_request_body)
-            except Exception as e:
-                logger.warning(f"Failed to log Kiro request: {e}")
+            # Log Kiro payload. The pretty-printed dump is built only when the
+            # logger will keep it: with DEBUG_MODE off it was a full
+            # multi-megabyte serialization on the event loop, discarded one call
+            # later, on every failover attempt.
+            if debug_logger and debug_logger.is_enabled():
+                try:
+                    debug_logger.log_kiro_request_body(
+                        json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode("utf-8")
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log Kiro request: {e}")
 
             # Create HTTP client
             url = auth_manager.generation_url
@@ -300,14 +305,20 @@ async def messages(
             shared_client = request.app.state.http_client
             http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
 
-            # Prepare data for token counting
-            messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-            tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
-            system_for_tokenizer: str | list[dict[str, Any]] | None
-            if isinstance(request_data.system, list):
-                system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
-            else:
-                system_for_tokenizer = request_data.system
+            # Only the fallback estimate reads these, and it runs only when the
+            # pre-flight measurement is missing, so they are not built otherwise.
+            messages_for_tokenizer: list[dict[str, Any]] | None = None
+            tools_for_tokenizer: list[dict[str, Any]] | None = None
+            system_for_tokenizer: str | list[dict[str, Any]] | None = None
+            if not measured_input_tokens:
+                messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+                tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+                if isinstance(request_data.system, list):
+                    system_for_tokenizer = [
+                        b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system
+                    ]
+                else:
+                    system_for_tokenizer = request_data.system
 
             async def make_search_request(tool_use_id: str, query: str, result_content: str) -> httpx.Response:
                 followup_request = request_data.model_copy(deep=True)
@@ -427,6 +438,7 @@ async def messages(
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
                             make_search_request=make_search_request,
+                            known_input_tokens=measured_input_tokens,
                         )
                         await account_manager.report_success(account.id, request_data.model)
 
@@ -625,6 +637,7 @@ async def count_tokens_endpoint(
     Raises:
         HTTPException: 401 if authentication fails (handled by dependency)
     """
+    note_request_model(request_data.model)
     logger.info(
         f"Request to /v1/messages/count_tokens (model={request_data.model}, messages={len(request_data.messages)})"
     )

@@ -170,6 +170,56 @@ class TestGpt56Entries:
 
 
 # =============================================================================
+# Tests for claude-opus-5.5
+# =============================================================================
+
+
+class TestOpus55Entry:
+    """Opus 5.5 is the one Opus that is not 2.2x."""
+
+    def test_multiplier_is_2x(self):
+        """
+        What it does: Verifies claude-opus-5.5 carries the published 2.0x rate.
+        Purpose: Kiro's table prices it below its siblings; copying 2.2 from the
+                 other Opus entries would overstate every request on it.
+        """
+        print(f"Checking claude-opus-5.5: {MODEL_COSTS['claude-opus-5.5'].multiplier}")
+        assert MODEL_COSTS["claude-opus-5.5"].multiplier == 2.0
+
+    def test_it_is_cheaper_than_opus_5(self):
+        """
+        What it does: Verifies 5.5 prices below claude-opus-5.
+        Purpose: The direction is the point - this is the first Opus to get
+                 cheaper than its predecessor, so an accidental copy of 2.2
+                 would be invisible without asserting the comparison.
+        """
+        newer = MODEL_COSTS["claude-opus-5.5"].multiplier
+        older = MODEL_COSTS["claude-opus-5"].multiplier
+        print(f"Comparing: 5.5 at {newer} vs 5 at {older}")
+        assert newer < older
+
+    def test_it_declares_no_long_tier(self):
+        """
+        What it does: Verifies the entry is single-rate.
+        Purpose: Kiro publishes no threshold for it, and a guessed second tier
+                 would read as a published figure.
+        """
+        entry = MODEL_COSTS["claude-opus-5.5"]
+        print(f"Checking long fields: {entry.long_multiplier}, {entry.long_threshold}")
+        assert entry.long_multiplier is None
+        assert entry.long_threshold is None
+
+    def test_the_hyphenated_client_form_resolves(self):
+        """
+        What it does: Verifies the id clients send resolves to the entry.
+        Purpose: Anthropic's API id is claude-opus-5-5; the runtime id is the
+                 dotted form, and the table is keyed by the latter.
+        """
+        print("Action: Looking up claude-opus-5-5...")
+        assert multiplier_for("claude-opus-5-5") == 2.0
+
+
+# =============================================================================
 # Tests for multiplier_for and credits_for
 # =============================================================================
 

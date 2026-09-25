@@ -43,7 +43,7 @@ from kiro.offload import run_in_worker
 from kiro.payload_guards import PayloadTooLargeError
 from kiro.streaming_openai import collect_stream_response, stream_with_first_token_retry
 from kiro.streaming_responses import translate_chat_stream_to_responses
-from kiro.usage_tracking import current_account_id, current_api_key_id
+from kiro.usage_tracking import current_account_id, current_api_key_id, note_request_model
 from kiro.utils import generate_conversation_id
 
 if TYPE_CHECKING:
@@ -331,6 +331,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     Raises:
         HTTPException: On validation or API errors
     """
+    note_request_model(request_data.model)
     logger.info(f"Request to /v1/chat/completions (model={request_data.model}, stream={request_data.stream})")
 
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
@@ -437,13 +438,17 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
-            # Log Kiro payload
-            try:
-                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode("utf-8")
-                if debug_logger:
-                    debug_logger.log_kiro_request_body(kiro_request_body)
-            except Exception as e:
-                logger.warning(f"Failed to log Kiro request: {e}")
+            # Log Kiro payload. The pretty-printed dump is built only when the
+            # logger will keep it: with DEBUG_MODE off it was a full
+            # multi-megabyte serialization on the event loop, discarded one call
+            # later, on every failover attempt.
+            if debug_logger and debug_logger.is_enabled():
+                try:
+                    debug_logger.log_kiro_request_body(
+                        json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode("utf-8")
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log Kiro request: {e}")
 
             # Create HTTP client
             url = auth_manager.generation_url
@@ -727,6 +732,7 @@ async def responses(request: Request, request_data: ResponsesRequest):
         StreamingResponse of Responses events for streaming mode
         JSONResponse holding a `response` object otherwise
     """
+    note_request_model(request_data.model)
     logger.info(f"Request to /v1/responses (model={request_data.model}, stream={request_data.stream})")
 
     chat_request = responses_request_to_chat(request_data)

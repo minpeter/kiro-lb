@@ -112,6 +112,15 @@ def _cjk_ratio(text: str) -> float:
     if not text:
         return 0.0
 
+    # No ASCII character has category "Lo" - letters there are Lu or Ll - so an
+    # all-ASCII text is provably 0.0 and needs no scan. The loop below is pure
+    # Python and calls unicodedata.category() per character: it cost 64ms on 1MB
+    # of Latin prose just to return 0.0, and it holds the GIL while doing it,
+    # which stalls the event loop even from a worker thread. str.isascii() is a
+    # flag check in C.
+    if text.isascii():
+        return 0.0
+
     cjk = 0
     counted = 0
     for char in text:

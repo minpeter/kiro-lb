@@ -23,7 +23,6 @@ Priority: CLI args > Environment variables > Default values
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import sys
@@ -74,6 +73,7 @@ from kiro.debug_middleware import DebugLoggerMiddleware
 from kiro.endpoint_settings import load_from_store as load_endpoint_settings
 from kiro.exceptions import http_exception_handler, validation_exception_handler
 from kiro.gateway_tunables import load_all as load_gateway_tunables
+from kiro.offload import run_in_worker
 from kiro.prompt_filter import load_from_store as load_prompt_filter_setting
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.routes_openai import router as openai_router
@@ -560,16 +560,7 @@ async def dashboard_favicon():
 async def dashboard_request_metrics(request, call_next):
     """Record /v1 request metadata. Request and response text never touch disk."""
     started = time.perf_counter()
-    model = None
     is_data_plane = request.url.path.startswith("/v1/")
-
-    if is_data_plane and request.headers.get("content-type", "").startswith("application/json"):
-        try:
-            payload = json.loads((await request.body()).decode("utf-8"))
-            if isinstance(payload, dict):
-                model = payload.get("model")
-        except Exception:
-            pass
 
     if not is_data_plane:
         return await call_next(request)
@@ -590,9 +581,9 @@ async def dashboard_request_metrics(request, call_next):
         # returns, so its recording is deferred to the relay's completion; a
         # non-streamed response records here.
         if response is None or not hasattr(response, "body_iterator"):
-            _persist(request, model, response, started, usage_holder)
+            await _persist(request, response, started, usage_holder)
         else:
-            _pending.append((request, model, response, started, usage_holder))
+            _pending.append((request, response, started, usage_holder))
 
 
 # Streamed requests are recorded when their body finishes, not when the
@@ -600,15 +591,18 @@ async def dashboard_request_metrics(request, call_next):
 _pending: list = []
 
 
-def _persist(request, model, response, started, usage_holder=None):
+async def _persist(request, response, started, usage_holder=None):
     status = getattr(response, "status_code", None) or 500
     # What the streaming layer reported for this request. Nothing is derived
     # from response text: Kiro publishes no token-to-credit rate, and the body
     # itself is never retained.
     usage = usage_holder or {}
-    record_request(
+    # A sqlite INSERT plus commit; on the event loop it stalls every other
+    # in-flight stream for the duration of the write.
+    await run_in_worker(
+        record_request,
         request.url.path,
-        model,
+        usage.get("model"),
         status,
         int((time.perf_counter() - started) * 1000),
         client_ip=request.client.host if request.client else None,
@@ -633,10 +627,10 @@ def _defer_until_stream_end(response):
             async for chunk in original:
                 yield chunk
         finally:
-            entry = next((item for item in _pending if item[2] is response), None)
+            entry = next((item for item in _pending if item[1] is response), None)
             if entry is not None:
                 _pending.remove(entry)
-                _persist(*entry)
+                await _persist(*entry)
 
     response.body_iterator = relay()
     return response
