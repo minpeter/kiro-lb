@@ -28,7 +28,7 @@ RUN chown kiro:kiro /app
 # known CVEs (Trivy flags the vendored copies under setuptools/_vendor too),
 # so upgrade the packaging toolchain before installing anything with it.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+RUN pip install --no-cache-dir --upgrade pip 'setuptools>=78.1.1' wheel \
     && pip install --no-cache-dir -r requirements.txt
 
 # Bake the tiktoken vocabularies into the image. tiktoken ships no BPE data: it
