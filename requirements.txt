@@ -1,5 +1,6 @@
 # Prod dependencies
 fastapi==0.141.1
+starlette==1.7.0
 uvicorn[standard]==0.52.4
 httpx==0.28.1
 loguru==0.7.3
@@ -10,3 +11,5 @@ tiktoken==0.14.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
 hypothesis==6.165.10
+# Starlette TestClient uses this successor package instead of deprecated httpx.
+httpx2==2.13.1
