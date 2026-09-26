@@ -119,14 +119,18 @@ init_env() {
   slot="$(allocate_slot)"
   api="${slot% *}"
   web="${slot#* }"
+  # Secrets are generated here, never written as literals in this file.
+  local api_key dashboard_secret
+  api_key="dev-$(openssl rand -hex 16)"
+  dashboard_secret="dev-$(openssl rand -hex 8)"
   # noclobber: never replace an existing file; umask: 0600 before any secret lands.
   (
     set -C
     umask 077
     {
       printf '# Local development only (scripts/dev.sh). Never reuse production values.\n'
-      printf 'PROXY_API_KEY="dev-%s"\n' "$(openssl rand -hex 16)"
-      printf 'DASHBOARD_PASSWORD="dev-%s"\n' "$(openssl rand -hex 8)"
+      printf '%s="%s"\n' PROXY_API_KEY "$api_key"
+      printf '%s="%s"\n' DASHBOARD_PASSWORD "$dashboard_secret"
       printf 'DASHBOARD_DATA_DIR="data"\n'
       printf 'DASHBOARD_SECURE_COOKIE="false"\n'
       printf 'LOG_LEVEL="DEBUG"\n'
