@@ -276,6 +276,8 @@ separate git worktree so the store, secrets and slot file are physically apart.
    after their branch, so `ls ../kiro-lb-worktrees` is the list of work in
    flight and nothing lands inside the production checkout. Other projects in
    this parent directory follow the same `<repo>-worktrees/` convention.
+   Branches that differ only in prefix (`feat/x`, `fix/x`) map to the same
+   directory; pick a distinct `WT` for the second one.
 
    `.env`, `data/`, `debug_logs/`, `.venv/` and `frontend/node_modules/` are
    gitignored, so the new tree starts with none of them. Move a worktree with
@@ -285,15 +287,18 @@ separate git worktree so the store, secrets and slot file are physically apart.
 2. Write a dev-only `.env` (never copy the production one):
 
    ```bash
-   cat > .env <<EOF
-   PROXY_API_KEY="dev-$(openssl rand -hex 16)"
-   DASHBOARD_PASSWORD="dev-$(openssl rand -hex 8)"
-   DASHBOARD_DATA_DIR="data"
-   DASHBOARD_SECURE_COOKIE="false"
-   LOG_LEVEL="DEBUG"
-   EOF
-   chmod 600 .env
+   (umask 077; {
+     echo "PROXY_API_KEY=\"dev-$(openssl rand -hex 16)\""
+     echo "DASHBOARD_PASSWORD=\"dev-$(openssl rand -hex 8)\""
+     echo 'DASHBOARD_DATA_DIR="data"'
+     echo 'DASHBOARD_SECURE_COOKIE="false"'
+     echo 'LOG_LEVEL="DEBUG"'
+   } > .env)
    ```
+
+   `umask 077` creates the file 0600 before any secret is written. The
+   `echo` group, unlike a heredoc, still works when copied with this list's
+   indentation: an indented `EOF` never closes the heredoc.
 
    Host and port go on the command line (step 4), not here: pytest reads this
    `.env` too, and `SERVER_HOST`/`SERVER_PORT` in it fail the two
@@ -339,9 +344,11 @@ separate git worktree so the store, secrets and slot file are physically apart.
    (`127.0.0.1:8001`/`8002`). The session cookie must not be `Secure` over
    plain HTTP; `_secure_cookie()` (`dashboard.py`) already infers that from
    the scheme, and `DASHBOARD_SECURE_COOKIE="false"` from step 2 only pins it
-   so a stray `X-Forwarded-Proto: https` cannot break login. Two
-   worktrees running at once need their own pair of ports (e.g. 8110/5184);
-   `--strictPort` makes Vite fail instead of silently taking the next one.
+   so a stray `X-Forwarded-Proto: https` cannot break login.
+
+   Two worktrees running at once need their own pair of ports (e.g.
+   8110/5184); `--strictPort` makes Vite fail instead of silently taking the
+   next one.
 
    `load_dotenv()` (`config.py:15`) never overrides variables already in the
    process environment. A shell that exports `PROXY_API_KEY` or
@@ -360,11 +367,11 @@ separate git worktree so the store, secrets and slot file are physically apart.
 
    Open `http://$DEV_HOST:5174` from any device on the LAN, by IP: Vite's
    host check answers 403 to any other hostname unless it is added to
-   `server.allowedHosts`. Without `--host`
-   Vite binds `localhost` only. The backend no longer listens on loopback, so
-   the proxy target must be `$DEV_HOST` too. `/api`, `/v1` and `/health` are
-   proxied to the dev backend. Without `API_PROXY_TARGET` the proxy defaults
-   to `localhost:8000`, which is not the dev server.
+   `server.allowedHosts`. Without `--host` Vite binds `localhost` only. The
+   backend no longer listens on loopback, so the proxy target must be
+   `$DEV_HOST` too. `/api`, `/v1` and `/health` are proxied to the dev
+   backend. Without `API_PROXY_TARGET` the proxy defaults to
+   `localhost:8000`, which is not the dev server.
 
 6. Add accounts through the dev dashboard's device login, using a Kiro
    account that is **not** in the production pool. The server starts with an
@@ -446,5 +453,5 @@ separate git worktree so the store, secrets and slot file are physically apart.
   container silently degrades to character-based estimation.
 - Truncated upstream turns must not be reported as clean finishes
   (`kiro/stop_reasons.py`).
-- 19 files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1508)
+- 17 Python files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1508)
   and `kiro/account_manager.py` (1867) are the highest-risk edit sites.
