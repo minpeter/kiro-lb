@@ -264,10 +264,13 @@ separate git worktree so the store, secrets and slot file are physically apart.
    WT="../kiro-lb-worktrees/${BRANCH##*/}"   # directory = branch name minus its prefix
    git fetch origin
    mkdir -p ../kiro-lb-worktrees
-   git worktree add "$WT" -b "$BRANCH" origin/main
+   git worktree add --no-track "$WT" -b "$BRANCH" origin/main
    cd "$WT"
-   git branch --unset-upstream   # else `git push` targets main; use `git push -u origin HEAD`
    ```
+
+   `--no-track` keeps `origin/main` from becoming the branch's upstream;
+   without it a bare `git push` is refused for the name mismatch. Publish the
+   branch with `git push -u origin HEAD`.
 
    All worktrees live in the sibling `kiro-lb-worktrees/` directory, named
    after their branch, so `ls ../kiro-lb-worktrees` is the list of work in
@@ -355,7 +358,9 @@ separate git worktree so the store, secrets and slot file are physically apart.
      bun run dev --host "$DEV_HOST" --port 5174 --strictPort
    ```
 
-   Open `http://$DEV_HOST:5174` from any device on the LAN. Without `--host`
+   Open `http://$DEV_HOST:5174` from any device on the LAN, by IP: Vite's
+   host check answers 403 to any other hostname unless it is added to
+   `server.allowedHosts`. Without `--host`
    Vite binds `localhost` only. The backend no longer listens on loopback, so
    the proxy target must be `$DEV_HOST` too. `/api`, `/v1` and `/health` are
    proxied to the dev backend. Without `API_PROXY_TARGET` the proxy defaults
@@ -389,13 +394,19 @@ separate git worktree so the store, secrets and slot file are physically apart.
    checkout, so running it from a worktree would boot a slot against the dev
    store.
 
-10. Clean up when the branch is merged:
+10. Clean up when the branch is merged. Stop that worktree's dev servers
+    first, then:
 
     ```bash
     cd ~/github.com/minpeter/kiro-lb
-    git worktree remove ../kiro-lb-worktrees/my-change   # refuses if there are uncommitted changes
+    git pull --ff-only                        # so `branch -d` sees the merge
+    git worktree remove ../kiro-lb-worktrees/my-change
     git branch -d feat/my-change
     ```
+
+    `git worktree remove` refuses only on tracked changes. Ignored files go
+    with the tree without a prompt: the dev `.env`, and `data/` with the dev
+    accounts' refresh tokens. Copy them out first to reuse them.
 
 ## NOTES
 
