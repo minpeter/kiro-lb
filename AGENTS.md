@@ -289,22 +289,39 @@ Shipping the result is the next section, SHIP.
 2. Write a dev-only `.env` (never copy the production one):
 
    ```bash
-   (umask 077; {
+   # Port slot: lowest N not claimed by a sibling worktree's .env and not
+   # already listening. Backend 8100+10N, dashboard 5174+10N.
+   n=0
+   while grep -qsx "DEV_API_PORT=\"$((8100 + 10 * n))\"" ../*/.env \
+     || ss -ltnH "( sport = :$((8100 + 10 * n)) or sport = :$((5174 + 10 * n)) )" | grep -q .; do
+     n=$((n + 1))
+   done
+   (set -C; umask 077; {
      echo "PROXY_API_KEY=\"dev-$(openssl rand -hex 16)\""
      echo "DASHBOARD_PASSWORD=\"dev-$(openssl rand -hex 8)\""
      echo 'DASHBOARD_DATA_DIR="data"'
      echo 'DASHBOARD_SECURE_COOKIE="false"'
      echo 'LOG_LEVEL="DEBUG"'
-   } > .env)
+     echo "DEV_API_PORT=\"$((8100 + 10 * n))\""
+     echo "DEV_WEB_PORT=\"$((5174 + 10 * n))\""
+   } > .env) && grep '^DEV_' .env
    ```
 
-   `umask 077` creates the file 0600 before any secret is written. The
-   `echo` group, unlike a heredoc, still works when copied with this list's
-   indentation: an indented `EOF` never closes the heredoc.
+   `set -C` refuses to overwrite an existing `.env`, so rerunning this cannot
+   replace the secrets or hand this worktree a second slot. `umask 077`
+   creates the file 0600 before any secret is written. The `echo` group,
+   unlike a heredoc, still works when copied with this list's indentation: an
+   indented `EOF` never closes the heredoc.
 
-   Host and port go on the command line (step 4), not here: pytest reads this
-   `.env` too, and `SERVER_HOST`/`SERVER_PORT` in it fail the two
-   default-value tests in `tests/unit/test_config.py`.
+   The ports live in the worktree's `.env`, so they survive restarts (stable
+   URLs), `grep -H '^DEV_' ../*/.env` lists every worktree's pair, and
+   removing a worktree frees its slot. Slot 0 (8100/5174) stays clear of the
+   production edge (`:8000`) and both slots (`127.0.0.1:8001`/`8002`).
+
+   The gateway ignores `DEV_*`; only the commands in steps 4-5 read them. They
+   are not `SERVER_HOST`/`SERVER_PORT` because pytest reads this `.env` too,
+   and those two in it fail the default-value tests in
+   `tests/unit/test_config.py`.
 
    Leave `KIRO_SLOT` and `HANDOFF_SECRET` unset: without a slot the process
    is the store's sole writer, which is correct for its own `data/` and
@@ -323,15 +340,22 @@ Shipping the result is the next section, SHIP.
    the LAN:
 
    ```bash
-   # The host's address on the default-route interface (the LAN). Override by
-   # exporting DEV_HOST first. Set it in every terminal you start a server from.
+   # From the worktree root, in every terminal you start a server from.
+   # DEV_HOST: the address on the default-route interface (the LAN); export
+   # it beforehand to override. Ports: this worktree's slot from step 2.
    DEV_HOST="${DEV_HOST:-$(ip -4 -o addr show dev "$(ip -4 route show default \
      | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')" \
      | awk '{split($4,a,"/"); print a[1]; exit}')}"
-   echo "$DEV_HOST"   # must print the LAN address, not empty
+   DEV_API_PORT="$(sed -n 's/^DEV_API_PORT="\([0-9]*\)"$/\1/p' .env)"
+   DEV_WEB_PORT="$(sed -n 's/^DEV_WEB_PORT="\([0-9]*\)"$/\1/p' .env)"
+   echo "$DEV_HOST api:$DEV_API_PORT web:$DEV_WEB_PORT"   # none may be empty
 
-   env -i HOME="$HOME" PATH="$PATH" .venv/bin/python main.py --host "$DEV_HOST" --port 8100
+   env -i HOME="$HOME" PATH="$PATH" .venv/bin/python main.py \
+     --host "$DEV_HOST" --port "$DEV_API_PORT"
    ```
+
+   Only the two port lines are read, not the whole `.env`: sourcing it would
+   export the dev secrets into your shell over any production ones.
 
    Dev servers always bind the LAN address so other devices on that subnet can
    reach them. Do not use `127.0.0.1` (this host only) or `0.0.0.0` (also
@@ -342,38 +366,35 @@ Shipping the result is the next section, SHIP.
    `DASHBOARD_PASSWORD` are the only gates. Keep them random and distinct
    from production.
 
-   Port 8100 stays clear of the production edge (`:8000`) and both slots
-   (`127.0.0.1:8001`/`8002`). The session cookie must not be `Secure` over
+   The session cookie must not be `Secure` over
    plain HTTP; `_secure_cookie()` (`dashboard.py`) already infers that from
    the scheme, and `DASHBOARD_SECURE_COOKIE="false"` from step 2 only pins it
    so a stray `X-Forwarded-Proto: https` cannot break login.
-
-   Two worktrees running at once need their own pair of ports (e.g.
-   8110/5184); `--strictPort` makes Vite fail instead of silently taking the
-   next one.
 
    `load_dotenv()` (`config.py:15`) never overrides variables already in the
    process environment. A shell that exports `PROXY_API_KEY` or
    `DASHBOARD_PASSWORD` (the operator's does) silently wins over the dev
    `.env`, and the dev server then accepts the production key. `env -i` is the
    guard; check with `curl -H "Authorization: Bearer $PROXY_API_KEY"
-   "http://$DEV_HOST:8100/v1/models"` → must be 401.
+   "http://$DEV_HOST:$DEV_API_PORT/v1/models"` → must be 401.
 
 5. Run the dashboard with HMR in a second terminal:
 
    ```bash
-   cd frontend   # DEV_HOST set as in step 4
-   API_PROXY_TARGET="http://$DEV_HOST:8100" \
-     bun run dev --host "$DEV_HOST" --port 5174 --strictPort
+   # DEV_HOST / DEV_API_PORT / DEV_WEB_PORT set as in step 4, then:
+   cd frontend
+   API_PROXY_TARGET="http://$DEV_HOST:$DEV_API_PORT" \
+     bun run dev --host "$DEV_HOST" --port "$DEV_WEB_PORT" --strictPort
    ```
 
-   Open `http://$DEV_HOST:5174` from any device on the LAN, by IP: Vite's
-   host check answers 403 to any other hostname unless it is added to
-   `server.allowedHosts`. Without `--host` Vite binds `localhost` only. The
-   backend no longer listens on loopback, so the proxy target must be
-   `$DEV_HOST` too. `/api`, `/v1` and `/health` are proxied to the dev
-   backend. Without `API_PROXY_TARGET` the proxy defaults to
-   `localhost:8000`, which is not the dev server.
+   Open `http://$DEV_HOST:$DEV_WEB_PORT` from any device on the LAN, by IP:
+   Vite's host check answers 403 to any other hostname unless it is added to
+   `server.allowedHosts`. `--strictPort` makes Vite fail rather than drift to
+   the next free port, where the slot's URL would no longer be true. Without
+   `--host` Vite binds `localhost` only. The backend no longer listens on
+   loopback, so the proxy target must be `$DEV_HOST` too. `/api`, `/v1` and
+   `/health` are proxied to the dev backend. Without `API_PROXY_TARGET` the
+   proxy defaults to `localhost:8000`, which is not the dev server.
 
 6. Add accounts through the dev dashboard's device login, using a Kiro
    account that is **not** in the production pool. The server starts with an
