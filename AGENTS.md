@@ -19,7 +19,7 @@ kiro-lb/
 ├── kiro/                    # Gateway package: 56 modules, 23.9k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 2400 tests; network-blocked by conftest
+├── tests/                   # pytest, 2402 tests; network-blocked by conftest
 ├── data/                    # Unified private dashboard.sqlite3 store (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
@@ -28,7 +28,7 @@ kiro-lb/
 ├── docker-compose.homelab.yml  # Live: edge HAProxy :8000 + kiro-blue/green slots
 ├── docker/haproxy-edge.cfg.template  # rendered → haproxy-edge.generated.cfg
 ├── deploy/bluegreen/        # zero-downtime deploy.sh (nginx-fixed lab IP)
-├── scripts/dev.sh           # Per-worktree dev stack: init / api / web / status
+├── scripts/dev.sh           # Per-worktree dev stack behind portless: init / api / web / status
 └── manual_api_test.py       # Manual live-API script, excluded from pytest
 ```
 
@@ -230,8 +230,8 @@ trusting a pin here.
 ## COMMANDS
 
 ```bash
-# Dev stack: scripts/dev.sh init|api|web|status, from a worktree only (LOCAL DEVELOPMENT)
-pytest -q                                      # full suite (2400 tests, ~17s, no network)
+# Dev stack: scripts/dev.sh init|api|web|status|proxy-stop, worktree only (LOCAL DEVELOPMENT)
+pytest -q                                      # full suite (2402 tests, ~17s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
@@ -291,65 +291,84 @@ Shipping the result is the next section, SHIP.
 2. Initialise the worktree with `scripts/dev.sh`:
 
    ```bash
-   scripts/dev.sh init      # dev .env + port slot, then .venv (Python 3.12) and frontend deps
+   scripts/dev.sh init      # dev .env, then .venv (Python 3.12) and frontend deps incl. portless
    ```
 
    `init` writes a dev-only `.env` (0600, random `PROXY_API_KEY` and
-   `DASHBOARD_PASSWORD`, never a copy of production's) and assigns this
-   worktree a port slot: the lowest N that no other worktree's `.env` claims
-   and nothing listens on, backend `8100+10N`, dashboard `5174+10N`. The slot
-   is recorded in the `.env` as `DEV_API_PORT`/`DEV_WEB_PORT`, so URLs stay
-   stable across restarts and removing the worktree frees it. Slot 0 stays
-   clear of the production edge (`:8000`) and both slots (`8001`/`8002`).
-   Allocation holds a lock in the shared git dir, so parallel `init`s never
-   pick the same slot. Rerunning `init` keeps the existing `.env` and only
-   refreshes dependencies (`--no-deps` skips them); a `.venv` left pointing at
-   a moved worktree's old path is rebuilt.
+   `DASHBOARD_PASSWORD`, never a copy of production's) marked `DEV_ENV="1"`.
+   Rerunning it keeps the existing `.env` and only refreshes dependencies
+   (`--no-deps` skips them); a `.venv` left pointing at a moved worktree's old
+   path is rebuilt.
 
-   The gateway ignores `DEV_*`. They are not `SERVER_HOST`/`SERVER_PORT`
-   because pytest reads this `.env` too, and those two in it fail the
+   The gateway ignores `DEV_ENV`. Host and port never go in this `.env`:
+   pytest reads it too, and `SERVER_HOST`/`SERVER_PORT` in it fail the
    default-value tests in `tests/unit/test_config.py`. `KIRO_SLOT` and
    `HANDOFF_SECRET` stay unset: without a slot the process is the store's sole
    writer, which is correct for its own `data/` and exactly what must never
    happen against production's.
 
    Every `dev.sh` command refuses to run in the deploy root (the checkout
-   holding `deploy/bluegreen/active_slot`), and `api`/`web` refuse a `.env`
-   with no `DEV_` ports, which is what a production `.env` looks like.
+   holding `deploy/bluegreen/active_slot`) and refuses a `.env` without the
+   `DEV_ENV` marker, which is what a production `.env` looks like.
 
 3. Run the backend, then the dashboard in a second terminal:
 
    ```bash
-   scripts/dev.sh api       # FastAPI on $DEV_HOST:$DEV_API_PORT
-   scripts/dev.sh web       # Vite + HMR on $DEV_HOST:$DEV_WEB_PORT, proxied to the api
-   scripts/dev.sh status    # this worktree's URLs, and every worktree's slot
+   scripts/dev.sh api       # FastAPI behind portless
+   scripts/dev.sh web       # Vite + HMR behind portless, /api /v1 /health proxied to the api
+   scripts/dev.sh status    # routes of every running worktree, and this one's URLs
    ```
 
-   Both bind the LAN address so other devices on that subnet can reach them:
-   `DEV_HOST` is the IPv4 address on the default-route interface, derived at
-   run time; export it to override. Never use `127.0.0.1` (this host only) or
-   `0.0.0.0` (also exposes the server on the VPN and every Docker bridge), and
-   never write a literal IP into a command, `.env` or config. Binding picks
-   the interface, it is not a firewall: anything that can route to that
-   address can reach the port, so the dev `PROXY_API_KEY` and
-   `DASHBOARD_PASSWORD` are the only gates.
+   Both run through [portless](https://github.com/vercel-labs/portless)
+   (`frontend` devDependency, pinned). Each app listens on a loopback port
+   portless picks, and one shared portless proxy in LAN mode serves them as
+   `http://<branch>.kiro-lb.local:1356` (dashboard) and
+   `http://<branch>.api.kiro-lb.local:1356` (api). The branch prefix comes
+   from the worktree, so worktrees never collide and nothing needs a port
+   number. The first `api`/`web` starts the proxy; `dev.sh proxy-stop` stops
+   it.
+
+   The proxy is isolated from any other portless use on the host: its own
+   state dir (`~/.portless-kiro-lb`) and port (`1356`, not portless's
+   default `1355`), plain HTTP (no local CA, no sudo), and it never edits
+   `/etc/hosts`. `DEV_PROXY_PORT` and `DEV_PORTLESS_STATE_DIR` override the
+   first two.
+
+   Reaching it from other devices:
+   - LAN mode needs `avahi-utils` on this host (`avahi-publish-address`); it
+     publishes each name over mDNS with this host's LAN address.
+   - The advertised address is `DEV_HOST`: the IPv4 address on the
+     default-route interface, derived at run time and pinned with `--ip`
+     (auto-detection can pick a VPN interface). Export `DEV_HOST` to
+     override; never write a literal IP into a command, `.env` or config.
+   - Clients resolve `.local` names only if they speak mDNS (macOS and iOS do;
+     Linux needs `libnss-mdns`, Windows depends on version). Where they do
+     not, send the name in the Host header to the LAN address:
+     `curl --resolve <name>:1356:<DEV_HOST> http://<name>:1356/`. This host
+     resolves them with `avahi-resolve`, not `getent`: the default
+     `mdns4_minimal` NSS module skips multi-label names like these.
+
+   LAN mode binds the proxy to `0.0.0.0` and `::`; portless offers no
+   narrower bind. That reaches the LAN, and also the VPN and every Docker
+   bridge on this host. Binding is not a firewall either way, so the dev
+   `PROXY_API_KEY` and `DASHBOARD_PASSWORD` are the only gates; keep them
+   random and distinct from production. The apps themselves stay on
+   loopback, so nothing but the proxy is reachable.
 
    `api` starts `main.py` under `env -i`. `load_dotenv()` (`config.py:15`)
    never overrides variables already in the process environment, so a shell
    that exports the production `PROXY_API_KEY` or `DASHBOARD_PASSWORD` (the
    operator's does) would silently win over the dev `.env`, and the dev server
    would accept the production key. Check with `curl -H "Authorization: Bearer
-   $PROXY_API_KEY" http://<DEV_HOST>:<DEV_API_PORT>/v1/models`: must be 401.
-   For the same reason, `dev.sh` reads single lines from `.env` and never
-   sources it.
+   $PROXY_API_KEY"` against the api URL: must be 401.
 
-   Open the dashboard by IP (`status` prints the URL). Vite's host check
-   answers 403 to any other hostname unless it is added to
-   `server.allowedHosts`. `web` passes `--strictPort`, so a taken port fails
-   instead of drifting off the slot's recorded URL. The session cookie is not
-   `Secure` over plain HTTP: `_secure_cookie()` (`dashboard.py`) infers that
-   from the scheme, and `DASHBOARD_SECURE_COOKIE="false"` in the dev `.env`
-   pins it so a stray `X-Forwarded-Proto: https` cannot break login.
+   `web` points Vite's proxy at the portless proxy and names the api route in
+   the Host header (`API_PROXY_HOST`, `vite.config.ts`). The api's own port
+   changes on every restart, so restarting `api` never needs a `web` restart.
+   portless also adds `.local` to Vite's allowed hosts. The session cookie is
+   not `Secure` over plain HTTP: `_secure_cookie()` (`dashboard.py`) infers
+   that from the scheme, and `DASHBOARD_SECURE_COOKIE="false"` in the dev
+   `.env` pins it so a stray `X-Forwarded-Proto: https` cannot break login.
 
    The backend does not reload on Python changes; restart `api` after editing
    `kiro/` or `main.py`. The dashboard hot-reloads.
@@ -389,8 +408,9 @@ in the worktree; everything after it happens in the main checkout.
    checkout, so running it from a worktree would boot a slot against the dev
    store. A docs-only merge needs the pull but not the deploy.
 
-4. Clean up the worktree. Stop its dev servers first, then, from the main
-   checkout after the pull in step 3:
+4. Clean up the worktree. Stop its `api` and `web` first (Ctrl-C; portless
+   drops their routes and mDNS names on exit), then, from the main checkout
+   after the pull in step 3:
 
    ```bash
    git worktree remove ../kiro-lb-worktrees/my-change
@@ -404,6 +424,9 @@ in the worktree; everything after it happens in the main checkout.
    `branch -d` can refuse even after a merge: a squash or rebase merge puts
    new commits on `main`, so git sees the branch as unmerged once its remote
    copy is gone. Confirm the PR shows merged, then use `-D`.
+
+   Run `scripts/dev.sh proxy-stop` from any worktree once no worktree needs
+   the shared proxy.
 
 ## NOTES
 
