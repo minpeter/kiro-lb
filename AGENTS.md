@@ -236,10 +236,11 @@ pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
 mypy                                           # config in pyproject.toml (kiro + main.py)
 cd frontend && bun run lint && bun run typecheck && bun run test && bun run build
-docker compose -p kiro-lb -f docker-compose.homelab.yml up -d --build
+./deploy/bluegreen/deploy.sh --status          # production; ship via SHIP, never `compose up`
 ```
 
-The `-p kiro-lb` is required: the live container was created under that project
+The `-p kiro-lb` is required on any manual compose command (`deploy.sh`
+passes it itself): the live container was created under that project
 name, so a checkout directory that differs (for example an old `kiro-lb-python`
 clone) makes compose invent another project and hit a `container_name` conflict
 instead of recreating.
@@ -413,12 +414,16 @@ in the worktree; everything after it happens in the main checkout.
 
    ```bash
    git worktree remove ../kiro-lb-worktrees/my-change
-   git branch -d feat/my-change   # needs the merge pulled, else it refuses
+   git branch -d feat/my-change
    ```
 
    `git worktree remove` refuses only on tracked changes. Ignored files go
    with the tree without a prompt: the dev `.env`, and `data/` with the dev
    accounts' refresh tokens. Copy them out first to reuse them.
+
+   `branch -d` can refuse even after a merge: a squash or rebase merge puts
+   new commits on `main`, so git sees the branch as unmerged once its remote
+   copy is gone. Confirm the PR shows merged, then use `-D`.
 
 ## NOTES
 
