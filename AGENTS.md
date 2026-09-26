@@ -19,7 +19,7 @@ kiro-lb/
 ├── kiro/                    # Gateway package: 56 modules, 23.9k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 2385 tests; network-blocked by conftest
+├── tests/                   # pytest, 2400 tests; network-blocked by conftest
 ├── data/                    # Unified private dashboard.sqlite3 store (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
@@ -28,6 +28,7 @@ kiro-lb/
 ├── docker-compose.homelab.yml  # Live: edge HAProxy :8000 + kiro-blue/green slots
 ├── docker/haproxy-edge.cfg.template  # rendered → haproxy-edge.generated.cfg
 ├── deploy/bluegreen/        # zero-downtime deploy.sh (nginx-fixed lab IP)
+├── scripts/dev.sh           # Per-worktree dev stack: init / api / web / status
 └── manual_api_test.py       # Manual live-API script, excluded from pytest
 ```
 
@@ -229,8 +230,8 @@ trusting a pin here.
 ## COMMANDS
 
 ```bash
-# Dev server: run from a worktree only, see LOCAL DEVELOPMENT (steps 4-5)
-pytest -q                                      # full suite (2385 tests, ~17s, no network)
+# Dev stack: scripts/dev.sh init|api|web|status, from a worktree only (LOCAL DEVELOPMENT)
+pytest -q                                      # full suite (2400 tests, ~17s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
@@ -282,121 +283,78 @@ Shipping the result is the next section, SHIP.
    directory; pick a distinct `WT` for the second one.
 
    `.env`, `data/`, `debug_logs/`, `.venv/` and `frontend/node_modules/` are
-   gitignored, so the new tree starts with none of them. Move a worktree with
-   `git worktree move`, never `mv`, and recreate `.venv` afterwards: its
-   scripts carry the old absolute path in their shebang.
+   gitignored, so the new tree starts with none of them; step 2 creates
+   them. Move a worktree with `git worktree move`, never `mv`, then rerun
+   `scripts/dev.sh init` to rebuild the `.venv`, whose scripts carry the old
+   absolute path in their shebang.
 
-2. Write a dev-only `.env` (never copy the production one):
-
-   ```bash
-   # Port slot: lowest N not claimed by a sibling worktree's .env and not
-   # already listening. Backend 8100+10N, dashboard 5174+10N.
-   n=0
-   while grep -qsx "DEV_API_PORT=\"$((8100 + 10 * n))\"" ../*/.env \
-     || ss -ltnH "( sport = :$((8100 + 10 * n)) or sport = :$((5174 + 10 * n)) )" | grep -q .; do
-     n=$((n + 1))
-   done
-   (set -C; umask 077; {
-     echo "PROXY_API_KEY=\"dev-$(openssl rand -hex 16)\""
-     echo "DASHBOARD_PASSWORD=\"dev-$(openssl rand -hex 8)\""
-     echo 'DASHBOARD_DATA_DIR="data"'
-     echo 'DASHBOARD_SECURE_COOKIE="false"'
-     echo 'LOG_LEVEL="DEBUG"'
-     echo "DEV_API_PORT=\"$((8100 + 10 * n))\""
-     echo "DEV_WEB_PORT=\"$((5174 + 10 * n))\""
-   } > .env) && grep '^DEV_' .env
-   ```
-
-   `set -C` refuses to overwrite an existing `.env`, so rerunning this cannot
-   replace the secrets or hand this worktree a second slot. `umask 077`
-   creates the file 0600 before any secret is written. The `echo` group,
-   unlike a heredoc, still works when copied with this list's indentation: an
-   indented `EOF` never closes the heredoc.
-
-   The ports live in the worktree's `.env`, so they survive restarts (stable
-   URLs), `grep -H '^DEV_' ../*/.env` lists every worktree's pair, and
-   removing a worktree frees its slot. Slot 0 (8100/5174) stays clear of the
-   production edge (`:8000`) and both slots (`127.0.0.1:8001`/`8002`).
-
-   The gateway ignores `DEV_*`; only the commands in steps 4-5 read them. They
-   are not `SERVER_HOST`/`SERVER_PORT` because pytest reads this `.env` too,
-   and those two in it fail the default-value tests in
-   `tests/unit/test_config.py`.
-
-   Leave `KIRO_SLOT` and `HANDOFF_SECRET` unset: without a slot the process
-   is the store's sole writer, which is correct for its own `data/` and
-   exactly what must never happen against production's.
-
-3. Install dependencies (Python 3.12, matching CI and the Dockerfile):
+2. Initialise the worktree with `scripts/dev.sh`:
 
    ```bash
-   uv venv --python 3.12 .venv
-   uv pip install --python .venv/bin/python \
-     -r requirements.txt -r requirements-test.txt -r requirements-dev.txt
-   (cd frontend && bun install --frozen-lockfile)
+   scripts/dev.sh init      # dev .env + port slot, then .venv (Python 3.12) and frontend deps
    ```
 
-4. Run the backend with a clean environment, reachable from other devices on
-   the LAN:
+   `init` writes a dev-only `.env` (0600, random `PROXY_API_KEY` and
+   `DASHBOARD_PASSWORD`, never a copy of production's) and assigns this
+   worktree a port slot: the lowest N that no other worktree's `.env` claims
+   and nothing listens on, backend `8100+10N`, dashboard `5174+10N`. The slot
+   is recorded in the `.env` as `DEV_API_PORT`/`DEV_WEB_PORT`, so URLs stay
+   stable across restarts and removing the worktree frees it. Slot 0 stays
+   clear of the production edge (`:8000`) and both slots (`8001`/`8002`).
+   Allocation holds a lock in the shared git dir, so parallel `init`s never
+   pick the same slot. Rerunning `init` keeps the existing `.env` and only
+   refreshes dependencies (`--no-deps` skips them); a `.venv` left pointing at
+   a moved worktree's old path is rebuilt.
+
+   The gateway ignores `DEV_*`. They are not `SERVER_HOST`/`SERVER_PORT`
+   because pytest reads this `.env` too, and those two in it fail the
+   default-value tests in `tests/unit/test_config.py`. `KIRO_SLOT` and
+   `HANDOFF_SECRET` stay unset: without a slot the process is the store's sole
+   writer, which is correct for its own `data/` and exactly what must never
+   happen against production's.
+
+   Every `dev.sh` command refuses to run in the deploy root (the checkout
+   holding `deploy/bluegreen/active_slot`), and `api`/`web` refuse a `.env`
+   with no `DEV_` ports, which is what a production `.env` looks like.
+
+3. Run the backend, then the dashboard in a second terminal:
 
    ```bash
-   # From the worktree root, in every terminal you start a server from.
-   # DEV_HOST: the address on the default-route interface (the LAN); export
-   # it beforehand to override. Ports: this worktree's slot from step 2.
-   DEV_HOST="${DEV_HOST:-$(ip -4 -o addr show dev "$(ip -4 route show default \
-     | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')" \
-     | awk '{split($4,a,"/"); print a[1]; exit}')}"
-   DEV_API_PORT="$(sed -n 's/^DEV_API_PORT="\([0-9]*\)"$/\1/p' .env)"
-   DEV_WEB_PORT="$(sed -n 's/^DEV_WEB_PORT="\([0-9]*\)"$/\1/p' .env)"
-   echo "$DEV_HOST api:$DEV_API_PORT web:$DEV_WEB_PORT"   # none may be empty
-
-   env -i HOME="$HOME" PATH="$PATH" .venv/bin/python main.py \
-     --host "$DEV_HOST" --port "$DEV_API_PORT"
+   scripts/dev.sh api       # FastAPI on $DEV_HOST:$DEV_API_PORT
+   scripts/dev.sh web       # Vite + HMR on $DEV_HOST:$DEV_WEB_PORT, proxied to the api
+   scripts/dev.sh status    # this worktree's URLs, and every worktree's slot
    ```
 
-   Only the two port lines are read, not the whole `.env`: sourcing it would
-   export the dev secrets into your shell over any production ones.
+   Both bind the LAN address so other devices on that subnet can reach them:
+   `DEV_HOST` is the IPv4 address on the default-route interface, derived at
+   run time; export it to override. Never use `127.0.0.1` (this host only) or
+   `0.0.0.0` (also exposes the server on the VPN and every Docker bridge), and
+   never write a literal IP into a command, `.env` or config. Binding picks
+   the interface, it is not a firewall: anything that can route to that
+   address can reach the port, so the dev `PROXY_API_KEY` and
+   `DASHBOARD_PASSWORD` are the only gates.
 
-   Dev servers always bind the LAN address so other devices on that subnet can
-   reach them. Do not use `127.0.0.1` (this host only) or `0.0.0.0` (also
-   exposes the server on the VPN and every Docker bridge). Derive the address
-   as above; never write a literal IP into the command, `.env` or config.
-   Binding picks the interface, it is not a firewall: anything that can route
-   to that address can reach the port, so the dev `PROXY_API_KEY` and
-   `DASHBOARD_PASSWORD` are the only gates. Keep them random and distinct
-   from production.
+   `api` starts `main.py` under `env -i`. `load_dotenv()` (`config.py:15`)
+   never overrides variables already in the process environment, so a shell
+   that exports the production `PROXY_API_KEY` or `DASHBOARD_PASSWORD` (the
+   operator's does) would silently win over the dev `.env`, and the dev server
+   would accept the production key. Check with `curl -H "Authorization: Bearer
+   $PROXY_API_KEY" http://<DEV_HOST>:<DEV_API_PORT>/v1/models`: must be 401.
+   For the same reason, `dev.sh` reads single lines from `.env` and never
+   sources it.
 
-   The session cookie must not be `Secure` over
-   plain HTTP; `_secure_cookie()` (`dashboard.py`) already infers that from
-   the scheme, and `DASHBOARD_SECURE_COOKIE="false"` from step 2 only pins it
-   so a stray `X-Forwarded-Proto: https` cannot break login.
+   Open the dashboard by IP (`status` prints the URL). Vite's host check
+   answers 403 to any other hostname unless it is added to
+   `server.allowedHosts`. `web` passes `--strictPort`, so a taken port fails
+   instead of drifting off the slot's recorded URL. The session cookie is not
+   `Secure` over plain HTTP: `_secure_cookie()` (`dashboard.py`) infers that
+   from the scheme, and `DASHBOARD_SECURE_COOKIE="false"` in the dev `.env`
+   pins it so a stray `X-Forwarded-Proto: https` cannot break login.
 
-   `load_dotenv()` (`config.py:15`) never overrides variables already in the
-   process environment. A shell that exports `PROXY_API_KEY` or
-   `DASHBOARD_PASSWORD` (the operator's does) silently wins over the dev
-   `.env`, and the dev server then accepts the production key. `env -i` is the
-   guard; check with `curl -H "Authorization: Bearer $PROXY_API_KEY"
-   "http://$DEV_HOST:$DEV_API_PORT/v1/models"` → must be 401.
+   The backend does not reload on Python changes; restart `api` after editing
+   `kiro/` or `main.py`. The dashboard hot-reloads.
 
-5. Run the dashboard with HMR in a second terminal:
-
-   ```bash
-   # DEV_HOST / DEV_API_PORT / DEV_WEB_PORT set as in step 4, then:
-   cd frontend
-   API_PROXY_TARGET="http://$DEV_HOST:$DEV_API_PORT" \
-     bun run dev --host "$DEV_HOST" --port "$DEV_WEB_PORT" --strictPort
-   ```
-
-   Open `http://$DEV_HOST:$DEV_WEB_PORT` from any device on the LAN, by IP:
-   Vite's host check answers 403 to any other hostname unless it is added to
-   `server.allowedHosts`. `--strictPort` makes Vite fail rather than drift to
-   the next free port, where the slot's URL would no longer be true. Without
-   `--host` Vite binds `localhost` only. The backend no longer listens on
-   loopback, so the proxy target must be `$DEV_HOST` too. `/api`, `/v1` and
-   `/health` are proxied to the dev backend. Without `API_PROXY_TARGET` the
-   proxy defaults to `localhost:8000`, which is not the dev server.
-
-6. Add accounts through the dev dashboard's device login, using a Kiro
+4. Add accounts through the dev dashboard's device login, using a Kiro
    account that is **not** in the production pool. The server starts with an
    empty pool (only `PROXY_API_KEY` is mandatory, `main.py:203`). Do not copy
    production `data/dashboard.sqlite3`: it carries upstream refresh tokens, and
@@ -410,7 +368,8 @@ in the worktree; everything after it happens in the main checkout.
 
 1. Verify in the worktree with the same commands CI runs (see COMMANDS),
    prefixed with `env -i HOME="$HOME" PATH="$PATH"` and using `.venv/bin/`
-   tools, for the same reason as LOCAL DEVELOPMENT step 4. If `frontend/`
+   tools, for the same reason `dev.sh api` runs under `env -i` (LOCAL
+   DEVELOPMENT step 3). If `frontend/`
    changed, commit the `bun run build` output in `kiro/static/` too; it is
    tracked and the image serves it as-is.
 
