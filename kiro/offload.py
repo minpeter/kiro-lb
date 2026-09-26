@@ -18,3 +18,16 @@ async def run_in_worker(fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
     thread stalls /health and the dashboard until they finish.
     """
     return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+# Measured on tiktoken cl100k: a worker hop costs ~0.12ms, encoding 8k chars
+# ~0.3ms and 256k chars ~10.5ms. Below this size the hop costs more than the
+# work it moves, so small texts are counted inline.
+OFFLOAD_MIN_CHARS = 8192
+
+
+async def run_if_large(size: int, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> T:
+    """Run ``fn`` in a worker thread only when ``size`` makes the hop worth it."""
+    if size >= OFFLOAD_MIN_CHARS:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return fn(*args, **kwargs)

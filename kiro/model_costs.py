@@ -71,6 +71,7 @@ MODEL_COSTS: dict[str, ModelCost] = {
     "gpt-5.6-sol": ModelCost(4.4, 1_000_000, 8.8, GPT_5_6_LONG_THRESHOLD),
     "gpt-5.6-terra": ModelCost(2.2, 1_000_000, 4.4, GPT_5_6_LONG_THRESHOLD),
     "gpt-5.6-luna": ModelCost(1.1, 1_000_000, 2.2, GPT_5_6_LONG_THRESHOLD),
+    "claude-opus-5.5": ModelCost(2.0, 1_000_000),
     "claude-opus-5": ModelCost(2.2, 1_000_000),
     "claude-opus-4.8": ModelCost(2.2, 1_000_000),
     "claude-opus-4.7": ModelCost(2.2, 1_000_000),

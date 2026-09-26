@@ -56,6 +56,22 @@ def test_unverified_model_never_receives_the_field():
     assert "additionalModelRequestFields" not in _openai_payload(model="glm-5", reasoning_effort="max")
 
 
+def test_opus_5_5_receives_the_field():
+    """Verified against runtime.us-east-1.kiro.dev on 2026-09-25: claude-opus-5.5
+    accepted the adaptive fields and answered with thinking frames plus a
+    signature, so it belongs in NATIVE_THINKING_MODELS."""
+    payload = _openai_payload(model="claude-opus-5.5", reasoning_effort="high")
+
+    assert payload["additionalModelRequestFields"]["thinking"] == ADAPTIVE
+    assert payload["additionalModelRequestFields"]["output_config"] == {"effort": "high"}
+
+
+def test_opus_5_5_hyphenated_form_receives_the_field():
+    payload = _openai_payload(model="claude-opus-5-5", reasoning_effort="high")
+
+    assert payload["additionalModelRequestFields"]["thinking"] == ADAPTIVE
+
+
 def test_anthropic_adaptive_with_effort_is_forwarded():
     payload = _anthropic_payload(thinking={"type": "adaptive"}, output_config={"effort": "xhigh"})
 

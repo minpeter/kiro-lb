@@ -8,6 +8,7 @@ import json
 import math
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -24,20 +25,85 @@ def database_path() -> Path:
     return Path(os.getenv("DASHBOARD_DATA_DIR", "data")) / DB_FILENAME
 
 
-@contextmanager
-def connection() -> Iterator[sqlite3.Connection]:
-    path = database_path()
+# One reused connection per thread.
+#
+# Opening a fresh connection per call cost a mkdir, a connect, a chmod syscall
+# and two PRAGMAs - and "PRAGMA journal_mode = WAL" writes to the file header -
+# on every use. Two of those calls sit in the request path: the API key lookup
+# before the upstream request, and the request-log write after it.
+#
+# The cache holds a single entry, replaced when database_path() changes, so a
+# test that repoints DASHBOARD_DATA_DIR at a fresh tmp dir gets a fresh
+# connection rather than the previous test's file.
+_local = threading.local()
+
+
+def _open(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5.0)
     os.chmod(path, 0o600)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def _discard_cached() -> None:
+    conn = getattr(_local, "conn", None)
+    _local.conn = None
+    _local.path = None
+    _local.depth = 0
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def reset_connection_cache() -> None:
+    """Close this thread's cached connection, if any."""
+    _discard_cached()
+
+
+@contextmanager
+def connection() -> Iterator[sqlite3.Connection]:
+    path = database_path()
+    key = str(path)
+    conn = getattr(_local, "conn", None)
+    if conn is not None and getattr(_local, "path", None) != key:
+        if getattr(_local, "depth", 0):
+            # A nested call must never pull the connection out from under the
+            # block that owns the transaction.
+            raise RuntimeError("database path changed while a store transaction was open")
+        _discard_cached()
+        conn = None
+    if conn is None:
+        conn = _open(path)
+        _local.conn = conn
+        _local.path = key
+        _local.depth = 0
+
+    # Only the outermost block owns the transaction. sqlite3's context manager
+    # does not nest: an inner ``with conn`` would commit work the outer block had
+    # not finished, so nested callers simply reuse the open transaction.
+    outermost = _local.depth == 0
+    _local.depth += 1
     try:
-        with conn:
+        if outermost:
+            with conn:
+                yield conn
+        else:
             yield conn
+    except Exception:
+        if outermost:
+            # A connection that failed mid-transaction may be in an unknown
+            # state; the next caller opens a clean one rather than inheriting it.
+            _local.depth = 0
+            _discard_cached()
+        raise
     finally:
-        conn.close()
+        if _local.depth:
+            _local.depth -= 1
 
 
 def initialize() -> None:

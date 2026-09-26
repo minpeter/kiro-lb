@@ -21,6 +21,7 @@ import httpx
 from loguru import logger
 
 from kiro.config import FIRST_TOKEN_MAX_RETRIES, FIRST_TOKEN_TIMEOUT
+from kiro.offload import run_if_large, run_in_worker
 from kiro.parsers import parse_bracket_tool_calls, tool_call_signature
 from kiro.sse_validation import (
     StreamProtocolError,
@@ -73,7 +74,10 @@ def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
         Formatted SSE string
     """
     formatted = f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-    if debug_logger:
+    # ``debug_logger`` is a singleton, so ``if debug_logger`` never gated this:
+    # every outbound chunk was re-encoded to UTF-8 and handed to a logger that
+    # discards it. The error path below keeps the plain check, since it runs once.
+    if debug_logger is not None and debug_logger.is_enabled():
         debug_logger.log_modified_chunk(formatted.encode("utf-8"))
     try:
         validate_live_anthropic_event(event_type, data)
@@ -170,7 +174,8 @@ async def stream_kiro_to_anthropic(
     if known_input_tokens:
         input_tokens = known_input_tokens
     elif request_messages or request_tools or request_system:
-        request_token_stats = estimate_request_tokens(
+        request_token_stats = await run_in_worker(
+            estimate_request_tokens,
             messages=request_messages or [],
             tools=request_tools,
             system_prompt=request_system,
@@ -702,7 +707,8 @@ async def stream_kiro_to_anthropic(
             )
 
         # Calculate output tokens
-        output_tokens = count_tokens(full_content + full_thinking_content, model=model)
+        output_text = full_content + full_thinking_content
+        output_tokens = await run_if_large(len(output_text), count_tokens, output_text, model=model)
 
         # Calculate total tokens from context usage if available
         input_tokens_from_upstream = False
@@ -786,6 +792,7 @@ async def collect_anthropic_response(
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
     make_search_request: Optional[Callable[[str, str, str], Awaitable[httpx.Response]]] = None,
+    known_input_tokens: Optional[int] = None,
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -809,10 +816,15 @@ async def collect_anthropic_response(
     # whole call is generation time.
     generation = GenerationTimer()
 
-    # Non-streaming uses the same full-request estimation as streaming
+    # Same precedence as streaming: the pre-flight measurement is already paid
+    # for and reflects the trimmed payload actually sent. Re-estimating the whole
+    # request here ran tiktoken on the event loop, 88ms on a 1.6MB history.
     input_tokens = 0
-    if request_messages or request_tools or request_system:
-        request_token_stats = estimate_request_tokens(
+    if known_input_tokens:
+        input_tokens = known_input_tokens
+    elif request_messages or request_tools or request_system:
+        request_token_stats = await run_in_worker(
+            estimate_request_tokens,
             messages=request_messages or [],
             tools=request_tools,
             system_prompt=request_system,
@@ -963,7 +975,8 @@ async def collect_anthropic_response(
         )
 
     # Calculate output tokens
-    output_tokens = count_tokens(accumulated_content + accumulated_thinking, model=model)
+    output_text = accumulated_content + accumulated_thinking
+    output_tokens = await run_if_large(len(output_text), count_tokens, output_text, model=model)
 
     # Calculate from context usage if available
     if result.context_usage_percentage is not None:

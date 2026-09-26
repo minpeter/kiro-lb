@@ -12,7 +12,7 @@ Contains classes and functions for:
 import codecs
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -21,6 +21,44 @@ from kiro.utils import generate_tool_call_id
 
 class MalformedToolInputError(ValueError):
     """Raised when upstream tool arguments cannot be parsed safely."""
+
+
+_BRACE_SIGNIFICANT = re.compile(r'[{}"\\]')
+
+
+def _scan_braces(text: str, pos: int, depth: int, in_string: bool) -> tuple[int, int, int, bool]:
+    """Resumable form of ``find_matching_brace``.
+
+    Returns ``(end, resume_pos, depth, in_string)``. ``end`` is the closing
+    brace or -1; on -1 the other three let the next call continue where this one
+    stopped instead of rescanning the frame from its start, which made a large
+    tool-input frame arriving in small chunks quadratic. The regex jumps over
+    runs of ordinary characters in C, so only structural characters reach Python.
+    """
+    while True:
+        match = _BRACE_SIGNIFICANT.search(text, pos)
+        if match is None:
+            return -1, len(text), depth, in_string
+        i = match.start()
+        char = text[i]
+        if char == "\\":
+            if in_string:
+                pos = i + 2
+                if pos > len(text):
+                    return -1, pos, depth, in_string
+                continue
+            pos = i + 1
+            continue
+        if char == '"':
+            in_string = not in_string
+        elif not in_string:
+            if char == "{":
+                depth += 1
+            elif depth > 0:
+                depth -= 1
+                if depth == 0:
+                    return i, i + 1, 0, False
+        pos = i + 1
 
 
 def find_matching_brace(text: str, start_pos: int) -> int:
@@ -297,9 +335,20 @@ class AwsEventStreamParser:
         ('{"signature":', "native_thinking_signature"),
     ]
 
-    def __init__(self):
-        """Initializes the parser."""
+    def __init__(self, observe_frames: bool = True):
+        """Initializes the parser.
+
+        ``observe_frames`` drives the diagnostic pass that decodes every upstream
+        frame a second time for ``drain_observed_frames``. Its only consumer is
+        the debug logger, and walking and re-parsing every byte of every stream
+        for a logger that will discard the result is the most expensive thing on
+        the data plane, so the caller turns it off when capture is off.
+        """
+        self.observe_frames = observe_frames
         self.buffer = ""
+        # The frame the last feed() stopped inside: (event_type, resume_pos,
+        # depth, in_string). Its opening brace is always buffer[0].
+        self._pending_frame: Optional[Tuple[str, int, int, bool]] = None
         self._observation_buffer = ""
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.current_tool_call: Optional[Dict[str, Any]] = None
@@ -320,8 +369,9 @@ class AwsEventStreamParser:
         """
         decoded = self._utf8_decoder.decode(chunk, final=False)
         self.buffer += decoded
-        self._observation_buffer += decoded
-        while self._observation_buffer:
+        if self.observe_frames:
+            self._observation_buffer += decoded
+        while self.observe_frames and self._observation_buffer:
             start = self._observation_buffer.find("{")
             if start == -1:
                 self._observation_buffer = ""
@@ -341,29 +391,45 @@ class AwsEventStreamParser:
                 self._observed_frames.append(frame)
 
         events = []
+        buffer = self.buffer
+        pos = 0
+        # Next occurrence of each pattern at or after ``pos``. Recomputed only for
+        # a pattern whose cached hit has been consumed: searching all ten across
+        # the whole remaining buffer for every frame was quadratic in chunk size.
+        next_hit: Dict[str, int] = {}
 
         while True:
-            # Find nearest pattern
-            earliest_pos = -1
-            earliest_type = None
+            if self._pending_frame is not None:
+                earliest_type, scan_from, depth, in_string = self._pending_frame
+                self._pending_frame = None
+                earliest_pos = 0
+            else:
+                earliest_pos = -1
+                found_type: Optional[str] = None
+                for pattern, event_type in self.EVENT_PATTERNS:
+                    hit = next_hit.get(pattern, -2)
+                    if hit != -1 and hit < pos:
+                        hit = buffer.find(pattern, pos)
+                        next_hit[pattern] = hit
+                    if hit != -1 and (earliest_pos == -1 or hit < earliest_pos):
+                        earliest_pos = hit
+                        found_type = event_type
+                if earliest_pos == -1 or found_type is None:
+                    break
+                earliest_type = found_type
+                scan_from, depth, in_string = earliest_pos, 0, False
 
-            for pattern, event_type in self.EVENT_PATTERNS:
-                pos = self.buffer.find(pattern)
-                if pos != -1 and (earliest_pos == -1 or pos < earliest_pos):
-                    earliest_pos = pos
-                    earliest_type = event_type
-
-            if earliest_pos == -1 or earliest_type is None:
-                break
-
-            # Find JSON end
-            json_end = find_matching_brace(self.buffer, earliest_pos)
+            json_end, resume, depth, in_string = _scan_braces(buffer, scan_from, depth, in_string)
             if json_end == -1:
-                # JSON not complete, wait for more data
+                # JSON not complete: keep the frame at buffer[0] and remember how
+                # far it was scanned, so the next chunk continues from there.
+                buffer = buffer[earliest_pos:]
+                pos = 0
+                self._pending_frame = (earliest_type, resume - earliest_pos, depth, in_string)
                 break
 
-            json_str = self.buffer[earliest_pos : json_end + 1]
-            self.buffer = self.buffer[json_end + 1 :]
+            json_str = buffer[earliest_pos : json_end + 1]
+            pos = json_end + 1
 
             try:
                 data = json.loads(json_str)
@@ -373,6 +439,7 @@ class AwsEventStreamParser:
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON: {json_str[:100]}")
 
+        self.buffer = buffer[pos:] if pos else buffer
         return events
 
     def _process_event(self, data: dict, event_type: str) -> Optional[Dict[str, Any]]:
@@ -514,7 +581,9 @@ class AwsEventStreamParser:
         args = self.current_tool_call["function"]["arguments"]
         tool_name = self.current_tool_call["function"].get("name", "unknown")
 
-        logger.debug(f"Finalizing tool call '{tool_name}' with raw arguments: {repr(args)[:200]}")
+        logger.opt(lazy=True).debug(
+            "Finalizing tool call '{}' with raw arguments: {}", lambda: tool_name, lambda: repr(args)[:200]
+        )
 
         if isinstance(args, str):
             if args.strip():
@@ -669,6 +738,7 @@ class AwsEventStreamParser:
     def reset(self) -> None:
         """Resets parser state."""
         self.buffer = ""
+        self._pending_frame = None
         self._observation_buffer = ""
         self._utf8_decoder.reset()
         self.current_tool_call = None

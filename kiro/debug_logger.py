@@ -81,6 +81,15 @@ class DebugLogger:
         """Checks if logging is enabled."""
         return DEBUG_MODE in ("errors", "all")
 
+    def is_enabled(self) -> bool:
+        """Public form of the gate, for callers that must build the payload first.
+
+        Serializing a multi-megabyte Kiro payload only to have the logger drop it
+        cost more than the request it was describing. A caller that has to pay for
+        an artifact before handing it over asks here first.
+        """
+        return self._is_enabled()
+
     def _is_immediate_write(self) -> bool:
         """Checks if immediate file writing is needed (all mode)."""
         return DEBUG_MODE == "all"

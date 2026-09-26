@@ -39,6 +39,19 @@ current_api_key_id: ContextVar[str | None] = ContextVar("current_api_key_id", de
 # object from its own task.
 current_request_usage: ContextVar[Optional[dict]] = ContextVar("current_request_usage", default=None)
 
+
+def note_request_model(model) -> None:
+    """Hand the validated model name to the request log.
+
+    The middleware used to json.loads() the whole body on the event loop just to
+    read this one field, and pydantic then parsed the same body again. The route
+    already holds the validated value, so it passes it here instead.
+    """
+    holder = current_request_usage.get()
+    if holder is not None and isinstance(model, str):
+        holder["model"] = model
+
+
 # Field names a metering frame has been observed to wrap the credit figure in.
 # The frame is usually a bare number; nothing here derives credits from tokens.
 _CREDIT_FIELDS = ("creditUsage", "credit_usage", "creditsConsumed", "credits")
