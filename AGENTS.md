@@ -256,6 +256,7 @@ The main checkout (`~/github.com/minpeter/kiro-lb`) **is the production
 directory**: the live slot bind-mounts its `./data`, reads its `.env`, and
 `deploy.sh` flips from it. Never run `python main.py` there. Develop in a
 separate git worktree so the store, secrets and slot file are physically apart.
+Shipping the result is the next section, SHIP.
 
 1. Create the worktree from the main checkout, one per branch:
 
@@ -269,8 +270,8 @@ separate git worktree so the store, secrets and slot file are physically apart.
    ```
 
    `--no-track` keeps `origin/main` from becoming the branch's upstream;
-   without it a bare `git push` is refused for the name mismatch. Publish the
-   branch with `git push -u origin HEAD`.
+   without it a bare `git push` is refused for the name mismatch (SHIP step 2
+   publishes the branch).
 
    All worktrees live in the sibling `kiro-lb-worktrees/` directory, named
    after their branch, so `ls ../kiro-lb-worktrees` is the list of work in
@@ -380,15 +381,21 @@ separate git worktree so the store, secrets and slot file are physically apart.
    a refresh from the dev copy rotates the credential out from under the live
    slot.
 
-7. Verify before pushing, with the same commands CI runs (see COMMANDS),
+## SHIP
+
+From a verified worktree to the live slot. Everything up to the merge happens
+in the worktree; everything after it happens in the main checkout.
+
+1. Verify in the worktree with the same commands CI runs (see COMMANDS),
    prefixed with `env -i HOME="$HOME" PATH="$PATH"` and using `.venv/bin/`
-   tools for the same reason as step 4. If `frontend/` changed, commit the
-   `bun run build` output in `kiro/static/` too; it is tracked and the image
-   serves it as-is.
+   tools, for the same reason as LOCAL DEVELOPMENT step 4. If `frontend/`
+   changed, commit the `bun run build` output in `kiro/static/` too; it is
+   tracked and the image serves it as-is.
 
-8. Push the branch and open a PR against `main`. CI must be green before merge.
+2. Push with `git push -u origin HEAD` and open a PR against `main`. CI must
+   be green before merge.
 
-9. Deploy from the **main checkout** after merge, never from a worktree:
+3. Deploy from the **main checkout** after merge, never from a worktree:
 
    ```bash
    cd ~/github.com/minpeter/kiro-lb
@@ -399,21 +406,19 @@ separate git worktree so the store, secrets and slot file are physically apart.
 
    `deploy.sh` resolves `data/`, `.env` and `active_slot` relative to its own
    checkout, so running it from a worktree would boot a slot against the dev
-   store.
+   store. A docs-only merge needs the pull but not the deploy.
 
-10. Clean up when the branch is merged. Stop that worktree's dev servers
-    first, then:
+4. Clean up the worktree. Stop its dev servers first, then, from the main
+   checkout after the pull in step 3:
 
-    ```bash
-    cd ~/github.com/minpeter/kiro-lb
-    git pull --ff-only                        # so `branch -d` sees the merge
-    git worktree remove ../kiro-lb-worktrees/my-change
-    git branch -d feat/my-change
-    ```
+   ```bash
+   git worktree remove ../kiro-lb-worktrees/my-change
+   git branch -d feat/my-change   # needs the merge pulled, else it refuses
+   ```
 
-    `git worktree remove` refuses only on tracked changes. Ignored files go
-    with the tree without a prompt: the dev `.env`, and `data/` with the dev
-    accounts' refresh tokens. Copy them out first to reuse them.
+   `git worktree remove` refuses only on tracked changes. Ignored files go
+   with the tree without a prompt: the dev `.env`, and `data/` with the dev
+   accounts' refresh tokens. Copy them out first to reuse them.
 
 ## NOTES
 
