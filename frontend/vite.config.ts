@@ -9,6 +9,12 @@ const packageJson = JSON.parse(readFileSync(new URL("./package.json", import.met
 const appVersion = packageJson.version ?? "0.0.0";
 
 const proxyTarget = process.env.API_PROXY_TARGET || "http://localhost:8000";
+// Behind a portless proxy (scripts/dev.sh web) the target is the proxy itself
+// and API_PROXY_HOST names the api route. Rewriting Host is what routes the
+// request to the api instead of back to this dev server, and it survives api
+// restarts, which change the api's own port.
+const proxyHost = process.env.API_PROXY_HOST;
+const apiProxy = proxyHost ? { target: proxyTarget, headers: { host: proxyHost } } : proxyTarget;
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -22,9 +28,9 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": proxyTarget,
-      "/v1": proxyTarget,
-      "/health": proxyTarget,
+      "/api": apiProxy,
+      "/v1": apiProxy,
+      "/health": apiProxy,
     },
   },
   build: {

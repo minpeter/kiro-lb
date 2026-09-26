@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Commit:** f1c0db8
+**Commit:** bee73b3
 **Branch:** main
 
 ## OVERVIEW
@@ -15,11 +15,11 @@ Python 3.12 (`Dockerfile`, CI), httpx, loguru, tiktoken. **AGPL-3.0** — based 
 
 ```
 kiro-lb/
-├── main.py                  # App factory, lifespan, CLI, static mounts (824 lines)
-├── kiro/                    # Gateway package: 56 modules, 23.2k lines
+├── main.py                  # App factory, lifespan, CLI, static mounts (818 lines)
+├── kiro/                    # Gateway package: 56 modules, 23.9k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 2320 tests; network-blocked by conftest
+├── tests/                   # pytest, 2402 tests; network-blocked by conftest
 ├── data/                    # Unified private dashboard.sqlite3 store (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
@@ -28,6 +28,7 @@ kiro-lb/
 ├── docker-compose.homelab.yml  # Live: edge HAProxy :8000 + kiro-blue/green slots
 ├── docker/haproxy-edge.cfg.template  # rendered → haproxy-edge.generated.cfg
 ├── deploy/bluegreen/        # zero-downtime deploy.sh (nginx-fixed lab IP)
+├── scripts/dev.sh           # Per-worktree dev stack behind portless: init / api / web / status
 └── manual_api_test.py       # Manual live-API script, excluded from pytest
 ```
 
@@ -229,17 +230,18 @@ trusting a pin here.
 ## COMMANDS
 
 ```bash
-python main.py --host 127.0.0.1 --port 8000    # run gateway
-pytest -q                                      # full suite (2320 tests, ~6s, no network)
+# Dev stack: scripts/dev.sh init|api|web|status|proxy-stop, worktree only (LOCAL DEVELOPMENT)
+pytest -q                                      # full suite (2402 tests, ~17s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
 mypy                                           # config in pyproject.toml (kiro + main.py)
 cd frontend && bun run lint && bun run typecheck && bun run test && bun run build
-docker compose -p kiro-lb -f docker-compose.homelab.yml up -d --build
+./deploy/bluegreen/deploy.sh --status          # production; ship via SHIP, never `compose up`
 ```
 
-The `-p kiro-lb` is required: the live container was created under that project
+The `-p kiro-lb` is required on any manual compose command (`deploy.sh`
+passes it itself): the live container was created under that project
 name, so a checkout directory that differs (for example an old `kiro-lb-python`
 clone) makes compose invent another project and hit a `container_name` conflict
 instead of recreating.
@@ -249,6 +251,182 @@ ruff check, mypy, frontend eslint + tsc + vitest), `test` (pytest, then coverage
 `build`, which needs both. The build job Trivy-scans (report-only) and pushes
 multi-arch images on non-PR runs. Tool versions are pinned in
 `requirements-dev.txt` so a tool release cannot turn CI red on its own.
+
+## LOCAL DEVELOPMENT
+
+The main checkout (`~/github.com/minpeter/kiro-lb`) **is the production
+directory**: the live slot bind-mounts its `./data`, reads its `.env`, and
+`deploy.sh` flips from it. Never run `python main.py` there. Develop in a
+separate git worktree so the store, secrets and slot file are physically apart.
+Shipping the result is the next section, SHIP.
+
+1. Create the worktree from the main checkout, one per branch:
+
+   ```bash
+   BRANCH=feat/my-change
+   WT="../kiro-lb-worktrees/${BRANCH##*/}"   # directory = branch name minus its prefix
+   git fetch origin
+   mkdir -p ../kiro-lb-worktrees
+   git worktree add --no-track "$WT" -b "$BRANCH" origin/main
+   cd "$WT"
+   ```
+
+   `--no-track` keeps `origin/main` from becoming the branch's upstream;
+   without it a bare `git push` is refused for the name mismatch (SHIP step 2
+   publishes the branch).
+
+   All worktrees live in the sibling `kiro-lb-worktrees/` directory, named
+   after their branch, so `ls ../kiro-lb-worktrees` is the list of work in
+   flight and nothing lands inside the production checkout. Other projects in
+   this parent directory follow the same `<repo>-worktrees/` convention.
+   Branches that differ only in prefix (`feat/x`, `fix/x`) map to the same
+   directory; pick a distinct `WT` for the second one.
+
+   `.env`, `data/`, `debug_logs/`, `.venv/` and `frontend/node_modules/` are
+   gitignored, so the new tree starts with none of them; step 2 creates
+   them. Move a worktree with `git worktree move`, never `mv`, then rerun
+   `scripts/dev.sh init` to rebuild the `.venv`, whose scripts carry the old
+   absolute path in their shebang.
+
+2. Initialise the worktree with `scripts/dev.sh`:
+
+   ```bash
+   scripts/dev.sh init      # dev .env, then .venv (Python 3.12) and frontend deps incl. portless
+   ```
+
+   `init` writes a dev-only `.env` (0600, random `PROXY_API_KEY` and
+   `DASHBOARD_PASSWORD`, never a copy of production's) marked `DEV_ENV="1"`.
+   Rerunning it keeps the existing `.env` and only refreshes dependencies
+   (`--no-deps` skips them); a `.venv` left pointing at a moved worktree's old
+   path is rebuilt.
+
+   The gateway ignores `DEV_ENV`. Host and port never go in this `.env`:
+   pytest reads it too, and `SERVER_HOST`/`SERVER_PORT` in it fail the
+   default-value tests in `tests/unit/test_config.py`. `KIRO_SLOT` and
+   `HANDOFF_SECRET` stay unset: without a slot the process is the store's sole
+   writer, which is correct for its own `data/` and exactly what must never
+   happen against production's.
+
+   Every `dev.sh` command refuses to run in the deploy root (the checkout
+   holding `deploy/bluegreen/active_slot`) and refuses a `.env` without the
+   `DEV_ENV` marker, which is what a production `.env` looks like.
+
+3. Run the backend, then the dashboard in a second terminal:
+
+   ```bash
+   scripts/dev.sh api       # FastAPI behind portless
+   scripts/dev.sh web       # Vite + HMR behind portless, /api /v1 /health proxied to the api
+   scripts/dev.sh status    # routes of every running worktree, and this one's URLs
+   ```
+
+   Both run through [portless](https://github.com/vercel-labs/portless)
+   (`frontend` devDependency, pinned). Each app listens on a loopback port
+   portless picks, and one shared portless proxy in LAN mode serves them as
+   `http://<branch>.kiro-lb.local:1356` (dashboard) and
+   `http://<branch>.api.kiro-lb.local:1356` (api). The branch prefix comes
+   from the worktree, so worktrees never collide and nothing needs a port
+   number. The first `api`/`web` starts the proxy; `dev.sh proxy-stop` stops
+   it.
+
+   The proxy is isolated from any other portless use on the host: its own
+   state dir (`~/.portless-kiro-lb`) and port (`1356`, not portless's
+   default `1355`), plain HTTP (no local CA, no sudo), and it never edits
+   `/etc/hosts`. `DEV_PROXY_PORT` and `DEV_PORTLESS_STATE_DIR` override the
+   first two.
+
+   Reaching it from other devices:
+   - LAN mode needs `avahi-utils` on this host (`avahi-publish-address`); it
+     publishes each name over mDNS with this host's LAN address.
+   - The advertised address is `DEV_HOST`: the IPv4 address on the
+     default-route interface, derived at run time and pinned with `--ip`
+     (auto-detection can pick a VPN interface). Export `DEV_HOST` to
+     override; never write a literal IP into a command, `.env` or config.
+   - Clients resolve `.local` names only if they speak mDNS (macOS and iOS do;
+     Linux needs `libnss-mdns`, Windows depends on version). Where they do
+     not, send the name in the Host header to the LAN address:
+     `curl --resolve <name>:1356:<DEV_HOST> http://<name>:1356/`. This host
+     resolves them with `avahi-resolve`, not `getent`: the default
+     `mdns4_minimal` NSS module skips multi-label names like these.
+
+   LAN mode binds the proxy to `0.0.0.0` and `::`; portless offers no
+   narrower bind. That reaches the LAN, and also the VPN and every Docker
+   bridge on this host. Binding is not a firewall either way, so the dev
+   `PROXY_API_KEY` and `DASHBOARD_PASSWORD` are the only gates; keep them
+   random and distinct from production. The apps themselves stay on
+   loopback, so nothing but the proxy is reachable.
+
+   `api` starts `main.py` under `env -i`. `load_dotenv()` (`config.py:15`)
+   never overrides variables already in the process environment, so a shell
+   that exports the production `PROXY_API_KEY` or `DASHBOARD_PASSWORD` (the
+   operator's does) would silently win over the dev `.env`, and the dev server
+   would accept the production key. Check with `curl -H "Authorization: Bearer
+   $PROXY_API_KEY"` against the api URL: must be 401.
+
+   `web` points Vite's proxy at the portless proxy and names the api route in
+   the Host header (`API_PROXY_HOST`, `vite.config.ts`). The api's own port
+   changes on every restart, so restarting `api` never needs a `web` restart.
+   portless also adds `.local` to Vite's allowed hosts. The session cookie is
+   not `Secure` over plain HTTP: `_secure_cookie()` (`dashboard.py`) infers
+   that from the scheme, and `DASHBOARD_SECURE_COOKIE="false"` in the dev
+   `.env` pins it so a stray `X-Forwarded-Proto: https` cannot break login.
+
+   The backend does not reload on Python changes; restart `api` after editing
+   `kiro/` or `main.py`. The dashboard hot-reloads.
+
+4. Add accounts through the dev dashboard's device login, using a Kiro
+   account that is **not** in the production pool. The server starts with an
+   empty pool (only `PROXY_API_KEY` is mandatory, `main.py:203`). Do not copy
+   production `data/dashboard.sqlite3`: it carries upstream refresh tokens, and
+   a refresh from the dev copy rotates the credential out from under the live
+   slot.
+
+## SHIP
+
+From a verified worktree to the live slot. Everything up to the merge happens
+in the worktree; everything after it happens in the main checkout.
+
+1. Verify in the worktree with the same commands CI runs (see COMMANDS),
+   prefixed with `env -i HOME="$HOME" PATH="$PATH"` and using `.venv/bin/`
+   tools, for the same reason `dev.sh api` runs under `env -i` (LOCAL
+   DEVELOPMENT step 3). If `frontend/`
+   changed, commit the `bun run build` output in `kiro/static/` too; it is
+   tracked and the image serves it as-is.
+
+2. Push with `git push -u origin HEAD` and open a PR against `main`. CI must
+   be green before merge.
+
+3. Deploy from the **main checkout** after merge, never from a worktree:
+
+   ```bash
+   cd ~/github.com/minpeter/kiro-lb
+   git pull --ff-only
+   ./deploy/bluegreen/deploy.sh --status
+   ./deploy/bluegreen/deploy.sh
+   ```
+
+   `deploy.sh` resolves `data/`, `.env` and `active_slot` relative to its own
+   checkout, so running it from a worktree would boot a slot against the dev
+   store. A docs-only merge needs the pull but not the deploy.
+
+4. Clean up the worktree. Stop its `api` and `web` first (Ctrl-C; portless
+   drops their routes and mDNS names on exit), then, from the main checkout
+   after the pull in step 3:
+
+   ```bash
+   git worktree remove ../kiro-lb-worktrees/my-change
+   git branch -d feat/my-change
+   ```
+
+   `git worktree remove` refuses only on tracked changes. Ignored files go
+   with the tree without a prompt: the dev `.env`, and `data/` with the dev
+   accounts' refresh tokens. Copy them out first to reuse them.
+
+   `branch -d` can refuse even after a merge: a squash or rebase merge puts
+   new commits on `main`, so git sees the branch as unmerged once its remote
+   copy is gone. Confirm the PR shows merged, then use `-D`.
+
+   Run `scripts/dev.sh proxy-stop` from any worktree once no worktree needs
+   the shared proxy.
 
 ## NOTES
 
@@ -273,11 +451,9 @@ multi-arch images on non-PR runs. Tool versions are pinned in
   rather than restarting the container.
 - `/metrics` is not recorded by the request-metrics middleware (`main.py:623`
   filters to `/v1/`), so scraping does not inflate the counters it reports.
-- `main.py` refuses to start when the unified store has no usable account, even
-  
-  Account pool is always on; `validate_configuration` skips .env checks once accounts exist
- 
-  account policy from `.env` without writing gateway-owned JSON.
+- `main.py` starts with an empty account pool; accounts are added through the
+  dashboard's device login. `validate_configuration` (`main.py:203`) only opens
+  the store and requires `PROXY_API_KEY`.
 - The OpenAI `developer` role must be folded into the system prompt
   (`converters_openai.py:149`); dropping it makes Kiro answer `REQUEST_BODY_INVALID`.
 - The oversize rejection is `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, which names
@@ -290,6 +466,5 @@ multi-arch images on non-PR runs. Tool versions are pinned in
   container silently degrades to character-based estimation.
 - Truncated upstream turns must not be reported as clean finishes
   (`kiro/stop_reasons.py`).
-- The homelab compose mounts the host `kiro-cli` store read-only at
-- 15 files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1508)
-  and `kiro/account_manager.py` (1865) are the highest-risk edit sites.
+- 17 Python files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1508)
+  and `kiro/account_manager.py` (1867) are the highest-risk edit sites.
