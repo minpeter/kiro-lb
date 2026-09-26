@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Commit:** f1c0db8
+**Commit:** bee73b3
 **Branch:** main
 
 ## OVERVIEW
@@ -15,11 +15,11 @@ Python 3.12 (`Dockerfile`, CI), httpx, loguru, tiktoken. **AGPL-3.0** — based 
 
 ```
 kiro-lb/
-├── main.py                  # App factory, lifespan, CLI, static mounts (824 lines)
-├── kiro/                    # Gateway package: 56 modules, 23.2k lines
+├── main.py                  # App factory, lifespan, CLI, static mounts (818 lines)
+├── kiro/                    # Gateway package: 56 modules, 23.9k lines
 │   └── static/              # BUILD OUTPUT of frontend/ — never hand-edit
 ├── frontend/                # Bun + Vite + React 19 dashboard source
-├── tests/                   # pytest, 2320 tests; network-blocked by conftest
+├── tests/                   # pytest, 2385 tests; network-blocked by conftest
 ├── data/                    # Unified private dashboard.sqlite3 store (gitignored)
 ├── deploy/                  # Grafana dashboard + Pushgateway units for /metrics
 ├── debug_logs/              # Capture output when DEBUG_MODE is on (gitignored)
@@ -229,8 +229,8 @@ trusting a pin here.
 ## COMMANDS
 
 ```bash
-python main.py --host 127.0.0.1 --port 8000    # run gateway
-pytest -q                                      # full suite (2320 tests, ~6s, no network)
+# Dev server: run from a worktree only, see LOCAL DEVELOPMENT (steps 4-5)
+pytest -q                                      # full suite (2385 tests, ~17s, no network)
 pytest -v --tb=short                           # exactly what CI's test job runs
 pytest --cov=kiro --cov-report=term            # CI coverage step
 ruff format --check --diff . && ruff check .   # CI quality job, python half
@@ -249,6 +249,153 @@ ruff check, mypy, frontend eslint + tsc + vitest), `test` (pytest, then coverage
 `build`, which needs both. The build job Trivy-scans (report-only) and pushes
 multi-arch images on non-PR runs. Tool versions are pinned in
 `requirements-dev.txt` so a tool release cannot turn CI red on its own.
+
+## LOCAL DEVELOPMENT
+
+The main checkout (`~/github.com/minpeter/kiro-lb`) **is the production
+directory**: the live slot bind-mounts its `./data`, reads its `.env`, and
+`deploy.sh` flips from it. Never run `python main.py` there. Develop in a
+separate git worktree so the store, secrets and slot file are physically apart.
+
+1. Create the worktree from the main checkout, one per branch:
+
+   ```bash
+   BRANCH=feat/my-change
+   WT="../kiro-lb-worktrees/${BRANCH##*/}"   # directory = branch name minus its prefix
+   git fetch origin
+   mkdir -p ../kiro-lb-worktrees
+   git worktree add "$WT" -b "$BRANCH" origin/main
+   cd "$WT"
+   git branch --unset-upstream   # else `git push` targets main; use `git push -u origin HEAD`
+   ```
+
+   All worktrees live in the sibling `kiro-lb-worktrees/` directory, named
+   after their branch, so `ls ../kiro-lb-worktrees` is the list of work in
+   flight and nothing lands inside the production checkout. Other projects in
+   this parent directory follow the same `<repo>-worktrees/` convention.
+
+   `.env`, `data/`, `debug_logs/`, `.venv/` and `frontend/node_modules/` are
+   gitignored, so the new tree starts with none of them. Move a worktree with
+   `git worktree move`, never `mv`, and recreate `.venv` afterwards: its
+   scripts carry the old absolute path in their shebang.
+
+2. Write a dev-only `.env` (never copy the production one):
+
+   ```bash
+   cat > .env <<EOF
+   PROXY_API_KEY="dev-$(openssl rand -hex 16)"
+   DASHBOARD_PASSWORD="dev-$(openssl rand -hex 8)"
+   DASHBOARD_DATA_DIR="data"
+   DASHBOARD_SECURE_COOKIE="false"
+   LOG_LEVEL="DEBUG"
+   EOF
+   chmod 600 .env
+   ```
+
+   Host and port go on the command line (step 4), not here: pytest reads this
+   `.env` too, and `SERVER_HOST`/`SERVER_PORT` in it fail the two
+   default-value tests in `tests/unit/test_config.py`.
+
+   Leave `KIRO_SLOT` and `HANDOFF_SECRET` unset: without a slot the process
+   is the store's sole writer, which is correct for its own `data/` and
+   exactly what must never happen against production's.
+
+3. Install dependencies (Python 3.12, matching CI and the Dockerfile):
+
+   ```bash
+   uv venv --python 3.12 .venv
+   uv pip install --python .venv/bin/python \
+     -r requirements.txt -r requirements-test.txt -r requirements-dev.txt
+   (cd frontend && bun install --frozen-lockfile)
+   ```
+
+4. Run the backend with a clean environment, reachable from other devices on
+   the LAN:
+
+   ```bash
+   # The host's address on the default-route interface (the LAN). Override by
+   # exporting DEV_HOST first. Set it in every terminal you start a server from.
+   DEV_HOST="${DEV_HOST:-$(ip -4 -o addr show dev "$(ip -4 route show default \
+     | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')" \
+     | awk '{split($4,a,"/"); print a[1]; exit}')}"
+   echo "$DEV_HOST"   # must print the LAN address, not empty
+
+   env -i HOME="$HOME" PATH="$PATH" .venv/bin/python main.py --host "$DEV_HOST" --port 8100
+   ```
+
+   Dev servers always bind the LAN address so other devices on that subnet can
+   reach them. Do not use `127.0.0.1` (this host only) or `0.0.0.0` (also
+   exposes the server on the VPN and every Docker bridge). Derive the address
+   as above; never write a literal IP into the command, `.env` or config.
+   Binding picks the interface, it is not a firewall: anything that can route
+   to that address can reach the port, so the dev `PROXY_API_KEY` and
+   `DASHBOARD_PASSWORD` are the only gates. Keep them random and distinct
+   from production.
+
+   Port 8100 stays clear of the production edge (`:8000`) and both slots
+   (`127.0.0.1:8001`/`8002`). The session cookie must not be `Secure` over
+   plain HTTP; `_secure_cookie()` (`dashboard.py`) already infers that from
+   the scheme, and `DASHBOARD_SECURE_COOKIE="false"` from step 2 only pins it
+   so a stray `X-Forwarded-Proto: https` cannot break login. Two
+   worktrees running at once need their own pair of ports (e.g. 8110/5184);
+   `--strictPort` makes Vite fail instead of silently taking the next one.
+
+   `load_dotenv()` (`config.py:15`) never overrides variables already in the
+   process environment. A shell that exports `PROXY_API_KEY` or
+   `DASHBOARD_PASSWORD` (the operator's does) silently wins over the dev
+   `.env`, and the dev server then accepts the production key. `env -i` is the
+   guard; check with `curl -H "Authorization: Bearer $PROXY_API_KEY"
+   "http://$DEV_HOST:8100/v1/models"` → must be 401.
+
+5. Run the dashboard with HMR in a second terminal:
+
+   ```bash
+   cd frontend   # DEV_HOST set as in step 4
+   API_PROXY_TARGET="http://$DEV_HOST:8100" \
+     bun run dev --host "$DEV_HOST" --port 5174 --strictPort
+   ```
+
+   Open `http://$DEV_HOST:5174` from any device on the LAN. Without `--host`
+   Vite binds `localhost` only. The backend no longer listens on loopback, so
+   the proxy target must be `$DEV_HOST` too. `/api`, `/v1` and `/health` are
+   proxied to the dev backend. Without `API_PROXY_TARGET` the proxy defaults
+   to `localhost:8000`, which is not the dev server.
+
+6. Add accounts through the dev dashboard's device login, using a Kiro
+   account that is **not** in the production pool. The server starts with an
+   empty pool (only `PROXY_API_KEY` is mandatory, `main.py:203`). Do not copy
+   production `data/dashboard.sqlite3`: it carries upstream refresh tokens, and
+   a refresh from the dev copy rotates the credential out from under the live
+   slot.
+
+7. Verify before pushing, with the same commands CI runs (see COMMANDS),
+   prefixed with `env -i HOME="$HOME" PATH="$PATH"` and using `.venv/bin/`
+   tools for the same reason as step 4. If `frontend/` changed, commit the
+   `bun run build` output in `kiro/static/` too; it is tracked and the image
+   serves it as-is.
+
+8. Push the branch and open a PR against `main`. CI must be green before merge.
+
+9. Deploy from the **main checkout** after merge, never from a worktree:
+
+   ```bash
+   cd ~/github.com/minpeter/kiro-lb
+   git pull --ff-only
+   ./deploy/bluegreen/deploy.sh --status
+   ./deploy/bluegreen/deploy.sh
+   ```
+
+   `deploy.sh` resolves `data/`, `.env` and `active_slot` relative to its own
+   checkout, so running it from a worktree would boot a slot against the dev
+   store.
+
+10. Clean up when the branch is merged:
+
+    ```bash
+    cd ~/github.com/minpeter/kiro-lb
+    git worktree remove ../kiro-lb-worktrees/my-change   # refuses if there are uncommitted changes
+    git branch -d feat/my-change
+    ```
 
 ## NOTES
 
@@ -273,11 +420,9 @@ multi-arch images on non-PR runs. Tool versions are pinned in
   rather than restarting the container.
 - `/metrics` is not recorded by the request-metrics middleware (`main.py:623`
   filters to `/v1/`), so scraping does not inflate the counters it reports.
-- `main.py` refuses to start when the unified store has no usable account, even
-  
-  Account pool is always on; `validate_configuration` skips .env checks once accounts exist
- 
-  account policy from `.env` without writing gateway-owned JSON.
+- `main.py` starts with an empty account pool; accounts are added through the
+  dashboard's device login. `validate_configuration` (`main.py:203`) only opens
+  the store and requires `PROXY_API_KEY`.
 - The OpenAI `developer` role must be folded into the system prompt
   (`converters_openai.py:149`); dropping it makes Kiro answer `REQUEST_BODY_INVALID`.
 - The oversize rejection is `CONTENT_LENGTH_EXCEEDS_THRESHOLD`, which names
@@ -290,6 +435,5 @@ multi-arch images on non-PR runs. Tool versions are pinned in
   container silently degrades to character-based estimation.
 - Truncated upstream turns must not be reported as clean finishes
   (`kiro/stop_reasons.py`).
-- The homelab compose mounts the host `kiro-cli` store read-only at
-- 15 files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1508)
-  and `kiro/account_manager.py` (1865) are the highest-risk edit sites.
+- 19 files outside `tests/` exceed 500 lines; `kiro/converters_core.py` (1508)
+  and `kiro/account_manager.py` (1867) are the highest-risk edit sites.
