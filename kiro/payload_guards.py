@@ -10,11 +10,34 @@ tracks cl100k tokens of the compact JSON. claude-opus-5: 800_000 Hangul
 pass, 1_000_000 fail. This module provides:
 - Pre-flight token (and legacy byte) checking
 - Auto-trimming of oldest history entries to fit under the limit
+
+Image base64 is not part of that count. Measured 2026-09-27 on
+runtime.us-east-1.kiro.dev / claude-haiku-4.5 (text threshold ~195k tokens): a
+1.2 MB and a 2.9 MB PNG (1.17M and 2.82M cl100k tokens of base64) both returned
+200, and contextUsage grew by ~690 and ~1,530 tokens over a text-only control,
+the Anthropic ceil(w*h/750) rate. The only image limit hit was
+IMAGE_SIZE_EXCEEDED at 5 MiB of base64 per image, a separate upstream check that
+names both numbers. Images are therefore measured by that vision estimate and
+their data is left out of both the token and the byte count.
 """
 
+import base64
+import binascii
 import json
+import math
+import struct
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# Upper end of Anthropic's per-image cost after its ~1.15 MP resize; used when
+# the dimensions cannot be read from the image header.
+IMAGE_TOKENS_UNKNOWN_SIZE = 1600
+
+# Decoded header window for dimension sniffing. JPEG SOF can sit behind a large
+# EXIF segment; anything beyond this falls back to the constant.
+_HEADER_B64_CHARS = 87_384
+
+_JPEG_SOF_MARKERS = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
 
 
 @dataclass
@@ -79,17 +102,113 @@ def _payload_json(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+def _image_dimensions(head: bytes) -> Optional[Tuple[int, int]]:
+    """Read (width, height) from a PNG, JPEG, GIF or WebP header."""
+    if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR" and len(head) >= 24:
+        width, height = struct.unpack(">II", head[16:24])
+        return width, height
+    if head[:6] in (b"GIF87a", b"GIF89a") and len(head) >= 10:
+        width, height = struct.unpack("<HH", head[6:10])
+        return width, height
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP" and len(head) >= 30:
+        chunk = head[12:16]
+        if chunk == b"VP8X":
+            return 1 + int.from_bytes(head[24:27], "little"), 1 + int.from_bytes(head[27:30], "little")
+        if chunk == b"VP8 " and head[23:26] == b"\x9d\x01\x2a":
+            width, height = struct.unpack("<HH", head[26:30])
+            return width & 0x3FFF, height & 0x3FFF
+        if chunk == b"VP8L" and head[20] == 0x2F:
+            bits = int.from_bytes(head[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        return None
+    if head[:2] == b"\xff\xd8":
+        index = 2
+        while index + 9 <= len(head):
+            if head[index] != 0xFF:
+                return None
+            marker = head[index + 1]
+            if marker == 0xFF:
+                index += 1
+                continue
+            if marker in _JPEG_SOF_MARKERS:
+                height, width = struct.unpack(">HH", head[index + 5 : index + 9])
+                return width, height
+            if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+                index += 2
+                continue
+            (length,) = struct.unpack(">H", head[index + 2 : index + 4])
+            index += 2 + length
+    return None
+
+
+def estimate_image_tokens(data: str) -> int:
+    """Vision tokens for one base64 image: ceil(w*h/750), else the constant.
+
+    Not clamped to Anthropic's resize: models that accept higher resolutions
+    charge more, and over-counting is the safe direction for a pre-flight cap.
+    """
+    prefix = data[:_HEADER_B64_CHARS]
+    try:
+        head = base64.b64decode(prefix[: len(prefix) - len(prefix) % 4])
+    except (binascii.Error, ValueError):
+        return IMAGE_TOKENS_UNKNOWN_SIZE
+    dimensions = _image_dimensions(head)
+    if not dimensions or not all(dimensions):
+        return IMAGE_TOKENS_UNKNOWN_SIZE
+    width, height = dimensions
+    return math.ceil(width * height / 750)
+
+
+def _entry_images(entry: Any) -> List[Dict[str, Any]]:
+    """Image sources of one history/current entry (userInputMessage.images)."""
+    user = entry.get("userInputMessage") if isinstance(entry, dict) else None
+    if not isinstance(user, dict):
+        return []
+    sources = []
+    for image in user.get("images") or []:
+        source = image.get("source") if isinstance(image, dict) else None
+        if isinstance(source, dict) and isinstance(source.get("bytes"), str):
+            sources.append(source)
+    return sources
+
+
+def _payload_images(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    state = payload.get("conversationState")
+    if not isinstance(state, dict):
+        return []
+    entries = list(state.get("history") or [])
+    entries.append(state.get("currentMessage"))
+    return [source for entry in entries for source in _entry_images(entry)]
+
+
+def _measured_json(obj: Dict[str, Any], sources: List[Dict[str, Any]]) -> Tuple[str, int]:
+    """Serialize with image data blanked, returning (json, image tokens).
+
+    The data is swapped out and restored in place rather than deep-copying a
+    payload that can be megabytes of text.
+    """
+    saved = [source["bytes"] for source in sources]
+    for source in sources:
+        source["bytes"] = ""
+    try:
+        serialized = _payload_json(obj)
+    finally:
+        for source, data in zip(sources, saved):
+            source["bytes"] = data
+    return serialized, sum(estimate_image_tokens(data) for data in saved)
+
+
 def measure_payload(payload: Dict[str, Any]) -> tuple[int, int]:
     """Return (tokens, bytes) from a single serialization of the payload.
 
     check_payload_tokens() and check_payload_size() each serialized the payload
     independently, so the pre-flight guard paid the dump twice per request.
     """
-    serialized = _payload_json(payload)
+    serialized, image_tokens = _measured_json(payload, _payload_images(payload))
     from kiro.tokenizer import count_tokens
 
     tokens = count_tokens(serialized, apply_claude_correction=False, model="claude-haiku-4.5")
-    return tokens, len(serialized.encode("utf-8"))
+    return tokens + image_tokens, len(serialized.encode("utf-8"))
 
 
 def check_payload_size(payload: Dict[str, Any]) -> int:
@@ -97,9 +216,11 @@ def check_payload_size(payload: Dict[str, Any]) -> int:
 
     ensure_ascii=False matches the decoded Unicode the upstream tokenizer sees
     after JSON parse. The default True would count a Hangul syllable as the 6
-    bytes of a \\uXXXX escape instead of one cl100k token.
+    bytes of a \\uXXXX escape instead of one cl100k token. Image data is left
+    out: upstream bounds it per image (IMAGE_SIZE_EXCEEDED), not in this total.
     """
-    return len(_payload_json(payload).encode("utf-8"))
+    serialized, _ = _measured_json(payload, _payload_images(payload))
+    return len(serialized.encode("utf-8"))
 
 
 def payload_token_limit_for_model(model_id: str) -> int:
@@ -125,10 +246,9 @@ def check_payload_tokens(payload: Dict[str, Any]) -> int:
     chars failed, so the limit is tokenizer units, not wire bytes or Unicode
     scalars. The Claude CJK slope (1.15) is a local estimator for usage display
     and must not be applied here: it would reject the Hangul payload that passed.
+    Images count by estimate_image_tokens(), not by their base64.
     """
-    from kiro.tokenizer import count_tokens
-
-    return count_tokens(_payload_json(payload), apply_claude_correction=False, model="claude-haiku-4.5")
+    return measure_payload(payload)[0]
 
 
 def _strip_empty_tool_uses(history: list) -> None:
@@ -235,7 +355,7 @@ def _drop_pairs_by_estimate(
     if not history:
         return
 
-    entry_bytes = [len(_payload_json(entry).encode("utf-8")) + 1 for entry in history]
+    entry_bytes = [len(_measured_json(entry, _entry_images(entry))[0].encode("utf-8")) + 1 for entry in history]
     history_bytes = sum(entry_bytes)
     if history_bytes <= 0:
         return

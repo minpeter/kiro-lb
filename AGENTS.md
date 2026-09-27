@@ -179,6 +179,11 @@ trusting a pin here.
   `CONTENT_LENGTH_EXCEEDS_THRESHOLD` tracks cl100k tokens of the compact JSON
   (claude-opus-5: 800k Hangul pass / 1M fail on runtime.kiro.dev, 2026-08-23).
   (`payload_guards.py` `check_payload_tokens`).
+- Counting image base64 toward the payload guard. Upstream does not: a 2.9 MB
+  PNG (2.8M cl100k tokens of base64) passed on claude-haiku-4.5, whose text
+  threshold is ~195k, and contextUsage grew by the ceil(w*h/750) vision rate
+  (2026-09-27). `estimate_image_tokens` stands in for the data; the only image
+  limit is upstream's own `IMAGE_SIZE_EXCEEDED` at 5 MiB of base64 per image.
 - Trusting the advertised context window. `claude-opus-4.7`, `claude-opus-4.8`,
   `claude-opus-5` and `claude-sonnet-5` report 1000000 but charge against 666667;
   `FALLBACK_MODELS` (`config.py:294`) deliberately carries the measured value.

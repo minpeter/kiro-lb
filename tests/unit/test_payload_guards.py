@@ -5,13 +5,19 @@ Unit tests for payload size guard logic.
 Tests check_payload_size() and trim_payload_to_limit() functions.
 """
 
+import base64
 import json
+import random
+import struct
 
 import pytest
 
 from kiro.payload_guards import (
+    IMAGE_TOKENS_UNKNOWN_SIZE,
     check_payload_size,
     check_payload_tokens,
+    estimate_image_tokens,
+    measure_payload,
     payload_token_limit_for_model,
     trim_payload_to_limit,
 )
@@ -541,3 +547,150 @@ class TestKoreanUnderOldByteCapIsRejectedByTokens:
         )
         content = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
         assert content == "가" * 250000
+
+
+def _png_header(width, height):
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + ihdr + b"\x00\x00\x00\x00"
+
+
+def _jpeg_header(width, height):
+    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    sof0 = b"\xff\xc0" + struct.pack(">HBHHB", 17, 8, height, width, 3) + b"\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+    return b"\xff\xd8" + app0 + sof0
+
+
+def _gif_header(width, height):
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00\x00\x00"
+
+
+def _webp_vp8x_header(width, height):
+    vp8x = b"\x00\x00\x00\x00" + (width - 1).to_bytes(3, "little") + (height - 1).to_bytes(3, "little")
+    return b"RIFF" + struct.pack("<I", 30) + b"WEBP" + b"VP8X" + struct.pack("<I", 10) + vp8x
+
+
+def _image_b64(header, body_bytes):
+    # Seeded noise: base64 of random bytes is what inflated the old count.
+    return base64.b64encode(header + random.Random(0).randbytes(body_bytes)).decode()
+
+
+def _image_payload(image_b64, text="describe this"):
+    image = {"format": "png", "source": {"bytes": image_b64}}
+    return {
+        "conversationState": {
+            "chatTriggerType": "MANUAL",
+            "conversationId": "img",
+            "history": [
+                {"userInputMessage": {"content": "earlier", "images": [dict(image, source=dict(image["source"]))]}},
+                {"assistantResponseMessage": {"content": "seen"}},
+            ],
+            "currentMessage": {"userInputMessage": {"content": text, "modelId": "m", "images": [image]}},
+        }
+    }
+
+
+def _without_image_bytes(payload):
+    stripped = json.loads(json.dumps(payload))
+    state = stripped["conversationState"]
+    for entry in state["history"] + [state["currentMessage"]]:
+        for image in entry.get("userInputMessage", {}).get("images", []):
+            image["source"]["bytes"] = ""
+    return stripped
+
+
+class TestImagesAreNotCountedAsText:
+    """Image base64 is not text to CONTENT_LENGTH_EXCEEDS_THRESHOLD.
+
+    Measured 2026-09-27 on runtime.us-east-1.kiro.dev / claude-haiku-4.5, whose
+    text threshold is ~195k cl100k tokens: one 1.2 MB PNG (1.17M tokens by the
+    old count) and one 2.9 MB PNG (2.82M) both returned 200. contextUsage rose by
+    ~690 and ~1,530 tokens over a text-only control, the Anthropic w*h/750 rate.
+    The only image limit hit was IMAGE_SIZE_EXCEEDED at 5 MiB of base64 per image.
+    """
+
+    @pytest.mark.parametrize(
+        "header",
+        [_png_header(707, 707), _jpeg_header(707, 707), _gif_header(707, 707), _webp_vp8x_header(707, 707)],
+        ids=["png", "jpeg", "gif", "webp"],
+    )
+    def test_known_dimensions_use_area_over_750(self, header):
+        assert estimate_image_tokens(_image_b64(header, 1000)) == 667  # ceil(707 * 707 / 750)
+
+    def test_unknown_format_uses_the_conservative_constant(self):
+        assert estimate_image_tokens(_image_b64(b"not an image", 1000)) == IMAGE_TOKENS_UNKNOWN_SIZE
+        assert estimate_image_tokens("%%% not base64 %%%") == IMAGE_TOKENS_UNKNOWN_SIZE
+
+    def test_image_base64_is_replaced_by_its_vision_estimate(self):
+        from kiro.tokenizer import count_tokens
+
+        payload = _image_payload(_image_b64(_png_header(707, 707), 1_200_000))
+        stripped_json = json.dumps(_without_image_bytes(payload), ensure_ascii=False, separators=(",", ":"))
+        text_only = count_tokens(stripped_json, apply_claude_correction=False, model="claude-haiku-4.5")
+
+        assert check_payload_tokens(payload) == text_only + 2 * 667
+
+    def test_measure_payload_agrees_and_bytes_exclude_image_data(self):
+        payload = _image_payload(_image_b64(_png_header(707, 707), 1_200_000))
+        stripped = _without_image_bytes(payload)
+
+        assert measure_payload(payload) == (check_payload_tokens(payload), check_payload_size(stripped))
+        assert check_payload_size(payload) == check_payload_size(stripped)
+
+    def test_measurement_leaves_image_data_intact(self):
+        image_b64 = _image_b64(_png_header(707, 707), 10_000)
+        payload = _image_payload(image_b64)
+        before = json.dumps(payload)
+
+        measure_payload(payload)
+        check_payload_tokens(payload)
+        check_payload_size(payload)
+
+        assert json.dumps(payload) == before
+
+    def test_large_image_request_passes_default_guard(self, monkeypatch):
+        """The reported failure: a 1.5 MB PNG was rejected as ~2M tokens."""
+        import kiro.converters_core as cc
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 1085435)
+        image_b64 = _image_b64(_png_header(1024, 1024), 1_500_000)
+
+        result = cc.build_kiro_payload(
+            messages=[
+                cc.UnifiedMessage(
+                    role="user", content="what is this", images=[{"media_type": "image/png", "data": image_b64}]
+                )
+            ],
+            system_prompt="",
+            model_id="claude-opus-5",
+            tools=None,
+            conversation_id="conv-image",
+            profile_arn=None,
+        )
+
+        images = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["images"]
+        assert images[0]["source"]["bytes"] == image_b64
+        assert result.input_tokens < 5000
+
+    def test_text_over_the_cap_still_raises_with_an_image_attached(self, monkeypatch):
+        import kiro.converters_core as cc
+        from kiro.payload_guards import PayloadTooLargeError
+
+        monkeypatch.setattr(cc, "AUTO_TRIM_PAYLOAD", False)
+        monkeypatch.setattr(cc, "KIRO_MAX_PAYLOAD_BYTES", 0)
+        image_b64 = _image_b64(_png_header(707, 707), 1000)
+
+        with pytest.raises(PayloadTooLargeError) as exc_info:
+            cc.build_kiro_payload(
+                messages=[
+                    cc.UnifiedMessage(
+                        role="user", content="가" * 900000, images=[{"media_type": "image/png", "data": image_b64}]
+                    )
+                ],
+                system_prompt="",
+                model_id="claude-opus-5",
+                tools=None,
+                conversation_id="conv-image-text",
+                profile_arn=None,
+            )
+        assert exc_info.value.payload_tokens > 800000
