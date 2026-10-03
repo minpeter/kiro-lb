@@ -457,6 +457,133 @@ pub fn update_endpoints(
     Ok(Ok(settings))
 }
 
+// ----- account-tier routing ---------------------------------------------------------------
+
+/// How a paid account may treat a model the free accounts serve: `off` serves it
+/// like any other model, `soft` only while no free account can take the request,
+/// `strict` never.
+pub const PAID_ACCOUNT_FREE_MODEL_MODES: [&str; 3] = ["off", "soft", "strict"];
+
+/// Account-tier routing policies. Both default to the previous behaviour, where
+/// selection relies on each account's own model catalog alone.
+#[derive(Clone, Debug)]
+pub struct TierRouting {
+    /// Free-tier accounts never serve a model outside the free-model set, even
+    /// while their catalog is stale or unknown.
+    pub exclude_paid_models_from_free_accounts: bool,
+    /// What a paid-tier account does with a free-set model.
+    pub exclude_free_models_from_paid_accounts: String,
+}
+
+impl TierRouting {
+    fn defaults() -> TierRouting {
+        TierRouting {
+            exclude_paid_models_from_free_accounts: false,
+            exclude_free_models_from_paid_accounts: PAID_ACCOUNT_FREE_MODEL_MODES[0].to_owned(),
+        }
+    }
+
+    pub fn as_json(&self) -> Value {
+        json!({
+            "excludePaidModelsFromFreeAccounts": self.exclude_paid_models_from_free_accounts,
+            "excludeFreeModelsFromPaidAccounts": self.exclude_free_models_from_paid_accounts,
+        })
+    }
+
+    /// True while a paid account must yield a free-set model whenever a free
+    /// account can take it.
+    pub fn paid_yields_free_models(&self) -> bool {
+        self.exclude_free_models_from_paid_accounts != PAID_ACCOUNT_FREE_MODEL_MODES[0]
+    }
+
+    /// True while a paid account must never serve a free-set model.
+    pub fn paid_never_serves_free_models(&self) -> bool {
+        self.exclude_free_models_from_paid_accounts == PAID_ACCOUNT_FREE_MODEL_MODES[2]
+    }
+}
+
+fn validate_tier_routing(
+    exclude_paid_from_free: &Value,
+    exclude_free_from_paid: &Value,
+) -> Result<TierRouting, InvalidSetting> {
+    let exclude_paid_models_from_free_accounts =
+        exclude_paid_from_free.as_bool().ok_or_else(|| {
+            InvalidSetting("excludePaidModelsFromFreeAccounts must be a boolean".into())
+        })?;
+    let mode = exclude_free_from_paid.as_str().unwrap_or_default();
+    if !PAID_ACCOUNT_FREE_MODEL_MODES.contains(&mode) {
+        return Err(InvalidSetting(format!(
+            "excludeFreeModelsFromPaidAccounts must be one of {}",
+            PAID_ACCOUNT_FREE_MODEL_MODES
+                .iter()
+                .map(|m| format!("'{m}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(TierRouting {
+        exclude_paid_models_from_free_accounts,
+        exclude_free_models_from_paid_accounts: mode.to_owned(),
+    })
+}
+
+static TIER_ROUTING: RwLock<Option<TierRouting>> = RwLock::new(None);
+
+/// The active tier routing policies. Never blocks on the store.
+pub fn tier_routing() -> TierRouting {
+    if let Some(tier_routing) = TIER_ROUTING.read().as_ref() {
+        return tier_routing.clone();
+    }
+    TIER_ROUTING
+        .write()
+        .get_or_insert_with(TierRouting::defaults)
+        .clone()
+}
+
+pub fn load_tier_routing() {
+    let active = tier_routing();
+    let mut settings = TierRouting::defaults();
+    if let Some(Value::Object(persisted)) = store::load_setting("tier_routing") {
+        let exclude_paid_from_free = persisted
+            .get("excludePaidModelsFromFreeAccounts")
+            .cloned()
+            .unwrap_or_else(|| json!(active.exclude_paid_models_from_free_accounts));
+        let exclude_free_from_paid = persisted
+            .get("excludeFreeModelsFromPaidAccounts")
+            .cloned()
+            .unwrap_or_else(|| json!(active.exclude_free_models_from_paid_accounts));
+        match validate_tier_routing(&exclude_paid_from_free, &exclude_free_from_paid) {
+            Ok(loaded) => settings = loaded,
+            Err(e) => tracing::warn!("[TierRouting] Ignoring persisted settings: {e}"),
+        }
+    }
+    *TIER_ROUTING.write() = Some(settings);
+}
+
+pub fn update_tier_routing(
+    exclude_paid_from_free: &Value,
+    exclude_free_from_paid: &Value,
+) -> Result<Result<TierRouting, String>, InvalidSetting> {
+    let settings = validate_tier_routing(exclude_paid_from_free, exclude_free_from_paid)?;
+    if let Err(e) = store::save_setting("tier_routing", &settings.as_json()) {
+        return Ok(Err(e.to_string()));
+    }
+    tracing::info!(
+        "[TierRouting] excludePaidModelsFromFreeAccounts={} excludeFreeModelsFromPaidAccounts={}",
+        settings.exclude_paid_models_from_free_accounts,
+        settings.exclude_free_models_from_paid_accounts
+    );
+    *TIER_ROUTING.write() = Some(settings.clone());
+    Ok(Ok(settings))
+}
+
+/// Applies tier routing without persisting it. The policies are otherwise loaded
+/// from the store at startup; tests set them directly.
+#[cfg(test)]
+pub fn set_tier_routing(tier_routing: TierRouting) {
+    *TIER_ROUTING.write() = Some(tier_routing);
+}
+
 static UNLISTED_MODELS: RwLock<Option<Vec<String>>> = RwLock::new(None);
 
 pub fn listing_key(model: &str) -> String {
@@ -573,6 +700,7 @@ pub fn load_all() {
     apply_release_defaults();
     load_unlisted_models();
     load_endpoint_settings();
+    load_tier_routing();
     load_prompt_flags();
     load_tunables();
 }

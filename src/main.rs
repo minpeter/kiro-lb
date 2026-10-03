@@ -134,6 +134,10 @@ fn router(state: app::Shared) -> Router {
         )
         .route("/api/dashboard/endpoints/test", post(d::test_endpoints))
         .route("/api/dashboard/endpoints/ping", post(d::ping_endpoints))
+        .route(
+            "/api/dashboard/tier-routing",
+            get(d::get_tier_routing).put(d::put_tier_routing),
+        )
         .route("/api/dashboard/request-logs", get(d::request_logs))
         .route(
             "/api/dashboard/request-logs/{id}",

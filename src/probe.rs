@@ -80,11 +80,10 @@ async fn account(
     state: &Shared,
     model: &str,
 ) -> Result<std::sync::Arc<crate::auth::KiroAuth>, (u16, String)> {
-    let a = match state
-        .pool
-        .next_account(model, &Default::default(), None)
-        .await
-    {
+    // An operator probe answers "is it alive", so the account-tier policies do
+    // not narrow it: a free-set model must not pin the probe to the free
+    // accounts, which are the ones that deplete first.
+    let a = match state.pool.next_account_for_probe(model).await {
         Some(a) => Some(a),
         None => state.pool.first_initialized(),
     };

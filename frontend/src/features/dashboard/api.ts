@@ -21,6 +21,8 @@ import type {
   RequestLogOrder,
   RequestLogPage,
   RequestRate,
+  TierRoutingResponse,
+  TierRoutingSettings,
 } from "./types";
 
 export const AUTH_REQUIRED = "Dashboard authentication required";
@@ -81,6 +83,12 @@ export const dashboardApi = {
       body: JSON.stringify(only ? { reps, only } : { reps }),
     }),
   promptFilter: () => request<PromptFilterSettings>("/api/dashboard/prompt-filter"),
+  tierRouting: () => request<TierRoutingResponse>("/api/dashboard/tier-routing"),
+  saveTierRouting: (patch: Partial<TierRoutingSettings>) =>
+    request<{ settings: TierRoutingSettings }>("/api/dashboard/tier-routing", {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
   savePromptFilter: (patch: { shortenTools?: boolean; writeHint?: boolean }) =>
     request<PromptFilterSettings>("/api/dashboard/prompt-filter", {
       method: "PUT",

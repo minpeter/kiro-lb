@@ -168,6 +168,100 @@ impl SessionEntry {
     }
 }
 
+/// Subscription tier of an account, as reported by Kiro's usage limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountTier {
+    Free,
+    Paid,
+    Unknown,
+}
+
+/// Why an account is being selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionPurpose {
+    Client,
+    /// An operator probe asking "is this account alive", which no tier policy
+    /// may narrow.
+    Probe,
+}
+
+/// Classifies an account from the subscription fields of its usage row. A
+/// missing row is `Unknown`, which no policy restricts; anything not
+/// recognisably free is `Paid`, so a misread title can never widen the
+/// free-model set.
+pub fn classify_tier(
+    subscription_title: Option<&str>,
+    subscription_type: Option<&str>,
+) -> AccountTier {
+    let text = [subscription_title, subscription_type]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase();
+    if text.trim().is_empty() {
+        return AccountTier::Unknown;
+    }
+    if text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word == "FREE")
+    {
+        AccountTier::Free
+    } else {
+        AccountTier::Paid
+    }
+}
+
+/// The models the free-tier accounts serve, read from their live catalogs and
+/// never from a cost table. Empty means no free account is known yet, which
+/// makes both tier policies inert.
+fn free_model_set(
+    accounts: &[Arc<Account>],
+    tiers: &HashMap<String, AccountTier>,
+) -> HashSet<String> {
+    let mut free_models = HashSet::new();
+    for a in accounts {
+        if tiers.get(&a.id) == Some(&AccountTier::Free) {
+            free_models.extend(a.models.all_model_ids());
+        }
+    }
+    free_models
+}
+
+/// How the tier policies treat one candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TierVerdict {
+    Preferred,
+    /// A paid account yielding a free-set model: only reached when nothing else
+    /// can take the request.
+    SoftFallback,
+    Blocked,
+}
+
+fn tier_verdict(
+    tier: AccountTier,
+    model: &str,
+    free_models: &HashSet<String>,
+    policy: &settings::TierRouting,
+) -> TierVerdict {
+    if free_models.is_empty() || tier == AccountTier::Unknown {
+        return TierVerdict::Preferred;
+    }
+    let free_model = free_models.contains(&model_resolver::get_model_id_for_kiro(model));
+    match tier {
+        AccountTier::Free if !free_model && policy.exclude_paid_models_from_free_accounts => {
+            TierVerdict::Blocked
+        }
+        AccountTier::Paid if free_model && policy.paid_never_serves_free_models() => {
+            TierVerdict::Blocked
+        }
+        AccountTier::Paid if free_model && policy.paid_yields_free_models() => {
+            TierVerdict::SoftFallback
+        }
+        _ => TierVerdict::Preferred,
+    }
+}
+
 #[derive(Default)]
 struct PoolInner {
     order: Vec<String>,
@@ -177,6 +271,10 @@ struct PoolInner {
     observations: VecDeque<RateObservation>,
     unsaved: Vec<RateObservation>,
     sessions: HashMap<u64, SessionEntry>,
+    /// Subscription tier per account, read off the request path from the stored
+    /// usage rows.
+    account_tiers: HashMap<String, AccountTier>,
+    tiers_read_at: f64,
 }
 
 /// Per-account bound for one warm-up initialization.
@@ -189,6 +287,7 @@ pub struct AccountManager {
     mutations: tokio::sync::Mutex<()>,
     warm: tokio::sync::Mutex<()>,
     warm_failed_at: Mutex<Option<std::time::Instant>>,
+    tiers_scheduled: std::sync::atomic::AtomicBool,
 }
 
 /// After a warm-up that initialized nothing, discovery answers "not ready"
@@ -222,6 +321,7 @@ impl AccountManager {
             mutations: tokio::sync::Mutex::new(()),
             warm: tokio::sync::Mutex::new(()),
             warm_failed_at: Mutex::new(None),
+            tiers_scheduled: false.into(),
         })
     }
 
@@ -943,6 +1043,7 @@ impl AccountManager {
         // background recovery cannot enqueue consecutive attempts.
         let warm_idle = self.warm.try_lock().ok();
         let now = store::now_f64();
+        self.schedule_tier_read(now);
         for a in self.accounts() {
             if a.auth.lock().is_none() {
                 if warm_idle.is_none() {
@@ -1004,6 +1105,99 @@ impl AccountManager {
                     .store(false, std::sync::atomic::Ordering::Release);
             });
         }
+    }
+
+    /// Tiers are only known from the stored usage rows, so they are read in the
+    /// background at most once a minute; selection reads the in-memory map and
+    /// never touches SQLite.
+    const TIERS_TTL_SECONDS: f64 = 60.0;
+
+    fn schedule_tier_read(self: &Arc<Self>, now: f64) {
+        if now - self.inner.lock().tiers_read_at < Self::TIERS_TTL_SECONDS {
+            return;
+        }
+        if self
+            .tiers_scheduled
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let rows = tokio::task::spawn_blocking(crate::dashboard_store::account_subscriptions)
+                .await
+                .unwrap_or_default();
+            let tiers = rows
+                .into_iter()
+                .map(|(id, (title, kind))| (id, classify_tier(title.as_deref(), kind.as_deref())))
+                .collect();
+            let mut inner = pool.inner.lock();
+            inner.account_tiers = tiers;
+            inner.tiers_read_at = store::now_f64();
+            drop(inner);
+            pool.tiers_scheduled
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    /// What the dashboard needs to explain the policies: the derived free-model
+    /// set and how each account was classified.
+    pub fn tier_view(&self) -> Value {
+        let accounts = self.accounts();
+        let tiers = self.inner.lock().account_tiers.clone();
+        let mut free_models: Vec<String> = free_model_set(&accounts, &tiers).into_iter().collect();
+        free_models.sort();
+        json!({
+            "freeModels": free_models,
+            "accounts": accounts
+                .iter()
+                .map(|a| {
+                    let tier = tiers.get(&a.id).copied().unwrap_or(AccountTier::Unknown);
+                    json!({
+                        "label": account_label(&a.id),
+                        "tier": match tier {
+                            AccountTier::Free => "free",
+                            AccountTier::Paid => "paid",
+                            AccountTier::Unknown => "unknown",
+                        },
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Splits `candidates` by the account-tier policies: the accounts that may
+    /// serve `model` now, and the paid accounts that may serve it only when
+    /// nothing else can (`soft`). A probe is never narrowed.
+    fn tier_split(
+        &self,
+        candidates: Vec<Arc<Account>>,
+        model: &str,
+        purpose: SelectionPurpose,
+    ) -> (Vec<Arc<Account>>, Vec<Arc<Account>>) {
+        let tiers = self.inner.lock().account_tiers.clone();
+        let free_models = free_model_set(&candidates, &tiers);
+        if purpose == SelectionPurpose::Probe || free_models.is_empty() {
+            return (candidates, Vec::new());
+        }
+        let policy = settings::tier_routing();
+        let mut preferred = Vec::with_capacity(candidates.len());
+        let mut soft_fallback = Vec::new();
+        for a in candidates {
+            let tier = tiers.get(&a.id).copied().unwrap_or(AccountTier::Unknown);
+            match tier_verdict(tier, model, &free_models, &policy) {
+                TierVerdict::Preferred => preferred.push(a),
+                TierVerdict::SoftFallback => soft_fallback.push(a),
+                TierVerdict::Blocked => {}
+            }
+        }
+        (preferred, soft_fallback)
     }
 
     fn routing_weight_at(s: &AccountState, now: f64, refresh_interval: i64) -> f64 {
@@ -1133,8 +1327,27 @@ impl AccountManager {
         exclude: &HashSet<String>,
         session: Option<u64>,
     ) -> Option<Arc<Account>> {
+        self.next_account_with(model, exclude, session, SelectionPurpose::Client)
+            .await
+    }
+
+    /// Selection for an operator probe. The account-tier policies do not narrow
+    /// the candidates, so "is it alive" still answers while the free accounts
+    /// that a free-set model would pin the probe to are exhausted.
+    pub async fn next_account_for_probe(self: &Arc<Self>, model: &str) -> Option<Arc<Account>> {
+        self.next_account_with(model, &HashSet::new(), None, SelectionPurpose::Probe)
+            .await
+    }
+
+    async fn next_account_with(
+        self: &Arc<Self>,
+        model: &str,
+        exclude: &HashSet<String>,
+        session: Option<u64>,
+        purpose: SelectionPurpose,
+    ) -> Option<Arc<Account>> {
         self.schedule_account_maintenance();
-        if let Some(a) = self.select(model, exclude, session, false).await {
+        if let Some(a) = self.select(model, exclude, session, false, purpose).await {
             return Some(a);
         }
         let any_depleted = self
@@ -1144,7 +1357,7 @@ impl AccountManager {
         if !any_depleted {
             return None;
         }
-        let a = self.select(model, exclude, session, true).await;
+        let a = self.select(model, exclude, session, true, purpose).await;
         if let Some(a) = &a {
             tracing::warn!("Routing to {} despite usage reporting its quota spent: no other account is eligible", a.id);
         }
@@ -1157,49 +1370,56 @@ impl AccountManager {
         exclude: &HashSet<String>,
         session: Option<u64>,
         last_resort: bool,
+        purpose: SelectionPurpose,
     ) -> Option<Arc<Account>> {
         let candidates = self.candidate_order(model, session);
         let single = candidates.len() == 1;
+        let (preferred, soft_fallback) = self.tier_split(candidates, model, purpose);
         let cfg = config::get();
         let mut unsupported = None;
-        for a in candidates {
-            if exclude.contains(&a.id) {
-                continue;
-            }
-            let now = store::now_f64();
-            if !single {
-                let s = a.state.lock();
-                if s.auth_dead_until > now
-                    || s.suspended_until > now
-                    || s.quota_exhausted_until > now
-                    || s.rate_limited_until > now
-                {
+        // The fallback pass exists only for `soft`; `strict` and probes leave it
+        // empty, so this is one pass over the policy-approved candidates.
+        for list in [preferred, soft_fallback] {
+            for a in list {
+                if exclude.contains(&a.id) {
                     continue;
                 }
-                if !last_resort && is_quota_depleted(&s, now) {
-                    continue;
-                }
-                if cooling_remaining(&s, now) > 0.0 {
-                    if rand::thread_rng().gen::<f64>() > cfg.account_probabilistic_retry_chance {
+                let now = store::now_f64();
+                if !single {
+                    let s = a.state.lock();
+                    if s.auth_dead_until > now
+                        || s.suspended_until > now
+                        || s.quota_exhausted_until > now
+                        || s.rate_limited_until > now
+                    {
                         continue;
                     }
-                    tracing::info!("Probabilistic retry for broken account {}", a.id);
+                    if !last_resort && is_quota_depleted(&s, now) {
+                        continue;
+                    }
+                    if cooling_remaining(&s, now) > 0.0 {
+                        if rand::thread_rng().gen::<f64>() > cfg.account_probabilistic_retry_chance
+                        {
+                            continue;
+                        }
+                        tracing::info!("Probabilistic retry for broken account {}", a.id);
+                    }
                 }
-            }
-            if a.auth.lock().is_none() {
-                continue;
-            }
-            let still_member = self
-                .inner
-                .lock()
-                .accounts
-                .get(&a.id)
-                .is_some_and(|live| Arc::ptr_eq(live, &a));
-            if still_member && a.auth.lock().is_some() {
-                if a.models.support(model) == ModelSupport::Unsupported {
-                    unsupported.get_or_insert(a);
-                } else {
-                    return Some(a);
+                if a.auth.lock().is_none() {
+                    continue;
+                }
+                let still_member = self
+                    .inner
+                    .lock()
+                    .accounts
+                    .get(&a.id)
+                    .is_some_and(|live| Arc::ptr_eq(live, &a));
+                if still_member && a.auth.lock().is_some() {
+                    if a.models.support(model) == ModelSupport::Unsupported {
+                        unsupported.get_or_insert(a);
+                    } else {
+                        return Some(a);
+                    }
                 }
             }
         }
@@ -1215,8 +1435,17 @@ impl AccountManager {
         if accounts.is_empty() {
             return Unavailable::Temporary;
         }
+        let policy = settings::tier_routing();
+        let tiers = self.inner.lock().account_tiers.clone();
+        let free_models = free_model_set(&accounts, &tiers);
         let (mut serving, mut quota, mut gone, mut soonest) = (0, 0, 0, f64::MAX);
         for a in &accounts {
+            let tier = tiers.get(&a.id).copied().unwrap_or(AccountTier::Unknown);
+            // A `soft` paid account still counts: it can serve the model, just
+            // not before a free one, so its reason for not serving is reported.
+            if tier_verdict(tier, model, &free_models, &policy) == TierVerdict::Blocked {
+                continue;
+            }
             if a.models.support(model) == ModelSupport::Unsupported {
                 continue;
             }
@@ -1911,6 +2140,291 @@ mod tests {
         drop(state);
         assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
         assert!(pool.inner.lock().observations.is_empty());
+    }
+
+    // ----- account-tier routing ---------------------------------------------------------------
+
+    fn authed_account(id: &str) -> Arc<Account> {
+        let a = account(id);
+        let dir = std::env::temp_dir().join(format!("kiro-lb-tier-test-{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        std::fs::write(
+            &path,
+            json!({"refreshToken": "unused", "region": config::REGION}).to_string(),
+        )
+        .unwrap();
+        let auth = KiroAuth::new(
+            Source::File(path.to_string_lossy().into_owned()),
+            config::REGION,
+            None,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        *a.auth.lock() = Some(Arc::new(auth));
+        // A fresh cached_at keeps maintenance from scheduling a catalog refresh
+        // against the network during a test.
+        a.state.lock().models_cached_at = store::now_f64();
+        a
+    }
+
+    fn tier_pool(
+        accounts: Vec<Arc<Account>>,
+        tiers: &[(&str, AccountTier)],
+    ) -> Arc<AccountManager> {
+        let pool = AccountManager::new(reqwest::Client::new());
+        {
+            let mut inner = pool.inner.lock();
+            for a in &accounts {
+                inner.order.push(a.id.clone());
+                inner.accounts.insert(a.id.clone(), a.clone());
+            }
+            for (id, tier) in tiers {
+                inner.account_tiers.insert((*id).to_owned(), *tier);
+            }
+            inner.tiers_read_at = store::now_f64();
+        }
+        pool
+    }
+
+    fn tier_policy(
+        exclude_paid_models_from_free_accounts: bool,
+        mode: &str,
+    ) -> settings::TierRouting {
+        settings::TierRouting {
+            exclude_paid_models_from_free_accounts,
+            exclude_free_models_from_paid_accounts: mode.to_owned(),
+        }
+    }
+
+    fn set_catalog(a: &Arc<Account>, ids: &[&str]) {
+        a.models
+            .update(ids.iter().map(|id| json!({"modelId": id})).collect());
+    }
+
+    async fn picked(
+        pool: &Arc<AccountManager>,
+        model: &str,
+        exclude: &HashSet<String>,
+    ) -> Option<String> {
+        pool.next_account(model, exclude, None)
+            .await
+            .map(|a| a.id.clone())
+    }
+
+    #[test]
+    fn tier_comes_from_the_subscription_and_an_unknown_one_is_not_free() {
+        assert_eq!(
+            classify_tier(Some("KIRO FREE"), Some("Q_DEVELOPER_STANDALONE_FREE")),
+            AccountTier::Free
+        );
+        assert_eq!(
+            classify_tier(Some("KIRO PRO"), Some("Q_DEVELOPER_STANDALONE_PRO")),
+            AccountTier::Paid
+        );
+        assert_eq!(classify_tier(Some("kiro free"), None), AccountTier::Free);
+        assert_eq!(classify_tier(None, None), AccountTier::Unknown);
+        assert_eq!(classify_tier(Some("   "), Some("")), AccountTier::Unknown);
+    }
+
+    #[test]
+    fn tier_policies_only_move_models_across_the_tier_boundary() {
+        let free_models: HashSet<String> = ["claude-haiku-4.5".to_owned()].into_iter().collect();
+        let none: HashSet<String> = HashSet::new();
+
+        // ①: a free account never serves a paid model while it is on.
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Free,
+                "claude-opus-5.5",
+                &free_models,
+                &tier_policy(false, "off")
+            ),
+            TierVerdict::Preferred
+        );
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Free,
+                "claude-opus-5.5",
+                &free_models,
+                &tier_policy(true, "off")
+            ),
+            TierVerdict::Blocked
+        );
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Free,
+                "claude-haiku-4.5",
+                &free_models,
+                &tier_policy(true, "strict")
+            ),
+            TierVerdict::Preferred
+        );
+
+        // ②: off serves a free model anywhere, soft only as a fallback, strict never.
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Paid,
+                "claude-haiku-4.5",
+                &free_models,
+                &tier_policy(true, "off")
+            ),
+            TierVerdict::Preferred
+        );
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Paid,
+                "claude-haiku-4.5",
+                &free_models,
+                &tier_policy(true, "soft")
+            ),
+            TierVerdict::SoftFallback
+        );
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Paid,
+                "claude-haiku-4.5",
+                &free_models,
+                &tier_policy(true, "strict")
+            ),
+            TierVerdict::Blocked
+        );
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Paid,
+                "claude-opus-5.5",
+                &free_models,
+                &tier_policy(true, "strict")
+            ),
+            TierVerdict::Preferred
+        );
+
+        // No free account known yet, and no tier known: inert either way.
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Paid,
+                "claude-haiku-4.5",
+                &none,
+                &tier_policy(true, "strict")
+            ),
+            TierVerdict::Preferred
+        );
+        assert_eq!(
+            tier_verdict(
+                AccountTier::Unknown,
+                "claude-haiku-4.5",
+                &free_models,
+                &tier_policy(true, "strict")
+            ),
+            TierVerdict::Preferred
+        );
+    }
+
+    #[test]
+    fn free_model_set_is_the_union_of_the_free_accounts_catalogs() {
+        let free = account("free");
+        set_catalog(&free, &["claude-haiku-4.5", "glm-5"]);
+        let paid = account("paid");
+        set_catalog(&paid, &["claude-opus-5.5"]);
+        let known = account("known");
+        set_catalog(&known, &["claude-sonnet-5"]);
+        let tiers = HashMap::from([
+            ("free".to_owned(), AccountTier::Free),
+            ("paid".to_owned(), AccountTier::Paid),
+            ("known".to_owned(), AccountTier::Unknown),
+        ]);
+
+        let set = free_model_set(&[free.clone(), paid.clone(), known.clone()], &tiers);
+        assert!(set.contains("claude-haiku-4.5"));
+        assert!(set.contains("glm-5"));
+        assert!(!set.contains("claude-opus-5.5"));
+        assert!(!set.contains("claude-sonnet-5"));
+        assert!(free_model_set(&[paid, known], &tiers).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tier_policies_steer_models_to_their_tier_and_probes_bypass_them() {
+        // A free account with a stale catalog still takes a paid model while no
+        // free catalog is known: the free-model set is what ① keys off, so the
+        // policy is inert until one free account has reported.
+        let stale = authed_account("stale");
+        let alone = tier_pool(vec![stale.clone()], &[("stale", AccountTier::Free)]);
+        settings::set_tier_routing(tier_policy(true, "off"));
+        assert_eq!(
+            picked(&alone, "claude-opus-5.5", &HashSet::new())
+                .await
+                .as_deref(),
+            Some("stale")
+        );
+
+        // Once it has, the same account is held off paid models. `known` is
+        // excluded from selection so the choice is deterministic; it still
+        // contributes the free-model set.
+        let known = authed_account("known");
+        set_catalog(&known, &["claude-haiku-4.5"]);
+        let pool = tier_pool(
+            vec![stale.clone(), known.clone()],
+            &[("stale", AccountTier::Free), ("known", AccountTier::Free)],
+        );
+        let only_stale: HashSet<String> = ["known".to_owned()].into_iter().collect();
+        assert_eq!(picked(&pool, "claude-opus-5.5", &only_stale).await, None);
+        settings::set_tier_routing(tier_policy(false, "off"));
+        assert_eq!(
+            picked(&pool, "claude-opus-5.5", &only_stale)
+                .await
+                .as_deref(),
+            Some("stale")
+        );
+
+        // ②: a paid account yields the free models the free account serves.
+        let free = authed_account("free");
+        set_catalog(&free, &["claude-haiku-4.5"]);
+        let paid = authed_account("paid");
+        set_catalog(&paid, &["claude-haiku-4.5", "claude-opus-5.5"]);
+        let pool = tier_pool(
+            vec![paid.clone(), free.clone()],
+            &[("free", AccountTier::Free), ("paid", AccountTier::Paid)],
+        );
+
+        settings::set_tier_routing(tier_policy(true, "strict"));
+        assert_eq!(
+            picked(&pool, "claude-haiku-4.5", &HashSet::new())
+                .await
+                .as_deref(),
+            Some("free")
+        );
+        // Other models are untouched by the policy.
+        assert_eq!(
+            picked(&pool, "claude-opus-5.5", &HashSet::new())
+                .await
+                .as_deref(),
+            Some("paid")
+        );
+
+        // The free account cannot take the free model: strict gives nothing,
+        // soft falls back to the paid account, and a probe still finds one.
+        free.state.lock().rate_limited_until = store::now_f64() + 60.0;
+        assert_eq!(
+            picked(&pool, "claude-haiku-4.5", &HashSet::new()).await,
+            None
+        );
+        settings::set_tier_routing(tier_policy(true, "soft"));
+        assert_eq!(
+            picked(&pool, "claude-haiku-4.5", &HashSet::new())
+                .await
+                .as_deref(),
+            Some("paid")
+        );
+        settings::set_tier_routing(tier_policy(true, "strict"));
+        assert_eq!(
+            pool.next_account_for_probe("claude-haiku-4.5")
+                .await
+                .map(|a| a.id.clone())
+                .as_deref(),
+            Some("paid")
+        );
+
+        settings::set_tier_routing(tier_policy(false, "off"));
     }
 }
 

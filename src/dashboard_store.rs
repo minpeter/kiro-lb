@@ -213,6 +213,28 @@ pub fn account_emails() -> HashMap<String, String> {
     .unwrap_or_default()
 }
 
+/// Subscription title and type per account, for the account-tier routing
+/// policies. A row is written when the usage limits are refreshed, so an account
+/// that has never been refreshed is absent rather than guessed at.
+pub fn account_subscriptions() -> HashMap<String, (Option<String>, Option<String>)> {
+    store::with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT account_id, subscription_title, subscription_type FROM account_usage",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ),
+            ))
+        })?;
+        rows.collect()
+    })
+    .unwrap_or_default()
+}
+
 pub fn cached_usage(account_id: &str) -> Value {
     store::with(|c| {
         c.query_row("SELECT u.* FROM account_usage u JOIN account_sources s ON s.account_id = u.account_id AND s.login_identity = u.login_identity WHERE u.account_id = ?1", [account_id], |r| {

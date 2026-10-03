@@ -39,6 +39,7 @@ import { usePreferences } from "../preferences";
 import { compareModels } from "../model-family";
 import { ModelMark } from "./model-marks";
 import { ModelListingCard } from "./model-listing-card";
+import { TierRoutingCard } from "./tier-routing-card";
 import { pushError } from "../alerts";
 import { describeLatency, describeShortenStats, loadBalancingHelp, loadBalancingLabel } from "./routing-labels";
 
@@ -864,6 +865,8 @@ export function SettingsPanel({ onNotice, leading }: SettingsPanelProps) {
           </CardContent>
         </Card>
       </div>
+
+      <TierRoutingCard onNotice={onNotice} />
 
       <ModelListingCard onNotice={onNotice} />
 

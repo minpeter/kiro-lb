@@ -1441,6 +1441,40 @@ pub async fn concurrency(headers: HeaderMap) -> Response {
     json_response(200, up::concurrency_status())
 }
 
+pub async fn get_tier_routing(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    guard!(headers);
+    json_response(
+        200,
+        json!({
+            "settings": settings::tier_routing().as_json(),
+            "freeModelModes": settings::PAID_ACCOUNT_FREE_MODEL_MODES,
+            "derived": state.pool.tier_view(),
+        }),
+    )
+}
+
+pub async fn put_tier_routing(headers: HeaderMap, body: Bytes) -> Response {
+    guard!(headers);
+    let p = match json_object(&body) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let active = settings::tier_routing();
+    let exclude_paid_from_free = p
+        .get("excludePaidModelsFromFreeAccounts")
+        .cloned()
+        .unwrap_or(json!(active.exclude_paid_models_from_free_accounts));
+    let exclude_free_from_paid = p
+        .get("excludeFreeModelsFromPaidAccounts")
+        .cloned()
+        .unwrap_or(json!(active.exclude_free_models_from_paid_accounts));
+    match settings::update_tier_routing(&exclude_paid_from_free, &exclude_free_from_paid) {
+        Err(e) => detail(400, e.to_string()),
+        Ok(Err(e)) => detail(500, format!("Could not persist the setting: {e}")),
+        Ok(Ok(s)) => json_response(200, json!({"settings": s.as_json()})),
+    }
+}
+
 pub async fn get_tunables(headers: HeaderMap) -> Response {
     guard!(headers);
     json_response(200, settings::tunables_snapshot())

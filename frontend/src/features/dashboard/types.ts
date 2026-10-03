@@ -351,3 +351,27 @@ export interface PromptFilterSettings {
   lastShorten?: ToolShortenStats | null;
 }
 
+export type TierRoutingMode = "off" | "soft" | "strict";
+
+export interface TierRoutingSettings {
+  excludePaidModelsFromFreeAccounts: boolean;
+  excludeFreeModelsFromPaidAccounts: TierRoutingMode;
+}
+
+export interface TierRoutingAccount {
+  label: string;
+  tier: "free" | "paid" | "unknown";
+}
+
+/** What the gateway derives: the free-model set and each account's tier. */
+export interface TierRoutingDerived {
+  freeModels: string[];
+  accounts: TierRoutingAccount[];
+}
+
+export interface TierRoutingResponse {
+  settings: TierRoutingSettings;
+  freeModelModes: TierRoutingMode[];
+  derived: TierRoutingDerived;
+}
+
