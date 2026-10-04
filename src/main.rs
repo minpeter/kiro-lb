@@ -143,6 +143,22 @@ fn router(state: app::Shared) -> Router {
             "/api/dashboard/accounts/device-login/{id}/register",
             post(d::register_device_login),
         )
+        .route(
+            "/api/dashboard/accounts/browser-login",
+            post(d::start_browser_login),
+        )
+        .route(
+            "/api/dashboard/accounts/browser-login/{id}",
+            get(d::poll_browser_login).delete(d::cancel_browser_login),
+        )
+        .route(
+            "/api/dashboard/accounts/browser-login/{id}/callback",
+            post(d::complete_browser_login),
+        )
+        .route(
+            "/api/dashboard/accounts/browser-login/{id}/register",
+            post(d::register_browser_login),
+        )
         .route("/api/dashboard/accounts/{label}", delete(d::delete_account))
         .route(
             "/api/dashboard/accounts/{label}/enabled",

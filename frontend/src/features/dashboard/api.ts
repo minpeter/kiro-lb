@@ -3,6 +3,7 @@ import type {
   Account,
   AccountTokenUsage,
   ApiKey,
+  BrowserLoginFlow,
   DataOverview,
   DeviceLoginFlow,
   DeviceLoginProvider,
@@ -153,4 +154,22 @@ export const dashboardApi = {
     ),
   cancelDeviceLogin: (flowId: string) =>
     request<{ ok: boolean }>(`/api/dashboard/accounts/device-login/${flowId}`, { method: "DELETE" }),
+  startBrowserLogin: (provider: "google" | "github") =>
+    request<BrowserLoginFlow>("/api/dashboard/accounts/browser-login", {
+      method: "POST",
+      body: JSON.stringify({ provider }),
+    }),
+  pollBrowserLogin: (flowId: string) => request<BrowserLoginFlow>(`/api/dashboard/accounts/browser-login/${flowId}`),
+  completeBrowserLogin: (flowId: string, url: string) =>
+    request<BrowserLoginFlow>(`/api/dashboard/accounts/browser-login/${flowId}/callback`, {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
+  registerBrowserLogin: (flowId: string) =>
+    request<{ accountId: string; initialized: boolean; provider: string; signedOut: string[] }>(
+      `/api/dashboard/accounts/browser-login/${flowId}/register`,
+      { method: "POST" },
+    ),
+  cancelBrowserLogin: (flowId: string) =>
+    request<{ ok: boolean }>(`/api/dashboard/accounts/browser-login/${flowId}`, { method: "DELETE" }),
 };

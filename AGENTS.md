@@ -45,6 +45,7 @@ kiro-lb/
 | Account failover / routing | `src/pool.rs` | Circuit breaker, weighted/sticky/most_credits/session |
 | Credentials + hosts | `src/auth.rs`, `src/config.rs` | Builder ID routes to a different host |
 | Device login | `src/device_login.rs` | Social + Builder ID flows |
+| Browser sign-in | `src/browser_login.rs` | Google/GitHub PKCE via app.kiro.dev, loopback callback on 3128 |
 | SQLite persistence | `src/store.rs`, `src/dashboard_store.rs` | WAL, additive migrations |
 | Dashboard API | `src/routes_dashboard.rs` | `/api/dashboard/*`, `/metrics`, handoff |
 | Runtime settings | `src/settings.rs` | Tunables, endpoint rotation, tool shortening |

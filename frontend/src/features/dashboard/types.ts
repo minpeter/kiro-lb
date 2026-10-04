@@ -249,6 +249,18 @@ export type DeviceLoginFlow = {
   expiresInSeconds: number;
 };
 
+export type BrowserLoginFlow = {
+  flowId: string;
+  provider: string;
+  status: "pending" | "approved" | "failed" | "expired";
+  detail: string | null;
+  authorizationUrl: string;
+  callbackUri: string;
+  /** False when kiro-lb could not bind the callback port; the operator pastes the callback URL. */
+  listening: boolean;
+  expiresInSeconds: number;
+};
+
 export const TAB_IDS = ["overview", "accounts", "keys", "settings", "info"] as const;
 export type TabId = (typeof TAB_IDS)[number];
 

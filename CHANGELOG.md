@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- browser sign-in for Google and GitHub (#99): the dashboard opens Kiro's sign-in page with PKCE and takes the callback on `localhost:3128`, or from a pasted callback address when kiro-lb cannot listen there. Each account gets its own session, so a second Google/GitHub user no longer signs the first one out. The device code stays available behind "Use a device code instead"
+
 ## [0.2.8](https://github.com/minpeter/kiro-lb/compare/v0.2.7...v0.2.8) - 2026-10-03
 
 ### Added

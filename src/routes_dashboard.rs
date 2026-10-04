@@ -18,7 +18,7 @@ use crate::pool::{self, account_label, routing_state};
 use crate::settings::{self, TunableKey};
 use crate::upstream::{endpoints, http as up};
 use crate::usage_tracking::{ROOT_KEY_ID, UNKNOWN_ACCOUNT_ID};
-use crate::{config, device_login, model_costs, prompt_filter, store};
+use crate::{browser_login, config, device_login, model_costs, prompt_filter, store};
 
 const COOKIE: &str = "kiro_lb_session";
 const SESSION_TTL: i64 = 12 * 60 * 60;
@@ -1234,16 +1234,23 @@ pub async fn register_device_login(
         Err(e) => return detail(400, e),
     };
     let entry = json!({"type": "internal", "id": format!("device-{}-{}", flow.provider.to_lowercase(), flow.id), "credential": credential});
-    let account_id = store::account_id_for_entry(&entry);
-    let result = register(&state, entry, "").await;
+    let response = register_login(&state, flow.provider, entry).await;
     device_login::discard(&id);
-    match result {
+    response
+}
+
+/// Registers a credential produced by a dashboard login. After a Google/GitHub
+/// login it probes the other social accounts so a sign-out Kiro caused upstream
+/// is reported now rather than at their next refresh.
+async fn register_login(state: &Shared, provider: &str, entry: Value) -> Response {
+    let account_id = store::account_id_for_entry(&entry);
+    match register(state, entry, "").await {
         Ok(mut v) => {
             if let Some(o) = v.as_object_mut() {
                 o.remove("type");
             }
-            v["provider"] = json!(flow.provider);
-            let signed_out = if flow.provider == "BuilderId" {
+            v["provider"] = json!(provider);
+            let signed_out = if provider == "BuilderId" {
                 Vec::new()
             } else {
                 state.pool.probe_social_sessions(&account_id).await
@@ -1256,6 +1263,87 @@ pub async fn register_device_login(
         }
         Err(r) => r,
     }
+}
+
+pub async fn start_browser_login(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    guard!(headers);
+    let payload: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+    let provider = match browser_login::resolve_provider(
+        payload
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("google"),
+    ) {
+        Ok(p) => p,
+        Err(e) => return detail(400, e),
+    };
+    match browser_login::start(&state.http, provider).await {
+        Ok(v) => json_response(200, v),
+        Err(e) => detail(500, format!("Could not start the sign-in: {e}")),
+    }
+}
+
+pub async fn poll_browser_login(headers: HeaderMap, Path(id): Path<String>) -> Response {
+    guard!(headers);
+    match browser_login::poll(&id) {
+        Some(f) => json_response(200, f.view()),
+        None => detail(404, "Unknown or expired sign-in"),
+    }
+}
+
+/// Finishes a sign-in from the callback address pasted from the browser, for
+/// when the browser cannot reach kiro-lb's loopback listener.
+pub async fn complete_browser_login(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    guard!(headers);
+    let p = match json_object(&body) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let Some(url) = p.get("url").and_then(Value::as_str) else {
+        return detail(400, "url is required");
+    };
+    let exchange = browser_login::Exchange::kiro(state.http.clone());
+    match browser_login::complete_from_url(&exchange, &id, url).await {
+        Ok(f) => json_response(200, f.view()),
+        Err(e) => detail(400, e),
+    }
+}
+
+pub async fn register_browser_login(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    guard!(headers);
+    let Some(flow) = browser_login::poll(&id) else {
+        return detail(404, "Unknown or expired sign-in");
+    };
+    if flow.status != "approved" {
+        return detail(409, format!("Sign-in is {}, not approved yet", flow.status));
+    }
+    let credential = match browser_login::internal_credentials(&flow) {
+        Ok(c) => c,
+        Err(e) => return detail(400, e),
+    };
+    let entry = json!({"type": "internal", "id": flow.account_id(), "credential": credential});
+    let response = register_login(&state, flow.provider, entry).await;
+    browser_login::discard(&id);
+    response
+}
+
+pub async fn cancel_browser_login(headers: HeaderMap, Path(id): Path<String>) -> Response {
+    guard!(headers);
+    browser_login::discard(&id);
+    json_response(200, json!({"ok": true}))
 }
 
 pub async fn cancel_device_login(headers: HeaderMap, Path(id): Path<String>) -> Response {

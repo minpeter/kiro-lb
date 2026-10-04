@@ -64,6 +64,20 @@ const enUS = {
   "accounts.login.continueWith": "Continue with {provider}",
   "accounts.login.signedOut":
     "Approving this login signed out {ids}: Kiro revoked its refresh token. Signing it in again may sign out this one.",
+  "accounts.login.browserDescription":
+    "Google and GitHub open Kiro's sign-in page in your browser. Each account gets its own session, so adding another one keeps the earlier ones signed in.",
+  "accounts.login.deviceDescription":
+    "Copy the link and approve it in any browser. Approving a different Google or GitHub user signs out the one added before it.",
+  "accounts.login.openSignIn": "Open sign-in page",
+  "accounts.login.waitingSignIn": "Waiting for sign-in · {time}",
+  "accounts.login.pasteLabel": "Address the browser ended on",
+  "accounts.login.pasteHint":
+    "If the browser shows that localhost:3128 cannot be reached, copy that page's address here.",
+  "accounts.login.pasteNotListening":
+    "Kiro-LB could not listen on port 3128, so after signing in copy the address the browser ended on here.",
+  "accounts.login.pasteSubmit": "Finish sign-in",
+  "accounts.login.useDevice": "Use a device code instead",
+  "accounts.login.useBrowser": "Use browser sign-in",
   "keys.noTraffic": "No traffic recorded for this key yet.",
   "keys.col.model": "Model",
   "keys.col.requests": "Requests",
@@ -210,6 +224,19 @@ const koKR: Messages = {
   "accounts.login.continueWith": "{provider}(으)로 계속",
   "accounts.login.signedOut":
     "이 로그인을 승인하면서 {ids} 계정이 로그아웃되었습니다(Kiro가 갱신 토큰을 폐기함). 그 계정으로 다시 로그인하면 이 계정이 로그아웃될 수 있습니다.",
+  "accounts.login.browserDescription":
+    "Google과 GitHub는 브라우저에서 Kiro 로그인 페이지를 엽니다. 계정마다 세션이 따로 생겨서 다른 계정을 추가해도 기존 계정은 로그인 상태로 남습니다.",
+  "accounts.login.deviceDescription":
+    "링크를 복사해 아무 브라우저에서 승인하세요. 다른 Google 또는 GitHub 사용자로 승인하면 앞서 추가한 계정이 로그아웃됩니다.",
+  "accounts.login.openSignIn": "로그인 페이지 열기",
+  "accounts.login.waitingSignIn": "로그인 대기 중 · {time}",
+  "accounts.login.pasteLabel": "브라우저가 마지막으로 연 주소",
+  "accounts.login.pasteHint": "브라우저에 localhost:3128에 연결할 수 없다고 나오면 그 페이지 주소를 여기에 붙여넣으세요.",
+  "accounts.login.pasteNotListening":
+    "Kiro-LB가 3128 포트를 열지 못했습니다. 로그인한 뒤 브라우저가 마지막으로 연 주소를 여기에 붙여넣으세요.",
+  "accounts.login.pasteSubmit": "로그인 완료",
+  "accounts.login.useDevice": "기기 코드로 추가",
+  "accounts.login.useBrowser": "브라우저 로그인 사용",
   "keys.noTraffic": "이 키에 기록된 트래픽이 아직 없습니다.",
   "keys.col.model": "모델",
   "keys.col.requests": "요청",
@@ -353,6 +380,17 @@ const zhCN: Messages = {
   "accounts.login.copyLink": "复制批准链接",
   "accounts.login.continueWith": "使用 {provider} 继续",
   "accounts.login.signedOut": "批准此登录后，{ids} 已被注销（Kiro 撤销了其刷新令牌）。重新登录该账户可能会注销此账户。",
+  "accounts.login.browserDescription":
+    "Google 和 GitHub 会在浏览器中打开 Kiro 登录页面。每个账户都有自己的会话，添加新账户不会让之前的账户退出登录。",
+  "accounts.login.deviceDescription": "复制链接并在任意浏览器中批准。以另一个 Google 或 GitHub 用户批准会注销之前添加的账户。",
+  "accounts.login.openSignIn": "打开登录页面",
+  "accounts.login.waitingSignIn": "等待登录 · {time}",
+  "accounts.login.pasteLabel": "浏览器最后打开的地址",
+  "accounts.login.pasteHint": "如果浏览器显示无法访问 localhost:3128，请把该页面的地址粘贴到这里。",
+  "accounts.login.pasteNotListening": "Kiro-LB 无法监听 3128 端口。登录后，请把浏览器最后打开的地址粘贴到这里。",
+  "accounts.login.pasteSubmit": "完成登录",
+  "accounts.login.useDevice": "改用设备代码",
+  "accounts.login.useBrowser": "使用浏览器登录",
   "keys.noTraffic": "此密钥尚无流量记录。",
   "keys.col.model": "模型",
   "keys.col.requests": "请求",
@@ -495,6 +533,19 @@ const ptBR: Messages = {
   "accounts.login.continueWith": "Continuar com {provider}",
   "accounts.login.signedOut":
     "Aprovar este login desconectou {ids}: o Kiro revogou o refresh token. Fazer login nela de novo pode desconectar esta.",
+  "accounts.login.browserDescription":
+    "Google e GitHub abrem a página de login do Kiro no seu navegador. Cada conta tem a própria sessão, então adicionar outra mantém as anteriores conectadas.",
+  "accounts.login.deviceDescription":
+    "Copie o link e aprove em qualquer navegador. Aprovar outro usuário Google ou GitHub desconecta a conta adicionada antes.",
+  "accounts.login.openSignIn": "Abrir página de login",
+  "accounts.login.waitingSignIn": "Aguardando login · {time}",
+  "accounts.login.pasteLabel": "Endereço em que o navegador parou",
+  "accounts.login.pasteHint": "Se o navegador disser que não consegue acessar localhost:3128, copie o endereço dessa página aqui.",
+  "accounts.login.pasteNotListening":
+    "O Kiro-LB não conseguiu escutar a porta 3128. Depois de entrar, copie aqui o endereço em que o navegador parou.",
+  "accounts.login.pasteSubmit": "Concluir login",
+  "accounts.login.useDevice": "Usar um código de dispositivo",
+  "accounts.login.useBrowser": "Usar login pelo navegador",
   "keys.noTraffic": "Nenhum tráfego registrado para esta chave ainda.",
   "keys.col.model": "Modelo",
   "keys.col.requests": "Requisições",

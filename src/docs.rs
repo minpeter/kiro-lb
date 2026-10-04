@@ -61,6 +61,31 @@ pub async fn openapi() -> Response {
             "Register device login",
         ),
         (
+            "/api/dashboard/accounts/browser-login",
+            "post",
+            "Start browser sign-in",
+        ),
+        (
+            "/api/dashboard/accounts/browser-login/{flow_id}",
+            "get",
+            "Poll browser sign-in",
+        ),
+        (
+            "/api/dashboard/accounts/browser-login/{flow_id}",
+            "delete",
+            "Cancel browser sign-in",
+        ),
+        (
+            "/api/dashboard/accounts/browser-login/{flow_id}/callback",
+            "post",
+            "Finish browser sign-in from a pasted callback URL",
+        ),
+        (
+            "/api/dashboard/accounts/browser-login/{flow_id}/register",
+            "post",
+            "Register browser sign-in",
+        ),
+        (
             "/api/dashboard/accounts/{label}",
             "delete",
             "Delete account",

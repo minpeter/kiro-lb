@@ -44,7 +44,12 @@ tar -xzf kirolb-linux-x64.tar.gz
 ```
 
 On first run it creates `.env` and `.env.example` with generated credentials
-and prints them. Open http://localhost:8000 and add accounts with device login.
+and prints them. Open http://localhost:8000 and add accounts by signing in.
+Google and GitHub use browser sign-in, which listens on `localhost:3128` for
+the callback (the redirect Kiro allows); if that port is unreachable, paste the
+address the browser ended on into the dashboard. A device code is still
+available for headless setups, but approving a second Google/GitHub user that
+way signs the first one out.
 `SHA256SUMS` in the release lists every file's checksum.
 
 At startup and every hour, the gateway checks GitHub's latest stable
