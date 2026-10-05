@@ -1,5 +1,7 @@
 export type Overview = {
   proxy: { status: string; uptimeSeconds: number };
+  /** Configured browser-facing TokenHub dashboard, never its internal API. */
+  tokenHubDashboardUrl?: string | null;
   version?: {
     current: string;
     latest: string | null;
@@ -43,10 +45,11 @@ export type AccountRoutingState =
   | "quota_depleted"
   | "cooling_down"
   | "suspended"
+  /** ERR-837 observed by TokenHub's isolated automatic AWS email-step check. */
+  | "account_issue"
   /**
    * The stored refresh token was rejected by the auth host, so the account
-   * cannot obtain a token at all. Outranks every other exclusion and only a
-   * re-login clears it.
+   * needs reauthentication. This alone does not establish an AWS account issue.
    */
   | "auth_dead"
   /**
@@ -62,6 +65,14 @@ export type Account = {
   initialized: boolean;
   routingState: AccountRoutingState;
   eligibleInSeconds: number;
+  /** Epoch seconds of the last automatic positive ERR-837 observation. */
+  awsLoginIssueAt?: number | null;
+  /** Latest automated AWS email-step diagnostic, when one has run. */
+  awsLoginDiagnostic?: {
+    result: "ERR-837" | "password_required" | "inconclusive";
+    /** Epoch seconds when the diagnostic completed. */
+    checkedAt: number;
+  } | null;
   /** Unused quota fraction the router weights by, or null when unpolled. */
   quotaHeadroom?: number | null;
   /** Epoch seconds of the next allowance reset, or null when unknown. */
@@ -362,4 +373,3 @@ export interface PromptFilterSettings {
   shortenNote: string;
   lastShorten?: ToolShortenStats | null;
 }
-

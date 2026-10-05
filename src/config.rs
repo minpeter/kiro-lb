@@ -152,6 +152,7 @@ pub struct Config {
     pub dashboard_password: String,
     pub dashboard_auth: bool,
     pub dashboard_secure_cookie: Option<bool>,
+    pub tokenhub_dashboard_url: Option<String>,
     pub data_dir: String,
     pub kiro_slot: String,
     pub handoff_secret: String,
@@ -233,6 +234,7 @@ impl Config {
             dashboard_secure_cookie: std::env::var("DASHBOARD_SECURE_COOKIE")
                 .ok()
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
+            tokenhub_dashboard_url: dashboard_link(&env_str("TOKENHUB_DASHBOARD_URL", "")),
             data_dir: env_str("DASHBOARD_DATA_DIR", "data"),
             kiro_slot: env_str("KIRO_SLOT", ""),
             handoff_secret: env_str("HANDOFF_SECRET", ""),
@@ -250,6 +252,17 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 
 pub fn get() -> &'static Config {
     CONFIG.get_or_init(Config::from_env)
+}
+
+/// Browser-facing links must not execute scripts or embed credentials.
+fn dashboard_link(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none())
+    .then(|| url.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,6 +344,31 @@ pub fn fallback_limits(model: &str) -> Option<&'static FallbackModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenhub_dashboard_links_preserve_routes_but_reject_unsafe_targets() {
+        for url in [
+            "https://hub.example/dashboard/#accounts",
+            "http://192.0.2.10:19084/",
+        ] {
+            assert_eq!(dashboard_link(url).as_deref(), Some(url));
+        }
+        assert_eq!(
+            dashboard_link(" https://hub.example ").as_deref(),
+            Some("https://hub.example/")
+        );
+        for url in [
+            "",
+            "/dashboard",
+            "//hub.example",
+            "javascript:alert(1)",
+            "data:text/html,test",
+            "https://user:pass@hub.example/",
+            "https://hub.example/?token=secret",
+        ] {
+            assert_eq!(dashboard_link(url), None, "accepted {url:?}");
+        }
+    }
 
     #[test]
     fn region_validation_supports_current_and_future_partition_shapes() {

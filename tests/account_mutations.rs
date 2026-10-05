@@ -238,11 +238,12 @@ async fn concurrent_disables_cannot_both_remove_the_last_account() {
         .unwrap();
     assert_eq!(resume.status(), StatusCode::OK);
     let restored = pool.get(paused_id).unwrap();
-    let restored_state = restored.state.lock();
-    assert_eq!(restored_state.stats.total, expected.0);
-    assert_eq!(restored_state.stats.success, expected.1);
-    assert_eq!(restored_state.stats.failed, expected.2);
-    drop(restored_state);
+    {
+        let restored_state = restored.state.lock();
+        assert_eq!(restored_state.stats.total, expected.0);
+        assert_eq!(restored_state.stats.success, expected.1);
+        assert_eq!(restored_state.stats.failed, expected.2);
+    }
     assert_eq!(
         live_account.state.lock().rate_limited_until,
         rate_limited_until,

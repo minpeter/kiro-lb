@@ -2,6 +2,7 @@ import { renderToString } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { groupAccounts } from "./components/account-groups";
 import { AccountsPanel } from "./components/accounts-panel";
+import accountMessages from "./i18n/accounts";
 import type { Account } from "./types";
 
 const mockAccount: Account = {
@@ -142,6 +143,7 @@ describe("excluded account grouping", () => {
       pausedAccounts: [paused, secondBanned, secondAuthDead],
       authDeadAccounts: [authDead],
       bannedAccounts: [banned],
+      accountIssueAccounts: [],
       displayedAccounts: [mockAccount, ...otherStates, paused, secondBanned, secondAuthDead, authDead, banned],
     });
     expect(groups.pausedAccounts[0]).toBe(paused);
@@ -157,6 +159,7 @@ describe("excluded account grouping", () => {
       pausedAccounts: [],
       authDeadAccounts: [],
       bannedAccounts: [],
+      accountIssueAccounts: [],
       displayedAccounts: [],
     });
   });
@@ -172,6 +175,7 @@ describe("excluded account grouping", () => {
       disabled: "pausedAccounts",
       auth_dead: "authDeadAccounts",
       suspended: "bannedAccounts",
+      account_issue: "accountIssueAccounts",
     } as const satisfies Record<Account["routingState"], keyof ReturnType<typeof groupAccounts>>;
     for (const [state, expectedGroup] of Object.entries(expectedGroups)) {
       const account = { ...mockAccount, enabled, routingState: state as Account["routingState"] };
@@ -207,8 +211,8 @@ describe("excluded account grouping", () => {
     for (const layout of [cards, table]) {
       expect(layout.match(/Unavailable accounts/g)).toHaveLength(1);
       expect(layout.match(/Paused accounts/g)).toHaveLength(1);
-      expect(layout.match(/Auth-dead accounts/g)).toHaveLength(1);
-      expect(layout.match(/Banned accounts/g)).toHaveLength(1);
+      expect(layout.match(/Authentication failures/g)).toHaveLength(1);
+      expect(layout.match(/Temporarily suspended accounts/g)).toHaveLength(1);
       expect(layout.lastIndexOf(mockAccount.id)).toBeLessThan(layout.indexOf("Unavailable accounts"));
       for (const account of otherStates) {
         expect(layout).toContain(account.id);
@@ -216,11 +220,11 @@ describe("excluded account grouping", () => {
         expect(layout.lastIndexOf(account.id)).toBeLessThan(layout.indexOf("Paused accounts"));
       }
       expect(layout.indexOf("Paused accounts")).toBeLessThan(layout.indexOf(paused.id));
-      expect(layout.lastIndexOf(paused.id)).toBeLessThan(layout.indexOf("Auth-dead accounts"));
-      expect(layout.indexOf("Auth-dead accounts")).toBeLessThan(layout.indexOf(authDead.id));
+      expect(layout.lastIndexOf(paused.id)).toBeLessThan(layout.indexOf("Authentication failures"));
+      expect(layout.indexOf("Authentication failures")).toBeLessThan(layout.indexOf(authDead.id));
       expect(layout.lastIndexOf(authDead.id)).toBeLessThan(layout.indexOf(secondAuthDead.id));
-      expect(layout.lastIndexOf(secondAuthDead.id)).toBeLessThan(layout.indexOf("Banned accounts"));
-      expect(layout.indexOf("Banned accounts")).toBeLessThan(layout.indexOf(banned.id));
+      expect(layout.lastIndexOf(secondAuthDead.id)).toBeLessThan(layout.indexOf("Temporarily suspended accounts"));
+      expect(layout.indexOf("Temporarily suspended accounts")).toBeLessThan(layout.indexOf(banned.id));
       expect(layout.lastIndexOf(banned.id)).toBeLessThan(layout.indexOf(secondBanned.id));
     }
     expect(cards.match(/<article /g)).toHaveLength(11);
@@ -242,7 +246,7 @@ describe("excluded account grouping", () => {
 
   it("does not show empty sections for a ready-only pool", () => {
     const html = renderToString(<AccountsPanel accounts={[mockAccount]} isLoading={false} />);
-    for (const label of ["Unavailable accounts", "Paused accounts", "Auth-dead accounts", "Banned accounts"]) {
+    for (const label of ["Unavailable accounts", "Paused accounts", "Authentication failures", "Temporarily suspended accounts", "AWS account issues"]) {
       expect(html).not.toContain(label);
     }
   });
@@ -253,10 +257,10 @@ describe("excluded account grouping", () => {
     );
     const [cards, table] = html.split("<table");
     for (const layout of [cards, table]) {
-      expect(layout.match(enabled === false ? /Paused accounts/g : /Auth-dead accounts/g)).toHaveLength(1);
-      expect(layout).not.toContain(enabled === false ? "Auth-dead accounts" : "Paused accounts");
+      expect(layout.match(enabled === false ? /Paused accounts/g : /Authentication failures/g)).toHaveLength(1);
+      expect(layout).not.toContain(enabled === false ? "Authentication failures" : "Paused accounts");
       expect(layout).not.toContain("Unavailable accounts");
-      expect(layout).not.toContain("Banned accounts");
+      expect(layout).not.toContain("Temporarily suspended accounts");
       expect(layout).not.toContain("No accounts registered");
       expect(layout).toContain("auth-dead@example.com");
       expect(layout).toContain("Kiro Free");
@@ -266,7 +270,7 @@ describe("excluded account grouping", () => {
       expect(layout).toContain(">3<");
       expect(layout).toContain("Previous reading");
       expect(layout).not.toContain("last check failed");
-      expect(layout).toContain("re-login required");
+      expect(layout).toContain('aria-haspopup="dialog"');
       expect(layout).not.toContain("contact support");
     }
     expect(cards).toContain("Delete");
@@ -283,9 +287,9 @@ describe("excluded account grouping", () => {
     );
     const [cards, table] = html.split("<table");
     for (const layout of [cards, table]) {
-      expect(layout).toContain("Banned accounts");
+      expect(layout).toContain("Temporarily suspended accounts");
       expect(layout).not.toContain("Paused accounts");
-      expect(layout).not.toContain("Auth-dead accounts");
+      expect(layout).not.toContain("Authentication failures");
       expect(layout).not.toContain("No accounts registered");
       expect(layout).toContain("last known details are kept");
       expect(layout).toContain("banned@example.com");
@@ -293,7 +297,7 @@ describe("excluded account grouping", () => {
       expect(layout).toContain("37.00%");
       expect(layout).toContain(">73<");
       expect(layout).toContain(">5<");
-      expect(layout).toContain("contact support");
+      expect(layout).toContain('aria-haspopup="dialog"');
     }
     expect(cards).toContain(">Pause<");
     expect(cards).toContain("Delete");
@@ -305,8 +309,53 @@ describe("excluded account grouping", () => {
       <AccountsPanel accounts={[paused, ...otherStates]} isLoading={false} />,
     );
     expect(html).toContain("Paused accounts");
-    expect(html).not.toContain("Auth-dead accounts");
-    expect(html).not.toContain("Banned accounts");
+    expect(html).not.toContain("Authentication failures");
+    expect(html).not.toContain("Temporarily suspended accounts");
+  });
+
+  it.each([null, "https://hub.example/dashboard/#accounts"])("keeps AWS issues separate and links only a configured Token Hub dashboard (%s)", (dashboardUrl) => {
+    const issue: Account = {
+      ...authDead,
+      id: "confirmed_aws",
+      routingState: "account_issue",
+      awsLoginIssueAt: 1791200000,
+      awsLoginDiagnostic: { result: "ERR-837", checkedAt: 1791200000 },
+    };
+    const inconclusiveAuth: Account = {
+      ...authDead,
+      id: "inconclusive_auth",
+      awsLoginDiagnostic: { result: "inconclusive", checkedAt: 1791203600 },
+    };
+    const groups = groupAccounts([issue, banned, inconclusiveAuth]);
+    expect(groups.accountIssueAccounts).toEqual([issue]);
+    expect(groups.authDeadAccounts).toEqual([inconclusiveAuth]);
+    expect(groups.bannedAccounts).toEqual([banned]);
+    const html = renderToString(<AccountsPanel accounts={[issue, banned, inconclusiveAuth]} tokenHubDashboardUrl={dashboardUrl} isLoading={false} />);
+    for (const layout of html.split("<table")) {
+      expect(layout).toContain("AWS account issues");
+      expect(layout).toContain("ERR-837 observed by automatic check");
+      expect(layout).toContain("Token Hub");
+      expect(layout).toContain('viewBox="0 0 64 64"');
+      if (dashboardUrl) {
+        expect(layout).toContain('href="https://hub.example/dashboard/#accounts"');
+        expect(layout).toContain('target="_blank"');
+        expect(layout).toContain('rel="noopener noreferrer"');
+        expect(layout).toContain('aria-label="Open Token Hub dashboard (new tab)"');
+      } else {
+        expect(layout).not.toContain('href="');
+        expect(layout).toContain("Token Hub dashboard URL is not configured");
+      }
+      expect(layout).toContain('aria-expanded="false"');
+      expect(layout).not.toContain("permanent ban");
+    }
+  });
+
+  it("defines automated diagnostic copy without manual status controls", () => {
+    const messages = accountMessages["en-US"] as Record<string, string>;
+    expect(messages["accounts.diagnostic.password_required"]).toContain("does not prove the account is healthy");
+    expect(messages["accounts.diagnostic.inconclusive"]).toContain("existing classification is unchanged");
+    expect(messages["accounts.lastConfirmedAt"]).not.toBe(messages["accounts.lastCheckedAt"]);
+    expect(Object.keys(messages).some((key) => key.includes("recordLoginIssue") || key.includes("confirmLoginIssue"))).toBe(false);
   });
 });
 
@@ -372,16 +421,16 @@ describe("RoutingStateCell", () => {
 
   it("labels a rejected credential rather than reporting it as ready", () => {
     const html = renderToString(<AccountsPanel accounts={[authDeadAccount]} isLoading={false} />);
-    expect(html).toContain("AUTH DEAD");
+    expect(html).toContain("Authentication failed");
     expect(html).not.toContain(">ready<");
   });
 
-  it("names the remedy, because this exclusion is the operator's to fix", () => {
-    // A suspension needs Kiro support; a dead credential needs a re-login. The
-    // row has to say which, or an operator files the wrong ticket.
+  it("keeps detailed remedies out of the closed row and exposes a keyboard-accessible trigger", () => {
     const html = renderToString(<AccountsPanel accounts={[authDeadAccount]} isLoading={false} />);
-    expect(html).toContain("re-login required");
+    expect(html).toContain('aria-label="Authentication failed · details for acc_authdead01"');
+    expect(html).toContain('aria-expanded="false"');
     expect(html).not.toContain("contact support");
+    expect(html).not.toContain("ERR-837");
   });
 });
 

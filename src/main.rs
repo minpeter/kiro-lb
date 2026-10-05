@@ -205,6 +205,10 @@ fn router(state: app::Shared) -> Router {
             post(d::internal_register_account),
         )
         .route("/_internal/accounts/quota", get(d::internal_account_quota))
+        .route(
+            "/_internal/accounts/login-diagnostics",
+            get(d::internal_login_diagnostics).post(d::internal_report_login_diagnostic),
+        )
         .fallback(|method: Method, uri: Uri| async move {
             if method == Method::GET || method == Method::HEAD {
                 static_file(uri).await

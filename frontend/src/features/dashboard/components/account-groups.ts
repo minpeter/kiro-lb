@@ -6,10 +6,13 @@ export function groupAccounts(accounts: readonly Account[]) {
   const pausedAccounts: Account[] = [];
   const authDeadAccounts: Account[] = [];
   const bannedAccounts: Account[] = [];
+  const accountIssueAccounts: Account[] = [];
 
   for (const account of accounts) {
     if (account.enabled === false || account.routingState === "disabled") {
       pausedAccounts.push(account);
+    } else if (account.routingState === "account_issue") {
+      accountIssueAccounts.push(account);
     } else if (account.routingState === "auth_dead") {
       authDeadAccounts.push(account);
     } else if (account.routingState === "suspended") {
@@ -27,6 +30,7 @@ export function groupAccounts(accounts: readonly Account[]) {
     pausedAccounts,
     authDeadAccounts,
     bannedAccounts,
-    displayedAccounts: [...activeAccounts, ...unavailableAccounts, ...pausedAccounts, ...authDeadAccounts, ...bannedAccounts],
+    accountIssueAccounts,
+    displayedAccounts: [...activeAccounts, ...unavailableAccounts, ...pausedAccounts, ...authDeadAccounts, ...bannedAccounts, ...accountIssueAccounts],
   };
 }

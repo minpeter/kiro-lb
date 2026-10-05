@@ -293,6 +293,7 @@ export default function App() {
           <TabsContent value="accounts" className="space-y-6">
             <AccountsPanel
               accounts={dashboard.accounts}
+              tokenHubDashboardUrl={dashboard.overview?.tokenHubDashboardUrl}
               isLoading={isLoading}
               isMutating={isMutating}
               onDeleteAccount={(id) => void runAction(() => dashboardApi.deleteAccount(id))}
