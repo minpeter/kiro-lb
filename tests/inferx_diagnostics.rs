@@ -20,6 +20,7 @@ use tower::ServiceExt;
 struct Mock {
     usage: Mutex<(StatusCode, String)>,
     refresh: Mutex<(StatusCode, String)>,
+    generation: Mutex<String>,
     calls: AtomicUsize,
     refresh_calls: AtomicUsize,
     blocked: AtomicBool,
@@ -47,6 +48,10 @@ async fn refresh(State(mock): State<Arc<Mock>>) -> (StatusCode, String) {
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
     mock.refresh.lock().unwrap().clone()
+}
+
+async fn generate(State(mock): State<Arc<Mock>>) -> String {
+    mock.generation.lock().unwrap().clone()
 }
 
 async fn call(app: &Router, id: &str, method: &str, owner: &str) -> (StatusCode, Value) {
@@ -102,6 +107,10 @@ fn credential(id: &str) -> Option<String> {
 async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
     let dir = common::data_dir("inferx-diagnostics");
     common::seed(&[]);
+    let mut endpoints = kiro_lb::settings::endpoint_settings().as_json();
+    endpoints["rotation"] = json!(false);
+    store::save_setting("endpoints", &endpoints).unwrap();
+    kiro_lb::settings::load_endpoint_settings();
     // Exercise additive migration against a pre-diagnostics database, twice.
     store::with(|c| c.execute_batch("ALTER TABLE inferx_connections DROP COLUMN diagnostics_json; ALTER TABLE inferx_connections DROP COLUMN next_recheck_at;")).unwrap();
     store::initialize().unwrap();
@@ -115,6 +124,7 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
             "accessToken":"private-upstream-token", "profileArn":"private-profile-arn"
         }).to_string())),
         refresh: Mutex::new((StatusCode::OK, json!({"accessToken":"fixture-rotated-access","refreshToken":"fixture-rotated-refresh","expiresIn":3600}).to_string())),
+        generation: Mutex::new(String::new()),
         calls: AtomicUsize::new(0), refresh_calls: AtomicUsize::new(0),
         blocked: AtomicBool::new(false), entered: Notify::new(), release: Notify::new(),
         slow_refresh: AtomicBool::new(false),
@@ -123,9 +133,11 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
     let base = format!("http://{}/", listener.local_addr().unwrap());
     std::env::set_var("KIRO_TEST_MANAGEMENT_URL", &base);
     std::env::set_var("KIRO_TEST_REFRESH_URL", format!("{base}refresh"));
+    std::env::set_var("KIRO_TEST_RUNTIME_URL", format!("{base}generate"));
     let mock_app = Router::new()
         .route("/getUsageLimits", get(usage))
         .route("/refresh", post(refresh))
+        .route("/generate", post(generate))
         .with_state(mock.clone());
     let server = tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
     // Any accidental non-mock request fails locally instead of reaching Kiro.
@@ -191,7 +203,65 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
         )
     })
     .unwrap();
-    assert!((59_000..=60_000).contains(&(cooldown - d["checkedAt"].as_i64().unwrap())));
+    assert_eq!(cooldown - d["checkedAt"].as_i64().unwrap(), 60_000);
+
+    // Native HTTP-200 rejection frames must update persisted health in both
+    // response modes. Similar reason strings and ordinary output cannot do so.
+    for streaming in [false, true] {
+        for (upstream, health, status) in [
+            (
+                r#"{"reason":"TEMPORARILY_SUSPENDED","message":"private-native-detail"}"#,
+                "temporarily_suspended",
+                "failed",
+            ),
+            (
+                r#"{"reason":"OTHER_TEMPORARILY_SUSPENDED","message":"private-native-detail"}"#,
+                "healthy",
+                "failed",
+            ),
+            (
+                r#"{"content":"TEMPORARILY_SUSPENDED"}{"usage":1}{"stopReason":"end_turn"}"#,
+                "healthy",
+                "succeeded",
+            ),
+        ] {
+            store::with(|c| {
+                c.execute(
+                    "UPDATE inferx_connections SET diagnostics_json=?2 WHERE id=?1",
+                    rusqlite::params![id, d.to_string()],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+            *mock.generation.lock().unwrap() = upstream.into();
+            let response = app.clone().oneshot(Request::builder()
+                .method("POST").uri(format!("/requests/{}", uuid::Uuid::new_v4()))
+                .header("authorization", "Bearer fixture-control")
+                .body(Body::from(json!({"connectionId":id,"ownerId":"alice","request":{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":streaming}}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+            let body = std::str::from_utf8(&bytes).unwrap();
+            let receipt: Value = if streaming {
+                serde_json::from_str(
+                    body.split("event: inferx.receipt\ndata: ")
+                        .nth(1)
+                        .unwrap()
+                        .trim(),
+                )
+                .unwrap()
+            } else {
+                serde_json::from_str(body).unwrap()
+            };
+            assert_eq!(receipt["status"], status);
+            assert!(!body.contains("private-native-detail"));
+            let view = call(&app, &id, "GET", "alice").await.1;
+            assert_eq!(view["status"], "registered");
+            assert_eq!(view["diagnostics"]["health"], health);
+            assert_eq!(view["diagnostics"]["usage"], d["usage"]);
+            assert!(!view.to_string().contains("private-"));
+        }
+    }
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
 
     // All transient/unclassified failures keep the exact successful usage,
     // including its old timestamp, while the health becomes unknown.
@@ -338,6 +408,21 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
         timeout["diagnostics"]["usage"],
         missing["diagnostics"]["usage"]
     );
+    let cooldown: i64 = store::with(|c| {
+        c.query_row(
+            "SELECT next_recheck_at FROM inferx_connections WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        cooldown - timeout["diagnostics"]["checkedAt"].as_i64().unwrap(),
+        60_000
+    );
+    let calls = mock.calls.load(Ordering::SeqCst);
+    assert_eq!(call(&app, &id, "POST", "alice").await.1, timeout);
+    assert_eq!(mock.calls.load(Ordering::SeqCst), calls);
     tokio::time::timeout(Duration::from_secs(5), mock.entered.notified())
         .await
         .unwrap();
@@ -376,6 +461,7 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
     for key in [
         "KIRO_TEST_MANAGEMENT_URL",
         "KIRO_TEST_REFRESH_URL",
+        "KIRO_TEST_RUNTIME_URL",
         "INFERX_CONTROL_TOKEN",
     ] {
         std::env::remove_var(key);

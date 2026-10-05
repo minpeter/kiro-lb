@@ -180,6 +180,19 @@ fn management_health(error: &ManagementError) -> Health {
     }
 }
 
+fn stream_health(error: stream_core::StreamError) -> Health {
+    // The parser retains native pre-output rejection reasons in this exact
+    // form. Do not classify transport errors or generated content by substring.
+    match error {
+        stream_core::StreamError::Upstream(message)
+            if message.strip_prefix("Kiro reported ") == Some(crate::errors::SUSPENSION_REASON) =>
+        {
+            Health::TemporarilySuspended
+        }
+        _ => Health::Unknown,
+    }
+}
+
 fn error(status: u16, code: &str, message: &str) -> Response {
     json_response(status, json!({"code": code, "message": message}))
 }
@@ -393,8 +406,8 @@ pub async fn recheck_connection(
         let owner = p.owner_id;
         match store::run(move |c| {
             c.execute(
-                "UPDATE inferx_connections SET diagnostics_json=?3,credential_json=COALESCE(?4,credential_json),updated_at=?5 WHERE id=?1 AND owner_id=?2 AND status='registered'",
-                rusqlite::params![id, owner, serde_json::to_string(&diagnostics).unwrap(), rotated, now_ms()],
+                "UPDATE inferx_connections SET diagnostics_json=?3,credential_json=COALESCE(?4,credential_json),updated_at=?5,next_recheck_at=?6 WHERE id=?1 AND owner_id=?2 AND status='registered'",
+                rusqlite::params![id, owner, serde_json::to_string(&diagnostics).unwrap(), rotated, now_ms(), diagnostics.checked_at + RECHECK_COOLDOWN_MS],
             )?;
             read_row(c, &id)
         }).await {
@@ -1090,9 +1103,7 @@ async fn execute_inference(
         search_followup: None,
     };
     let (completion, output, delivery_complete) =
-        respond(bytes, stream_ctx, &prepared, guard, max_tokens, stream_tx)
-            .await
-            .map_err(|_| Health::Unknown)?;
+        respond(bytes, stream_ctx, &prepared, guard, max_tokens, stream_tx).await?;
     let usage = ctx.usage.lock().clone();
     Ok((
         completion,
@@ -1118,7 +1129,7 @@ async fn respond(
     mut guard: crate::inferx_contract::ToolGuard,
     max_tokens: i64,
     stream_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
-) -> Result<(Value, i64, bool), ()> {
+) -> Result<(Value, i64, bool), Health> {
     let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exceeded = overflow.clone();
     let bounded = bytes.scan(0usize, move |size, item| {
@@ -1151,7 +1162,7 @@ async fn respond(
         let mut usage = None;
         let mut response_size = 0usize;
         while let Some(item) = native.next().await {
-            let chunk = item.map_err(|_| ())?;
+            let chunk = item.map_err(stream_health)?;
             if chunk == "data: [DONE]\n\n" {
                 continue;
             }
@@ -1194,7 +1205,7 @@ async fn respond(
     } else {
         let completion = stream_openai::collect(events, stream_ctx, opts, false)
             .await
-            .map_err(|_| ())?;
+            .map_err(stream_health)?;
         rejected = !guard.allow(&completion["choices"][0]["message"]["tool_calls"]);
         completion
     };
@@ -1208,9 +1219,12 @@ async fn respond(
         || !guard.satisfied()
         || output > max_tokens
         || (!streaming
-            && serde_json::to_vec(&completion).map_err(|_| ())?.len() > MAX_INFERENCE_RESPONSE)
+            && serde_json::to_vec(&completion)
+                .map_err(|_| Health::Unknown)?
+                .len()
+                > MAX_INFERENCE_RESPONSE)
     {
-        return Err(());
+        return Err(Health::Unknown);
     }
     Ok((completion, output, delivery_complete))
 }
@@ -1510,7 +1524,7 @@ mod tests {
         choice: Value,
         upstream: &'static str,
         streaming: bool,
-    ) -> (Result<(Value, i64, bool), ()>, Vec<Value>, bool) {
+    ) -> (Result<(Value, i64, bool), Health>, Vec<Value>, bool) {
         let mut request = tool_choice_request(Some(choice));
         request["stream"] = json!(streaming);
         let (prepared, guard, built) = build(&request, "cid", "").unwrap();

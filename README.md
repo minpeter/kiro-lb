@@ -288,7 +288,9 @@ lifecycle status: an unhealthy account remains `registered`. Its shape is:
 the usual connection response. It refreshes credentials as needed and calls
 Kiro's usage API without generating tokens. A persisted 60-second cooldown per
 connection returns cached results for repeated requests, including after failed
-checks or process restarts. Upstream work is bounded to 30 seconds after acquiring
+checks or process restarts. The cooldown runs from check completion; an initial
+claim also prevents immediate retries if the process exits mid-check.
+Upstream work is bounded to 30 seconds after acquiring
 the connection lock; it serializes with inference and disconnect. Non-registered
 connections return their cached response without contacting Kiro. Missing and
 other-owner UUIDs return the same 404 body.
