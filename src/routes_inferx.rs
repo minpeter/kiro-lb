@@ -773,6 +773,26 @@ pub async fn fence_request(
     }
 }
 
+/// Builds the Kiro payload from a prepared copy of the request; the receipt
+/// hash keeps covering the original.
+fn build(
+    request: &Value,
+    conversation_id: &str,
+    profile_arn: &str,
+) -> Result<
+    (
+        Value,
+        crate::inferx_contract::ToolGuard,
+        crate::convert_core::KiroPayloadResult,
+    ),
+    (),
+> {
+    let (prepared, guard) = crate::inferx_contract::prepare_tool_choice(request).ok_or(())?;
+    let built =
+        convert_openai::openai_to_kiro(&prepared, conversation_id, profile_arn).map_err(|_| ())?;
+    Ok((prepared, guard, built))
+}
+
 async fn execute_inference(
     state: &Shared,
     connection: &str,
@@ -786,11 +806,9 @@ async fn execute_inference(
     let arn = auth.request_profile_arn().unwrap_or_default();
     let req = request.clone();
     let cid = utils::conversation_id();
-    let built =
-        tokio::task::spawn_blocking(move || convert_openai::openai_to_kiro(&req, &cid, &arn))
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+    let (prepared, guard, built) = tokio::task::spawn_blocking(move || build(&req, &cid, &arn))
+        .await
+        .map_err(|_| ())??;
     let input = built.input_tokens as i64;
     if input > 200_000 {
         return Err(());
@@ -817,6 +835,44 @@ async fn execute_inference(
         return Err(());
     }
     let (bytes, _permits) = response.into_stream();
+    let ctx = RequestCtx::new(None);
+    let stream_ctx = StreamCtx {
+        model: model.to_owned(),
+        models: Arc::new(crate::model_resolver::ModelInfoCache::new()),
+        auth: auth.clone(),
+        transport: state.transport.clone(),
+        input_tokens: input,
+        request: ctx.clone(),
+        search_followup: None,
+    };
+    let (completion, output, delivery_complete) =
+        respond(bytes, stream_ctx, &prepared, guard, max_tokens, stream_tx).await?;
+    let usage = ctx.usage.lock().clone();
+    Ok((
+        completion,
+        (
+            input.max(0),
+            output.max(0),
+            started.elapsed().as_millis() as i64,
+            usage.ttft_ms.map(|v| v as f64),
+            usage.generation_ms.map(|v| v as f64),
+        ),
+        delivery_complete,
+    ))
+}
+
+/// Drains one upstream response into the private InferX completion. Kiro has
+/// no native `tool_choice`, so tool calls are checked before forwarding: a
+/// disallowed call, or a `required`/named turn without a compliant call, is
+/// never delivered and fails the request after the provider stream is drained.
+async fn respond(
+    bytes: stream_core::ByteStream,
+    stream_ctx: StreamCtx,
+    request: &Value,
+    mut guard: crate::inferx_contract::ToolGuard,
+    max_tokens: i64,
+    stream_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
+) -> Result<(Value, i64, bool), ()> {
     let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exceeded = overflow.clone();
     let bounded = bytes.scan(0usize, move |size, item| {
@@ -830,17 +886,6 @@ async fn execute_inference(
         futures_util::future::ready(keep.then_some(item))
     });
     let events = stream_core::parse_kiro_stream(Box::pin(bounded), 30.0, 30.0);
-    let ctx = RequestCtx::new(None);
-    let models = Arc::new(crate::model_resolver::ModelInfoCache::new());
-    let stream_ctx = StreamCtx {
-        model: model.to_owned(),
-        models,
-        auth: auth.clone(),
-        transport: state.transport.clone(),
-        input_tokens: input,
-        request: ctx.clone(),
-        search_followup: None,
-    };
     let opts = OpenAIOptions {
         execute_web_search: false,
         include_reasoning: true,
@@ -854,6 +899,7 @@ async fn execute_inference(
     let streaming = stream_tx.is_some();
     let mut delivery_complete = true;
     let mut response_overflow = false;
+    let mut rejected = false;
     let completion = if let Some(tx) = stream_tx {
         let mut native = stream_openai::stream(events, stream_ctx, opts);
         let mut usage = None;
@@ -872,6 +918,20 @@ async fn execute_inference(
                 if value.get("usage").is_some() {
                     usage = value.get("usage").cloned();
                 }
+                // Tool calls arrive fully assembled; check them, and the
+                // terminal chunk, before either is forwarded.
+                let choice = &value["choices"][0];
+                if choice["delta"]
+                    .get("tool_calls")
+                    .is_some_and(|calls| !guard.allow(calls))
+                    || !choice["finish_reason"].is_null() && !guard.satisfied()
+                {
+                    rejected = true;
+                }
+            }
+            if rejected {
+                // Keep draining for accounting; nothing more is delivered.
+                continue;
             }
             if response_size > MAX_INFERENCE_RESPONSE {
                 response_overflow = true;
@@ -886,9 +946,11 @@ async fn execute_inference(
         }
         json!({"usage":usage.unwrap_or_else(||json!({}))})
     } else {
-        stream_openai::collect(events, stream_ctx, opts, false)
+        let completion = stream_openai::collect(events, stream_ctx, opts, false)
             .await
-            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        rejected = !guard.allow(&completion["choices"][0]["message"]["tool_calls"]);
+        completion
     };
     let output = completion
         .pointer("/usage/completion_tokens")
@@ -896,24 +958,15 @@ async fn execute_inference(
         .unwrap_or(0);
     if overflow.load(std::sync::atomic::Ordering::Relaxed)
         || response_overflow
+        || rejected
+        || !guard.satisfied()
         || output > max_tokens
         || (!streaming
             && serde_json::to_vec(&completion).map_err(|_| ())?.len() > MAX_INFERENCE_RESPONSE)
     {
         return Err(());
     }
-    let usage = ctx.usage.lock().clone();
-    Ok((
-        completion,
-        (
-            input.max(0),
-            output.max(0),
-            started.elapsed().as_millis() as i64,
-            usage.ttft_ms.map(|v| v as f64),
-            usage.generation_ms.map(|v| v as f64),
-        ),
-        delivery_complete,
-    ))
+    Ok((completion, output, delivery_complete))
 }
 
 #[cfg(test)]
@@ -1056,5 +1109,243 @@ mod tests {
         assert!(!columns
             .iter()
             .any(|name| matches!(name.as_str(), "prompt" | "completion" | "credential_json")));
+    }
+
+    fn tool_choice_request(choice: Option<Value>) -> Value {
+        let mut request = json!({"model":"claude-sonnet-4","stream":false,"max_tokens":4096,
+        "messages":[
+            {"role":"system","content":"You are terse."},
+            {"role":"user","content":"Find the forecast"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"call-prior","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"forecast\"}"}}]},
+            {"role":"tool","tool_call_id":"call-prior","content":"Prior lookup result"}
+        ],
+        "tools":[
+            {"type":"function","function":{"name":"lookup","description":"Search notes","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}},
+            {"type":"function","function":{"name":"weather","description":"Weather by city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}
+        ]});
+        if let Some(choice) = choice {
+            request["tool_choice"] = choice;
+        }
+        assert!(crate::inferx_contract::valid(&request), "{request}");
+        request
+    }
+
+    fn named(name: &str) -> Value {
+        json!({"type":"function","function":{"name":name}})
+    }
+
+    #[test]
+    fn tool_choice_prepares_only_the_execution_copy_of_the_kiro_payload() {
+        let current = "/conversationState/currentMessage/userInputMessage";
+        let tools = |payload: &Value| -> Vec<Value> {
+            payload
+                .pointer(&format!("{current}/userInputMessageContext/tools"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let text = |payload: &Value| {
+            payload
+                .pointer(&format!("{current}/content"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        // auto is unchanged: same prepared request and same payload.
+        let auto = tool_choice_request(Some(json!("auto")));
+        let (prepared, _, built) = build(&auto, "cid", "").unwrap();
+        assert_eq!(prepared, auto);
+        let random = "/conversationState/agentContinuationId";
+        let mut payload = built.payload.clone();
+        let mut direct = convert_openai::openai_to_kiro(&auto, "cid", "")
+            .unwrap()
+            .payload;
+        *payload.pointer_mut(random).unwrap() = Value::Null;
+        *direct.pointer_mut(random).unwrap() = Value::Null;
+        assert_eq!(payload, direct);
+        assert!(!built.serialized.contains("Tool choice for this turn"));
+        let unset = tool_choice_request(None);
+        assert_eq!(build(&unset, "cid", "").unwrap().0, unset);
+
+        for (choice, kept, reminder) in [
+            (json!("none"), vec![], "do not call any tools"),
+            (
+                json!("required"),
+                vec!["lookup", "weather"],
+                "call at least one of the declared tools",
+            ),
+            (
+                named("weather"),
+                vec!["weather"],
+                "call the `weather` function",
+            ),
+        ] {
+            let request = tool_choice_request(Some(choice.clone()));
+            let original = request.clone();
+            let envelope = InferenceEnvelope {
+                connection_id: "11111111-1111-4111-8111-111111111111".into(),
+                owner_id: "owner".into(),
+                request: request.clone(),
+            };
+            let hash = request_hash(&envelope);
+            let (prepared, _, built) = build(&request, "cid", "").unwrap();
+            assert_eq!(request, original, "{choice}: original request mutated");
+            assert_eq!(request_hash(&envelope), hash);
+            let payload = &built.payload;
+            let names: Vec<String> = tools(payload)
+                .iter()
+                .map(|t| t["toolSpecification"]["name"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(names, kept, "{choice}");
+            // The instruction is a current-turn reminder after the tool result,
+            // not part of the client's system prompt.
+            let turn = text(payload);
+            assert!(turn.contains("<system-reminder>"), "{choice}: {turn}");
+            assert!(turn.contains(reminder), "{choice}: {turn}");
+            let history = payload["conversationState"]["history"].to_string();
+            assert!(history.contains("You are terse."));
+            assert!(!history.contains("Tool choice for this turn"), "{choice}");
+            // Prior tool history survives: as tool uses/results with tools, as
+            // text when `none` removes every definition.
+            assert!(built.serialized.contains("Prior lookup result"), "{choice}");
+            assert!(history.contains("forecast"), "{choice}");
+            if kept.is_empty() {
+                assert!(prepared.get("tools").is_none());
+                assert!(payload
+                    .pointer(&format!("{current}/userInputMessageContext/toolResults"))
+                    .is_none());
+            } else {
+                assert!(history.contains("call-prior"), "{choice}");
+            }
+        }
+        // The named tool keeps its own definition, not its neighbour's.
+        let (_, _, built) = build(&tool_choice_request(Some(named("weather"))), "cid", "").unwrap();
+        let spec = &tools(&built.payload)[0]["toolSpecification"];
+        assert_eq!(spec["description"], "Weather by city");
+        assert_eq!(
+            spec["inputSchema"]["json"]["properties"],
+            json!({"city":{"type":"string"}})
+        );
+        let (_, _, built) = build(&tool_choice_request(Some(named("lookup"))), "cid", "").unwrap();
+        let spec = &tools(&built.payload)[0]["toolSpecification"];
+        assert_eq!(spec["name"], "lookup");
+        assert_eq!(spec["description"], "Search notes");
+        // Validation still guards the private path.
+        let mut invalid = tool_choice_request(None);
+        invalid["tool_choice"] = named("missing");
+        assert!(build(&invalid, "cid", "").is_err());
+    }
+
+    const TEXT: &str = r#"{"content":"plain answer"}{"usage":1}{"stopReason":"end_turn"}"#;
+    const WEATHER: &str = r#"{"name":"weather","toolUseId":"call-w","input":"{\"city\":\"Seoul\"}","stop":true}{"usage":1}{"stopReason":"tool_use"}"#;
+    const LOOKUP: &str = r#"{"name":"lookup","toolUseId":"call-l","input":"{\"q\":\"x\"}","stop":true}{"usage":1}{"stopReason":"tool_use"}"#;
+    const UNDECLARED: &str = r#"{"name":"gamma","toolUseId":"call-g","input":"{}","stop":true}{"usage":1}{"stopReason":"tool_use"}"#;
+
+    /// Runs the private adapter's response path over a synthetic Kiro body.
+    async fn run(
+        choice: Value,
+        upstream: &'static str,
+        streaming: bool,
+    ) -> (Result<(Value, i64, bool), ()>, Vec<Value>, bool) {
+        let mut request = tool_choice_request(Some(choice));
+        request["stream"] = json!(streaming);
+        let (prepared, guard, built) = build(&request, "cid", "").unwrap();
+        let credential = json!({"accessToken":"fixture-access","refreshToken":"fixture-refresh","expiresAt":"2999-01-01T00:00:00Z","region":"us-east-1"});
+        let http = reqwest::Client::new();
+        let ctx = RequestCtx::new(None);
+        let stream_ctx = StreamCtx {
+            model: "claude-sonnet-4".into(),
+            models: Arc::new(crate::model_resolver::ModelInfoCache::new()),
+            auth: Arc::new(
+                KiroAuth::from_device_credentials("fixture", &credential, http.clone()).unwrap(),
+            ),
+            transport: Arc::new(crate::upstream::http::Transport { shared: http }),
+            input_tokens: built.input_tokens as i64,
+            request: ctx.clone(),
+            search_followup: None,
+        };
+        let body: stream_core::ByteStream = Box::pin(futures_util::stream::iter([Ok(
+            Bytes::from_static(upstream.as_bytes()),
+        )]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let result = respond(
+            body,
+            stream_ctx,
+            &prepared,
+            guard,
+            4096,
+            streaming.then_some(tx),
+        )
+        .await;
+        let mut frames = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            let chunk = std::str::from_utf8(&chunk).unwrap().to_owned();
+            assert_ne!(chunk, "data: [DONE]\n\n");
+            frames
+                .push(serde_json::from_str(chunk.strip_prefix("data: ").unwrap().trim()).unwrap());
+        }
+        // Usage is recorded only after the provider stream has been drained.
+        let drained = ctx.usage.lock().output_tokens.is_some();
+        (result, frames, drained)
+    }
+
+    fn streamed_calls(frames: &[Value]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| f.pointer("/choices/0/delta/tool_calls"))
+            .flat_map(|calls| calls.as_array().unwrap().iter())
+            .map(|call| call["function"]["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn terminal(frames: &[Value]) -> bool {
+        frames
+            .iter()
+            .any(|f| !f["choices"][0]["finish_reason"].is_null())
+    }
+
+    #[tokio::test]
+    async fn tool_choice_output_is_checked_before_forwarding() {
+        for (choice, upstream, accepted) in [
+            (json!("auto"), TEXT, None),
+            (json!("auto"), LOOKUP, Some("lookup")),
+            (json!("auto"), UNDECLARED, Some("gamma")),
+            (json!("none"), TEXT, None),
+            (json!("required"), WEATHER, Some("weather")),
+            (json!("required"), LOOKUP, Some("lookup")),
+            (named("weather"), WEATHER, Some("weather")),
+        ] {
+            let (result, _, drained) = run(choice.clone(), upstream, false).await;
+            let (completion, output, _) = result.expect("collected output accepted");
+            assert!(drained && output > 0);
+            let calls = &completion["choices"][0]["message"]["tool_calls"];
+            assert_eq!(calls[0]["function"]["name"].as_str(), accepted, "{choice}");
+            let (result, frames, drained) = run(choice.clone(), upstream, true).await;
+            assert!(result.is_ok() && drained, "{choice} streamed");
+            assert_eq!(
+                streamed_calls(&frames),
+                accepted.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            );
+            assert!(terminal(&frames), "{choice} streamed terminal");
+        }
+        for (choice, upstream) in [
+            (json!("none"), WEATHER),
+            (json!("required"), TEXT),
+            (json!("required"), UNDECLARED),
+            (named("weather"), LOOKUP),
+            (named("weather"), TEXT),
+            (named("weather"), UNDECLARED),
+        ] {
+            let (result, _, drained) = run(choice.clone(), upstream, false).await;
+            assert!(result.is_err(), "{choice} {upstream} collected");
+            assert!(drained);
+            let (result, frames, drained) = run(choice.clone(), upstream, true).await;
+            assert!(result.is_err(), "{choice} {upstream} streamed");
+            assert!(drained, "{choice}: provider stream drained");
+            // Neither the disallowed calls nor a terminal success frame leave.
+            assert!(streamed_calls(&frames).is_empty(), "{choice}: {frames:?}");
+            assert!(!terminal(&frames), "{choice}: {frames:?}");
+            assert!(frames.iter().all(|f| f.get("usage").is_none()));
+        }
     }
 }
