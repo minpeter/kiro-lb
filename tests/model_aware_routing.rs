@@ -13,6 +13,9 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
+// Bootstrap metadata alone must not make an account eligible for this model.
+const MODEL: &str = "gpt-5.6-luna";
+
 fn profile_arn(id: &str) -> String {
     format!("arn:aws:codewhisperer:us-east-1:123456789012:profile/{id}")
 }
@@ -125,19 +128,19 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     let refresh_account = refreshing.clone();
     let refresh = tokio::spawn(async move {
         refresh_pool
-            .refresh_models_with(&refresh_account, |_| async move {
+            .force_refresh_models_with(&refresh_account, |_| async move {
                 let _ = started_tx.send(());
                 let _ = finish_rx.await;
-                Some(vec![json!({"modelId": "target-model"})])
+                Some(vec![json!({"modelId": MODEL})])
             })
             .await;
     });
     started_rx.await.unwrap();
-    refreshing.models.record_unsupported("target-model");
+    refreshing.models.record_unsupported(MODEL);
     finish_tx.send(()).unwrap();
     refresh.await.unwrap();
     assert_eq!(
-        refreshing.models.support("target-model"),
+        refreshing.models.support(MODEL),
         kiro_lb::model_resolver::ModelSupport::Unsupported,
         "a completed refresh must preserve newer request outcome evidence"
     );
@@ -147,13 +150,13 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         .models
         .update(vec![json!({"modelId": "other-model"})]);
     pool.get("known-a").unwrap().models.update(vec![
-        json!({"modelId": "target-model"}),
+        json!({"modelId": MODEL}),
         json!({"modelId": "other-model"}),
     ]);
     pool.get("known-b")
         .unwrap()
         .models
-        .update(vec![json!({"modelId": "target-model"})]);
+        .update(vec![json!({"modelId": MODEL})]);
     pool.get("unknown").unwrap().models.seed_fallback();
 
     hang_refresh.store(true, Ordering::SeqCst);
@@ -173,7 +176,7 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     for _ in 0..8 {
         let selected = tokio::time::timeout(
             Duration::from_millis(100),
-            pool.next_account("target-model", &excluded(&["known-b"]), None),
+            pool.next_account(MODEL, &excluded(&["known-b"]), None),
         )
         .await
         .expect("background recovery must not block routing")
@@ -188,7 +191,7 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     tokio::time::sleep(kiro_lb::pool::WARM_UP_RETRY_AFTER + Duration::from_millis(50)).await;
     let selected = tokio::time::timeout(
         Duration::from_millis(100),
-        pool.next_account("target-model", &excluded(&["known-b"]), None),
+        pool.next_account(MODEL, &excluded(&["known-b"]), None),
     )
     .await
     .expect("a due recovery must stay off the request path")
@@ -203,9 +206,26 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
         pool.get("recovering").unwrap().auth().is_some(),
         "an uninitialized account must recover while a proven account keeps serving"
     );
+    assert!(
+        pool.next_account(
+            MODEL,
+            &excluded(&["unsupported", "known-a", "known-b", "unknown", "builder"]),
+            None,
+        )
+        .await
+        .is_none(),
+        "recovered auth without a real catalog is not eligible"
+    );
+    let recovering = pool.get("recovering").unwrap();
+    assert!(
+        pool.force_refresh_models_with(&recovering, |_| async {
+            Some(vec![json!({"modelId": MODEL})])
+        })
+        .await
+    );
     let recovered = pool
         .next_account(
-            "target-model",
+            MODEL,
             &excluded(&["unsupported", "known-a", "known-b", "unknown", "builder"]),
             None,
         )
@@ -214,35 +234,42 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     assert_eq!(recovered.id, "recovering");
     pool.get("recovering").unwrap().state.lock().suspended_until = f64::MAX;
 
-    let fallback_cached_at =
-        kiro_lb::store::now_f64() - kiro_lb::config::MODEL_CACHE_TTL as f64 - 1.0;
-    pool.get("unknown").unwrap().state.lock().models_cached_at = fallback_cached_at;
+    let unknown = pool.get("unknown").unwrap();
+    assert_eq!(unknown.state.lock().models_cached_at, 0.0);
+    let expired_retry_at = kiro_lb::store::now_f64() - 1.0;
+    unknown.state.lock().models_retry_at = expired_retry_at;
     let selected = tokio::time::timeout(
         Duration::from_secs(1),
-        pool.next_account("target-model", &excluded(&["known-b"]), None),
+        pool.next_account(MODEL, &excluded(&["known-b"]), None),
     )
     .await
     .expect("fallback refresh must not block selection")
     .unwrap();
     assert_eq!(selected.id, "known-a");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    while pool.get("unknown").unwrap().state.lock().models_cached_at <= fallback_cached_at
+    while unknown.state.lock().models_retry_at <= expired_retry_at
         && tokio::time::Instant::now() < deadline
     {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
-        pool.get("unknown").unwrap().state.lock().models_cached_at > fallback_cached_at,
-        "an unknown fallback must refresh even while a supported account serves the request"
+        unknown.state.lock().models_retry_at > kiro_lb::store::now_f64(),
+        "a failed background retry must set the next retry deadline"
     );
+    assert_eq!(unknown.state.lock().models_cached_at, 0.0);
 
     let authoritative_cached_at =
         kiro_lb::store::now_f64() - kiro_lb::config::get().account_cache_ttl as f64 - 1.0;
-    pool.get("known-b").unwrap().state.lock().models_cached_at = authoritative_cached_at;
+    {
+        let known_b = pool.get("known-b").unwrap();
+        let mut state = known_b.state.lock();
+        state.models_cached_at = authoritative_cached_at;
+        state.models_retry_at = 0.0;
+    }
     hang_refresh.store(true, Ordering::SeqCst);
     let selected = tokio::time::timeout(
         Duration::from_millis(100),
-        pool.next_account("target-model", &excluded(&["known-b"]), None),
+        pool.next_account(MODEL, &excluded(&["known-b"]), None),
     )
     .await
     .expect("an authoritative refresh must not block selection")
@@ -259,34 +286,47 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     hang_refresh.store(false, Ordering::SeqCst);
 
     let selected = pool
-        .next_account("target-model", &excluded(&["known-b"]), None)
+        .next_account(MODEL, &excluded(&["known-b"]), None)
         .await
         .unwrap();
     assert_eq!(selected.id, "known-a", "known support must beat fallbacks");
 
     let selected = pool
-        .next_account("target-model", &excluded(&["known-a", "known-b"]), None)
-        .await
-        .unwrap();
-    assert_eq!(selected.id, "unknown", "unknown evidence remains eligible");
+        .next_account(MODEL, &excluded(&["known-a", "known-b"]), None)
+        .await;
+    assert!(
+        selected.is_none(),
+        "unknown support must not permit generation"
+    );
 
     let selected = pool
-        .next_account(
-            "target-model",
-            &excluded(&["known-a", "known-b", "unknown"]),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        selected.id, "unsupported",
-        "negative evidence is a preference, not an exclusion"
+        .next_account(MODEL, &excluded(&["known-a", "known-b", "unknown"]), None)
+        .await;
+    assert!(
+        selected.is_none(),
+        "unsupported accounts must not be used as a last resort"
     );
 
     let session = Some(41);
     pool.pin_session(session, "unknown");
     let selected = pool
-        .next_account("target-model", &HashSet::new(), session)
+        .next_account(MODEL, &HashSet::new(), session)
+        .await
+        .unwrap();
+    assert!(
+        ["known-a", "known-b"].contains(&selected.id.as_str()),
+        "an unknown session pin must yield to a supported account"
+    );
+    // Once discovery succeeds, normal affinity and failover apply to the account.
+    unknown.state.lock().models_retry_at = expired_retry_at;
+    pool.refresh_models_with(&unknown, |_| async {
+        Some(vec![json!({"modelId": MODEL})])
+    })
+    .await;
+    assert_eq!(unknown.state.lock().models_retry_at, 0.0);
+    assert!(unknown.state.lock().models_cached_at > 0.0);
+    let selected = pool
+        .next_account(MODEL, &HashSet::new(), session)
         .await
         .unwrap();
     assert_eq!(
@@ -296,25 +336,25 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
 
     pool.pin_session(session, "unsupported");
     let selected = pool
-        .next_account("target-model", &excluded(&["known-b"]), session)
+        .next_account(MODEL, &excluded(&["known-b"]), session)
         .await
         .unwrap();
-    assert_eq!(
-        selected.id, "known-a",
-        "known-negative affinity must fail over"
+    assert!(
+        ["known-a", "unknown"].contains(&selected.id.as_str()),
+        "known-negative affinity must fail over to a supported account"
     );
 
     pool.pin_session(session, "known-a");
     pool.report_failure(
         "known-a",
-        "target-model",
+        MODEL,
         ErrorType::Recoverable,
         429,
         Some("USER_REQUEST_RATE_EXCEEDED"),
         None,
     );
     let selected = pool
-        .next_account("target-model", &excluded(&["known-b"]), session)
+        .next_account(MODEL, &excluded(&["known-b"]), session)
         .await
         .unwrap();
     assert_eq!(selected.id, "unknown", "unhealthy affinity must fail over");
@@ -328,7 +368,7 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     }
     let selected = pool
         .next_account(
-            "target-model",
+            MODEL,
             &excluded(&["known-b", "unknown", "unsupported"]),
             None,
         )
@@ -352,7 +392,7 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
             "builder",
             &builder_auth,
             Bytes::from_static(b"{}"),
-            "target-model",
+            MODEL,
             true,
             false,
         )
@@ -377,7 +417,7 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     let held = concurrency_slot("known-a").await.unwrap();
     assert_eq!(account_concurrency_load("known-a"), Some((1, 1)));
     let selected = pool
-        .next_account("target-model", &excluded(&["unknown", "unsupported"]), None)
+        .next_account(MODEL, &excluded(&["unknown", "unsupported"]), None)
         .await
         .unwrap();
     assert_eq!(
@@ -386,21 +426,17 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
     );
 
     let selected = pool
-        .next_account("target-model", &excluded(&["known-b", "unsupported"]), None)
+        .next_account(MODEL, &excluded(&["known-b", "unsupported"]), None)
         .await
         .unwrap();
     assert_eq!(
         selected.id, "unknown",
-        "an idle unknown account must precede a saturated supported account"
+        "an idle supported account must precede a saturated supported account"
     );
 
     pool.pin_session(session, "known-a");
     let selected = pool
-        .next_account(
-            "target-model",
-            &excluded(&["unknown", "unsupported"]),
-            session,
-        )
+        .next_account(MODEL, &excluded(&["unknown", "unsupported"]), session)
         .await
         .unwrap();
     assert_eq!(
@@ -421,14 +457,14 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
 
     pool.report_failure(
         "known-a",
-        "target-model",
+        MODEL,
         ErrorType::Recoverable,
         400,
         Some("INVALID_MODEL_ID"),
         None,
     );
     assert_eq!(
-        pool.get("known-a").unwrap().models.support("target-model"),
+        pool.get("known-a").unwrap().models.support(MODEL),
         kiro_lb::model_resolver::ModelSupport::Unsupported
     );
     assert_eq!(
@@ -439,18 +475,14 @@ async fn selection_preserves_affinity_and_uses_capability_health_quota_and_capac
 
     let replaced = pool.get("known-b").unwrap();
     pool.remove_account("known-b");
-    replaced
-        .models
-        .update(vec![json!({"modelId": "target-model"})]);
+    replaced.models.update(vec![json!({"modelId": MODEL})]);
     pool.load_credentials();
     let replacement = pool.get("known-b").unwrap();
     assert!(pool.initialize_account("known-b").await);
-    replacement
-        .models
-        .update(vec![json!({"modelId": "target-model"})]);
+    replacement.models.update(vec![json!({"modelId": MODEL})]);
     let selected = pool
         .next_account(
-            "target-model",
+            MODEL,
             &excluded(&["known-a", "unknown", "unsupported"]),
             None,
         )

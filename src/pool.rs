@@ -52,6 +52,8 @@ pub struct AccountState {
     pub suspended_until: f64,
     pub auth_dead_until: f64,
     pub models_cached_at: f64,
+    /// Transient retry deadline, separate from the last successful catalog read.
+    pub models_retry_at: f64,
     pub quota_headroom: Option<f64>,
     pub quota_observed_at: f64,
     pub quota_resets_at: f64,
@@ -149,6 +151,15 @@ pub struct Account {
 impl Account {
     pub fn auth(&self) -> Option<Arc<KiroAuth>> {
         self.auth.lock().clone()
+    }
+
+    fn models_refresh_due(&self, now: f64) -> bool {
+        let state = self.state.lock();
+        if state.models_retry_at > 0.0 {
+            return now >= state.models_retry_at;
+        }
+        state.models_cached_at <= 0.0
+            || now - state.models_cached_at > config::get().account_cache_ttl as f64
     }
 }
 
@@ -252,6 +263,7 @@ struct PoolInner {
 
 /// Per-account bound for one warm-up initialization.
 pub const WARM_UP_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+pub const MODEL_REFRESH_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 pub struct AccountManager {
     inner: Mutex<PoolInner>,
@@ -296,14 +308,16 @@ impl AccountManager {
         })
     }
 
-    /// True when at least one account has initialized auth and a model list,
+    /// True when at least one account has initialized auth and a real model list,
     /// which is what model discovery and handoff readiness need.
     pub fn catalog_ready(&self) -> bool {
-        self.accounts().iter().any(|a| a.auth.lock().is_some())
+        self.accounts()
+            .iter()
+            .any(|a| a.auth.lock().is_some() && a.models.is_authoritative())
     }
 
-    /// Initializes every uninitialized account concurrently, each bounded by
-    /// `per_account`, so a dead or slow account never holds up a healthy one.
+    /// Initializes accounts and retries missing catalogs concurrently, each bounded
+    /// by `per_account`, so a dead or slow account never holds up a healthy one.
     /// Single-flight: a caller that arrives while a warm-up runs waits for it
     /// instead of starting another. Only the runtime writer may call this; it
     /// can refresh credentials through the lease.
@@ -312,13 +326,17 @@ impl AccountManager {
         let pending: Vec<Arc<Account>> = self
             .accounts()
             .into_iter()
-            .filter(|a| a.auth.lock().is_none())
+            .filter(|a| a.auth.lock().is_none() || !a.models.is_authoritative())
             .collect();
         let tasks: Vec<_> = pending
             .into_iter()
             .map(|a| {
                 let pool = self.clone();
                 tokio::spawn(async move {
+                    if a.auth().is_some() {
+                        let _ = tokio::time::timeout(per_account, pool.refresh_models(&a)).await;
+                        return;
+                    }
                     if a.init_scheduled.load(std::sync::atomic::Ordering::Acquire) {
                         let _ = tokio::time::timeout(per_account, async {
                             loop {
@@ -353,6 +371,7 @@ impl AccountManager {
     /// discovery right after activation does not return an empty list.
     pub async fn ensure_catalog(self: &Arc<Self>, limit: std::time::Duration) -> bool {
         if self.catalog_ready() || self.accounts().is_empty() {
+            self.schedule_account_maintenance();
             return true;
         }
         let recently_failed = self
@@ -874,7 +893,17 @@ impl AccountManager {
             return false;
         }
         *a.auth.lock() = Some(auth);
-        a.state.lock().models_cached_at = store::now_f64();
+        {
+            let now = store::now_f64();
+            let mut state = a.state.lock();
+            if a.models.is_authoritative() {
+                state.models_cached_at = now;
+                state.models_retry_at = 0.0;
+            } else {
+                state.models_cached_at = 0.0;
+                state.models_retry_at = now + MODEL_REFRESH_RETRY_AFTER.as_secs_f64();
+            }
+        }
         for m in &available {
             let list = inner.model_to_accounts.entry(m.clone()).or_default();
             if !list.contains(&id) {
@@ -976,14 +1005,8 @@ impl AccountManager {
         Fut: std::future::Future<Output = Option<Vec<Value>>>,
     {
         let _flight = a.models_refresh.lock().await;
-        let ttl = if a.models.is_authoritative() {
-            config::get().account_cache_ttl as f64
-        } else {
-            config::MODEL_CACHE_TTL as f64
-        };
-        let cached = a.state.lock().models_cached_at;
-        if !force && cached > 0.0 && store::now_f64() - cached <= ttl {
-            return true;
+        if !force && !a.models_refresh_due(store::now_f64()) {
+            return a.models.is_authoritative() && a.state.lock().models_retry_at == 0.0;
         }
         let Some(auth) = a.auth() else { return false };
         let refresh_revision = a.models.refresh_revision();
@@ -998,31 +1021,34 @@ impl AccountManager {
             );
             return false;
         }
-        let ok = refreshed.is_some();
-        match refreshed {
-            Some(m) => {
-                a.models.update_after_refresh(m, refresh_revision);
-                let available = model_resolver::available_models(&a.models);
-                let mut inner = self.inner.lock();
-                for m in available {
-                    let list = inner.model_to_accounts.entry(m).or_default();
-                    if !list.contains(&a.id) {
-                        list.push(a.id.clone());
-                    }
+        let Some(models) = refreshed else {
+            a.state.lock().models_retry_at =
+                store::now_f64() + MODEL_REFRESH_RETRY_AFTER.as_secs_f64();
+            tracing::warn!(
+                "[Models] Catalog read for {} failed; keeping the current catalog and retrying after {}s",
+                a.id,
+                MODEL_REFRESH_RETRY_AFTER.as_secs()
+            );
+            return false;
+        };
+        a.models.update_after_refresh(models, refresh_revision);
+        let available = model_resolver::available_models(&a.models);
+        {
+            let mut inner = self.inner.lock();
+            for m in available {
+                let list = inner.model_to_accounts.entry(m).or_default();
+                if !list.contains(&a.id) {
+                    list.push(a.id.clone());
                 }
             }
-            None if force && a.models.is_authoritative() => {
-                tracing::warn!(
-                    "[Models] Forced catalog read for {} failed; keeping the current catalog",
-                    a.id
-                );
-                return false;
-            }
-            None => a.models.seed_fallback(),
         }
-        a.state.lock().models_cached_at = store::now_f64();
+        {
+            let mut state = a.state.lock();
+            state.models_cached_at = store::now_f64();
+            state.models_retry_at = 0.0;
+        }
         self.mark_dirty();
-        ok
+        true
     }
 
     fn schedule_account_maintenance(self: &Arc<Self>) {
@@ -1064,14 +1090,7 @@ impl AccountManager {
                 }
                 continue;
             }
-            let ttl = if a.models.is_authoritative() {
-                config::get().account_cache_ttl as f64
-            } else {
-                config::MODEL_CACHE_TTL as f64
-            };
-            let cached = a.state.lock().models_cached_at;
-            if cached <= 0.0
-                || now - cached <= ttl
+            if !a.models_refresh_due(now)
                 || a.models_refresh_scheduled
                     .compare_exchange(
                         false,
@@ -1260,9 +1279,8 @@ impl AccountManager {
         let single = self.inner.lock().order.len() == 1;
         let candidates = self.candidate_order(model, session);
         let cfg = config::get();
-        let mut unsupported = None;
         for a in candidates {
-            if exclude.contains(&a.id) {
+            if exclude.contains(&a.id) || a.models.support(model) != ModelSupport::Supported {
                 continue;
             }
             let now = store::now_f64();
@@ -1295,14 +1313,10 @@ impl AccountManager {
                 .get(&a.id)
                 .is_some_and(|live| Arc::ptr_eq(live, &a));
             if still_member && a.auth.lock().is_some() {
-                if a.models.support(model) == ModelSupport::Unsupported {
-                    unsupported.get_or_insert(a);
-                } else {
-                    return Some(a);
-                }
+                return Some(a);
             }
         }
-        unsupported
+        None
     }
 
     /// Why no account can take `model` right now. Only `Temporary` is worth a
@@ -1316,8 +1330,10 @@ impl AccountManager {
         }
         let (mut serving, mut quota, mut gone, mut soonest) = (0, 0, 0, f64::MAX);
         for a in &accounts {
-            if a.models.support(model) == ModelSupport::Unsupported {
-                continue;
+            match a.models.support(model) {
+                ModelSupport::Unknown => return Unavailable::Temporary,
+                ModelSupport::Unsupported => continue,
+                ModelSupport::Supported => {}
             }
             serving += 1;
             let s = a.state.lock();
@@ -1929,6 +1945,26 @@ mod tests {
             models_refresh: tokio::sync::Mutex::new(()),
             models_refresh_scheduled: false.into(),
         })
+    }
+
+    #[test]
+    fn model_refresh_retry_deadline_overrides_the_success_cache_ttl() {
+        let a = account("a");
+        let now = 100_000.0;
+        assert!(a.models_refresh_due(now));
+        for cached_at in [0.0, 1.0, now] {
+            {
+                let mut state = a.state.lock();
+                state.models_cached_at = cached_at;
+                state.models_retry_at = now + 60.0;
+            }
+            assert!(!a.models_refresh_due(now + 59.0));
+            assert!(a.models_refresh_due(now + 60.0));
+        }
+        a.state.lock().models_retry_at = 0.0;
+        let ttl = config::get().account_cache_ttl as f64;
+        assert!(!a.models_refresh_due(now + ttl));
+        assert!(a.models_refresh_due(now + ttl + 1.0));
     }
 
     #[test]

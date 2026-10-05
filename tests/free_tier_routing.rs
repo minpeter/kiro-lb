@@ -182,6 +182,10 @@ async fn registered_free_account_serves_free_routing_models() {
         .unwrap()
         .models
         .update(vec![json!({"modelId": SONNET})]);
+    pool.get("pro-acct")
+        .unwrap()
+        .models
+        .update(vec![json!({"modelId": SONNET}), json!({"modelId": OTHER})]);
     for model in [SONNET, "claude-sonnet-4-5-20250929"] {
         for _ in 0..20 {
             let selected = pool
@@ -199,9 +203,11 @@ async fn registered_free_account_serves_free_routing_models() {
     assert_eq!(other.id, "pro-acct", "other models use the whole pool");
     let other = pool
         .next_account(OTHER, &excluded(&["pro-acct"]), None)
-        .await
-        .unwrap();
-    assert_eq!(other.id, "free-acct");
+        .await;
+    assert!(
+        other.is_none(),
+        "free accounts cannot serve an unlisted model"
+    );
 
     let fallback = pool
         .next_account(SONNET, &excluded(&["free-acct"]), None)

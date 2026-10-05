@@ -6,7 +6,7 @@ use axum::routing::get;
 use axum::Router;
 use common::*;
 use kiro_lb::app::Shared;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Once;
 use std::time::{Duration, Instant};
@@ -70,15 +70,23 @@ async fn a_dead_first_account_does_not_block_the_healthy_one() {
     let took = started.elapsed();
 
     assert!(took < Duration::from_secs(5), "{took:?}");
-    assert!(pool.catalog_ready());
+    assert!(!pool.catalog_ready());
     assert!(initialized(&pool, "h1"));
     assert!(!initialized(&pool, "d1"));
-    assert!(!pool.all_available_models().is_empty());
+    assert!(pool.all_available_models().is_empty());
     assert!(up.refresh_calls() >= 1);
+    assert!(
+        pool.force_refresh_models_with(&pool.get("h1").unwrap(), |_| async {
+            Some(vec![json!({"modelId": "target-model"})])
+        })
+        .await
+    );
+    assert!(pool.catalog_ready());
+    assert_eq!(pool.all_available_models(), ["target-model"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hanging_account_is_bounded_and_the_healthy_one_is_ready() {
+async fn a_hanging_account_is_bounded_and_the_healthy_one_initializes() {
     setup();
     let up = upstream().await;
     let pool = pool(&up.http, &["x1", "h1"]);
@@ -94,7 +102,7 @@ async fn a_hanging_account_is_bounded_and_the_healthy_one_is_ready() {
     let took = started.elapsed();
 
     assert!(took < Duration::from_secs(2), "{took:?}");
-    assert!(pool.catalog_ready());
+    assert!(!pool.catalog_ready(), "the model fetch failed");
     assert!(initialized(&pool, "h1"));
     assert!(!initialized(&pool, "x1"));
 }
@@ -118,8 +126,8 @@ async fn concurrent_ensure_catalog_initializes_each_account_once() {
         .collect();
     for t in tasks {
         let (ready, models) = t.await.unwrap();
-        assert!(ready);
-        assert!(models > 0);
+        assert!(!ready);
+        assert_eq!(models, 0);
     }
 
     assert_eq!(up.management_calls(), 2);
@@ -127,6 +135,14 @@ async fn concurrent_ensure_catalog_initializes_each_account_once() {
     assert!(initialized(&pool, "h2"));
     assert!(!initialized(&pool, "d1"));
     let h1 = pool.get("h1").unwrap().auth().unwrap();
+    assert!(!pool.ensure_catalog(Duration::from_secs(1)).await);
+    assert_eq!(up.management_calls(), 2);
+    assert!(
+        pool.force_refresh_models_with(&pool.get("h1").unwrap(), |_| async {
+            Some(vec![json!({"modelId": "target-model"})])
+        })
+        .await
+    );
     assert!(pool.ensure_catalog(Duration::from_secs(1)).await);
     assert!(std::sync::Arc::ptr_eq(
         &h1,
@@ -136,11 +152,19 @@ async fn concurrent_ensure_catalog_initializes_each_account_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_model_discovery_after_start_sees_a_catalog() {
+async fn concurrent_model_discovery_after_catalog_recovery_sees_only_real_models() {
     setup();
     let up = upstream().await;
     let pool = pool(&up.http, &["d1", "h1", "h2"]);
     let app = router(state(pool.clone(), &up.http, false));
+    let (status, _, body) = list_models(&app).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        pool.force_refresh_models_with(&pool.get("h1").unwrap(), |_| async {
+            Some(vec![json!({"modelId": "target-model"})])
+        })
+        .await
+    );
 
     let tasks: Vec<_> = (0..16)
         .map(|_| {
@@ -153,8 +177,8 @@ async fn concurrent_model_discovery_after_start_sees_a_catalog() {
         let (status, _, body) = t.await.unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
         let data = body["data"].as_array().unwrap().clone();
-        assert!(!data.is_empty(), "{body}");
         let ids: Vec<Value> = data.iter().map(|m| m["id"].clone()).collect();
+        assert_eq!(ids, [json!("target-model")]);
         match &first {
             None => first = Some(ids),
             Some(f) => assert_eq!(f, &ids),
@@ -293,7 +317,8 @@ async fn catalog_discovery_waits_for_scheduled_initialization() {
     );
     up.block_management(false);
 
-    assert!(discovery.await.unwrap());
-    assert!(pool.catalog_ready());
+    assert!(!discovery.await.unwrap(), "the joined model fetch failed");
+    assert!(initialized(&pool, "h1"));
+    assert!(!pool.catalog_ready());
     assert_eq!(up.management_calls(), 1);
 }

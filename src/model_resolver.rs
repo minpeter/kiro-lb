@@ -221,12 +221,9 @@ impl ModelInfoCache {
         if state.rejected.contains_key(&id) {
             return ModelSupport::Unsupported;
         }
-        if !state.authoritative
-            || state.models.is_empty()
-            || state
-                .refreshed_at
-                .is_none_or(|t| t.elapsed().as_secs() > config::get().account_cache_ttl as u64)
-        {
+        // Bootstrap metadata never establishes account eligibility. Keep using
+        // the last real catalog while its refresh is pending or failing.
+        if !state.authoritative {
             return ModelSupport::Unknown;
         }
         if state.models.contains_key(&id) {
@@ -319,18 +316,27 @@ pub fn resolve(cache: &ModelInfoCache, external: &str) -> ModelResolution {
 }
 
 pub fn available_models(cache: &ModelInfoCache) -> Vec<String> {
-    let mut models: BTreeSet<String> = cache.all_model_ids().into_iter().collect();
+    let mut models: BTreeSet<String> = {
+        let state = cache.inner.read();
+        state
+            .models
+            .keys()
+            .chain(state.confirmed.keys())
+            .cloned()
+            .collect()
+    };
     models.extend(HIDDEN_MODELS.iter().map(|(k, _)| (*k).to_owned()));
-    for hidden in HIDDEN_FROM_LIST {
-        models.remove(*hidden);
-    }
     models.extend(MODEL_ALIASES.iter().map(|(k, _)| (*k).to_owned()));
+    models.retain(|id| {
+        !HIDDEN_FROM_LIST.contains(&id.as_str()) && cache.support(id) == ModelSupport::Supported
+    });
     models.into_iter().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::time::Duration;
 
     #[test]
@@ -386,17 +392,36 @@ mod tests {
     }
 
     #[test]
-    fn fallback_and_stale_catalogs_are_unknown() {
+    fn fallback_is_not_evidence_but_stale_real_catalogs_remain_usable() {
         let fallback = ModelInfoCache::new();
         fallback.seed_fallback();
         assert_eq!(fallback.support("claude-sonnet-4.5"), ModelSupport::Unknown);
+        assert_eq!(fallback.support("gpt-5.6-luna"), ModelSupport::Unknown);
+        assert_eq!(fallback.support("auto-kiro"), ModelSupport::Unknown);
+        assert_eq!(fallback.support("made-up-model"), ModelSupport::Unknown);
+        assert!(available_models(&fallback).is_empty());
 
         let stale = ModelInfoCache::new();
         stale.update(vec![serde_json::json!({"modelId": "model-a"})]);
         stale.inner.write().refreshed_at =
             Some(Instant::now() - Duration::from_secs(config::get().account_cache_ttl as u64 + 1));
-        assert_eq!(stale.support("model-a"), ModelSupport::Unknown);
-        assert_eq!(stale.support("model-b"), ModelSupport::Unknown);
+        assert!(stale.is_stale());
+        assert_eq!(stale.support("model-a"), ModelSupport::Supported);
+        assert_eq!(stale.support("model-b"), ModelSupport::Unsupported);
+        assert_eq!(available_models(&stale), ["model-a"]);
+    }
+
+    #[test]
+    fn listings_follow_support_evidence_including_aliases_and_observations() {
+        let cache = ModelInfoCache::new();
+        cache.update(vec![json!({"modelId": "claude-sonnet-4.5"})]);
+        assert_eq!(available_models(&cache), ["claude-sonnet-4.5"]);
+        cache.record_supported("auto");
+        cache.record_supported("new-model");
+        cache.record_unsupported("claude-sonnet-4.5");
+        assert_eq!(available_models(&cache), ["auto-kiro", "new-model"]);
+        cache.record_unsupported("auto-kiro");
+        assert_eq!(available_models(&cache), ["new-model"]);
     }
 
     #[test]
