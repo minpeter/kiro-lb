@@ -613,6 +613,10 @@ impl KiroAuth {
         auth.refresh_url =
             config::kiro_refresh_url(c.sso_region.as_deref().unwrap_or(crate::config::REGION))
                 .map_err(|e| AuthError::Other(e.to_string()))?;
+        #[cfg(debug_assertions)]
+        if let Ok(url) = std::env::var("KIRO_TEST_REFRESH_URL") {
+            auth.refresh_url = url;
+        }
         auth.api_host =
             config::kiro_api_host(&region).map_err(|e| AuthError::Other(e.to_string()))?;
         auth.q_host =
@@ -960,6 +964,20 @@ impl KiroAuth {
     }
 
     fn dead(&self, e: AuthError) -> AuthError {
+        // Ephemeral marketplace diagnostics must distinguish a suspension from
+        // a rejected refresh token. Keep its structured reason for the caller.
+        if matches!(self.source, Source::Ephemeral(_)) {
+            if let AuthError::Http { status, body } = &e {
+                let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                if crate::errors::is_suspension_error(
+                    *status,
+                    value["message"].as_str(),
+                    value["reason"].as_str(),
+                ) {
+                    return e;
+                }
+            }
+        }
         match e {
             AuthError::Http { status, ref body } if is_credential_dead_response(status, body) => {
                 let account = self
@@ -1238,6 +1256,11 @@ impl KiroAuth {
     }
 
     fn persist(&self) -> Result<(), AuthError> {
+        // The connection owner persists ephemeral credentials under its own
+        // lock. These auth objects have no account_sources login identity.
+        if matches!(self.source, Source::Ephemeral(_)) {
+            return Ok(());
+        }
         if !self.is_current_login() {
             return Err(AuthError::Other(
                 "Refused to persist credentials for a replaced login".into(),

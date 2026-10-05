@@ -103,6 +103,10 @@ fn router(state: app::Shared) -> Router {
             post(inferx::poll_connection).layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
         .route(
+            "/internal/inferx/v1/connections/{id}/recheck",
+            post(inferx::recheck_connection).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
             "/internal/inferx/v1/requests/{id}",
             get(inferx::get_request)
                 .post(inferx::post_request)
