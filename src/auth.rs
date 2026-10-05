@@ -55,14 +55,59 @@ impl std::fmt::Display for AuthError {
             AuthError::CredentialDead { account, status } => {
                 write!(f, "Refresh token for {account} was rejected by the auth host (HTTP {status}); re-login required")
             }
-            AuthError::Http { status, .. } => write!(f, "token refresh failed with HTTP {status}"),
+            AuthError::Http { status, body } => {
+                write!(f, "token refresh failed with HTTP {status}")?;
+                if let Some(code) = refresh_error_code(body) {
+                    write!(f, " ({code})")?;
+                }
+                Ok(())
+            }
             AuthError::Other(m) => f.write_str(m),
         }
     }
 }
 
-pub fn is_credential_dead_status(status: u16) -> bool {
-    matches!(status, 400 | 401 | 403)
+/// Only expose known error codes: auth response messages can contain credentials.
+fn refresh_error_code(body: &str) -> Option<&'static str> {
+    let body: Value = serde_json::from_str(body).ok()?;
+    let code = body.get("error").or_else(|| body.get("__type"))?.as_str()?;
+    match code.rsplit('#').next()?.split(':').next()? {
+        "invalid_grant" | "InvalidGrantException" => Some("invalid_grant"),
+        "invalid_client" | "InvalidClientException" => Some("invalid_client"),
+        "expired_token" | "ExpiredTokenException" => Some("expired_token"),
+        "invalid_token" => Some("invalid_token"),
+        "access_denied" | "AccessDeniedException" => Some("access_denied"),
+        "unauthorized_client" | "UnauthorizedClientException" => Some("unauthorized_client"),
+        "slow_down" | "SlowDownException" => Some("slow_down"),
+        "temporarily_unavailable" => Some("temporarily_unavailable"),
+        "server_error" | "InternalServerException" => Some("server_error"),
+        "invalid_request" | "InvalidRequestException" => Some("invalid_request"),
+        "invalid_scope" | "InvalidScopeException" => Some("invalid_scope"),
+        "unsupported_grant_type" | "UnsupportedGrantTypeException" => {
+            Some("unsupported_grant_type")
+        }
+        "authorization_pending" | "AuthorizationPendingException" => Some("authorization_pending"),
+        _ => None,
+    }
+}
+
+fn is_credential_dead_response(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 401 | 403) {
+        return false;
+    }
+    match refresh_error_code(body) {
+        Some(
+            "invalid_grant"
+            | "invalid_client"
+            | "expired_token"
+            | "invalid_token"
+            | "access_denied"
+            | "unauthorized_client",
+        ) => true,
+        // Social auth can reject credentials without an OAuth error document.
+        None => matches!(status, 401 | 403),
+        _ => false,
+    }
 }
 
 pub const REFRESH_RETRY_SECONDS: f64 = 30.0;
@@ -75,7 +120,13 @@ fn refresh_backoff_error() -> AuthError {
 
 fn is_transient_refresh_error(e: &AuthError) -> bool {
     match e {
-        AuthError::Http { status, .. } => *status >= 500 || *status == 429,
+        AuthError::Http { status, body } => {
+            *status >= 500
+                || matches!(status, 408 | 429)
+                // OIDC throttling is HTTP 400. Unknown/configuration errors must
+                // also back off rather than condemn a login or hammer the host.
+                || (*status == 400 && !is_credential_dead_response(*status, body))
+        }
         AuthError::Other(m) => m == REFRESH_NETWORK_ERROR,
         AuthError::CredentialDead { .. } => false,
     }
@@ -863,15 +914,6 @@ impl KiroAuth {
         }
         match self.refresh_with_lease(false).await {
             Ok(()) => {}
-            Err(AuthError::Http { status: 400, .. })
-                if matches!(self.source, Source::Sqlite(_)) =>
-            {
-                if let Some(t) = self.cached_token().filter(|_| !self.expired()) {
-                    tracing::warn!("Using existing access_token until it expires. Run 'kiro-cli login' when convenient.");
-                    return Ok(t);
-                }
-                return Err(AuthError::Other("Token expired and refresh failed. Please run 'kiro-cli login' to refresh your credentials.".into()));
-            }
             Err(e) if is_transient_refresh_error(&e) => {
                 *self.refresh_retry_at.lock() = now() + REFRESH_RETRY_SECONDS;
                 if let Some(t) = self.cached_token().filter(|_| !self.expired()) {
@@ -919,11 +961,12 @@ impl KiroAuth {
 
     fn dead(&self, e: AuthError) -> AuthError {
         match e {
-            AuthError::Http { status, .. } if is_credential_dead_status(status) => {
+            AuthError::Http { status, ref body } if is_credential_dead_response(status, body) => {
                 let account = self
                     .lease_account_id()
                     .unwrap_or_else(|| "refresh_token account".into());
-                tracing::error!("Refresh token for {account} was rejected by the auth host (HTTP {status}); the credential cannot be renewed and needs a re-login.");
+                let code = refresh_error_code(body).unwrap_or("unrecognized");
+                tracing::error!("Refresh token for {account} was rejected by the auth host (HTTP {status}, {code}); the credential cannot be renewed and needs a re-login.");
                 AuthError::CredentialDead { account, status }
             }
             other => other,
@@ -959,7 +1002,9 @@ impl KiroAuth {
                     ));
                 }
                 validate_credential_regions(&self.creds.lock().clone())?;
-                if self.cached_token().is_some() && !self.expired() {
+                let renewed_elsewhere = self.cached_token() != previous;
+                if self.cached_token().is_some() && !self.expired() && (!force || renewed_elsewhere)
+                {
                     return Ok(());
                 }
                 tracing::warn!("Refresh lease for account {account} not acquired in {wait}s; not refreshing without ownership");
@@ -1012,7 +1057,10 @@ impl KiroAuth {
             AuthType::KiroDesktop => self.do_desktop_refresh().await,
         };
         match first {
-            Err(AuthError::Http { status: 400, .. }) if self.reload_raw_external() => {
+            Err(AuthError::Http {
+                status: 400,
+                ref body,
+            }) if is_credential_dead_response(400, body) && self.reload_raw_external() => {
                 tracing::warn!(
                     "Token refresh failed with 400; retrying with raw external credentials"
                 );
@@ -1027,7 +1075,7 @@ impl KiroAuth {
     }
 
     fn reload_raw_external(&self) -> bool {
-        if matches!(self.source, Source::Internal(_)) {
+        if !matches!(self.source, Source::File(_) | Source::Sqlite(_)) {
             return false;
         }
         let Some(fresh) = Self::read_source(&self.source) else {
@@ -1096,7 +1144,8 @@ impl KiroAuth {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         if status != 200 {
-            tracing::error!("Token refresh failed: status={status}");
+            let code = refresh_error_code(&text).unwrap_or("unrecognized");
+            tracing::error!("Token refresh failed: status={status}, code={code}");
             return Err(AuthError::Http { status, body: text });
         }
         serde_json::from_str(&text).map_err(|e| {
@@ -1264,6 +1313,273 @@ mod tests {
             reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let client = reqwest::Client::builder().proxy(proxy).build().unwrap();
         (client, listener)
+    }
+
+    #[test]
+    fn refresh_rejections_are_classified_by_oauth_code_not_http_400() {
+        for code in [
+            "invalid_grant",
+            "invalid_client",
+            "expired_token",
+            "invalid_token",
+            "access_denied",
+            "unauthorized_client",
+        ] {
+            let body = json!({"error": code}).to_string();
+            assert!(is_credential_dead_response(400, &body), "{code}");
+            assert!(!is_transient_refresh_error(&AuthError::Http {
+                status: 400,
+                body
+            }));
+        }
+        for body in [
+            r#"{"error":"slow_down"}"#,
+            r#"{"__type":"com.amazonaws.sso.oidc#SlowDownException"}"#,
+            r#"{"error":"temporarily_unavailable"}"#,
+            r#"{"error":"invalid_request"}"#,
+            r#"{"error":"unsupported_grant_type"}"#,
+            r#"{"error":"unknown-upstream-error"}"#,
+            "not JSON",
+        ] {
+            assert!(!is_credential_dead_response(400, body), "{body}");
+            assert!(is_transient_refresh_error(&AuthError::Http {
+                status: 400,
+                body: body.into(),
+            }));
+        }
+        assert!(is_credential_dead_response(401, ""));
+        assert!(is_credential_dead_response(403, ""));
+        assert!(is_credential_dead_response(
+            400,
+            r#"{"__type":"com.amazonaws.sso.oidc#AccessDeniedException"}"#
+        ));
+        assert!(!is_credential_dead_response(
+            503,
+            r#"{"error":"invalid_grant"}"#
+        ));
+        for body in [
+            r#"{"error":"secret-token","message":"private"}"#,
+            r#"{"error":"slow_down","error_description":"secret-token private"}"#,
+        ] {
+            let message = AuthError::Http {
+                status: 400,
+                body: body.into(),
+            }
+            .to_string();
+            assert!(!message.contains("secret-token"));
+            assert!(!message.contains("private"));
+        }
+        assert_eq!(
+            AuthError::Http {
+                status: 400,
+                body: r#"{"error":"slow_down"}"#.into()
+            }
+            .to_string(),
+            "token refresh failed with HTTP 400 (slow_down)"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_refresh_failure_preserves_only_unexpired_access_tokens() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        for (code, permanent) in [
+            ("slow_down", false),
+            ("invalid_request", false),
+            ("access_denied", true),
+        ] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"error": code})),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut auth = KiroAuth::from_device_credentials(
+                "refresh-fixture",
+                &json!({
+                    "refreshToken": "keep-this-refresh-token", "accessToken": "still-valid",
+                    "expiresAt": iso_from_epoch(now() + 300.0), "region": "us-east-1"
+                }),
+                reqwest::Client::new(),
+            )
+            .unwrap();
+            auth.refresh_url = url;
+
+            if permanent {
+                assert!(matches!(
+                    auth.access_token().await,
+                    Err(AuthError::CredentialDead { status: 400, .. })
+                ));
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(auth.access_token().await.unwrap(), "still-valid", "{code}");
+                assert_eq!(auth.access_token().await.unwrap(), "still-valid", "{code}");
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+                assert!(*auth.refresh_retry_at.lock() < auth.expires_at().unwrap() - 200.0);
+                assert!(
+                    auth.force_refresh().await.is_err(),
+                    "forced refresh cannot serve a rejected token"
+                );
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+            }
+
+            // Force a real refresh while the access token is still unexpired.
+            *auth.refresh_retry_at.lock() = 0.0;
+            let error = auth.force_refresh().await.unwrap_err();
+            assert_eq!(
+                matches!(error, AuthError::CredentialDead { .. }),
+                permanent,
+                "{code}: {error}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                auth.credential_document()["refreshToken"],
+                "keep-this-refresh-token"
+            );
+
+            auth.creds.lock().expires_at = Some(now() - 1.0);
+            *auth.refresh_retry_at.lock() = now() + 30.0;
+            assert!(
+                auth.access_token().await.is_err(),
+                "backoff must not serve expired tokens"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            *auth.refresh_retry_at.lock() = 0.0;
+            let error = auth.access_token().await.unwrap_err();
+            assert_eq!(
+                matches!(error, AuthError::CredentialDead { .. }),
+                permanent,
+                "{code}: {error}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 3);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn external_refresh_sources_back_off_without_masking_permanent_rejections() {
+        use std::sync::Arc;
+
+        // The store and config are process globals; never initialize them against
+        // the operator's data directory or another unit test's configuration.
+        if std::env::var_os("KIRO_TEST_EXTERNAL_REFRESH_CHILD").is_none() {
+            let data = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "auth::tests::external_refresh_sources_back_off_without_masking_permanent_rejections", "--nocapture"])
+                .env("KIRO_TEST_EXTERNAL_REFRESH_CHILD", "1")
+                .env("DASHBOARD_DATA_DIR", data.path())
+                .current_dir(data.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        store::initialize().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received = requests.clone();
+        let app = axum::Router::new().route(
+            "/{code}",
+            axum::routing::post(
+                move |axum::extract::Path(code): axum::extract::Path<String>,
+                      axum::Json(body): axum::Json<Value>| {
+                    received
+                        .lock()
+                        .push(body["refreshToken"].as_str().unwrap().to_owned());
+                    async move {
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"error": code})),
+                        )
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        for sqlite in [false, true] {
+            let path = dir
+                .path()
+                .join(if sqlite { "creds.sqlite" } else { "creds.json" });
+            let source = if sqlite {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO auth_kv (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        SQLITE_TOKEN_KEYS[0],
+                        json!({"refresh_token": "raw-refresh", "expires_at": "2000-01-01T00:00:00Z"}).to_string()
+                    ],
+                )
+                .unwrap();
+                Source::Sqlite(path.to_string_lossy().into_owned())
+            } else {
+                std::fs::write(
+                    &path,
+                    json!({"refreshToken": "raw-refresh", "expiresAt": "2000-01-01T00:00:00Z"})
+                        .to_string(),
+                )
+                .unwrap();
+                Source::File(path.to_string_lossy().into_owned())
+            };
+            let mut auth =
+                KiroAuth::new(source, "us-east-1", None, reqwest::Client::new()).unwrap();
+            auth.refresh_url = format!("{url}/slow_down");
+            requests.lock().clear();
+            assert!(matches!(
+                auth.access_token().await,
+                Err(AuthError::Http { status: 400, .. })
+            ));
+            assert!(auth.access_token().await.is_err());
+            assert_eq!(*requests.lock(), ["raw-refresh"]);
+
+            *auth.refresh_retry_at.lock() = 0.0;
+            auth.refresh_url = format!("{url}/invalid_grant");
+            assert!(matches!(
+                auth.access_token().await,
+                Err(AuthError::CredentialDead { status: 400, .. })
+            ));
+
+            // A rejected persisted overlay can still retry the same login's raw file/SQLite token.
+            auth.creds.lock().refresh_token = Some("overlay-refresh".into());
+            requests.lock().clear();
+            assert!(auth.refresh_request().await.is_err());
+            assert_eq!(*requests.lock(), ["overlay-refresh", "raw-refresh"]);
+
+            // Throttling is not evidence against the overlay and must not reload or retry it.
+            auth.creds.lock().refresh_token = Some("overlay-refresh".into());
+            auth.refresh_url = format!("{url}/slow_down");
+            requests.lock().clear();
+            assert!(auth.refresh_request().await.is_err());
+            assert_eq!(*requests.lock(), ["overlay-refresh"]);
+            assert_eq!(
+                auth.credential_document()["refreshToken"],
+                "overlay-refresh"
+            );
+        }
+        server.abort();
     }
 
     #[test]
