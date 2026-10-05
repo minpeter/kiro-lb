@@ -12,6 +12,7 @@ import type { AccountRoutingState } from "./types";
  */
 const UNROUTABLE_STATES: ReadonlySet<string> = new Set([
   "suspended",
+  "account_issue",
   // A rejected credential belongs here for the same reason as a suspension: it
   // cannot serve the next request and no amount of waiting changes that, so its
   // flat line would only crowd the chart. Only a re-login clears it.

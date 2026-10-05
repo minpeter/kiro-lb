@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { Ban, Check, Clock3, Copy, KeyRound, PauseCircle, PlayCircle, ServerCog, Trash2, Users } from "lucide-react";
+import { Popover } from "radix-ui";
+import { Ban, Check, Clock3, Copy, ExternalLink, Info, KeyRound, PauseCircle, PlayCircle, ServerCog, ShieldAlert, Trash2, Users, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,20 +35,58 @@ const ROUTING_STATE_LABEL: Record<AccountRoutingState, string> = {
   quota_exhausted: "quota exhausted",
   quota_depleted: "quota spent",
   cooling_down: "cooling down",
-  suspended: "BANNED",
+  suspended: "Temporary suspension",
+  account_issue: "AWS account issue",
   auth_dead: "AUTH DEAD",
   disabled: "disabled",
   uninitialized: "pending",
 };
 
+function TokenHubBadge({ dashboardUrl }: { dashboardUrl?: string | null }) {
+  const { t } = usePreferences();
+  const brand = <>
+    {/* Official mark from ino-tokenhub/apps/dashboard/public/brand/token-hub.svg. */}
+    <svg viewBox="0 0 64 64" fill="currentColor" aria-hidden="true" className="size-4!">
+      <path d="M7 17 27 5V23L19 30V59L7 51ZM45 7 57 15V51L37 61V45L45 37ZM29 25 41 33 43 37 35 43H33L21 35V31L27 25Z" />
+    </svg>
+    <span>Token Hub</span>
+  </>;
+  if (!dashboardUrl) return (
+    <Badge variant="outline" className="min-h-8 gap-1.5" title={t("accounts.tokenHubNotConfigured")}>
+      {brand}
+    </Badge>
+  );
+  return (
+    <Badge asChild variant="outline" className="min-h-8 gap-1.5 motion-reduce:transition-none">
+      <a href={dashboardUrl} target="_blank" rel="noopener noreferrer" aria-label={t("accounts.openTokenHub")} title={t("accounts.openTokenHub")}>
+        {brand}<ExternalLink className="opacity-60" aria-hidden="true" />
+      </a>
+    </Badge>
+  );
+}
+
 /** Only "ready" is a routing target; everything else is currently excluded. */
-function RoutingStateCell({ account }: { account: Account }) {
+function RoutingStateCell({ account, tokenHubDashboardUrl }: {
+  account: Account;
+  tokenHubDashboardUrl?: string | null;
+}) {
   const { t } = usePreferences();
   const state = account.routingState;
+  const [open, setOpen] = useState(false);
+  const pinned = useRef(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const restoringFocus = useRef(false);
+  const returnFocusOnClose = useRef(false);
+  const cancelTimer = () => { if (timer.current) clearTimeout(timer.current); };
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
   const label = ROUTING_STATE_LABEL[state] ? t(`accounts.state.${state}`) : state;
   const variant = state === "available" ? "secondary" : state === "uninitialized" || state === "disabled" ? "outline" : "destructive";
   const suspended = state === "suspended";
   const authDead = state === "auth_dead";
+  const accountIssue = state === "account_issue";
+  const hasDetails = accountIssue || authDead || suspended;
   // The one reset display for the row: the countdown from the router, stated
   // here and nowhere else.
   const quotaGone = state === "quota_exhausted" || state === "quota_depleted";
@@ -59,23 +98,82 @@ function RoutingStateCell({ account }: { account: Account }) {
     : eta
       ? t("accounts.backIn", { d: eta })
       : null;
-  return (
-    <div className="space-y-1">
-      <Badge variant={variant} className={suspended || authDead ? "font-semibold tracking-wide" : undefined}>
-        {suspended && <Ban size={12} />}
+  const badge = (
+      <>
+        {suspended && <Clock3 size={12} />}
+        {state === "account_issue" && <ShieldAlert size={12} />}
         {authDead && <KeyRound size={12} />}
         {label}
-      </Badge>
-      {authDead ? (
-        // Names the remedy rather than the symptom: unlike a suspension, this one
-        // is fixed by the operator re-registering the account.
-        <p className="text-xs text-destructive">{t("accounts.authDeadHint")}</p>
-      ) : suspended ? (
-        <p className="text-xs text-destructive">{t("accounts.suspendedHint")}</p>
-      ) : (
-        hint && <p className="text-xs tabular-nums text-muted-foreground">{hint}</p>
-      )}
+      </>
+  );
+  if (!hasDetails) return (
+    <div className="space-y-1">
+      <Badge variant={variant}>{badge}</Badge>
+      {hint && <p className="text-xs tabular-nums text-muted-foreground">{hint}</p>}
     </div>
+  );
+  const closeAfterHover = () => {
+    cancelTimer();
+    timer.current = setTimeout(() => {
+      if (!pinned.current && !content.current?.contains(document.activeElement) && !trigger.current?.matches(":focus-visible")) setOpen(false);
+    }, 180);
+  };
+  return (
+    <Popover.Root open={open} onOpenChange={(next) => { cancelTimer(); if (!next) pinned.current = false; setOpen(next); }}>
+      <Popover.Trigger asChild>
+        <Badge asChild variant={variant} className="cursor-pointer gap-1.5 outline-none hover:brightness-110 motion-reduce:transition-none">
+          <button ref={trigger} type="button" aria-label={t("accounts.statusDetails", { state: label, id: account.id })}
+            onPointerEnter={(event) => {
+              if (event.pointerType !== "mouse") return;
+              cancelTimer(); timer.current = setTimeout(() => setOpen(true), 150);
+            }}
+            onPointerLeave={closeAfterHover}
+            onFocus={() => { if (!restoringFocus.current && trigger.current?.matches(":focus-visible")) { cancelTimer(); setOpen(true); } }}
+            onClick={(event) => { event.preventDefault(); cancelTimer(); pinned.current = true; setOpen(true); }}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowDown" && open) { event.preventDefault(); content.current?.focus(); }
+            }}
+          >{badge}<Info size={12} className="opacity-65" aria-hidden /></button>
+        </Badge>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content ref={content} side="bottom" align="start" sideOffset={8} collisionPadding={16}
+          aria-label={t("accounts.statusDetails", { state: label, id: account.id })} tabIndex={-1}
+          onPointerEnter={cancelTimer} onPointerLeave={closeAfterHover}
+          onFocusCapture={() => { returnFocusOnClose.current = true; }}
+          onInteractOutside={() => { returnFocusOnClose.current = false; }}
+          onOpenAutoFocus={(event) => event.preventDefault()}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (returnFocusOnClose.current) {
+              returnFocusOnClose.current = false;
+              restoringFocus.current = true;
+              trigger.current?.focus();
+              queueMicrotask(() => { restoringFocus.current = false; });
+            }
+          }}
+          className="z-50 w-80 max-w-[calc(100vw-2rem)] space-y-3 rounded-lg border bg-popover p-4 text-popover-foreground shadow-lg outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0 data-[state=open]:zoom-in-95 data-[state=closed]:zoom-out-95 duration-150 motion-reduce:animate-none!"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold">{t(accountIssue ? "accounts.state.account_issue" : `accounts.state.${state}`)}</p>
+            <Popover.Close asChild><Button size="icon-xs" variant="ghost" aria-label={t("accounts.closeDetails")}><X /></Button></Popover.Close>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="w-fit rounded border bg-muted/40 px-2 py-1 font-mono text-[11px]">{accountIssue ? "ERR-837" : suspended ? "TEMPORARILY_SUSPENDED" : "AUTH DEAD"}</p>
+            {(accountIssue || account.awsLoginDiagnostic) && <TokenHubBadge dashboardUrl={tokenHubDashboardUrl} />}
+          </div>
+          <p className="text-sm leading-relaxed text-muted-foreground">{t(accountIssue ? "accounts.accountIssueHint" : suspended ? "accounts.suspendedHint" : "accounts.authDeadHint")}</p>
+          {!!account.awsLoginIssueAt && <p className="text-xs text-muted-foreground">{t("accounts.lastConfirmedAt", { at: formatTimestamp(account.awsLoginIssueAt) })}</p>}
+          {account.awsLoginDiagnostic && !(account.awsLoginDiagnostic.result === "ERR-837" && account.awsLoginDiagnostic.checkedAt === account.awsLoginIssueAt) && (
+            <div className="space-y-1 border-t pt-3 text-xs text-muted-foreground">
+              <p>{t(`accounts.diagnostic.${account.awsLoginDiagnostic.result}`)}</p>
+              <p>{t("accounts.lastCheckedAt", { at: formatTimestamp(account.awsLoginDiagnostic.checkedAt) })}</p>
+            </div>
+          )}
+          <Popover.Arrow className="fill-popover" />
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }
 
@@ -183,23 +281,24 @@ function UsageCell({ account }: { account: Account }) {
 
 function AccountCard({
   account,
+  tokenHubDashboardUrl,
   isMutating,
   onDelete,
   onToggle,
 }: {
   account: Account;
+  tokenHubDashboardUrl?: string | null;
   isMutating?: boolean;
   onDelete: (account: Account) => void;
   onToggle?: (id: string, enabled: boolean) => void;
 }) {
   const { t } = usePreferences();
   const overage = account.usage?.overageStatus;
-  const needsAttention = account.routingState === "suspended" || account.routingState === "auth_dead";
   return (
     <article className={cn("space-y-4 rounded-lg border p-4", (account.enabled === false || account.routingState !== "available") && "bg-muted/15 text-muted-foreground")}>
-      <div className={cn("flex min-w-0 items-start justify-between gap-3", needsAttention && "flex-col")}>
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 max-w-full flex-1"><AccountCell account={account} /></div>
-        <RoutingStateCell account={account} />
+        <RoutingStateCell account={account} tokenHubDashboardUrl={tokenHubDashboardUrl} />
       </div>
       <UsageCell account={account} />
       <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm sm:grid-cols-3">
@@ -260,16 +359,17 @@ function AccountCard({
 
 export type AccountsPanelProps = {
   accounts: Account[];
+  tokenHubDashboardUrl?: string | null;
   isLoading: boolean;
   isMutating?: boolean;
   onDeleteAccount?: (id: string) => void;
   onToggleAccount?: (id: string, enabled: boolean) => void;
 };
 
-export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount, onToggleAccount }: AccountsPanelProps) {
+export function AccountsPanel({ accounts, tokenHubDashboardUrl, isLoading, isMutating, onDeleteAccount, onToggleAccount }: AccountsPanelProps) {
   const { t } = usePreferences();
   const [deleting, setDeleting] = useState<Account | null>(null);
-  const { activeAccounts, unavailableAccounts, pausedAccounts, authDeadAccounts, bannedAccounts, displayedAccounts } = groupAccounts(accounts);
+  const { activeAccounts, unavailableAccounts, pausedAccounts, authDeadAccounts, bannedAccounts, accountIssueAccounts, displayedAccounts } = groupAccounts(accounts);
   return (
     <Card>
       <CardHeader>
@@ -287,7 +387,7 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
           <>
             <div className="space-y-3 lg:hidden">
               {activeAccounts.map((account) => (
-                <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                <AccountCard key={account.id} account={account} tokenHubDashboardUrl={tokenHubDashboardUrl} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
               ))}
               {unavailableAccounts.length > 0 && (
                 <div className="space-y-3 pt-2">
@@ -299,7 +399,7 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                     <p className="text-xs break-keep text-muted-foreground">{t("accounts.unavailableDescription")}</p>
                   </div>
                   {unavailableAccounts.map((account) => (
-                    <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                    <AccountCard key={account.id} account={account} tokenHubDashboardUrl={tokenHubDashboardUrl} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
                   ))}
                 </div>
               )}
@@ -310,7 +410,7 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                     <p className="text-xs break-keep text-muted-foreground">{t("accounts.pausedDescription")}</p>
                   </div>
                   {pausedAccounts.map((account) => (
-                    <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                    <AccountCard key={account.id} account={account} tokenHubDashboardUrl={tokenHubDashboardUrl} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
                   ))}
                 </div>
               )}
@@ -324,7 +424,7 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                     <p className="text-xs break-keep text-muted-foreground">{t("accounts.authDeadDescription")}</p>
                   </div>
                   {authDeadAccounts.map((account) => (
-                    <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                    <AccountCard key={account.id} account={account} tokenHubDashboardUrl={tokenHubDashboardUrl} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
                   ))}
                 </div>
               )}
@@ -338,7 +438,23 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                     <p className="text-xs break-keep text-muted-foreground">{t("accounts.bannedDescription")}</p>
                   </div>
                   {bannedAccounts.map((account) => (
-                    <AccountCard key={account.id} account={account} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                    <AccountCard key={account.id} account={account} tokenHubDashboardUrl={tokenHubDashboardUrl} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
+                  ))}
+                </div>
+              )}
+              {accountIssueAccounts.length > 0 && (
+                <div className="space-y-3 pt-2">
+                  <div className="rounded-md bg-destructive/5 px-3 py-2">
+                    <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+                      <p className="flex items-center gap-2 font-medium text-destructive">
+                        <ShieldAlert size={14} aria-hidden="true" />{t("accounts.accountIssueSection")}
+                      </p>
+                      <TokenHubBadge dashboardUrl={tokenHubDashboardUrl} />
+                    </div>
+                    <p className="text-xs break-keep text-muted-foreground">{t("accounts.accountIssueDescription")}</p>
+                  </div>
+                  {accountIssueAccounts.map((account) => (
+                    <AccountCard key={account.id} account={account} tokenHubDashboardUrl={tokenHubDashboardUrl} isMutating={isMutating} onDelete={setDeleting} onToggle={onToggleAccount} />
                   ))}
                 </div>
               )}
@@ -412,12 +528,25 @@ export function AccountsPanel({ accounts, isLoading, isMutating, onDeleteAccount
                       </TableCell>
                     </TableRow>
                   )}
+                  {account === accountIssueAccounts[0] && (
+                    <TableRow className="bg-destructive/5 hover:bg-destructive/5">
+                      <TableCell colSpan={10} className="whitespace-normal py-3">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                          <span className="inline-flex items-center gap-2 font-medium text-destructive">
+                            <ShieldAlert size={14} aria-hidden="true" />{t("accounts.accountIssueSection")}
+                          </span>
+                          <TokenHubBadge dashboardUrl={tokenHubDashboardUrl} />
+                          <span className="text-xs text-muted-foreground">{t("accounts.accountIssueDescription")}</span>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
                   <TableRow className={account.enabled === false || account.routingState !== "available" ? "bg-muted/15 text-muted-foreground hover:bg-muted/25" : undefined}>
                     <TableCell className="max-w-56">
                       <AccountCell account={account} />
                     </TableCell>
                     <TableCell>
-                      <RoutingStateCell account={account} />
+                      <RoutingStateCell account={account} tokenHubDashboardUrl={tokenHubDashboardUrl} />
                     </TableCell>
                     <TableCell className="hidden md:table-cell">{account.usage?.subscriptionTitle ?? "—"}</TableCell>
                     <TableCell className="hidden md:table-cell">

@@ -14,6 +14,7 @@ async fn overview_serves_cached_version_only_to_dashboard_sessions() {
     let dir = common::data_dir("dashboard-version");
     std::env::set_var("DASHBOARD_PASSWORD", "test-password");
     std::env::set_var("PROXY_API_KEY", "test-api-key");
+    std::env::set_var("TOKENHUB_DASHBOARD_URL", "https://hub.example/dashboard/");
     common::seed(&[]);
     let upstream = common::upstream().await;
     let state = common::state(common::pool(&upstream.http, &[]), &upstream.http, false);
@@ -99,6 +100,10 @@ async fn overview_serves_cached_version_only_to_dashboard_sessions() {
         assert_eq!(res.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(
+            body["tokenHubDashboardUrl"],
+            "https://hub.example/dashboard/"
+        );
         assert_eq!(
             body["version"],
             json!({

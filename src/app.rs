@@ -320,7 +320,8 @@ pub fn is_account_mutation(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
     (path.starts_with("/api/dashboard/accounts")
         || path.starts_with("/internal/inferx/")
-        || path == "/_internal/accounts/register")
+        || path == "/_internal/accounts/register"
+        || path == "/_internal/accounts/login-diagnostics")
         && !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
@@ -399,6 +400,14 @@ mod tests {
         assert!(is_account_mutation(
             &Method::POST,
             "/_internal/accounts/register"
+        ));
+        assert!(is_account_mutation(
+            &Method::POST,
+            "/_internal/accounts/login-diagnostics"
+        ));
+        assert!(!is_account_mutation(
+            &Method::GET,
+            "/_internal/accounts/login-diagnostics"
         ));
         assert!(is_account_mutation(
             &Method::POST,

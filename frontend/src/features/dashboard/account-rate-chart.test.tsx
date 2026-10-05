@@ -34,7 +34,7 @@ function rate(accounts: AccountRateSeries[]): RequestRate {
 }
 
 describe("isUnroutable", () => {
-  it.each(["suspended", "auth_dead", "quota_exhausted", "quota_depleted"] as const)(
+  it.each(["suspended", "auth_dead", "account_issue", "quota_exhausted", "quota_depleted"] as const)(
     "hides %s until a human or monthly reset intervenes",
     (state) => expect(isUnroutable(state)).toBe(true),
   );
@@ -104,7 +104,7 @@ describe("combined account usage", () => {
     expect(html).toContain("active");
     expect(html).toContain("800");
     expect(html).toContain("80.0%");
-    expect(html).toContain("BANNED");
+    expect(html).toContain("Temporary suspension");
     expect(html).toContain("Show request history");
     expect(html).not.toContain("Peak requests per minute for account active:");
     expect(html).toContain("Peak requests per minute for account limited:");

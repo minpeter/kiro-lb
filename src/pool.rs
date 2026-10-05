@@ -8,6 +8,7 @@
 
 use parking_lot::Mutex;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -42,6 +43,23 @@ pub struct AccountStats {
     pub failed: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AwsLoginResult {
+    #[serde(rename = "ERR-837")]
+    AccountIssue,
+    #[serde(rename = "password_required")]
+    PasswordRequired,
+    #[serde(rename = "inconclusive")]
+    Inconclusive,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AwsLoginDiagnostic {
+    pub result: AwsLoginResult,
+    pub checked_at: f64,
+}
+
 #[derive(Default)]
 pub struct AccountState {
     pub login_identity: Option<String>,
@@ -51,6 +69,9 @@ pub struct AccountState {
     pub quota_exhausted_until: f64,
     pub suspended_until: f64,
     pub auth_dead_until: f64,
+    /// Last ERR-837 observed by TokenHub's automatic AWS email-step probe.
+    pub aws_login_issue_at: f64,
+    pub aws_login_diagnostic: Option<AwsLoginDiagnostic>,
     pub models_cached_at: f64,
     /// Transient retry deadline, separate from the last successful catalog read.
     pub models_retry_at: f64,
@@ -197,6 +218,9 @@ fn cooling_remaining(s: &AccountState, now: f64) -> f64 {
 
 pub fn routing_state(a: &Account, now: f64) -> (&'static str, i64) {
     let s = a.state.lock();
+    if s.aws_login_issue_at > 0.0 {
+        return ("account_issue", 0);
+    }
     for (until, name) in [
         (s.auth_dead_until, "auth_dead"),
         (s.suspended_until, "suspended"),
@@ -665,6 +689,13 @@ impl AccountManager {
                 restored.quota_exhausted_until = f("quota_exhausted_until");
                 restored.suspended_until = f("suspended_until");
                 restored.auth_dead_until = f("auth_dead_until");
+                restored.aws_login_diagnostic = d
+                    .get("aws_login_diagnostic")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                // Never turn the abandoned manual-label format into automatic evidence.
+                if restored.aws_login_diagnostic.is_some() {
+                    restored.aws_login_issue_at = f("aws_login_issue_at");
+                }
                 restored.models_cached_at = f("models_cached_at");
                 let stats = d.get("stats").cloned().unwrap_or(json!({}));
                 restored.stats = AccountStats {
@@ -714,6 +745,8 @@ impl AccountManager {
                         "failures": s.failures, "last_failure_time": s.last_failure_time,
                         "quota_exhausted_until": s.quota_exhausted_until, "suspended_until": s.suspended_until,
                         "auth_dead_until": s.auth_dead_until, "models_cached_at": s.models_cached_at,
+                        "aws_login_issue_at": s.aws_login_issue_at,
+                        "aws_login_diagnostic": s.aws_login_diagnostic,
                         "stats": {"total_requests": s.stats.total, "successful_requests": s.stats.success, "failed_requests": s.stats.failed},
                     }),
                 )
@@ -807,6 +840,9 @@ impl AccountManager {
 
     async fn initialize(&self, a: &Arc<Account>) -> bool {
         let _guard = a.init.lock().await;
+        if a.state.lock().aws_login_issue_at > 0.0 {
+            return false;
+        }
         if a.auth.lock().is_some() {
             return true;
         }
@@ -1057,6 +1093,9 @@ impl AccountManager {
         let warm_idle = self.warm.try_lock().ok();
         let now = store::now_f64();
         for a in self.accounts() {
+            if a.state.lock().aws_login_issue_at > 0.0 {
+                continue;
+            }
             if a.auth.lock().is_none() {
                 if warm_idle.is_none() {
                     continue;
@@ -1280,7 +1319,10 @@ impl AccountManager {
         let candidates = self.candidate_order(model, session);
         let cfg = config::get();
         for a in candidates {
-            if exclude.contains(&a.id) || a.models.support(model) != ModelSupport::Supported {
+            if exclude.contains(&a.id)
+                || a.state.lock().aws_login_issue_at > 0.0
+                || a.models.support(model) != ModelSupport::Supported
+            {
                 continue;
             }
             let now = store::now_f64();
@@ -1330,6 +1372,13 @@ impl AccountManager {
         }
         let (mut serving, mut quota, mut gone, mut soonest) = (0, 0, 0, f64::MAX);
         for a in &accounts {
+            if a.state.lock().aws_login_issue_at > 0.0
+                && a.models.support(model) != ModelSupport::Unsupported
+            {
+                serving += 1;
+                gone += 1;
+                continue;
+            }
             match a.models.support(model) {
                 ModelSupport::Unknown => return Unavailable::Temporary,
                 ModelSupport::Unsupported => continue,
@@ -1441,6 +1490,7 @@ impl AccountManager {
         }
         let s = a.state.lock();
         s.login_identity != entry.login_identity
+            || s.aws_login_issue_at > 0.0
             || s.auth_dead_until > now
             || s.suspended_until > now
             || s.quota_exhausted_until > now
@@ -2120,6 +2170,50 @@ mod tests {
         a.models
             .update(models.iter().map(|m| json!({"modelId": m})).collect());
         a
+    }
+
+    #[tokio::test]
+    async fn confirmed_login_issue_excludes_even_a_single_account_without_inventing_an_expiry() {
+        let http = reqwest::Client::new();
+        let pool = AccountManager::new(http.clone());
+        let a = serving(account("login-issue-test"), &["claude-sonnet-4.5"]);
+        *a.auth.lock() = Some(Arc::new(
+            KiroAuth::new(Source::Ephemeral("test".into()), "us-east-1", None, http).unwrap(),
+        ));
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push(a.id.clone());
+            inner.accounts.insert(a.id.clone(), a.clone());
+        }
+        let excluded = HashSet::new();
+        assert!(pool
+            .select("claude-sonnet-4.5", &excluded, None, false)
+            .await
+            .is_some());
+        a.state.lock().aws_login_issue_at = 123.0;
+        assert_eq!(routing_state(&a, 1_000_000.0), ("account_issue", 0));
+        for last_resort in [false, true] {
+            assert!(pool
+                .select("claude-sonnet-4.5", &excluded, None, last_resort)
+                .await
+                .is_none());
+        }
+        assert_eq!(
+            pool.unavailability("claude-sonnet-4.5"),
+            Unavailable::Accounts
+        );
+        assert_eq!(pool.unavailability("not-in-catalog"), Unavailable::Model);
+        // An in-flight success must not erase an independently observed login failure.
+        pool.report_success(&a.id, "claude-sonnet-4.5");
+        assert_eq!(a.state.lock().aws_login_issue_at, 123.0);
+        a.state.lock().aws_login_issue_at = 0.0;
+        assert!(pool
+            .select("claude-sonnet-4.5", &excluded, None, false)
+            .await
+            .is_some());
+        pool.report_credential_dead(&a.id, 400);
+        assert_eq!(a.state.lock().aws_login_issue_at, 0.0);
+        assert_eq!(routing_state(&a, store::now_f64()).0, "auth_dead");
     }
 
     #[test]

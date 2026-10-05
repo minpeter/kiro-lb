@@ -326,6 +326,7 @@ pub async fn overview(State(state): State<Shared>, headers: HeaderMap) -> Respon
             "proxy": {"status": "healthy", "uptimeSeconds": (store::now_f64() - state.started_at) as i64},
             "version": &*state.version.info.read(),
             "update": &*state.version.installation.read(),
+            "tokenHubDashboardUrl": config::get().tokenhub_dashboard_url,
             "requests24h": requests, "successes24h": successes, "averageLatencyMs": avg.round() as i64,
             "accounts": {"total": accounts.len(), "initialized": accounts.iter().filter(|a| a.auth().is_some()).count()},
             "models": if models == 0 { config::FALLBACK_MODELS.len() } else { models },
@@ -379,6 +380,8 @@ fn account_view(a: &pool::Account, deletable: bool, sessions: i64) -> Value {
     json!({
         "id": account_label(&a.id), "deletable": deletable, "initialized": a.auth().is_some(),
         "routingState": routing, "eligibleInSeconds": eligible, "failures": s.failures,
+        "awsLoginIssueAt": if s.aws_login_issue_at > 0.0 { json!(s.aws_login_issue_at) } else { Value::Null },
+        "awsLoginDiagnostic": s.aws_login_diagnostic,
         "cooldownSeconds": if s.last_failure_time > 0.0 { (s.last_failure_time - now).max(0.0) as i64 } else { 0 },
         "modelsCachedAt": s.models_cached_at as i64, "requests": s.stats.total,
         "successfulRequests": s.stats.success, "failedRequests": s.stats.failed,
@@ -447,6 +450,8 @@ pub async fn accounts(State(state): State<Shared>, headers: HeaderMap) -> Respon
             views.push(json!({
                 "id": account_label(&id), "initialized": false, "routingState": "disabled",
                 "eligibleInSeconds": 0,
+                "awsLoginIssueAt": snapshot.filter(|s| s.get("aws_login_diagnostic").is_some_and(Value::is_object)).and_then(|s| s.get("aws_login_issue_at")).and_then(Value::as_f64).filter(|at| *at > 0.0),
+                "awsLoginDiagnostic": snapshot.and_then(|s| s.get("aws_login_diagnostic")),
                 "requests": stats.and_then(|value| value.get("total_requests")).and_then(Value::as_i64).unwrap_or(0),
                 "successfulRequests": stats.and_then(|value| value.get("successful_requests")).and_then(Value::as_i64).unwrap_or(0),
                 "failedRequests": stats.and_then(|value| value.get("failed_requests")).and_then(Value::as_i64).unwrap_or(0),
@@ -1151,6 +1156,111 @@ pub async fn internal_account_quota(State(state): State<Shared>, headers: Header
     .await
     .unwrap_or_default();
     json_response(200, json!({"accounts": accounts}))
+}
+
+fn needs_login_diagnostic(s: &pool::AccountState, now: f64) -> bool {
+    s.auth_dead_until > now || s.suspended_until > now || s.aws_login_issue_at > 0.0
+}
+
+/// Due-only work for TokenHub's automatic, isolated AWS email-step checker.
+/// Only a current-lineage upstream email may identify the account to probe.
+pub async fn internal_login_diagnostics(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authorize_registration(&headers) {
+        return r;
+    }
+    if state.quiesced.load(std::sync::atomic::Ordering::SeqCst) {
+        return detail(503, "Gateway is quiesced for handoff");
+    }
+    let now = store::now_f64();
+    let accounts: Vec<Value> = state.pool.accounts().iter().filter_map(|a| {
+        if !a.id.starts_with("tokenhub-") { return None; }
+        let (identity, checked_at) = {
+            let s = a.state.lock();
+            if !needs_login_diagnostic(&s, now) { return None; }
+            let checked_at = s.aws_login_diagnostic.map_or(0.0, |d| d.checked_at);
+            let delay = if s.aws_login_diagnostic.is_some_and(|d| d.result == pool::AwsLoginResult::Inconclusive) {
+                3600.0
+            } else {
+                6.0 * 3600.0
+            };
+            if checked_at > 0.0 && checked_at + delay > now { return None; }
+            (s.login_identity.clone()?, checked_at)
+        };
+        if store::login_identity(&a.id).as_deref() != Some(identity.as_str()) { return None; }
+        let usage = ds::cached_usage(&a.id);
+        let email = usage.get("email")?.as_str()?.trim();
+        if email.is_empty() { return None; }
+        Some(json!({"id": a.id, "email": email, "loginIdentity": identity, "previousCheckedAt": checked_at}))
+    }).take(50).collect();
+    json_response(200, json!({"accounts": accounts}))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LoginDiagnosticReport {
+    id: String,
+    login_identity: String,
+    previous_checked_at: f64,
+    result: pool::AwsLoginResult,
+}
+
+/// Accepts only machine observations bound to the probed login and revision.
+/// A password page removes ERR-837 evidence, not other authentication failures.
+pub async fn internal_report_login_diagnostic(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = authorize_registration(&headers) {
+        return r;
+    }
+    let report: LoginDiagnosticReport = match serde_json::from_slice(&body) {
+        Ok(report) => report,
+        Err(_) => return detail(400, "Expected an account-bound AWS login diagnostic result"),
+    };
+    if !report.id.starts_with("tokenhub-") || report.previous_checked_at < 0.0 {
+        return detail(400, "Invalid login diagnostic binding");
+    }
+    let _serial = state.pool.lock_mutations().await;
+    let Some(account) = state.pool.get(&report.id) else {
+        return detail(409, "Account is no longer active");
+    };
+    if store::login_identity(&report.id).as_deref() != Some(report.login_identity.as_str()) {
+        return detail(409, "Account login changed during diagnosis");
+    }
+    let now = store::now_f64();
+    let previous = {
+        let mut s = account.state.lock();
+        if s.login_identity.as_deref() != Some(report.login_identity.as_str())
+            || s.aws_login_diagnostic.map_or(0.0, |d| d.checked_at) != report.previous_checked_at
+            || !needs_login_diagnostic(&s, now)
+        {
+            return detail(409, "Account state changed during diagnosis");
+        }
+        let previous = (s.aws_login_issue_at, s.aws_login_diagnostic);
+        // Whole seconds survive JSON round trips exactly. Advance even when two
+        // reports finish within one second so a stale revision cannot overwrite.
+        let checked_at = now.floor().max(report.previous_checked_at + 1.0);
+        match report.result {
+            pool::AwsLoginResult::AccountIssue => s.aws_login_issue_at = checked_at,
+            pool::AwsLoginResult::PasswordRequired => s.aws_login_issue_at = 0.0,
+            pool::AwsLoginResult::Inconclusive => {}
+        }
+        s.aws_login_diagnostic = Some(pool::AwsLoginDiagnostic {
+            result: report.result,
+            checked_at,
+        });
+        previous
+    };
+    if !state.pool.save_state() {
+        let mut s = account.state.lock();
+        (s.aws_login_issue_at, s.aws_login_diagnostic) = previous;
+        return detail(500, "Could not save the AWS login diagnostic");
+    }
+    json_response(200, json!({"ok": true}))
 }
 
 async fn register_from_body(state: &Shared, body: &Bytes) -> Response {
