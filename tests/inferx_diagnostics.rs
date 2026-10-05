@@ -23,6 +23,7 @@ struct Mock {
     calls: AtomicUsize,
     refresh_calls: AtomicUsize,
     blocked: AtomicBool,
+    slow_refresh: AtomicBool,
     entered: Notify,
     release: Notify,
 }
@@ -42,6 +43,9 @@ async fn usage(State(mock): State<Arc<Mock>>, headers: HeaderMap) -> (StatusCode
 
 async fn refresh(State(mock): State<Arc<Mock>>) -> (StatusCode, String) {
     mock.refresh_calls.fetch_add(1, Ordering::SeqCst);
+    if mock.slow_refresh.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
     mock.refresh.lock().unwrap().clone()
 }
 
@@ -113,6 +117,7 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
         refresh: Mutex::new((StatusCode::OK, json!({"accessToken":"fixture-rotated-access","refreshToken":"fixture-rotated-refresh","expiresIn":3600}).to_string())),
         calls: AtomicUsize::new(0), refresh_calls: AtomicUsize::new(0),
         blocked: AtomicBool::new(false), entered: Notify::new(), release: Notify::new(),
+        slow_refresh: AtomicBool::new(false),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/", listener.local_addr().unwrap());
@@ -315,19 +320,28 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
         .to_string()
         .contains("private-"));
 
-    // An actual stalled request times out and preserves the last successful usage.
+    // Fifteen seconds of refresh followed by a stalled usage call exceeds the
+    // outer 30s budget before management's own 20s timeout can fire at 35s.
+    // Removing or extending RECHECK_TIMEOUT must fail this 32s assertion.
     due(&id);
+    expire_token(&id);
+    mock.slow_refresh.store(true, Ordering::SeqCst);
     mock.blocked.store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
     let timeout = tokio::time::timeout(Duration::from_secs(32), call(&app, &id, "POST", "alice"))
         .await
         .unwrap()
         .1;
+    assert!(started.elapsed() >= Duration::from_secs(29));
     assert_eq!(timeout["diagnostics"]["health"], "unknown");
     assert_eq!(
         timeout["diagnostics"]["usage"],
         missing["diagnostics"]["usage"]
     );
-    mock.entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), mock.entered.notified())
+        .await
+        .unwrap();
+    mock.slow_refresh.store(false, Ordering::SeqCst);
     mock.release.notify_waiters();
 
     // Cancellation after token rotation cannot release the lock ahead of save.
