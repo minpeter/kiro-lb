@@ -1002,7 +1002,9 @@ impl KiroAuth {
                     ));
                 }
                 validate_credential_regions(&self.creds.lock().clone())?;
-                if self.cached_token().is_some() && !self.expired() {
+                let renewed_elsewhere = self.cached_token() != previous;
+                if self.cached_token().is_some() && !self.expired() && (!force || renewed_elsewhere)
+                {
                     return Ok(());
                 }
                 tracing::warn!("Refresh lease for account {account} not acquired in {wait}s; not refreshing without ownership");
