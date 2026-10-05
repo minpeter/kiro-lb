@@ -850,7 +850,9 @@ async fn native_web_search(
         );
     };
     let Some(account) = state.pool.next_account(&model, &HashSet::new(), None).await else {
-        return anthropic_error(503, "api_error", "Service temporarily unavailable");
+        return unavailable_response(&state, Protocol::Anthropic, &model).unwrap_or_else(|| {
+            anthropic_error(503, "api_error", "Service temporarily unavailable")
+        });
     };
     let Some(auth) = account.auth() else {
         return anthropic_error(503, "api_error", "Account unavailable");

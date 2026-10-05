@@ -52,7 +52,7 @@ kiro-lb/
 | Prometheus exposition | `src/metrics.rs` | Model labels clamped |
 | Token accounting | `src/usage_tracking.rs` | Per key, account, model; batched flush |
 | Token counting | `src/tokenizer.rs` | Per-family encoding + CJK-only correction |
-| Model names | `src/model_resolver.rs` | Never rejects; unknown names pass through |
+| Model names | `src/model_resolver.rs`, `src/pool.rs` | Normalize aliases; reject models absent from account catalogs before upstream calls |
 | Payload guard | `src/payload_guard.rs` | cl100k tokens of the compact JSON |
 | Claude Code tool shortening | `src/prompt_filter.rs` | Shorten long tool descriptions and add the Write/Edit note (on by default) |
 | Debug capture / replay | `src/debug.rs` | `kirolb replay <capture>` |
@@ -159,7 +159,13 @@ kiro-lb/
   cross-site requests, since no cookie stands in the way.
 - Answering a spent pool with 503. Clients retry 5xx; a missing model, an
   exhausted monthly quota or a suspended pool gets 404/402/403 instead.
-- Rejecting unknown model names, or suggesting a model from another family.
+- Sending a model absent from an account's catalog to that account, even as a
+  last resort. Reject it locally with 404 when every account confirms it is
+  unavailable; do not substitute another model. An unknown catalog permits no
+  generation and yields 503 when no supported account can serve. Bootstrap
+  metadata does not establish support. Stale real catalogs remain usable;
+  failed refreshes preserve their successful timestamp and retry after 60s.
+  `/v1/models` lists only supported IDs and aliases with supported targets.
 - Labelling a Prometheus series with a raw model name.
 - Sharing one machine id across accounts, or mixing CLI markers into the IDE
   user agent. Headers mirror a captured Kiro IDE (`src/utils.rs`), and each
@@ -171,7 +177,8 @@ kiro-lb/
 - Persisting `quota_headroom`, `quota_resets_at` or `quota_overage_enabled` with
   runtime state; they are re-seeded from usage rows.
 - Ending a 402 quarantine on a fixed timer; it runs to the reported reset.
-- Removing the last-resort pass in account selection.
+- Removing the quota last-resort pass in account selection; it still requires
+  model eligibility.
 - Escalating a burst into a long exclusion: `USER_REQUEST_RATE_EXCEEDED` parks
   an account for 10s; only `MONTHLY_REQUEST_COUNT` quarantines it (6h).
 - Assuming cache metadata exists.

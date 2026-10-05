@@ -14,6 +14,7 @@ pub const HANG_REGION: &str = "eu-central-1";
 
 pub struct Upstream {
     pub http: reqwest::Client,
+    pub connections: Arc<AtomicUsize>,
     pub management: Arc<AtomicUsize>,
     pub refresh: Arc<AtomicUsize>,
     management_blocked: Arc<AtomicBool>,
@@ -41,6 +42,8 @@ impl Upstream {
 pub async fn upstream() -> Upstream {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = connections.clone();
     let management = Arc::new(AtomicUsize::new(0));
     let refresh = Arc::new(AtomicUsize::new(0));
     let management_blocked = Arc::new(AtomicBool::new(false));
@@ -56,6 +59,7 @@ pub async fn upstream() -> Upstream {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
+            accepted.fetch_add(1, Ordering::SeqCst);
             let (m, r, blocked, block) = (m.clone(), r.clone(), blocked.clone(), block.clone());
             tokio::spawn(async move {
                 let mut buf = Vec::new();
@@ -98,6 +102,7 @@ pub async fn upstream() -> Upstream {
         .unwrap();
     Upstream {
         http,
+        connections,
         management,
         refresh,
         management_blocked,

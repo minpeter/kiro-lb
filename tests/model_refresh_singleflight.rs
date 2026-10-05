@@ -42,7 +42,7 @@ async fn concurrent_expired_cache_readers_share_one_model_refresh() {
                 pool.refresh_models_with(&acct, |_| async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(300)).await;
-                    Some(vec![])
+                    Some(vec![json!({"modelId": "old-model"})])
                 })
                 .await;
             })
@@ -51,8 +51,76 @@ async fn concurrent_expired_cache_readers_share_one_model_refresh() {
     for t in tasks {
         t.await.unwrap();
     }
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(acct.state.lock().models_cached_at > 1.0);
+
+    // Even a failed forced read of a fresh catalog must retry sooner than its TTL.
+    let cached_at = acct.state.lock().models_cached_at;
+    let before_failure = kiro_lb::store::now_f64();
+    assert!(
+        !pool
+            .force_refresh_models_with(&acct, |_| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+            .await
+    );
+    let retry_at = acct.state.lock().models_retry_at;
+    assert_eq!(acct.state.lock().models_cached_at, cached_at);
+    assert!((60.0..61.0).contains(&(retry_at - before_failure)));
+    assert_eq!(
+        kiro_lb::model_resolver::available_models(&acct.models),
+        ["old-model"]
+    );
+    assert!(pool.state_document()["accounts"]["a"]
+        .get("models_retry_at")
+        .is_none());
+
+    // Concurrent readers during the failure backoff must not storm the upstream.
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let (pool, acct, calls) = (pool.clone(), acct.clone(), calls.clone());
+            tokio::spawn(async move {
+                pool.refresh_models_with(&acct, |_| async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    None
+                })
+                .await;
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    acct.state.lock().models_retry_at = kiro_lb::store::now_f64() - 1.0;
+    pool.refresh_models_with(&acct, |_| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Some(vec![json!({"modelId": "new-model"})])
+    })
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "retry deadline must override the unexpired normal TTL"
+    );
+    assert_eq!(acct.state.lock().models_retry_at, 0.0);
+    assert!(acct.state.lock().models_cached_at >= cached_at);
+    assert_eq!(
+        kiro_lb::model_resolver::available_models(&acct.models),
+        ["new-model"]
+    );
+    pool.refresh_models_with(&acct, |_| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        None
+    })
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "successful refresh restores the normal TTL"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

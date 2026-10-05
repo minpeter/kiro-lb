@@ -7,7 +7,7 @@ use axum::Router;
 use common::*;
 use kiro_lb::app::Shared;
 use kiro_lb::routes_dashboard as d;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Once;
 use std::time::{Duration, Instant};
@@ -66,7 +66,7 @@ fn models() -> Request<Body> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ready_waits_for_an_initialized_account() {
+async fn ready_waits_for_a_real_catalog_not_just_initialized_auth() {
     setup();
     let up = upstream().await;
     let pool = pool(&up.http, &["d1", "h1"]);
@@ -78,6 +78,15 @@ async fn ready_waits_for_an_initialized_account() {
 
     pool.warm_up(Duration::from_secs(5)).await;
 
+    let (status, body) = call(&app, handoff("GET", "/_internal/handoff/ready")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(initialized(&pool, "h1"));
+    assert!(
+        pool.force_refresh_models_with(&pool.get("h1").unwrap(), |_| async {
+            Some(vec![json!({"modelId": "target-model"})])
+        })
+        .await
+    );
     let (status, body) = call(&app, handoff("GET", "/_internal/handoff/ready")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["state"], "active");
@@ -99,20 +108,23 @@ async fn an_activated_standby_becomes_ready_with_a_catalog() {
     assert!(!state.quiesced.load(Ordering::SeqCst));
 
     let started = Instant::now();
-    let mut ready = StatusCode::SERVICE_UNAVAILABLE;
-    while started.elapsed() < Duration::from_secs(5) {
-        ready = call(&app, handoff("GET", "/_internal/handoff/ready"))
-            .await
-            .0;
-        if ready == StatusCode::OK {
-            break;
-        }
+    while !initialized(&pool, "h1") && started.elapsed() < Duration::from_secs(5) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(ready, StatusCode::OK, "after {:?}", started.elapsed());
     assert!(initialized(&pool, "h1"));
+    let (status, body) = call(&app, handoff("GET", "/_internal/handoff/ready")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        pool.force_refresh_models_with(&pool.get("h1").unwrap(), |_| async {
+            Some(vec![json!({"modelId": "target-model"})])
+        })
+        .await
+    );
+    let (status, body) = call(&app, handoff("GET", "/_internal/handoff/ready")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     let (status, body) = call(&app, models()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(!body["data"].as_array().unwrap().is_empty(), "{body}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["data"][0]["id"], "target-model");
 }
