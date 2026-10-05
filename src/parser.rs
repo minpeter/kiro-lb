@@ -291,7 +291,9 @@ impl AwsEventStreamParser {
             pos = end + 1;
             match sonic_rs::from_str::<Value>(json_str) {
                 Ok(data) => {
-                    if let Some(e) = self.process_event(data, kind) {
+                    if kind.starts_with("native_thinking") {
+                        events.extend(self.thinking_events(&data));
+                    } else if let Some(e) = self.process_event(data, kind) {
                         events.push(e);
                     }
                 }
@@ -372,27 +374,6 @@ impl AwsEventStreamParser {
                     .and_then(Value::as_str)?;
                 (!r.is_empty()).then(|| ParsedEvent::StopReason(r.to_owned()))
             }
-            "native_thinking" => {
-                let e = ParsedEvent::Thinking {
-                    text: data
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
-                    is_first: !self.thinking_started,
-                };
-                self.thinking_started = true;
-                Some(e)
-            }
-            "native_thinking_signature" => {
-                self.thinking_started = false;
-                Some(ParsedEvent::ThinkingSignature(
-                    data.get("signature")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
-                ))
-            }
             "upstream_error" => Some(ParsedEvent::UpstreamError {
                 reason: data
                     .get("reason")
@@ -407,6 +388,26 @@ impl AwsEventStreamParser {
             }),
             _ => None,
         }
+    }
+
+    /// A reasoning frame is classified by the keys it carries, not by the one it
+    /// happens to start with: some models (MiniMax M2.1) send `{"signature":…,"text":…}`,
+    /// and matching on the leading key alone dropped that text. Text comes first so
+    /// a signature in the same frame closes the block it belongs to.
+    fn thinking_events(&mut self, data: &Value) -> Vec<ParsedEvent> {
+        let mut out = Vec::new();
+        if let Some(text) = data.get("text").and_then(Value::as_str) {
+            out.push(ParsedEvent::Thinking {
+                text: text.to_owned(),
+                is_first: !self.thinking_started,
+            });
+            self.thinking_started = true;
+        }
+        if let Some(signature) = data.get("signature").and_then(Value::as_str) {
+            self.thinking_started = false;
+            out.push(ParsedEvent::ThinkingSignature(signature.to_owned()));
+        }
+        out
     }
 
     fn start_tool(&mut self, data: &Value) -> Option<ParsedEvent> {
