@@ -59,17 +59,21 @@ async fn refresh_leases_release_on_cancel_and_reject_unchanged_forced_tokens() {
     );
     let owner = kiro_lb::store::try_acquire_refresh_lease(&account, 60.0).unwrap();
     let _lease = RefreshLease { account, owner };
-    assert_eq!(auth.access_token().await.unwrap(), "rejected-access");
-    assert!(
-        matches!(auth.force_refresh().await, Err(kiro_lb::auth::AuthError::Other(ref message)) if message.contains("owned by another slot")),
-        "a forced refresh cannot reuse the unchanged token after lease timeout"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        assert_eq!(auth.access_token().await.unwrap(), "rejected-access");
+        assert!(
+            matches!(auth.force_refresh().await, Err(kiro_lb::auth::AuthError::Other(ref message)) if message.contains("owned by another slot")),
+            "a forced refresh cannot reuse the unchanged token after lease timeout"
+        );
 
-    // A different token persisted by the lease owner is safe to use, without a
-    // second refresh request or a change of login lineage.
-    credential["accessToken"] = serde_json::json!("renewed-elsewhere");
-    std::fs::write(&path, credential.to_string()).unwrap();
-    assert_eq!(auth.force_refresh().await.unwrap(), "renewed-elsewhere");
+        // A different token persisted by the lease owner is safe to use, without a
+        // second refresh request or a change of login lineage.
+        credential["accessToken"] = serde_json::json!("renewed-elsewhere");
+        std::fs::write(&path, credential.to_string()).unwrap();
+        assert_eq!(auth.force_refresh().await.unwrap(), "renewed-elsewhere");
+    })
+    .await
+    .expect("lease contention checks must finish without provider traffic");
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
