@@ -85,8 +85,8 @@ function RoutingStateCell({ account, tokenHubDashboardUrl }: {
   const variant = state === "available" ? "secondary" : state === "uninitialized" || state === "disabled" ? "outline" : "destructive";
   const suspended = state === "suspended";
   const authDead = state === "auth_dead";
-  const accountIssue = state === "account_issue";
-  const hasDetails = accountIssue || authDead || suspended;
+  const accountIssue = state === "account_issue" || (state === "disabled" && !!account.awsLoginIssueAt);
+  const hasDetails = accountIssue || authDead || suspended || (state === "disabled" && !!account.awsLoginDiagnostic);
   // The one reset display for the row: the countdown from the router, stated
   // here and nowhere else.
   const quotaGone = state === "quota_exhausted" || state === "quota_depleted";
@@ -155,14 +155,15 @@ function RoutingStateCell({ account, tokenHubDashboardUrl }: {
           className="z-50 w-80 max-w-[calc(100vw-2rem)] space-y-3 rounded-lg border bg-popover p-4 text-popover-foreground shadow-lg outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0 data-[state=open]:zoom-in-95 data-[state=closed]:zoom-out-95 duration-150 motion-reduce:animate-none!"
         >
           <div className="flex items-center justify-between gap-3">
-            <p className="text-sm font-semibold">{t(accountIssue ? "accounts.state.account_issue" : `accounts.state.${state}`)}</p>
+            <p className="text-sm font-semibold">{label}</p>
             <Popover.Close asChild><Button size="icon-xs" variant="ghost" aria-label={t("accounts.closeDetails")}><X /></Button></Popover.Close>
           </div>
+          {state === "disabled" && <p className="text-sm text-muted-foreground">{t("accounts.pausedDiagnosticHint")}</p>}
           <div className="flex flex-wrap items-center gap-2">
-            <p className="w-fit rounded border bg-muted/40 px-2 py-1 font-mono text-[11px]">{accountIssue ? "ERR-837" : suspended ? "TEMPORARILY_SUSPENDED" : "AUTH DEAD"}</p>
+            {(accountIssue || suspended || authDead) && <p className="w-fit rounded border bg-muted/40 px-2 py-1 font-mono text-[11px]">{accountIssue ? "ERR-837" : suspended ? "TEMPORARILY_SUSPENDED" : "AUTH DEAD"}</p>}
             {(accountIssue || account.awsLoginDiagnostic) && <TokenHubBadge dashboardUrl={tokenHubDashboardUrl} />}
           </div>
-          <p className="text-sm leading-relaxed text-muted-foreground">{t(accountIssue ? "accounts.accountIssueHint" : suspended ? "accounts.suspendedHint" : "accounts.authDeadHint")}</p>
+          {(accountIssue || suspended || authDead) && <p className="text-sm leading-relaxed text-muted-foreground">{t(accountIssue ? "accounts.accountIssueHint" : suspended ? "accounts.suspendedHint" : "accounts.authDeadHint")}</p>}
           {!!account.awsLoginIssueAt && <p className="text-xs text-muted-foreground">{t("accounts.lastConfirmedAt", { at: formatTimestamp(account.awsLoginIssueAt) })}</p>}
           {account.awsLoginDiagnostic && !(account.awsLoginDiagnostic.result === "ERR-837" && account.awsLoginDiagnostic.checkedAt === account.awsLoginIssueAt) && (
             <div className="space-y-1 border-t pt-3 text-xs text-muted-foreground">

@@ -233,8 +233,7 @@ fn spawn_background(state: app::Shared) {
         loop {
             tokio::time::sleep(Duration::from_secs(interval)).await;
             if s.pool.is_dirty() {
-                let p = s.pool.clone();
-                let _ = tokio::task::spawn_blocking(move || p.save_state()).await;
+                s.pool.save_state().await;
             }
         }
     });
@@ -507,9 +506,9 @@ async fn serve(host: String, port: u16) -> Option<kiro_lb::update_install::Insta
         let rows = p.drain_unsaved_observations();
         dashboard_store::record_rate_observations(&rows);
         dashboard_store::flush_key_model_usage();
-        p.save_state();
     })
     .await;
+    pool.save_state().await;
     installed
 }
 

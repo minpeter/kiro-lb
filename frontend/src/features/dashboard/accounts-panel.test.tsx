@@ -313,6 +313,27 @@ describe("excluded account grouping", () => {
     expect(html).not.toContain("Temporarily suspended accounts");
   });
 
+  it.each(["ERR-837", "password_required", "inconclusive", null] as const)("keeps a paused account's saved diagnostic reachable (%s)", (result) => {
+    const account: Account = {
+      ...paused,
+      id: "paused_diagnostic",
+      awsLoginIssueAt: result === "ERR-837" ? 1791200000 : null,
+      awsLoginDiagnostic: result ? { result, checkedAt: 1791203600 } : null,
+    };
+    const html = renderToString(<AccountsPanel accounts={[account]} isLoading={false} />);
+    for (const layout of html.split("<table")) {
+      expect(layout).toContain("Paused accounts");
+      expect(layout).not.toContain("Authentication failures");
+      const trigger = 'aria-label="Disabled · details for paused_diagnostic"';
+      if (result) {
+        expect(layout).toContain(trigger);
+        expect(layout).toContain('aria-haspopup="dialog"');
+      } else {
+        expect(layout).not.toContain(trigger);
+      }
+    }
+  });
+
   it.each([null, "https://hub.example/dashboard/#accounts"])("keeps AWS issues separate and links only a configured Token Hub dashboard (%s)", (dashboardUrl) => {
     const issue: Account = {
       ...authDead,

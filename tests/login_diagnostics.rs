@@ -52,6 +52,7 @@ async fn automatic_login_diagnostics_are_bound_persisted_and_never_infer_recover
     std::env::set_var("HANDOFF_SECRET", SECRET);
     std::env::set_var("DASHBOARD_AUTH", "false");
     seed(&[
+        healthy("tokenhub-bad-email"),
         healthy(ID),
         healthy("tokenhub-suspended"),
         healthy("tokenhub-no-email"),
@@ -66,6 +67,7 @@ async fn automatic_login_diagnostics_are_bound_persisted_and_never_infer_recover
     let identity = bound_identity.as_str();
     let now = store::now_i64() as f64;
     for (id, dead, email) in [
+        ("tokenhub-bad-email", true, false),
         (ID, true, true),
         ("tokenhub-suspended", false, true),
         ("tokenhub-no-email", true, false),
@@ -112,6 +114,38 @@ async fn automatic_login_diagnostics_are_bound_persisted_and_never_infer_recover
             call(&app, method, PATH, "wrong", Value::Null).await.0,
             StatusCode::FORBIDDEN
         );
+    }
+    // A malformed upstream reading must not poison the entire Zod-validated
+    // batch in TokenHub. Check the strict email boundaries, not only emptiness.
+    for (email, valid) in [
+        ("Builder+label@Sub.Example.com", true),
+        ("o'name@example.com", true),
+        (" a_b-c@example.com ", true),
+        ("unknown", false),
+        (".user@example.com", false),
+        ("user..name@example.com", false),
+        ("user.@example.com", false),
+        ("user'@example.com", false),
+        ("user@-example.com", false),
+        ("user@example.c", false),
+        ("user@example.123", false),
+        ("user name@example.com", false),
+        ("\u{212a}@example.com", false),
+        ("user@example.co\u{17f}", false),
+        ("user@example.com\ninvalid", false),
+    ] {
+        assert!(dashboard_store::save_account_usage(
+            "tokenhub-bad-email",
+            &store::login_identity("tokenhub-bad-email").unwrap(),
+            &json!({"email": email}),
+        ));
+        let response = call(&app, "GET", PATH, SECRET, Value::Null).await;
+        assert_eq!(response.0, StatusCode::OK);
+        let rows = response.1["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), if valid { 3 } else { 2 }, "{email:?}");
+        if valid {
+            assert_eq!(rows[0]["email"], email.trim());
+        }
     }
     let due = call(&app, "GET", PATH, SECRET, Value::Null).await;
     assert_eq!(due.0, StatusCode::OK);
@@ -176,6 +210,40 @@ async fn automatic_login_diagnostics_are_bound_persisted_and_never_infer_recover
         .await
         .0,
         StatusCode::CONFLICT
+    );
+
+    // A failed clear must roll memory back before the mutation gate is released;
+    // a later periodic flush must not accidentally persist the rejected result.
+    store::with(|c| {
+        c.execute_batch(
+            "CREATE TEMP TRIGGER reject_diagnostic_save BEFORE INSERT ON account_runtime
+         BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;",
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            PATH,
+            SECRET,
+            report(identity, confirmed, "password_required")
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(a.state.lock().aws_login_issue_at, confirmed);
+    assert_eq!(
+        a.state.lock().aws_login_diagnostic.unwrap().checked_at,
+        confirmed
+    );
+    assert!(manager.is_dirty());
+    store::with(|c| c.execute_batch("DROP TRIGGER reject_diagnostic_save;")).unwrap();
+    assert!(manager.save_state().await);
+    assert_eq!(
+        store::load_runtime_state().unwrap()["accounts"][ID]["aws_login_issue_at"],
+        confirmed
     );
 
     // A CAPTCHA/network failure must retain the earlier positive evidence.
@@ -256,7 +324,7 @@ async fn automatic_login_diagnostics_are_bound_persisted_and_never_infer_recover
         result: pool::AwsLoginResult::Inconclusive,
         checked_at: checked,
     });
-    assert!(manager.save_state());
+    assert!(manager.save_state().await);
     manager.reload_durable_state();
     assert_eq!(
         manager.get(ID).unwrap().state.lock().aws_login_issue_at,

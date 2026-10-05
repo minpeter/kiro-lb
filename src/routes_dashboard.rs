@@ -815,7 +815,7 @@ async fn register(state: &Shared, entry: Value, requested_type: &str) -> Result<
         tracing::warn!("Registered account {id} could not be initialized yet");
     }
     state.pool.schedule_catalog_rereads(&id);
-    state.pool.save_state();
+    state.pool.save_state_locked(&_serial);
     if let Some(a) = state.pool.get(&id).filter(|a| a.auth().is_some()) {
         refresh_account_usage(state, &a).await;
     }
@@ -1162,6 +1162,18 @@ fn needs_login_diagnostic(s: &pool::AccountState, now: f64) -> bool {
     s.auth_dead_until > now || s.suspended_until > now || s.aws_login_issue_at > 0.0
 }
 
+fn diagnostic_email_valid(email: &str) -> bool {
+    // Match TokenHub's Zod default email contract (https://zod.dev/api#emails).
+    // Rust regex has no lookahead; enforce those two assertions separately.
+    static EMAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i-u)\A[a-z0-9_'+.\-]*[a-z0-9_+\-]@(?:[a-z0-9][a-z0-9\-]*\.)+[a-z]{2,}\z",
+        )
+        .expect("diagnostic email regex")
+    });
+    !email.starts_with('.') && !email.contains("..") && EMAIL.is_match(email)
+}
+
 /// Due-only work for TokenHub's automatic, isolated AWS email-step checker.
 /// Only a current-lineage upstream email may identify the account to probe.
 pub async fn internal_login_diagnostics(
@@ -1192,7 +1204,7 @@ pub async fn internal_login_diagnostics(
         if store::login_identity(&a.id).as_deref() != Some(identity.as_str()) { return None; }
         let usage = ds::cached_usage(&a.id);
         let email = usage.get("email")?.as_str()?.trim();
-        if email.is_empty() { return None; }
+        if !diagnostic_email_valid(email) { return None; }
         Some(json!({"id": a.id, "email": email, "loginIdentity": identity, "previousCheckedAt": checked_at}))
     }).take(50).collect();
     json_response(200, json!({"accounts": accounts}))
@@ -1255,7 +1267,7 @@ pub async fn internal_report_login_diagnostic(
         });
         previous
     };
-    if !state.pool.save_state() {
+    if !state.pool.save_state_locked(&_serial) {
         let mut s = account.state.lock();
         (s.aws_login_issue_at, s.aws_login_diagnostic) = previous;
         return detail(500, "Could not save the AWS login diagnostic");
@@ -1990,11 +2002,7 @@ pub async fn handoff_quiesce(State(state): State<Shared>, headers: HeaderMap) ->
         }
         let _ = tokio::time::timeout(std::time::Duration::from_millis(200), notified).await;
     }
-    let st = state.clone();
-    if !tokio::task::spawn_blocking(move || st.pool.save_state())
-        .await
-        .unwrap_or(false)
-    {
+    if !state.pool.save_state().await {
         return detail(
             500,
             "Runtime state write skipped: this process is not the active writer",
