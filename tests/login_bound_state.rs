@@ -118,7 +118,7 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
         state.quota_exhausted_until = store::now_f64() + 3600.0;
         state.models_cached_at = 123.0;
     }
-    assert!(pool.save_state());
+    assert!(pool.save_state().await);
     let future_reset = store::now_f64() + 3600.0;
     assert!(dashboard_store::save_account_usage(
         "same",
@@ -318,7 +318,7 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
     let missing_account = pool.get("missing").unwrap();
     *missing_account.auth.lock() = Some(Arc::new(missing_a));
     missing_account.state.lock().failures = 3;
-    assert!(pool.save_state());
+    assert!(pool.save_state().await);
     assert!(dashboard_store::save_account_usage(
         "missing",
         &missing_identity,
@@ -391,7 +391,7 @@ async fn login_identity_isolates_credentials_runtime_models_and_quota() {
     let builder_account = pool.get("builder").unwrap();
     *builder_account.auth.lock() = Some(Arc::new(builder_a));
     builder_account.state.lock().failures = 9;
-    assert!(pool.save_state());
+    assert!(pool.save_state().await);
     assert!(dashboard_store::save_account_usage(
         "builder",
         &builder_identity,

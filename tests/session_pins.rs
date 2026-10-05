@@ -77,7 +77,7 @@ async fn session_pins_survive_bursts_and_restarts_and_rotation_without_quota_wei
     );
 
     assert!(pool.commit_success(&c, "m", Some(2)));
-    assert!(pool.save_state());
+    assert!(pool.save_state().await);
     let restarted = pool_with(&["a", "b", "c"]).await;
     assert_eq!(pinned(&restarted, 1).await, "a", "pins survive a restart");
     assert_eq!(pinned(&restarted, 2).await, "c");

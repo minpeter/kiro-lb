@@ -414,9 +414,8 @@ impl AccountManager {
         self.catalog_ready()
     }
 
-    /// Held across a whole account read/check/mutate/persist sequence
-    /// (register, delete, enable, disable) so two operators cannot both pass
-    /// the last-account check against the same snapshot.
+    /// Held across a whole account read/check/mutate/persist sequence and every
+    /// runtime snapshot/write, so a saver cannot overwrite a newer mutation.
     pub async fn lock_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.mutations.lock().await
     }
@@ -789,12 +788,27 @@ impl AccountManager {
         self.state_document_for_sources(&store::load_account_sources())
     }
 
-    pub fn save_state(&self) -> bool {
+    pub async fn save_state(self: &Arc<Self>) -> bool {
+        let pool = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let serial = pool.mutations.blocking_lock();
+            pool.save_state_locked(&serial)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// The caller holds this pool's mutation gate, including on rollback after
+    /// a rejected write. Background saves must use `save_state` instead.
+    pub fn save_state_locked(&self, _serial: &tokio::sync::MutexGuard<'_, ()>) -> bool {
+        // Clear before taking the snapshot, never after writing: data-plane
+        // updates during either phase must leave the next flush pending.
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let doc = self.state_document();
         let written = store::save_runtime_state(&doc);
-        if written {
-            self.dirty
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+        if !written {
+            self.mark_dirty();
         }
         written
     }
@@ -1372,13 +1386,6 @@ impl AccountManager {
         }
         let (mut serving, mut quota, mut gone, mut soonest) = (0, 0, 0, f64::MAX);
         for a in &accounts {
-            if a.state.lock().aws_login_issue_at > 0.0
-                && a.models.support(model) != ModelSupport::Unsupported
-            {
-                serving += 1;
-                gone += 1;
-                continue;
-            }
             match a.models.support(model) {
                 ModelSupport::Unknown => return Unavailable::Temporary,
                 ModelSupport::Unsupported => continue,
@@ -1386,7 +1393,9 @@ impl AccountManager {
             }
             serving += 1;
             let s = a.state.lock();
-            if s.quota_exhausted_until > now {
+            if s.aws_login_issue_at > 0.0 {
+                gone += 1;
+            } else if s.quota_exhausted_until > now {
                 quota += 1;
                 soonest = soonest.min(s.quota_exhausted_until - now);
             } else if is_quota_depleted(&s, now) {
@@ -2170,6 +2179,29 @@ mod tests {
         a.models
             .update(models.iter().map(|m| json!({"modelId": m})).collect());
         a
+    }
+
+    #[test]
+    fn login_issue_does_not_establish_model_support() {
+        let pool = AccountManager::new(reqwest::Client::new());
+        let a = account("diagnosed-with-unknown-catalog");
+        a.state.lock().aws_login_issue_at = 123.0;
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push(a.id.clone());
+            inner.accounts.insert(a.id.clone(), a.clone());
+        }
+        // A persisted diagnostic after restart does not make an unknown model
+        // catalog authoritative. Clients must still receive a retryable 503.
+        assert_eq!(
+            pool.unavailability("requested-model"),
+            Unavailable::Temporary
+        );
+        a.models.update(vec![json!({"modelId": "other-model"})]);
+        assert_eq!(pool.unavailability("requested-model"), Unavailable::Model);
+        assert_eq!(pool.unavailability("other-model"), Unavailable::Accounts);
+        a.state.lock().quota_exhausted_until = f64::MAX;
+        assert_eq!(pool.unavailability("other-model"), Unavailable::Accounts);
     }
 
     #[tokio::test]
