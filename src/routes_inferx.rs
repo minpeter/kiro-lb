@@ -8,7 +8,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use futures_util::StreamExt;
 use rusqlite::OptionalExtension;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 use crate::app::{json_response, InflightGuard, Shared};
-use crate::auth::KiroAuth;
+use crate::auth::{AuthError, KiroAuth};
+use crate::model_catalog::ManagementError;
 use crate::stream_anthropic::StreamCtx;
 use crate::stream_openai::OpenAIOptions;
 use crate::usage_tracking::RequestCtx;
@@ -32,6 +33,8 @@ const MAX_BODY: usize = 4096;
 const MAX_INFERENCE_BODY: usize = crate::inferx_contract::MAX_BODY;
 const MAX_INFERENCE_RESPONSE: usize = 1024 * 1024;
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(120);
+const RECHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const RECHECK_COOLDOWN_MS: i64 = 60_000;
 
 static CONNECTION_LOCKS: LazyLock<
     parking_lot::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
@@ -59,6 +62,122 @@ struct Row {
     upstream: Option<String>,
     email: Option<String>,
     next_poll: i64,
+    diagnostics: Option<Diagnostics>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum Health {
+    Unknown,
+    Healthy,
+    AuthenticationFailed,
+    TemporarilySuspended,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Overage {
+    Enabled,
+    Disabled,
+    Unknown,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Usage {
+    plan: Option<String>,
+    used: Option<f64>,
+    limit: Option<f64>,
+    resets_at: Option<i64>,
+    overage: Overage,
+    updated_at: i64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Diagnostics {
+    checked_at: i64,
+    health: Health,
+    usage: Option<Usage>,
+}
+
+impl Diagnostics {
+    fn success(u: &Value) -> Self {
+        let now = now_ms();
+        // Kiro's nextDateReset is Unix seconds, sometimes encoded as a string.
+        let reset = u["nextDateReset"].as_f64().or_else(|| {
+            u["nextDateReset"]
+                .as_str()
+                .and_then(|s| s.trim().parse().ok())
+        });
+        Self {
+            checked_at: now,
+            health: Health::Healthy,
+            usage: Some(Usage {
+                plan: u["subscriptionTitle"]
+                    .as_str()
+                    .filter(|s| !s.is_empty() && *s != "Unknown")
+                    .map(str::to_owned),
+                used: u["currentUsage"].as_f64(),
+                limit: u["usageLimit"].as_f64(),
+                resets_at: reset
+                    .filter(|r| r.is_finite() && *r > 0.0 && *r < i64::MAX as f64 / 1000.0)
+                    .map(|r| (r * 1000.0) as i64),
+                overage: match u["overageStatus"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "ENABLED" => Overage::Enabled,
+                    "DISABLED" => Overage::Disabled,
+                    _ => Overage::Unknown,
+                },
+                updated_at: now,
+            }),
+        }
+    }
+
+    fn failure(previous: Option<Self>, health: Health) -> Self {
+        Self {
+            checked_at: now_ms(),
+            health,
+            usage: previous.and_then(|d| d.usage),
+        }
+    }
+}
+
+fn http_health(status: u16, body: &str) -> Health {
+    let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    if crate::errors::is_suspension_error(
+        status,
+        value["message"].as_str(),
+        value["reason"].as_str(),
+    ) {
+        Health::TemporarilySuspended
+    } else if status == 401 {
+        Health::AuthenticationFailed
+    } else {
+        // A bare 403 can mean a permission/configuration problem, not a dead login.
+        Health::Unknown
+    }
+}
+
+fn auth_health(error: &AuthError) -> Health {
+    match error {
+        AuthError::CredentialDead { .. } => Health::AuthenticationFailed,
+        AuthError::Http { status, body } => http_health(*status, body),
+        _ => Health::Unknown,
+    }
+}
+
+fn management_health(error: &ManagementError) -> Health {
+    match error {
+        ManagementError::Auth(e) => auth_health(e),
+        ManagementError::Http { status, body } => http_health(*status, body),
+        ManagementError::Other(_) => Health::Unknown,
+    }
 }
 
 fn error(status: u16, code: &str, message: &str) -> Response {
@@ -104,13 +223,13 @@ fn valid_field(value: &str, max: usize) -> bool {
 
 fn read_row(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Row>> {
     use rusqlite::OptionalExtension;
-    c.query_row("SELECT id,owner_id,provider,status,flow_id,authorization_json,credential_json,upstream_id,email,next_poll_at FROM inferx_connections WHERE id=?1", [id], |r| {
-        Ok(Row { id:r.get(0)?, owner:r.get(1)?, provider:r.get(2)?, status:r.get(3)?, flow:r.get(4)?, authorization:r.get::<_,Option<String>>(5)?.and_then(|s|serde_json::from_str(&s).ok()), upstream:r.get(7)?, email:r.get(8)?, next_poll:r.get(9)? })
+    c.query_row("SELECT id,owner_id,provider,status,flow_id,authorization_json,credential_json,upstream_id,email,next_poll_at,diagnostics_json FROM inferx_connections WHERE id=?1", [id], |r| {
+        Ok(Row { id:r.get(0)?, owner:r.get(1)?, provider:r.get(2)?, status:r.get(3)?, flow:r.get(4)?, authorization:r.get::<_,Option<String>>(5)?.and_then(|s|serde_json::from_str(&s).ok()), upstream:r.get(7)?, email:r.get(8)?, next_poll:r.get(9)?, diagnostics:r.get::<_,Option<String>>(10)?.and_then(|s|serde_json::from_str(&s).ok()) })
     }).optional()
 }
 
 fn response(row: &Row) -> Value {
-    json!({"id":row.id,"status":row.status,"authorization":if row.status=="pending" {row.authorization.clone()} else {None},"account":if row.status=="registered" {Some(json!({"id":row.upstream,"email":row.email}))} else {None}})
+    json!({"id":row.id,"status":row.status,"authorization":if row.status=="pending" {row.authorization.clone()} else {None},"account":if row.status=="registered" {Some(json!({"id":row.upstream,"email":row.email}))} else {None},"diagnostics":row.diagnostics})
 }
 
 fn expired(row: &Row) -> bool {
@@ -182,6 +301,110 @@ pub async fn get_connection(
         }
         Err(r) => r,
     }
+}
+
+pub async fn recheck_connection(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = guard(&headers) {
+        return r;
+    }
+    if !valid_id(&id) {
+        return error(404, "not_found", "Not found");
+    }
+    if body.len() > MAX_BODY {
+        return error(413, "request_too_large", "Request body too large");
+    }
+    let Ok(p) = serde_json::from_slice::<PollBody>(&body) else {
+        return error(400, "invalid_request", "Invalid request");
+    };
+    if !valid_field(&p.owner_id, MAX_OWNER) {
+        return error(400, "invalid_request", "Invalid ownerId");
+    }
+    // Check ownership before waiting on another owner's potentially long request.
+    if let Err(r) = owned(id.clone(), p.owner_id.clone()).await {
+        return r;
+    }
+    let operation_guard = connection_lock(&id).lock_owned().await;
+    let row = match owned(id.clone(), p.owner_id.clone()).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if row.status != "registered" {
+        return json_response(200, response(&row));
+    }
+    let sid = id.clone();
+    let owner = p.owner_id.clone();
+    let credential = store::run(move |c| {
+        let now = now_ms();
+        if c.execute(
+            "UPDATE inferx_connections SET next_recheck_at=?3 WHERE id=?1 AND owner_id=?2 AND status='registered' AND next_recheck_at<=?4",
+            rusqlite::params![sid, owner, now + RECHECK_COOLDOWN_MS, now],
+        )? == 0 {
+            return Ok(None);
+        }
+        c.query_row("SELECT credential_json FROM inferx_connections WHERE id=?1", [sid], |r| r.get::<_, Option<String>>(0))
+            .map(|doc| Some(doc.unwrap_or_default()))
+    }).await;
+    let credential = match credential {
+        Ok(Some(doc)) => serde_json::from_str(&doc).unwrap_or(Value::Null),
+        Ok(None) => return json_response(200, response(&row)),
+        Err(_) => return error(500, "internal_error", "Internal error"),
+    };
+    let drain = InflightGuard::enter(&state);
+    // Once refresh starts, client cancellation must not discard rotated secrets
+    // or release the disconnect fence before persistence finishes.
+    let task = tokio::spawn(async move {
+        let _drain = drain;
+        let _guard = operation_guard;
+        let auth = KiroAuth::from_device_credentials(
+            &format!("inferx-{id}"),
+            &credential,
+            state.http.clone(),
+        );
+        let result = tokio::time::timeout(RECHECK_TIMEOUT, async {
+            let auth = auth.as_ref().map_err(auth_health)?;
+            let mut result =
+                model_catalog::fetch_account_usage_checked(auth, &state.http, auth.profile_arn())
+                    .await;
+            // A rejected access token may only be stale; refresh once before
+            // declaring authentication failure. Never retry a suspension.
+            if matches!(&result, Err(e @ ManagementError::Http { status: 401, .. }) if management_health(e) == Health::AuthenticationFailed) {
+                auth.force_refresh().await.map_err(|e| auth_health(&e))?;
+                result = model_catalog::fetch_account_usage_checked(
+                    auth,
+                    &state.http,
+                    auth.profile_arn(),
+                )
+                .await;
+            }
+            result.map_err(|e| management_health(&e))
+        })
+        .await;
+        let diagnostics = match result {
+            Ok(Ok(u)) => Diagnostics::success(&u),
+            Ok(Err(health)) => Diagnostics::failure(row.diagnostics, health),
+            Err(_) => Diagnostics::failure(row.diagnostics, Health::Unknown),
+        };
+        let rotated = auth.ok().map(|a| a.credential_document().to_string());
+        let owner = p.owner_id;
+        match store::run(move |c| {
+            c.execute(
+                "UPDATE inferx_connections SET diagnostics_json=?3,credential_json=COALESCE(?4,credential_json),updated_at=?5 WHERE id=?1 AND owner_id=?2 AND status='registered'",
+                rusqlite::params![id, owner, serde_json::to_string(&diagnostics).unwrap(), rotated, now_ms()],
+            )?;
+            read_row(c, &id)
+        }).await {
+            Ok(Some(row)) => json_response(200, response(&row)),
+            Ok(None) => error(404, "not_found", "Not found"),
+            Err(_) => error(500, "internal_error", "Internal error"),
+        }
+    });
+    task.await
+        .unwrap_or_else(|_| error(500, "internal_error", "Internal error"))
 }
 
 pub async fn put_connection(
@@ -390,7 +613,9 @@ pub async fn poll_connection(
     let sc = rotated.to_string();
     let suid = uid.clone();
     let se = email.clone();
-    let result = store::run(move |c| register_in(c, &sid, &sc, &suid, se.as_deref())).await;
+    let diagnostics = Diagnostics::success(&u);
+    let result =
+        store::run(move |c| register_in(c, &sid, &sc, &suid, se.as_deref(), &diagnostics)).await;
     if result.is_err() {
         return error(500, "internal_error", "Internal error");
     }
@@ -412,6 +637,7 @@ fn register_in(
     credential: &str,
     upstream: &str,
     email: Option<&str>,
+    diagnostics: &Diagnostics,
 ) -> rusqlite::Result<bool> {
     let conflict: i64 = c.query_row(
         "SELECT COUNT(*) FROM inferx_connections WHERE upstream_id=?1 AND id<>?2",
@@ -422,8 +648,8 @@ fn register_in(
         return Ok(false);
     }
     Ok(c.execute(
-        "UPDATE inferx_connections SET status='registered',credential_json=?2,upstream_id=?3,email=?4,flow_id=NULL,authorization_json=NULL,updated_at=?5 WHERE id=?1 AND status='pending'",
-        rusqlite::params![id, credential, upstream, email, now_ms()],
+        "UPDATE inferx_connections SET status='registered',credential_json=?2,upstream_id=?3,email=?4,flow_id=NULL,authorization_json=NULL,updated_at=?5,diagnostics_json=?6,next_recheck_at=?7 WHERE id=?1 AND status='pending'",
+        rusqlite::params![id, credential, upstream, email, now_ms(), serde_json::to_string(diagnostics).unwrap(), diagnostics.checked_at + RECHECK_COOLDOWN_MS],
     )? == 1)
 }
 
@@ -469,7 +695,7 @@ pub async fn delete_connection(
     let _lock = connection_lock(&id).lock_owned().await;
     let sid = id.clone();
     let owner = q.owner_id.clone();
-    let result=store::run(move|c|{if let Some(r)=read_row(c,&sid)?{if r.owner!=owner{return Ok(None)};if let Some(f)=r.flow.as_deref(){device_login::discard(f)};c.execute("UPDATE inferx_connections SET status='disconnected',flow_id=NULL,authorization_json=NULL,credential_json=NULL,upstream_id=NULL,email=NULL,updated_at=?2 WHERE id=?1",rusqlite::params![sid,(store::now_f64()*1000.0)as i64])?;}else{let now=(store::now_f64()*1000.0)as i64;c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,created_at,updated_at)VALUES(?1,?2,'github','disconnected',?3,?3)",rusqlite::params![sid,owner,now])?;}read_row(c,&sid)}).await;
+    let result=store::run(move|c|{if let Some(r)=read_row(c,&sid)?{if r.owner!=owner{return Ok(None)};if let Some(f)=r.flow.as_deref(){device_login::discard(f)};c.execute("UPDATE inferx_connections SET status='disconnected',flow_id=NULL,authorization_json=NULL,credential_json=NULL,upstream_id=NULL,email=NULL,diagnostics_json=NULL,next_recheck_at=0,updated_at=?2 WHERE id=?1",rusqlite::params![sid,(store::now_f64()*1000.0)as i64])?;}else{let now=(store::now_f64()*1000.0)as i64;c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,created_at,updated_at)VALUES(?1,?2,'github','disconnected',?3,?3)",rusqlite::params![sid,owner,now])?;}read_row(c,&sid)}).await;
     match result {
         Ok(Some(r)) => json_response(200, response(&r)),
         Ok(None) => error(404, "not_found", "Not found"),
@@ -683,7 +909,7 @@ pub async fn post_request(
             execute_inference(
                 &task_state,
                 &task_connection,
-                auth.as_ref().ok_or(())?.clone(),
+                auth.as_ref().ok_or(Health::Unknown)?.clone(),
                 &request,
                 &model,
                 max_tokens,
@@ -692,6 +918,12 @@ pub async fn post_request(
             .await
         })
         .await;
+        let health = match &result {
+            Ok(Err(health @ (Health::AuthenticationFailed | Health::TemporarilySuspended))) => {
+                Some(*health)
+            }
+            _ => None,
+        };
         let (status, completion, usage, delivery_complete) = match result {
             Ok(Ok((v, u, delivered))) => ("succeeded", Some(v), Some(u), delivered),
             Ok(Err(_)) => ("failed", None, None, true),
@@ -710,7 +942,13 @@ pub async fn post_request(
         let metering = usage
             .as_ref()
             .map(|_| crate::inferx_contract::metering().to_string());
-        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}read_receipt(c,&sid)}).await.ok().flatten();
+        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}
+            if let Some(health) = health {
+                let previous = read_row(c, &connection)?.and_then(|r| r.diagnostics);
+                let diagnostics = Diagnostics::failure(previous, health);
+                c.execute("UPDATE inferx_connections SET diagnostics_json=?3 WHERE id=?1 AND owner_id=?2 AND status='registered'", rusqlite::params![connection, owner, serde_json::to_string(&diagnostics).unwrap()])?;
+            }
+            read_receipt(c,&sid)}).await.ok().flatten();
         if let Some(receipt) = saved {
             let _ = tx.send((receipt, completion, delivery_complete));
         }
@@ -801,17 +1039,18 @@ async fn execute_inference(
     model: &str,
     max_tokens: i64,
     stream_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
-) -> Result<(Value, (i64, i64, i64, Option<f64>, Option<f64>), bool), ()> {
+) -> Result<(Value, (i64, i64, i64, Option<f64>, Option<f64>), bool), Health> {
     let started = Instant::now();
     let arn = auth.request_profile_arn().unwrap_or_default();
     let req = request.clone();
     let cid = utils::conversation_id();
     let (prepared, guard, built) = tokio::task::spawn_blocking(move || build(&req, &cid, &arn))
         .await
-        .map_err(|_| ())??;
+        .map_err(|_| Health::Unknown)?
+        .map_err(|_| Health::Unknown)?;
     let input = built.input_tokens as i64;
     if input > 200_000 {
-        return Err(());
+        return Err(Health::Unknown);
     }
     let model_id = built
         .payload
@@ -830,9 +1069,14 @@ async fn execute_inference(
             false,
         )
         .await
-        .map_err(|_| ())?;
+        .map_err(|e| match e {
+            crate::upstream::http::TransportError::Auth(e) => auth_health(&e),
+            crate::upstream::http::TransportError::Http { status, detail } => {
+                http_health(status, &detail)
+            }
+        })?;
     if response.status != 200 {
-        return Err(());
+        return Err(http_health(response.status, &response.text().await));
     }
     let (bytes, _permits) = response.into_stream();
     let ctx = RequestCtx::new(None);
@@ -846,7 +1090,9 @@ async fn execute_inference(
         search_followup: None,
     };
     let (completion, output, delivery_complete) =
-        respond(bytes, stream_ctx, &prepared, guard, max_tokens, stream_tx).await?;
+        respond(bytes, stream_ctx, &prepared, guard, max_tokens, stream_tx)
+            .await
+            .map_err(|_| Health::Unknown)?;
     let usage = ctx.usage.lock().clone();
     Ok((
         completion,
@@ -985,17 +1231,23 @@ mod tests {
             c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,created_at,updated_at) VALUES(?1,?2,'github',?3,0,0)", rusqlite::params![id,owner,status]).unwrap();
         }
         let credential = r#"{"refreshToken":"private-refresh","accessToken":"private-access"}"#;
+        let diagnostics = Diagnostics::success(
+            &json!({"subscriptionTitle":"Pro","currentUsage":12.75,"usageLimit":100}),
+        );
         assert!(register_in(
             &c,
             "a",
             credential,
             "upstream-alice",
-            Some("alice@example.test")
+            Some("alice@example.test"),
+            &diagnostics,
         )
         .unwrap());
-        assert!(!register_in(&c, "b", credential, "upstream-alice", None).unwrap());
-        assert!(!register_in(&c, "c", credential, "upstream-other", None).unwrap());
-        assert!(!register_in(&c, "a", "overwritten", "upstream-alice", None).unwrap());
+        assert!(!register_in(&c, "b", credential, "upstream-alice", None, &diagnostics).unwrap());
+        assert!(!register_in(&c, "c", credential, "upstream-other", None, &diagnostics).unwrap());
+        assert!(
+            !register_in(&c, "a", "overwritten", "upstream-alice", None, &diagnostics).unwrap()
+        );
         let persisted: String = c
             .query_row(
                 "SELECT credential_json FROM inferx_connections WHERE id='a'",
@@ -1007,11 +1259,23 @@ mod tests {
         let view = response(&read_row(&c, "a").unwrap().unwrap());
         assert_eq!(view["account"]["id"], "upstream-alice");
         assert_eq!(view["status"], "registered");
+        assert_eq!(view["diagnostics"]["health"], "healthy");
+        assert_eq!(view["diagnostics"]["usage"]["used"], 12.75);
+        assert_eq!(view["diagnostics"]["usage"]["limit"], 100.0);
+        assert!(read_row(&c, "c").unwrap().unwrap().diagnostics.is_none());
+        let next: i64 = c
+            .query_row(
+                "SELECT next_recheck_at FROM inferx_connections WHERE id='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, diagnostics.checked_at + 60_000);
         assert!(!view.to_string().contains("private-"));
         assert!(view["authorization"].is_null());
         assert_eq!(read_row(&c, "c").unwrap().unwrap().status, "disconnected");
         // A different verified identity is not confused with the first identity.
-        assert!(register_in(&c, "b", credential, "upstream-bob", None).unwrap());
+        assert!(register_in(&c, "b", credential, "upstream-bob", None, &diagnostics).unwrap());
     }
 
     #[tokio::test]

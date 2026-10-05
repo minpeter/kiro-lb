@@ -254,17 +254,58 @@ Do not add operator accounts later or expose the dashboard and `/v1` publicly.
 Protect the database and backups; managed encryption is still needed before a
 public marketplace rollout. Disconnect erases stored credentials, not upstream
 OAuth grants. Registered status checks read saved metadata, not current upstream
-health; credentials refresh on demand for seller-scoped serving. Continuous
-health checks are not included. Initialize a fresh dedicated database for this
+health; credentials refresh on demand for seller-scoped serving or diagnostics.
+Continuous health checks are not included. Initialize a fresh dedicated database for this
 contract; there is no compatibility path for earlier prototype schemas.
 
 `PUT` takes `{ownerId, provider}` with `provider` equal to `github`,
 `google`, or `builder-id`; polling takes `{ownerId}`. `GET` and `DELETE` take `ownerId` in the query.
-Responses expose only `{id, status, authorization, account}`. Authorization has
+Responses expose only `{id, status, authorization, account, diagnostics}`. Authorization has
 `url`, `userCode`, `expiresAt` (Unix milliseconds), and `intervalSeconds`; account
 has the verified upstream `id` and nullable `email`. Both are nullable. Status is
 `pending`, `registered`, `expired`, `failed`, or `disconnected`. Neither the
 control token nor provider tokens belong in browser requests.
+
+`diagnostics` is additive and nullable (null until checked), independent of the
+lifecycle status: an unhealthy account remains `registered`. Its shape is:
+
+```typescript
+{
+  checkedAt: number; // Unix milliseconds, latest completed diagnostic check
+  health: "unknown" | "healthy" | "authentication_failed" | "temporarily_suspended";
+  usage: null | {
+    plan: string | null;
+    used: number | null;
+    limit: number | null;
+    resetsAt: number | null; // Unix milliseconds
+    overage: "enabled" | "disabled" | "unknown";
+    updatedAt: number; // Unix milliseconds, latest successful usage reading
+  };
+}
+```
+
+`POST /internal/inferx/v1/connections/{uuid}/recheck` takes `{ownerId}` and returns
+the usual connection response. It refreshes credentials as needed and calls
+Kiro's usage API without generating tokens. A persisted 60-second cooldown per
+connection returns cached results for repeated requests, including after failed
+checks or process restarts. Upstream work is bounded to 30 seconds after acquiring
+the connection lock; it serializes with inference and disconnect. Non-registered
+connections return their cached response without contacting Kiro. Missing and
+other-owner UUIDs return the same 404 body.
+
+`GET` never contacts Kiro. Registration saves its already-fetched usage. Definitive
+inference credential rejection or suspension also updates health without replacing
+usage. A management 401 gets one credential refresh and retry before being treated
+as authentication failure. Explicit suspension reasons/messages are distinct from
+credential rejection; generic management 403, throttling, timeouts and other
+unclassified failures yield `unknown`. Failed diagnostic checks preserve the last
+successful `usage` and its `updatedAt`; missing upstream fields are null, not zero.
+`healthy` means the management check succeeded, not that every model is available
+or that quota remains. Diagnostics contain only the fields above, never raw errors,
+tokens or profile ARNs. They persist separately with the connection using additive
+SQLite columns. Disconnect clears diagnostics and credentials and fences delayed
+work; a cancelled HTTP recheck still saves any rotated credential before releasing
+that fence. Database and backup protection requirements above also apply here.
 
 Retry ambiguous requests with the same canonical UUID. Ownership is immutable,
 including after disconnection. Deleting an unknown UUID creates a tombstone to

@@ -4,9 +4,26 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::auth::{region_from_arn, KiroAuth};
+use crate::auth::{region_from_arn, AuthError, KiroAuth};
 use crate::config;
 use crate::utils::{management_headers, CODEWHISPERER_API, CONTROL_PLANE_API};
+
+#[derive(Debug)]
+pub(crate) enum ManagementError {
+    Auth(AuthError),
+    Http { status: u16, body: String },
+    Other(String),
+}
+
+impl std::fmt::Display for ManagementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auth(e) => e.fmt(f),
+            Self::Http { status, .. } => write!(f, "management host answered {status}"),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
 
 fn region(auth: &KiroAuth) -> Result<String, String> {
     let arn = auth.profile_arn().unwrap_or_default();
@@ -36,11 +53,13 @@ async fn management_call(
     http: &reqwest::Client,
     call: ManagementCall<'_>,
     label: &str,
-) -> Result<Value, String> {
-    let region = region(auth)?;
-    let token = auth.access_token().await.map_err(|e| e.to_string())?;
+) -> Result<Value, ManagementError> {
+    let region = region(auth).map_err(ManagementError::Other)?;
+    let token = auth.access_token().await.map_err(ManagementError::Auth)?;
     let arn = auth.request_profile_arn().or_else(|| auth.profile_arn());
     let base = format!("https://management.{region}.kiro.dev/");
+    #[cfg(debug_assertions)]
+    let base = std::env::var("KIRO_TEST_MANAGEMENT_URL").unwrap_or(base);
     let (mut req, target) = match call {
         ManagementCall::Json { target } => {
             let mut body = json!({"origin": "AI_EDITOR"});
@@ -62,12 +81,34 @@ async fn management_call(
     for (k, v) in management_headers(&token, target, label, &auth.machine_id()) {
         req = req.header(k, v);
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ManagementError::Other(e.to_string()))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("management host answered {}", status.as_u16()));
+        // Bound error bodies; retain them only in memory for classification.
+        let mut resp = resp;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| ManagementError::Other(e.to_string()))?
+        {
+            if body.len() + chunk.len() > 16 * 1024 {
+                body.clear();
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        return Err(ManagementError::Http {
+            status: status.as_u16(),
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
     }
-    resp.json::<Value>().await.map_err(|e| e.to_string())
+    resp.json::<Value>()
+        .await
+        .map_err(|e| ManagementError::Other(e.to_string()))
 }
 
 pub async fn fetch_available_models(auth: &KiroAuth, http: &reqwest::Client) -> Option<Vec<Value>> {
@@ -110,8 +151,20 @@ pub async fn fetch_account_usage(
     http: &reqwest::Client,
     stored_arn: Option<String>,
 ) -> Result<Value, String> {
+    fetch_account_usage_checked(auth, http, stored_arn)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn fetch_account_usage_checked(
+    auth: &KiroAuth,
+    http: &reqwest::Client,
+    stored_arn: Option<String>,
+) -> Result<Value, ManagementError> {
     if auth.request_profile_arn().is_none() && stored_arn.is_none() {
-        return Err("profile ARN is not available yet for this account".into());
+        return Err(ManagementError::Other(
+            "profile ARN is not available yet for this account".into(),
+        ));
     }
     let payload = management_call(
         auth,
@@ -126,6 +179,9 @@ pub async fn fetch_account_usage(
         CODEWHISPERER_API,
     )
     .await?;
+    if !payload.is_object() {
+        return Err(ManagementError::Other("invalid usage response".into()));
+    }
     let breakdowns = payload
         .get("usageBreakdownList")
         .and_then(Value::as_array)
@@ -202,7 +258,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(error.starts_with("invalid region:"));
+        assert!(error.to_string().starts_with("invalid region:"));
         assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
     }
 }
