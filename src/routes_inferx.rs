@@ -1118,6 +1118,90 @@ async fn execute_inference(
     ))
 }
 
+/// Restrict the provider-neutral event stream to the aggregate output-token
+/// budget used by the OpenAI adapter (visible text + reasoning + complete tool
+/// calls). Text is cut only at UTF-8 character boundaries and tool calls stay
+/// atomic. Returning drops the HTTP body; this stops local consumption but does
+/// not guarantee that Kiro stops billing work it has already generated.
+fn limit_output(
+    events: stream_core::EventStream,
+    model: &str,
+    max_tokens: i64,
+    parallel_tool_calls: bool,
+    limited: Arc<std::sync::atomic::AtomicBool>,
+) -> stream_core::EventStream {
+    let model = model.to_owned();
+    Box::pin(async_stream::try_stream! {
+        let mut events = events;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut native_tools = Vec::new();
+        let fits = |text: &str, reasoning: &str, tools: &[Value]| {
+            let projection = stream_openai::project_tool_calls(
+                text, tools, &Default::default(), parallel_tool_calls,
+            );
+            let tool_text = stream_openai::projected_tool_text(&projection.calls);
+            let aggregate = format!("{text}{reasoning}{tool_text}");
+            crate::tokenizer::count_tokens(&aggregate, true, Some(&model)) as i64 <= max_tokens
+        };
+        while let Some(event) = events.next().await {
+            let event = event?;
+            let piece = match &event {
+                stream_core::KiroEvent::Content(value) => Some((false, value.as_str())),
+                stream_core::KiroEvent::Thinking { text, .. } => Some((true, text.as_str())),
+                stream_core::KiroEvent::ToolUse(tool) => {
+                    let mut candidate = native_tools.clone();
+                    candidate.push(tool.clone());
+                    if !fits(&text, &reasoning, &candidate) {
+                        limited.store(true, std::sync::atomic::Ordering::Relaxed);
+                        yield stream_core::KiroEvent::StopReason("MAX_TOKENS".into());
+                        return;
+                    }
+                    // Keep raw history: a later duplicate can replace a selected call.
+                    native_tools = candidate;
+                    yield event;
+                    continue;
+                }
+                _ => None,
+            };
+            if let Some((thinking, value)) = piece {
+                let prefix_fits = |prefix: &str| {
+                    if thinking {
+                        fits(&text, &format!("{reasoning}{prefix}"), &native_tools)
+                    } else {
+                        fits(&format!("{text}{prefix}"), &reasoning, &native_tools)
+                    }
+                };
+                if !prefix_fits(value) {
+                    // BPE counts are non-monotonic. Search for a measured-safe
+                    // prefix, not necessarily the longest, in logarithmic probes.
+                    let boundaries: Vec<usize> = std::iter::once(0)
+                        .chain(value.char_indices().map(|(offset, ch)| offset + ch.len_utf8()))
+                        .collect();
+                    let (mut low, mut high) = (0, boundaries.len() - 1);
+                    while low + 1 < high {
+                        let mid = low + (high - low) / 2;
+                        if prefix_fits(&value[..boundaries[mid]]) { low = mid; } else { high = mid; }
+                    }
+                    if boundaries[low] > 0 {
+                        let prefix = value[..boundaries[low]].to_owned();
+                        yield if thinking {
+                            stream_core::KiroEvent::Thinking { text: prefix, is_first: matches!(event, stream_core::KiroEvent::Thinking { is_first: true, .. }) }
+                        } else {
+                            stream_core::KiroEvent::Content(prefix)
+                        };
+                    }
+                    limited.store(true, std::sync::atomic::Ordering::Relaxed);
+                    yield stream_core::KiroEvent::StopReason("MAX_TOKENS".into());
+                    return;
+                }
+                if thinking { reasoning.push_str(value); } else { text.push_str(value); }
+            }
+            yield event;
+        }
+    })
+}
+
 /// Drains one upstream response into the private InferX completion. Kiro has
 /// no native `tool_choice`, so tool calls are checked before forwarding: a
 /// disallowed call, or a `required`/named turn without a compliant call, is
@@ -1143,13 +1227,22 @@ async fn respond(
         futures_util::future::ready(keep.then_some(item))
     });
     let events = stream_core::parse_kiro_stream(Box::pin(bounded), 30.0, 30.0);
+    let limited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let parallel_tool_calls = request
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let events = limit_output(
+        events,
+        &stream_ctx.model,
+        max_tokens,
+        parallel_tool_calls,
+        limited.clone(),
+    );
     let opts = OpenAIOptions {
         execute_web_search: false,
         include_reasoning: true,
-        parallel_tool_calls: request
-            .get("parallel_tool_calls")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
+        parallel_tool_calls,
         request_messages: request["messages"].as_array().cloned().unwrap_or_default(),
         request_tools: request["tools"].as_array().cloned().unwrap_or_default(),
     };
@@ -1181,7 +1274,9 @@ async fn respond(
                 if choice["delta"]
                     .get("tool_calls")
                     .is_some_and(|calls| !guard.allow(calls))
-                    || !choice["finish_reason"].is_null() && !guard.satisfied()
+                    || !choice["finish_reason"].is_null()
+                        && !guard.satisfied()
+                        && !limited.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     rejected = true;
                 }
@@ -1216,7 +1311,7 @@ async fn respond(
     if overflow.load(std::sync::atomic::Ordering::Relaxed)
         || response_overflow
         || rejected
-        || !guard.satisfied()
+        || !guard.satisfied() && !limited.load(std::sync::atomic::Ordering::Relaxed)
         || output > max_tokens
         || (!streaming
             && serde_json::to_vec(&completion)
@@ -1524,9 +1619,21 @@ mod tests {
         choice: Value,
         upstream: &'static str,
         streaming: bool,
+        max_tokens: i64,
+    ) -> (Result<(Value, i64, bool), Health>, Vec<Value>, bool) {
+        run_parallel(choice, upstream, streaming, max_tokens, true).await
+    }
+
+    async fn run_parallel(
+        choice: Value,
+        upstream: &'static str,
+        streaming: bool,
+        max_tokens: i64,
+        parallel_tool_calls: bool,
     ) -> (Result<(Value, i64, bool), Health>, Vec<Value>, bool) {
         let mut request = tool_choice_request(Some(choice));
         request["stream"] = json!(streaming);
+        request["parallel_tool_calls"] = json!(parallel_tool_calls);
         let (prepared, guard, built) = build(&request, "cid", "").unwrap();
         let credential = json!({"accessToken":"fixture-access","refreshToken":"fixture-refresh","expiresAt":"2999-01-01T00:00:00Z","region":"us-east-1"});
         let http = reqwest::Client::new();
@@ -1551,7 +1658,7 @@ mod tests {
             stream_ctx,
             &prepared,
             guard,
-            4096,
+            max_tokens,
             streaming.then_some(tx),
         )
         .await;
@@ -1562,7 +1669,7 @@ mod tests {
             frames
                 .push(serde_json::from_str(chunk.strip_prefix("data: ").unwrap().trim()).unwrap());
         }
-        // Usage is recorded only after the provider stream has been drained.
+        // Usage is recorded after the bounded provider stream completes.
         let drained = ctx.usage.lock().output_tokens.is_some();
         (result, frames, drained)
     }
@@ -1583,6 +1690,296 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inferx_output_budget_counts_aggregate_output_and_keeps_utf8_and_tools_atomic() {
+        async fn limited(
+            events: Vec<stream_core::KiroEvent>,
+            max: i64,
+        ) -> Vec<stream_core::KiroEvent> {
+            let input: stream_core::EventStream =
+                Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)));
+            limit_output(
+                input,
+                "claude-sonnet-4",
+                max,
+                true,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect()
+        }
+
+        let text = limited(
+            vec![stream_core::KiroEvent::Content("one two three four".into())],
+            1,
+        )
+        .await;
+        assert!(
+            matches!(text.last(), Some(stream_core::KiroEvent::StopReason(reason)) if reason == "MAX_TOKENS")
+        );
+        let visible = text
+            .iter()
+            .filter_map(|event| match event {
+                stream_core::KiroEvent::Content(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(!visible.is_empty());
+        assert!(crate::tokenizer::count_tokens(&visible, true, Some("claude-sonnet-4")) <= 1);
+
+        let utf8 = limited(
+            vec![stream_core::KiroEvent::Content("你好世界abc".into())],
+            1,
+        )
+        .await;
+        assert!(utf8
+            .iter()
+            .filter_map(|event| match event {
+                stream_core::KiroEvent::Content(value) => Some(value),
+                _ => None,
+            })
+            .all(|value| std::str::from_utf8(value.as_bytes()).is_ok()));
+
+        let tool = json!({"id":"call","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Seoul\"}"}});
+        let aggregate = limited(
+            vec![
+                stream_core::KiroEvent::Thinking {
+                    text: "reasoning ".into(),
+                    is_first: true,
+                },
+                stream_core::KiroEvent::ToolUse(tool),
+            ],
+            1,
+        )
+        .await;
+        assert!(!aggregate
+            .iter()
+            .any(|event| matches!(event, stream_core::KiroEvent::ToolUse(_))));
+        assert!(
+            matches!(aggregate.last(), Some(stream_core::KiroEvent::StopReason(reason)) if reason == "MAX_TOKENS")
+        );
+
+        // Both pieces fit separately; they must share one budget.
+        let aggregate = limited(
+            vec![
+                stream_core::KiroEvent::Thinking {
+                    text: "one".into(),
+                    is_first: true,
+                },
+                stream_core::KiroEvent::Content(" two".into()),
+            ],
+            1,
+        )
+        .await;
+        assert!(
+            matches!(&aggregate[0], stream_core::KiroEvent::Thinking { text, .. } if text == "one")
+        );
+        assert!(!aggregate
+            .iter()
+            .any(|event| matches!(event, stream_core::KiroEvent::Content(text) if text == " two")));
+        assert!(
+            matches!(aggregate.last(), Some(stream_core::KiroEvent::StopReason(reason)) if reason == "MAX_TOKENS")
+        );
+    }
+
+    #[tokio::test]
+    async fn output_budget_uses_final_deduplicated_and_parallel_tool_projection() {
+        async fn apply(
+            events: Vec<stream_core::KiroEvent>,
+            max: i64,
+            parallel: bool,
+        ) -> Vec<stream_core::KiroEvent> {
+            let input: stream_core::EventStream =
+                Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)));
+            limit_output(
+                input,
+                "claude-sonnet-4",
+                max,
+                parallel,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect()
+        }
+        let call = |id: &str, name: &str, arguments: &str| json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}});
+        let assert_output = |events: &[stream_core::KiroEvent], max: usize, parallel: bool| {
+            let text = events
+                .iter()
+                .filter_map(|event| match event {
+                    stream_core::KiroEvent::Content(value) => Some(value.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            let tools = events
+                .iter()
+                .filter_map(|event| match event {
+                    stream_core::KiroEvent::ToolUse(tool) => Some(tool.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let projected =
+                stream_openai::project_tool_calls(&text, &tools, &Default::default(), parallel);
+            let output = format!(
+                "{text}{}",
+                stream_openai::projected_tool_text(&projected.calls)
+            );
+            assert!(crate::tokenizer::count_tokens(&output, true, Some("claude-sonnet-4")) <= max);
+            assert!(
+                matches!(events.last(), Some(stream_core::KiroEvent::StopReason(reason)) if reason == "MAX_TOKENS")
+            );
+            projected.calls
+        };
+
+        assert_eq!(
+            crate::tokenizer::count_tokens(
+                "abcdefghijklmnopqrstuvwxyz{}a{\"x\": 1}",
+                true,
+                Some("claude-sonnet-4")
+            ),
+            9
+        );
+        assert_eq!(
+            crate::tokenizer::count_tokens(
+                "abcdefghijklmnoa{\"x\": 1}",
+                true,
+                Some("claude-sonnet-4")
+            ),
+            10
+        );
+        let deduplicated = apply(
+            vec![
+                stream_core::KiroEvent::Content("abcdefghijklmno".into()),
+                stream_core::KiroEvent::ToolUse(call("call-x", "pqrstuvwxyz", "{}")),
+                stream_core::KiroEvent::ToolUse(call("call-x", "a", r#"{"x": 1}"#)),
+            ],
+            9,
+            true,
+        )
+        .await;
+        let tools = assert_output(&deduplicated, 9, true);
+        assert_eq!(tools[0]["function"]["name"], "pqrstuvwxyz");
+
+        let single = apply(
+            vec![
+                stream_core::KiroEvent::ToolUse(call("first", "a", "{}")),
+                stream_core::KiroEvent::ToolUse(call(
+                    "second",
+                    "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+                    "{}",
+                )),
+                stream_core::KiroEvent::Content("你".repeat(100)),
+            ],
+            115,
+            false,
+        )
+        .await;
+        let tools = assert_output(&single, 115, false);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "a");
+
+        let projection = stream_openai::project_tool_calls(
+            r#"[Called a with args: {"x": 1}]"#,
+            &[call("native", "a", r#"{"x":1}"#)],
+            &Default::default(),
+            true,
+        );
+        assert_eq!(projection.calls.len(), 1);
+        assert!(projection.calls[0].get("_bracket").is_none());
+    }
+
+    #[tokio::test]
+    async fn projected_tool_limits_succeed_streaming_and_collected_with_truthful_usage() {
+        const DEDUP: &str = r#"{"content":"abcdefghijklmno"}{"name":"pqrstuvwxyz","toolUseId":"call-x","input":"{}","stop":true}{"name":"a","toolUseId":"call-x","input":"{\"x\":1}","stop":true}{"usage":1}{"stopReason":"tool_use"}"#;
+        const PARALLEL: &str = r#"{"name":"a","toolUseId":"first","input":"{}","stop":true}{"name":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz","toolUseId":"second","input":"{}","stop":true}{"content":"你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你你"}{"usage":1}{"stopReason":"tool_use"}"#;
+        const BRACKET: &str = r#"{"content":"[Called a with args: {\"x\": 1}]"}{"name":"a","toolUseId":"native","input":"{\"x\":1}","stop":true}{"usage":1}{"stopReason":"tool_use"}"#;
+        for (upstream, max, parallel) in [
+            (DEDUP, 9, true),
+            (PARALLEL, 115, false),
+            (BRACKET, 20, true),
+        ] {
+            for streaming in [false, true] {
+                let (result, frames, drained) =
+                    run_parallel(json!("auto"), upstream, streaming, max, parallel).await;
+                let (completion, output, _) = result.expect("bounded output must be payable");
+                assert!(drained);
+                assert!(output <= max && output > 0, "{upstream}: {output}");
+                if streaming {
+                    assert!(terminal(&frames));
+                    assert_eq!(frames.last().unwrap()["usage"]["completion_tokens"], output);
+                    if upstream != BRACKET {
+                        assert!(frames
+                            .iter()
+                            .any(|frame| frame["choices"][0]["finish_reason"] == "length"));
+                    }
+                } else {
+                    assert_eq!(completion["usage"]["completion_tokens"], output);
+                    if upstream != BRACKET {
+                        assert_eq!(completion["choices"][0]["finish_reason"], "length");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn output_budget_drops_upstream_without_polling_the_rest() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let input = Box::pin(async_stream::try_stream! {
+            let _guard = guard;
+            yield stream_core::KiroEvent::Content("one two three four".into());
+            panic!("must not poll upstream after the output budget is exceeded");
+        });
+        let limited = Arc::new(AtomicBool::new(false));
+        let events = limit_output(input, "claude-sonnet-4", 1, true, limited.clone())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+        assert!(limited.load(Ordering::Relaxed));
+        assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn budget_length_is_a_paid_completion_even_before_a_required_tool_fits() {
+        for streaming in [false, true] {
+            for choice in [json!("auto"), json!("required"), named("weather")] {
+                let (result, frames, _) = run(choice, TEXT, streaming, 1).await;
+                let (completion, output, _) =
+                    result.expect("budget boundary must settle, not refund");
+                assert_eq!(output, 1);
+                if streaming {
+                    let text: String = frames
+                        .iter()
+                        .filter_map(|frame| frame["choices"][0]["delta"]["content"].as_str())
+                        .collect();
+                    assert!(!text.is_empty() && "plain".starts_with(&text));
+                    assert!(frames
+                        .iter()
+                        .any(|frame| frame["choices"][0]["finish_reason"] == "length"));
+                } else {
+                    let text = completion["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap();
+                    assert!(!text.is_empty() && "plain".starts_with(text));
+                    assert_eq!(completion["choices"][0]["finish_reason"], "length");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn tool_choice_output_is_checked_before_forwarding() {
         for (choice, upstream, accepted) in [
             (json!("auto"), TEXT, None),
@@ -1593,12 +1990,12 @@ mod tests {
             (json!("required"), LOOKUP, Some("lookup")),
             (named("weather"), WEATHER, Some("weather")),
         ] {
-            let (result, _, drained) = run(choice.clone(), upstream, false).await;
+            let (result, _, drained) = run(choice.clone(), upstream, false, 4096).await;
             let (completion, output, _) = result.expect("collected output accepted");
             assert!(drained && output > 0);
             let calls = &completion["choices"][0]["message"]["tool_calls"];
             assert_eq!(calls[0]["function"]["name"].as_str(), accepted, "{choice}");
-            let (result, frames, drained) = run(choice.clone(), upstream, true).await;
+            let (result, frames, drained) = run(choice.clone(), upstream, true, 4096).await;
             assert!(result.is_ok() && drained, "{choice} streamed");
             assert_eq!(
                 streamed_calls(&frames),
@@ -1614,10 +2011,10 @@ mod tests {
             (named("weather"), TEXT),
             (named("weather"), UNDECLARED),
         ] {
-            let (result, _, drained) = run(choice.clone(), upstream, false).await;
+            let (result, _, drained) = run(choice.clone(), upstream, false, 4096).await;
             assert!(result.is_err(), "{choice} {upstream} collected");
             assert!(drained);
-            let (result, frames, drained) = run(choice.clone(), upstream, true).await;
+            let (result, frames, drained) = run(choice.clone(), upstream, true, 4096).await;
             assert!(result.is_err(), "{choice} {upstream} streamed");
             assert!(drained, "{choice}: provider stream drained");
             // Neither the disallowed calls nor a terminal success frame leave.

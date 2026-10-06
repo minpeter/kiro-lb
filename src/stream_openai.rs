@@ -25,6 +25,56 @@ pub struct OpenAIOptions {
     pub request_tools: Vec<Value>,
 }
 
+pub(crate) struct ToolProjection {
+    pub calls: Vec<Value>,
+    pub before_parallel_limit: usize,
+}
+
+/// Apply the exact tool projection used when the OpenAI stream reaches EOF.
+/// Callers that meter prospective output must use this rather than raw native
+/// frames: bracket calls, duplicate IDs, and the parallel-call setting can all
+/// change the final visible call set.
+pub(crate) fn project_tool_calls(
+    full: &str,
+    native: &[Value],
+    intercepted: &HashSet<String>,
+    parallel_tool_calls: bool,
+) -> ToolProjection {
+    let mut all = native.to_vec();
+    all.extend(parse_bracket_tool_calls(full));
+    let mut all = deduplicate_tool_calls(&all);
+    if !intercepted.is_empty() {
+        all.retain(|t| {
+            !(t.get("_bracket").is_some_and(|b| b == true)
+                && intercepted.contains(&tool_call_signature(t)))
+        });
+    }
+    let before_parallel_limit = all.len();
+    if !parallel_tool_calls && all.len() > 1 {
+        all.truncate(1);
+    }
+    ToolProjection {
+        calls: all,
+        before_parallel_limit,
+    }
+}
+
+pub(crate) fn projected_tool_text(calls: &[Value]) -> String {
+    crate::usage_tracking::tool_call_text(calls.iter().filter(|t| t.get("_bracket").is_none()).map(
+        |t| {
+            (
+                t.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                t.pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        },
+    ))
+}
+
 fn data(v: &Value) -> String {
     format!("data: {}\n\n", serde_json::to_string(v).unwrap_or_default())
 }
@@ -111,16 +161,16 @@ pub fn stream(
         }
         if !received { Err(StreamError::Protocol(stream_core::NO_EVENTS))?; }
         let completed = metering_reported || legacy_usage_reported || context_usage.is_some();
-        let mut all = tools;
-        all.extend(parse_bracket_tool_calls(&full));
-        let mut all = deduplicate_tool_calls(&all);
-        if !intercepted.is_empty() {
-            all.retain(|t| !(t.get("_bracket").is_some_and(|b| b == true) && intercepted.contains(&tool_call_signature(t))));
+        let projection = project_tool_calls(
+            &full,
+            &tools,
+            &intercepted,
+            opts.parallel_tool_calls,
+        );
+        if !opts.parallel_tool_calls && projection.before_parallel_limit > 1 {
+            tracing::info!("parallel_tool_calls=false: forwarding the first of {} calls", projection.before_parallel_limit);
         }
-        if !opts.parallel_tool_calls && all.len() > 1 {
-            tracing::info!("parallel_tool_calls=false: forwarding the first of {} calls", all.len());
-            all.truncate(1);
-        }
+        let all = projection.calls;
         let truncated = !completed && !full.is_empty() && all.is_empty();
         if truncated {
             tracing::error!("Content truncated by Kiro API: stream ended without completion signals, length={} chars.", full.chars().count());
@@ -133,12 +183,7 @@ pub fn stream(
         } else {
             mapped.unwrap_or("stop")
         };
-        let tool_text = crate::usage_tracking::tool_call_text(all.iter().filter(|t| t.get("_bracket").is_none()).map(|t| {
-            (
-                t.pointer("/function/name").and_then(Value::as_str).unwrap_or(""),
-                t.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("").to_owned(),
-            )
-        }));
+        let tool_text = projected_tool_text(&all);
         let output_text = format!("{full}{thinking}{tool_text}");
         let model = ctx.model.clone();
         let completion = if output_text.len() >= 8192 {
