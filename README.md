@@ -329,8 +329,13 @@ durably fences an unknown UUID before the backend releases its hold. A late POST
 cannot execute a fenced request. Restart marks interrupted execution indeterminate;
 the backend does not bill unverified completions. Preserve the receipt database
 and drain admitted work on shutdown. Usage is tokenizer-estimated, not an upstream
-invoice; exceeding the requested output ceiling fails without confirmed usage but
-may consume seller quota. Never expose these endpoints directly to buyers.
+invoice. The InferX output limiter measures text, reasoning and complete tool calls
+before forwarding. It emits a safe UTF-8 prefix, omits any tool call that cannot fit,
+drops the upstream body at the budget boundary and succeeds with `finish_reason:
+"length"` plus bounded usage. A required tool may be absent at this boundary; the
+safe prefix need not fill the budget. The backend settles this receipt normally,
+instead of refunding already-delivered output. Local cancellation does not promise
+an upstream quota refund. Never expose these endpoints directly to buyers.
 
 ## Release maintenance
 

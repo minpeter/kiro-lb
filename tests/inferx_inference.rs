@@ -200,8 +200,9 @@ async fn images_and_tools_reach_upstream_and_survive_completion_stream_and_recov
             == Some(&json!("call-1"))));
     }
     drop(payloads);
-    // max_tokens is a post-drain accounting ceiling, including tool arguments.
-    // Delivered tool deltas cannot turn an over-limit request into success.
+    // max_tokens is enforced before output leaves the companion. A complete
+    // tool call is atomic, so one that does not fit is omitted and the bounded
+    // turn succeeds with truthful usage instead of becoming free output.
     for streaming in [false, true] {
         let mut body = initial.clone();
         body["request"]["stream"] = json!(streaming);
@@ -219,11 +220,12 @@ async fn images_and_tools_reach_upstream_and_survive_completion_stream_and_recov
             .unwrap();
         let bytes = to_bytes(response.into_body(), 2_000_000).await.unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(text.contains("\"status\":\"failed\""));
-        assert!(!text.contains("\"status\":\"succeeded\""));
+        assert!(text.contains("\"status\":\"succeeded\""));
+        assert!(!text.contains("call-1"), "over-budget tool leaked: {text}");
+        assert!(text.contains("\"finish_reason\":\"length\""));
         let receipt = call(&app, &id, "seller", "GET", None).await.1;
-        assert_eq!(receipt["status"], "failed");
-        assert!(receipt["usage"].is_null());
+        assert_eq!(receipt["status"], "succeeded");
+        assert!(receipt["usage"]["outputTokens"].as_i64().unwrap() <= 1);
     }
     std::env::remove_var("KIRO_TEST_RUNTIME_URL");
     store::save_setting("endpoints", &previous_endpoints).unwrap();
