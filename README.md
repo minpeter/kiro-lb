@@ -375,3 +375,6 @@ packaging logic. Do not move or reuse published version tags.
 
 The existing `main` Docker build remains independent; automatic binary releases
 do not add a versioned Docker image or deploy/restart any running server.
+
+
+<!-- Security scan triggered at 2026-10-07 11:17:49 -->
