@@ -276,6 +276,61 @@ fn client_for_proxy(url: &str) -> reqwest::Client {
     })
 }
 
+// Separate pools from the legacy/injected clients: their redirect and retry
+// policies cannot be inspected or safely changed after construction. None uses
+// the same configured VPN/system proxy behavior as production build_client.
+static ONCE_CLIENTS: Mutex<Option<HashMap<Option<String>, Arc<reqwest::Client>>>> =
+    Mutex::new(None);
+
+fn client_for_once(proxy: Option<&str>) -> Result<Arc<reqwest::Client>, TransportError> {
+    let mut guard = ONCE_CLIENTS.lock();
+    let clients = guard.get_or_insert_with(HashMap::new);
+    let key = proxy.map(str::to_owned);
+    if let Some(client) = clients.get(&key) {
+        return Ok(client.clone());
+    }
+    let client = Arc::new(
+        upstream_builder(proxy)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| TransportError::Http {
+                status: 502,
+                detail: "Transport configuration failed.".into(),
+            })?,
+    );
+    clients.insert(key, client.clone());
+    Ok(client)
+}
+
+async fn send_once(
+    request: reqwest::RequestBuilder,
+    proxy: Option<&str>,
+) -> Result<reqwest::Response, TransportError> {
+    match request.send().await {
+        Ok(response) => {
+            if let Some(proxy) = proxy {
+                with_proxies(|s| {
+                    s.cooldowns.remove(proxy);
+                });
+            }
+            Ok(response)
+        }
+        Err(error) => {
+            if let Some(proxy) = proxy.filter(|_| is_transport(&error)) {
+                with_proxies(|s| {
+                    s.cooldowns.insert(
+                        proxy.to_owned(),
+                        Instant::now() + Duration::from_secs_f64(PROXY_COOLDOWN),
+                    );
+                });
+            }
+            let (status, detail) = network_detail(&error);
+            Err(TransportError::Http { status, detail })
+        }
+    }
+}
+
 // ----- concurrency gate ----------------------------------------------------------------
 
 struct Gate {
@@ -702,22 +757,13 @@ impl Transport {
         let permits = concurrency_slot(account_id).await?;
         let token = auth.access_token().await.map_err(TransportError::Auth)?;
         let proxies = proxy_attempt_order();
-        let client = upstream_builder(proxies.first().map(String::as_str))
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .map_err(|_| TransportError::Http {
-                status: 502,
-                detail: "Transport configuration failed.".into(),
-            })?;
+        let proxy = proxies.first().map(String::as_str);
+        let client = client_for_once(proxy)?;
         let mut request = client.post(auth.generation_url()).body(body);
         for (name, value) in utils::kiro_headers(&token, &auth.machine_id()) {
             request = request.header(name, value);
         }
-        let response = request.send().await.map_err(|e| {
-            let (status, detail) = network_detail(&e);
-            TransportError::Http { status, detail }
-        })?;
+        let response = send_once(request, proxy).await?;
         Ok(UpstreamResponse {
             status: response.status().as_u16(),
             headers: response.headers().clone(),
@@ -864,5 +910,93 @@ impl Transport {
             }
             Err(Err(e)) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod once_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn once_pools_and_cools_only_for_future_requests() {
+        let failed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad = format!("http://{}", failed.local_addr().unwrap());
+        let good = format!("http://{}", healthy.local_addr().unwrap());
+        with_proxies(|s| {
+            s.chain = vec![bad.clone(), good.clone()];
+        });
+        let bad_client = client_for_once(Some(&bad)).unwrap();
+        assert!(Arc::ptr_eq(
+            &bad_client,
+            &client_for_once(Some(&bad)).unwrap()
+        ));
+        let direct = client_for_once(None).unwrap();
+        assert!(Arc::ptr_eq(&direct, &client_for_once(None).unwrap()));
+        assert!(!Arc::ptr_eq(&direct, &bad_client));
+
+        let bad_server = tokio::spawn(async move {
+            let (mut socket, _) = failed.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert!(buffer[..n].starts_with(b"POST "));
+            drop(socket); // ambiguous result after receiving the POST
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), failed.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert!(send_once(
+            bad_client.post("http://kiro.invalid/").body("{}"),
+            Some(&bad)
+        )
+        .await
+        .is_err());
+        // No fallback during this request; the alternate has not been contacted.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), healthy.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(proxy_attempt_order(), vec![good.clone(), bad.clone()]);
+        let next_proxy = proxy_attempt_order().into_iter().next().unwrap();
+        let client = client_for_once(Some(&next_proxy)).unwrap();
+        with_proxies(|s| {
+            assert!(proxy_cooling(s, &bad));
+            assert!(!proxy_cooling(s, &good));
+            // Even an HTTP error/redirect proves route reachability.
+            s.cooldowns
+                .insert(good.clone(), Instant::now() + Duration::from_secs(60));
+        });
+        let good_server = tokio::spawn(async move {
+            let (mut socket, _) = healthy.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert!(buffer[..n].starts_with(b"POST "));
+            socket.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://kiro.invalid/again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            drop(socket);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), healthy.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let response = send_once(
+            client.post("http://kiro.invalid/").body("{}"),
+            Some(&next_proxy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 307);
+        with_proxies(|s| {
+            assert!(!proxy_cooling(s, &good));
+            assert!(proxy_cooling(s, &bad));
+            s.chain.clear();
+            s.cooldowns.clear();
+        });
+        bad_server.await.unwrap();
+        good_server.await.unwrap();
     }
 }

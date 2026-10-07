@@ -16,6 +16,173 @@ const PNG: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5N8AAAAASUVORK5CYII=";
 
 #[tokio::test]
+async fn generic_forbidden_repairs_next_request_without_replaying_generation() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let _lock = TEST_LOCK.lock().await;
+    let dir = common::data_dir("inferx-forbidden-refresh");
+    common::seed(&[]);
+    std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
+    let generations = Arc::new(AtomicUsize::new(0));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let (g, r) = (generations.clone(), refreshes.clone());
+    let runtime = Router::new()
+        .route("/", axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let index = g.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if index == 0 {
+                    assert_eq!(headers["authorization"], "Bearer fixture-access");
+                    (StatusCode::FORBIDDEN, "private-rejected-access".to_owned())
+                } else if index >= 2 {
+                    let reason = match index {
+                        2 => "MONTHLY_REQUEST_COUNT",
+                        3 => "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+                        _ => "TEMPORARILY_SUSPENDED",
+                    };
+                    (if index < 4 { StatusCode::BAD_REQUEST } else { StatusCode::FORBIDDEN }, json!({"reason":reason,"message":"private-account"}).to_string())
+                } else {
+                    assert_eq!(headers["authorization"], "Bearer repaired-access");
+                    (StatusCode::OK, r#"{"content":"ok"}{"usage":1}{"stopReason":"end_turn"}"#.to_owned())
+                }
+            }
+        }))
+        .route("/refresh", axum::routing::post(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(json!({"accessToken":"repaired-access","refreshToken":"rotated-private-refresh","expiresIn":3600})) }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::env::set_var("KIRO_TEST_RUNTIME_URL", format!("{url}/"));
+    std::env::set_var("KIRO_TEST_REFRESH_URL", format!("{url}/refresh"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, runtime).await.unwrap();
+    });
+    let http = reqwest::Client::new();
+    let app = Router::new()
+        .route(
+            "/requests/{id}",
+            get(api::get_request).post(api::post_request),
+        )
+        .with_state(common::state(common::pool(&http, &[]), &http, false));
+    let connection = uuid::Uuid::new_v4().to_string();
+    let credential = json!({"accessToken":"fixture-access","refreshToken":"fixture-refresh","expiresAt":"2999-01-01T00:00:00Z","region":"us-east-1"});
+    store::with(|c| c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,created_at,updated_at) VALUES(?1,'seller','github','registered',?2,0,0)", rusqlite::params![connection,credential.to_string()]).map(|_|())).unwrap();
+    let body = json!({"ownerId":"seller","connectionId":connection,"request":{"model":"claude-sonnet-4","messages":[{"role":"user","content":"private-input"}],"max_tokens":64,"stream":false}});
+    let id = uuid::Uuid::new_v4().to_string();
+    let receipt = call(&app, &id, "seller", "POST", Some(body.clone()))
+        .await
+        .1;
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["failureCode"], "supplier_unavailable");
+    assert!(receipt["usage"].is_null());
+    for secret in [
+        "private",
+        "fixture-access",
+        "repaired-access",
+        "refresh",
+        "private-input",
+    ] {
+        assert!(!receipt.to_string().contains(secret));
+    }
+    assert_eq!(generations.load(Ordering::SeqCst), 1);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    let saved: String = store::with(|c| {
+        c.query_row(
+            "SELECT credential_json FROM inferx_connections WHERE id=?1",
+            [&connection],
+            |row| row.get(0),
+        )
+    })
+    .unwrap();
+    let saved: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["accessToken"], "repaired-access");
+    assert_eq!(saved["refreshToken"], "rotated-private-refresh");
+    assert_eq!(
+        call(&app, &id, "seller", "POST", Some(body.clone()))
+            .await
+            .1,
+        receipt
+    );
+    assert_eq!(generations.load(Ordering::SeqCst), 1);
+    let next = call(
+        &app,
+        &uuid::Uuid::new_v4().to_string(),
+        "seller",
+        "POST",
+        Some(body.clone()),
+    )
+    .await
+    .1;
+    assert_eq!(next["status"], "succeeded");
+    assert_eq!(generations.load(Ordering::SeqCst), 2);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    // The POST reached the server, but the response vanished: the outcome is
+    // ambiguous. Neither refresh nor retry/failover is safe for this receipt.
+    let ambiguous_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    std::env::set_var(
+        "KIRO_TEST_RUNTIME_URL",
+        format!("http://{}/", ambiguous_listener.local_addr().unwrap()),
+    );
+    let ambiguous_server = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let (mut socket, _) = ambiguous_listener.accept().await.unwrap();
+        let mut bytes = [0; 8192];
+        let n = socket.read(&mut bytes).await.unwrap();
+        assert!(n > 0 && bytes[..n].starts_with(b"POST "));
+        // Drop the connection without responding, after accepting the POST.
+    });
+    let ambiguous_id = uuid::Uuid::new_v4().to_string();
+    let ambiguous = call(&app, &ambiguous_id, "seller", "POST", Some(body.clone()))
+        .await
+        .1;
+    ambiguous_server.await.unwrap();
+    assert_eq!(ambiguous["status"], "failed");
+    assert_eq!(ambiguous["failureCode"], "generation_failed");
+    assert!(ambiguous["usage"].is_null());
+    assert!(!ambiguous.to_string().contains("private"));
+    assert_eq!(
+        call(&app, &ambiguous_id, "seller", "POST", Some(body.clone()))
+            .await
+            .1,
+        ambiguous
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    std::env::set_var("KIRO_TEST_RUNTIME_URL", format!("{url}/"));
+    for (index, expected) in [
+        "supplier_unavailable",
+        "context_length_exceeded",
+        "supplier_unavailable",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = uuid::Uuid::new_v4().to_string();
+        let receipt = call(&app, &id, "seller", "POST", Some(body.clone()))
+            .await
+            .1;
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["failureCode"], expected);
+        assert!(receipt["usage"].is_null());
+        assert!(!receipt.to_string().contains("private"));
+        assert_eq!(
+            call(&app, &id, "seller", "POST", Some(body.clone()))
+                .await
+                .1,
+            receipt
+        );
+        assert_eq!(generations.load(Ordering::SeqCst), index + 3);
+        // Quota, context overflow and suspension are not stale-token refreshes.
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+    std::env::remove_var("KIRO_TEST_RUNTIME_URL");
+    std::env::remove_var("KIRO_TEST_REFRESH_URL");
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn failures_are_sanitized_durable_and_never_retry_generation() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
