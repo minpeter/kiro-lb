@@ -16,15 +16,99 @@ const PNG: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5N8AAAAASUVORK5CYII=";
 
 #[tokio::test]
+async fn failures_are_sanitized_durable_and_never_retry_generation() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let _lock = TEST_LOCK.lock().await;
+    let dir = common::data_dir("inferx-failure-receipts");
+    common::seed(&[]);
+    std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let status = Arc::new(AtomicUsize::new(503));
+    let (count, code) = (calls.clone(), status.clone());
+    let runtime = Router::new().route(
+        "/",
+        axum::routing::post(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            let code = code.load(Ordering::SeqCst);
+            async move {
+                (
+                    StatusCode::from_u16(code as u16).unwrap(),
+                    [("location", "/")],
+                    "private-upstream-body-and-account",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    std::env::set_var(
+        "KIRO_TEST_RUNTIME_URL",
+        format!("http://{}/", listener.local_addr().unwrap()),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, runtime).await.unwrap();
+    });
+    let http = reqwest::Client::new();
+    let app = Router::new()
+        .route(
+            "/requests/{id}",
+            get(api::get_request)
+                .post(api::post_request)
+                .delete(api::fence_request),
+        )
+        .with_state(common::state(common::pool(&http, &[]), &http, false));
+    let connection = uuid::Uuid::new_v4().to_string();
+    let credential = json!({"accessToken":"fixture-access","refreshToken":"fixture-refresh","expiresAt":"2999-01-01T00:00:00Z","region":"us-east-1"});
+    store::with(|c| c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,created_at,updated_at) VALUES(?1,'seller','github','registered',?2,0,0)", rusqlite::params![connection, credential.to_string()]).map(|_|())).unwrap();
+    for (index, (http_status, expected)) in [
+        (503, "supplier_unavailable"),
+        (429, "supplier_unavailable"),
+        (401, "supplier_unavailable"),
+        (400, "generation_failed"),
+        (307, "generation_failed"),
+        // Accepted POST with an unusable response is ambiguous, not replayable.
+        (200, "generation_failed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        status.store(http_status, Ordering::SeqCst);
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = json!({"ownerId":"seller","connectionId":connection,"request":{"model":"claude-sonnet-4","messages":[{"role":"user","content":"private-input"}],"max_tokens":64,"stream":false}});
+        let receipt = call(&app, &id, "seller", "POST", Some(body.clone()))
+            .await
+            .1;
+        assert_eq!(receipt["failureCode"], expected);
+        assert_eq!(receipt["status"], "failed");
+        assert!(receipt["usage"].is_null() && receipt["retryAt"].is_null());
+        assert!(!receipt.to_string().contains("private-"));
+        store::initialize().unwrap();
+        assert_eq!(call(&app, &id, "seller", "GET", None).await.1, receipt);
+        assert_eq!(
+            call(&app, &id, "seller", "POST", Some(body)).await.1,
+            receipt
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+    }
+    std::env::remove_var("KIRO_TEST_RUNTIME_URL");
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn metering_upgrade_preserves_legacy_receipts_without_inventing_provenance() {
     let _test_lock = TEST_LOCK.lock().await;
     let dir = common::data_dir("inferx-metering-migration");
     common::seed(&[]);
     std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
     let id = uuid::Uuid::new_v4().to_string();
+    let failed_id = uuid::Uuid::new_v4().to_string();
     store::with(|c| {
-        c.execute_batch("ALTER TABLE inferx_requests DROP COLUMN metering_json")?;
+        c.execute_batch("ALTER TABLE inferx_requests DROP COLUMN metering_json; ALTER TABLE inferx_requests DROP COLUMN failure_code")?;
         c.execute("INSERT INTO inferx_requests(request_id,request_hash,owner_id,connection_id,status,input_tokens,output_tokens,duration_ms,created_at,updated_at) VALUES(?1,'hash','seller','connection','succeeded',17,9,50,0,0)", [&id])?;
+        c.execute("INSERT INTO inferx_requests(request_id,request_hash,owner_id,connection_id,status,created_at,updated_at) VALUES(?1,'hash','seller','connection','failed',11,12)", [&failed_id])?;
         Ok(())
     }).unwrap();
     store::initialize().unwrap();
@@ -34,6 +118,19 @@ async fn metering_upgrade_preserves_legacy_receipts_without_inventing_provenance
     assert_eq!(receipt["usage"]["inputTokens"], 17);
     assert_eq!(receipt["usage"]["outputTokens"], 9);
     assert!(receipt["usage"].get("metering").is_none());
+    let failed = call(&app, &failed_id, "seller", "GET", None).await.1;
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["failureCode"], "generation_failed");
+    assert!(failed["usage"].is_null());
+    let stored: (Option<String>, i64, i64) = store::with(|c| {
+        c.query_row(
+            "SELECT failure_code,created_at,updated_at FROM inferx_requests WHERE request_id=?1",
+            [&failed_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+    })
+    .unwrap();
+    assert_eq!(stored, (None, 11, 12));
     // Corrupt persisted usage must not become a valid zero-cost success.
     store::with(|c| c.execute("UPDATE inferx_requests SET input_tokens=-1,output_tokens=NULL,metering_json='broken' WHERE request_id=?1", [&id]).map(|_|())).unwrap();
     let corrupt = call(&app, &id, "seller", "GET", None).await.1;
@@ -226,6 +323,7 @@ async fn images_and_tools_reach_upstream_and_survive_completion_stream_and_recov
         let receipt = call(&app, &id, "seller", "GET", None).await.1;
         assert_eq!(receipt["status"], "succeeded");
         assert!(receipt["usage"]["outputTokens"].as_i64().unwrap() <= 1);
+        assert!(receipt["failureCode"].is_null());
     }
     std::env::remove_var("KIRO_TEST_RUNTIME_URL");
     store::save_setting("endpoints", &previous_endpoints).unwrap();

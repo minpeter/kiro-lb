@@ -193,6 +193,63 @@ fn stream_health(error: stream_core::StreamError) -> Health {
     }
 }
 
+#[derive(Debug)]
+struct InferenceFailure {
+    code: &'static str,
+    stage: &'static str,
+    health: Health,
+    upstream_status: Option<u16>,
+}
+
+impl From<Health> for InferenceFailure {
+    fn from(health: Health) -> Self {
+        Self {
+            code: match health {
+                Health::AuthenticationFailed | Health::TemporarilySuspended => {
+                    "supplier_unavailable"
+                }
+                _ => "generation_failed",
+            },
+            stage: "response",
+            health,
+            upstream_status: None,
+        }
+    }
+}
+
+fn inference_http_failure(status: u16, body: &str) -> InferenceFailure {
+    let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    InferenceFailure {
+        // A bare 400/404 does not prove that the buyer's input is wrong.
+        code: if status == 400
+            && value["reason"].as_str() == Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        {
+            "context_length_exceeded"
+        } else if matches!(status, 401 | 403 | 429 | 500..=599) {
+            "supplier_unavailable"
+        } else {
+            "generation_failed"
+        },
+        stage: "upstream",
+        health: http_health(status, body),
+        upstream_status: Some(status),
+    }
+}
+
+fn inference_auth_failure(error: &AuthError) -> InferenceFailure {
+    InferenceFailure {
+        code: "supplier_unavailable",
+        stage: "authentication",
+        health: auth_health(error),
+        upstream_status: match error {
+            AuthError::Http { status, .. } | AuthError::CredentialDead { status, .. } => {
+                Some(*status)
+            }
+            _ => None,
+        },
+    }
+}
+
 fn error(status: u16, code: &str, message: &str) -> Response {
     json_response(status, json!({"code": code, "message": message}))
 }
@@ -735,14 +792,15 @@ struct Receipt {
     ttft: Option<f64>,
     generation: Option<f64>,
     metering: Option<String>,
+    failure_code: Option<String>,
 }
 
 fn read_receipt(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Receipt>> {
     use rusqlite::OptionalExtension;
     c.query_row(
-        "SELECT request_id,status,input_tokens,output_tokens,duration_ms,ttft_ms,generation_ms,metering_json FROM inferx_requests WHERE request_id=?1",
+        "SELECT request_id,status,input_tokens,output_tokens,duration_ms,ttft_ms,generation_ms,metering_json,failure_code FROM inferx_requests WHERE request_id=?1",
         [id],
-        |r| Ok(Receipt { request_id:r.get(0)?, status:r.get(1)?, input:r.get(2)?, output:r.get(3)?, duration:r.get(4)?, ttft:r.get(5)?, generation:r.get(6)?, metering:r.get(7)? }),
+        |r| Ok(Receipt { request_id:r.get(0)?, status:r.get(1)?, input:r.get(2)?, output:r.get(3)?, duration:r.get(4)?, ttft:r.get(5)?, generation:r.get(6)?, metering:r.get(7)?, failure_code:r.get(8)? }),
     ).optional()
 }
 
@@ -755,6 +813,19 @@ fn receipt_json(receipt: &Receipt, completion: Option<Value>) -> Value {
         None
     };
     let mut value = json!({"requestId":receipt.request_id,"status":receipt.status,"usage":usage});
+    if receipt.status == "failed" {
+        value["failureCode"] = json!(receipt
+            .failure_code
+            .as_deref()
+            .filter(|code| matches!(
+                *code,
+                "supplier_unavailable"
+                    | "context_length_exceeded"
+                    | "generation_timeout"
+                    | "output_limit_exceeded"
+            ))
+            .unwrap_or("generation_failed"));
+    }
     if receipt.status == "succeeded" {
         if let Some(metering) = &receipt.metering {
             // A corrupt stored contract must not silently become a legacy estimate.
@@ -922,7 +993,14 @@ pub async fn post_request(
             execute_inference(
                 &task_state,
                 &task_connection,
-                auth.as_ref().ok_or(Health::Unknown)?.clone(),
+                auth.as_ref()
+                    .ok_or(InferenceFailure {
+                        code: "supplier_unavailable",
+                        stage: "credential",
+                        health: Health::Unknown,
+                        upstream_status: None,
+                    })?
+                    .clone(),
                 &request,
                 &model,
                 max_tokens,
@@ -932,15 +1010,30 @@ pub async fn post_request(
         })
         .await;
         let health = match &result {
-            Ok(Err(health @ (Health::AuthenticationFailed | Health::TemporarilySuspended))) => {
-                Some(*health)
+            Ok(Err(failure))
+                if matches!(
+                    failure.health,
+                    Health::AuthenticationFailed | Health::TemporarilySuspended
+                ) =>
+            {
+                Some(failure.health)
             }
+            _ => None,
+        };
+        let failure_code = match &result {
+            Ok(Err(failure)) => {
+                tracing::warn!(event = "inferx_generation_failed", request_id = %task_id, code = failure.code, stage = failure.stage, upstream_status = failure.upstream_status);
+                Some(failure.code)
+            }
+            // The owned future is cancelled at the deadline. This seals the
+            // request; it never permits another generation for the same ID.
+            Err(_) => Some("generation_timeout"),
             _ => None,
         };
         let (status, completion, usage, delivery_complete) = match result {
             Ok(Ok((v, u, delivered))) => ("succeeded", Some(v), Some(u), delivered),
             Ok(Err(_)) => ("failed", None, None, true),
-            Err(_) => ("indeterminate", None, None, true),
+            Err(_) => ("failed", None, None, true),
         };
         // Refresh can rotate credentials even if generation subsequently fails.
         let refreshed = auth.map(|auth| auth.credential_document());
@@ -955,7 +1048,7 @@ pub async fn post_request(
         let metering = usage
             .as_ref()
             .map(|_| crate::inferx_contract::metering().to_string());
-        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}
+        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9,failure_code=?10 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering,failure_code])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}
             if let Some(health) = health {
                 let previous = read_row(c, &connection)?.and_then(|r| r.diagnostics);
                 let diagnostics = Diagnostics::failure(previous, health);
@@ -1052,7 +1145,7 @@ async fn execute_inference(
     model: &str,
     max_tokens: i64,
     stream_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
-) -> Result<(Value, (i64, i64, i64, Option<f64>, Option<f64>), bool), Health> {
+) -> Result<(Value, (i64, i64, i64, Option<f64>, Option<f64>), bool), InferenceFailure> {
     let started = Instant::now();
     let arn = auth.request_profile_arn().unwrap_or_default();
     let req = request.clone();
@@ -1063,33 +1156,31 @@ async fn execute_inference(
         .map_err(|_| Health::Unknown)?;
     let input = built.input_tokens as i64;
     if input > 200_000 {
-        return Err(Health::Unknown);
+        return Err(InferenceFailure {
+            code: "context_length_exceeded",
+            stage: "input",
+            health: Health::Unknown,
+            upstream_status: None,
+        });
     }
-    let model_id = built
-        .payload
-        .pointer("/conversationState/currentMessage/userInputMessage/modelId")
-        .and_then(Value::as_str)
-        .unwrap_or(model)
-        .to_owned();
     let response = state
         .transport
-        .generate(
-            connection,
-            &auth,
-            Bytes::from(built.serialized),
-            &model_id,
-            true,
-            false,
-        )
+        .generate_once(connection, &auth, Bytes::from(built.serialized))
         .await
         .map_err(|e| match e {
-            crate::upstream::http::TransportError::Auth(e) => auth_health(&e),
-            crate::upstream::http::TransportError::Http { status, detail } => {
-                http_health(status, &detail)
-            }
+            crate::upstream::http::TransportError::Auth(e) => inference_auth_failure(&e),
+            crate::upstream::http::TransportError::Http { .. } => InferenceFailure {
+                code: "generation_failed",
+                stage: "transport",
+                health: Health::Unknown,
+                upstream_status: None,
+            },
         })?;
     if response.status != 200 {
-        return Err(http_health(response.status, &response.text().await));
+        return Err(inference_http_failure(
+            response.status,
+            &response.text().await,
+        ));
     }
     let (bytes, _permits) = response.into_stream();
     let ctx = RequestCtx::new(None);
@@ -1213,7 +1304,7 @@ async fn respond(
     mut guard: crate::inferx_contract::ToolGuard,
     max_tokens: i64,
     stream_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
-) -> Result<(Value, i64, bool), Health> {
+) -> Result<(Value, i64, bool), InferenceFailure> {
     let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exceeded = overflow.clone();
     let bounded = bytes.scan(0usize, move |size, item| {
@@ -1319,7 +1410,7 @@ async fn respond(
                 .len()
                 > MAX_INFERENCE_RESPONSE)
     {
-        return Err(Health::Unknown);
+        return Err(Health::Unknown.into());
     }
     Ok((completion, output, delivery_complete))
 }
@@ -1327,6 +1418,25 @@ async fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_classification_requires_structured_context_reason() {
+        for body in ["CONTENT_LENGTH_EXCEEDS_THRESHOLD", "private-body", "{}"] {
+            assert_eq!(inference_http_failure(400, body).code, "generation_failed");
+        }
+        assert_eq!(
+            inference_http_failure(
+                400,
+                r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD","message":"private-secret"}"#
+            )
+            .code,
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            inference_http_failure(503, "private-secret").code,
+            "supplier_unavailable"
+        );
+    }
 
     #[test]
     fn registration_is_identity_unique_and_never_revives_cancelled_rows() {
@@ -1620,7 +1730,11 @@ mod tests {
         upstream: &'static str,
         streaming: bool,
         max_tokens: i64,
-    ) -> (Result<(Value, i64, bool), Health>, Vec<Value>, bool) {
+    ) -> (
+        Result<(Value, i64, bool), InferenceFailure>,
+        Vec<Value>,
+        bool,
+    ) {
         run_parallel(choice, upstream, streaming, max_tokens, true).await
     }
 
@@ -1630,7 +1744,11 @@ mod tests {
         streaming: bool,
         max_tokens: i64,
         parallel_tool_calls: bool,
-    ) -> (Result<(Value, i64, bool), Health>, Vec<Value>, bool) {
+    ) -> (
+        Result<(Value, i64, bool), InferenceFailure>,
+        Vec<Value>,
+        bool,
+    ) {
         let mut request = tool_choice_request(Some(choice));
         request["stream"] = json!(streaming);
         request["parallel_tool_calls"] = json!(parallel_tool_calls);

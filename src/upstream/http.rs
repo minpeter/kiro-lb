@@ -691,6 +691,41 @@ impl Transport {
         }
     }
 
+    /// Receipt-backed execution cannot replay a POST after an ambiguous result.
+    /// Use one proxy and one endpoint, without refresh-and-resend or rotation.
+    pub async fn generate_once(
+        &self,
+        account_id: &str,
+        auth: &KiroAuth,
+        body: Bytes,
+    ) -> Result<UpstreamResponse, TransportError> {
+        let permits = concurrency_slot(account_id).await?;
+        let token = auth.access_token().await.map_err(TransportError::Auth)?;
+        let proxies = proxy_attempt_order();
+        let client = upstream_builder(proxies.first().map(String::as_str))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| TransportError::Http {
+                status: 502,
+                detail: "Transport configuration failed.".into(),
+            })?;
+        let mut request = client.post(auth.generation_url()).body(body);
+        for (name, value) in utils::kiro_headers(&token, &auth.machine_id()) {
+            request = request.header(name, value);
+        }
+        let response = request.send().await.map_err(|e| {
+            let (status, detail) = network_detail(&e);
+            TransportError::Http { status, detail }
+        })?;
+        Ok(UpstreamResponse {
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+            body: UpstreamBody::Stream(response),
+            permits,
+        })
+    }
+
     pub async fn generate(
         &self,
         account_id: &str,
