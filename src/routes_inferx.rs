@@ -193,6 +193,65 @@ fn stream_health(error: stream_core::StreamError) -> Health {
     }
 }
 
+#[derive(Debug)]
+struct InferenceFailure {
+    code: &'static str,
+    stage: &'static str,
+    health: Health,
+    upstream_status: Option<u16>,
+}
+
+impl From<Health> for InferenceFailure {
+    fn from(health: Health) -> Self {
+        Self {
+            code: match health {
+                Health::AuthenticationFailed | Health::TemporarilySuspended => {
+                    "supplier_unavailable"
+                }
+                _ => "generation_failed",
+            },
+            stage: "response",
+            health,
+            upstream_status: None,
+        }
+    }
+}
+
+fn inference_http_failure(status: u16, body: &str) -> InferenceFailure {
+    let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    InferenceFailure {
+        // A bare 400/404 does not prove that the buyer's input is wrong.
+        code: if status == 400
+            && value["reason"].as_str() == Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        {
+            "context_length_exceeded"
+        } else if (status == 400 && value["reason"].as_str() == Some("MONTHLY_REQUEST_COUNT"))
+            || matches!(status, 401 | 403 | 429 | 500..=599)
+        {
+            "supplier_unavailable"
+        } else {
+            "generation_failed"
+        },
+        stage: "upstream",
+        health: http_health(status, body),
+        upstream_status: Some(status),
+    }
+}
+
+fn inference_auth_failure(error: &AuthError) -> InferenceFailure {
+    InferenceFailure {
+        code: "supplier_unavailable",
+        stage: "authentication",
+        health: auth_health(error),
+        upstream_status: match error {
+            AuthError::Http { status, .. } | AuthError::CredentialDead { status, .. } => {
+                Some(*status)
+            }
+            _ => None,
+        },
+    }
+}
+
 fn error(status: u16, code: &str, message: &str) -> Response {
     json_response(status, json!({"code": code, "message": message}))
 }
@@ -735,14 +794,15 @@ struct Receipt {
     ttft: Option<f64>,
     generation: Option<f64>,
     metering: Option<String>,
+    failure_code: Option<String>,
 }
 
 fn read_receipt(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Receipt>> {
     use rusqlite::OptionalExtension;
     c.query_row(
-        "SELECT request_id,status,input_tokens,output_tokens,duration_ms,ttft_ms,generation_ms,metering_json FROM inferx_requests WHERE request_id=?1",
+        "SELECT request_id,status,input_tokens,output_tokens,duration_ms,ttft_ms,generation_ms,metering_json,failure_code FROM inferx_requests WHERE request_id=?1",
         [id],
-        |r| Ok(Receipt { request_id:r.get(0)?, status:r.get(1)?, input:r.get(2)?, output:r.get(3)?, duration:r.get(4)?, ttft:r.get(5)?, generation:r.get(6)?, metering:r.get(7)? }),
+        |r| Ok(Receipt { request_id:r.get(0)?, status:r.get(1)?, input:r.get(2)?, output:r.get(3)?, duration:r.get(4)?, ttft:r.get(5)?, generation:r.get(6)?, metering:r.get(7)?, failure_code:r.get(8)? }),
     ).optional()
 }
 
@@ -755,6 +815,19 @@ fn receipt_json(receipt: &Receipt, completion: Option<Value>) -> Value {
         None
     };
     let mut value = json!({"requestId":receipt.request_id,"status":receipt.status,"usage":usage});
+    if receipt.status == "failed" {
+        value["failureCode"] = json!(receipt
+            .failure_code
+            .as_deref()
+            .filter(|code| matches!(
+                *code,
+                "supplier_unavailable"
+                    | "context_length_exceeded"
+                    | "generation_timeout"
+                    | "output_limit_exceeded"
+            ))
+            .unwrap_or("generation_failed"));
+    }
     if receipt.status == "succeeded" {
         if let Some(metering) = &receipt.metering {
             // A corrupt stored contract must not silently become a legacy estimate.
@@ -845,6 +918,16 @@ pub async fn post_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    post_request_with_timeout(state, id, headers, body, INFERENCE_TIMEOUT).await
+}
+
+async fn post_request_with_timeout(
+    state: Shared,
+    id: String,
+    headers: HeaderMap,
+    body: Bytes,
+    inference_timeout: Duration,
+) -> Response {
     if let Err(response) = guard(&headers) {
         return response;
     }
@@ -918,11 +1001,18 @@ pub async fn post_request(
         )
         .ok()
         .map(Arc::new);
-        let result = tokio::time::timeout(INFERENCE_TIMEOUT, async {
+        let result = tokio::time::timeout(inference_timeout, async {
             execute_inference(
                 &task_state,
                 &task_connection,
-                auth.as_ref().ok_or(Health::Unknown)?.clone(),
+                auth.as_ref()
+                    .ok_or(InferenceFailure {
+                        code: "supplier_unavailable",
+                        stage: "credential",
+                        health: Health::Unknown,
+                        upstream_status: None,
+                    })?
+                    .clone(),
                 &request,
                 &model,
                 max_tokens,
@@ -932,15 +1022,30 @@ pub async fn post_request(
         })
         .await;
         let health = match &result {
-            Ok(Err(health @ (Health::AuthenticationFailed | Health::TemporarilySuspended))) => {
-                Some(*health)
+            Ok(Err(failure))
+                if matches!(
+                    failure.health,
+                    Health::AuthenticationFailed | Health::TemporarilySuspended
+                ) =>
+            {
+                Some(failure.health)
             }
+            _ => None,
+        };
+        let failure_code = match &result {
+            Ok(Err(failure)) => {
+                tracing::warn!(event = "inferx_generation_failed", request_id = %task_id, code = failure.code, stage = failure.stage, upstream_status = failure.upstream_status);
+                Some(failure.code)
+            }
+            // The owned future is cancelled at the deadline. This seals the
+            // request; it never permits another generation for the same ID.
+            Err(_) => Some("generation_timeout"),
             _ => None,
         };
         let (status, completion, usage, delivery_complete) = match result {
             Ok(Ok((v, u, delivered))) => ("succeeded", Some(v), Some(u), delivered),
             Ok(Err(_)) => ("failed", None, None, true),
-            Err(_) => ("indeterminate", None, None, true),
+            Err(_) => ("failed", None, None, true),
         };
         // Refresh can rotate credentials even if generation subsequently fails.
         let refreshed = auth.map(|auth| auth.credential_document());
@@ -955,7 +1060,7 @@ pub async fn post_request(
         let metering = usage
             .as_ref()
             .map(|_| crate::inferx_contract::metering().to_string());
-        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}
+        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9,failure_code=?10 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering,failure_code])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}
             if let Some(health) = health {
                 let previous = read_row(c, &connection)?.and_then(|r| r.diagnostics);
                 let diagnostics = Diagnostics::failure(previous, health);
@@ -1052,7 +1157,7 @@ async fn execute_inference(
     model: &str,
     max_tokens: i64,
     stream_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
-) -> Result<(Value, (i64, i64, i64, Option<f64>, Option<f64>), bool), Health> {
+) -> Result<(Value, (i64, i64, i64, Option<f64>, Option<f64>), bool), InferenceFailure> {
     let started = Instant::now();
     let arn = auth.request_profile_arn().unwrap_or_default();
     let req = request.clone();
@@ -1063,33 +1168,44 @@ async fn execute_inference(
         .map_err(|_| Health::Unknown)?;
     let input = built.input_tokens as i64;
     if input > 200_000 {
-        return Err(Health::Unknown);
+        return Err(InferenceFailure {
+            code: "context_length_exceeded",
+            stage: "input",
+            health: Health::Unknown,
+            upstream_status: None,
+        });
     }
-    let model_id = built
-        .payload
-        .pointer("/conversationState/currentMessage/userInputMessage/modelId")
-        .and_then(Value::as_str)
-        .unwrap_or(model)
-        .to_owned();
     let response = state
         .transport
-        .generate(
-            connection,
-            &auth,
-            Bytes::from(built.serialized),
-            &model_id,
-            true,
-            false,
-        )
+        .generate_once(connection, &auth, Bytes::from(built.serialized))
         .await
         .map_err(|e| match e {
-            crate::upstream::http::TransportError::Auth(e) => auth_health(&e),
-            crate::upstream::http::TransportError::Http { status, detail } => {
-                http_health(status, &detail)
-            }
+            crate::upstream::http::TransportError::Auth(e) => inference_auth_failure(&e),
+            crate::upstream::http::TransportError::Http { .. } => InferenceFailure {
+                code: "generation_failed",
+                stage: "transport",
+                health: Health::Unknown,
+                upstream_status: None,
+            },
         })?;
     if response.status != 200 {
-        return Err(http_health(response.status, &response.text().await));
+        let status = response.status;
+        let body = response.text().await;
+        let failure = inference_http_failure(status, &body);
+        if status == 403
+            && !crate::errors::is_suspension_error(
+                status,
+                Some(&body),
+                crate::errors::reason_of(&body).as_deref(),
+            )
+        {
+            // Repair only the next request's credentials. Never replay this
+            // generation; post_request persists any rotated credential document.
+            auth.force_refresh()
+                .await
+                .map_err(|e| inference_auth_failure(&e))?;
+        }
+        return Err(failure);
     }
     let (bytes, _permits) = response.into_stream();
     let ctx = RequestCtx::new(None);
@@ -1202,6 +1318,15 @@ fn limit_output(
     })
 }
 
+fn output_limit_failure() -> InferenceFailure {
+    InferenceFailure {
+        code: "output_limit_exceeded",
+        stage: "response",
+        health: Health::Unknown,
+        upstream_status: None,
+    }
+}
+
 /// Drains one upstream response into the private InferX completion. Kiro has
 /// no native `tool_choice`, so tool calls are checked before forwarding: a
 /// disallowed call, or a `required`/named turn without a compliant call, is
@@ -1213,7 +1338,7 @@ async fn respond(
     mut guard: crate::inferx_contract::ToolGuard,
     max_tokens: i64,
     stream_tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
-) -> Result<(Value, i64, bool), Health> {
+) -> Result<(Value, i64, bool), InferenceFailure> {
     let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exceeded = overflow.clone();
     let bounded = bytes.scan(0usize, move |size, item| {
@@ -1247,6 +1372,13 @@ async fn respond(
         request_tools: request["tools"].as_array().cloned().unwrap_or_default(),
     };
     let streaming = stream_tx.is_some();
+    let response_failure = |e| {
+        if overflow.load(std::sync::atomic::Ordering::Relaxed) {
+            output_limit_failure()
+        } else {
+            stream_health(e).into()
+        }
+    };
     let mut delivery_complete = true;
     let mut response_overflow = false;
     let mut rejected = false;
@@ -1255,7 +1387,13 @@ async fn respond(
         let mut usage = None;
         let mut response_size = 0usize;
         while let Some(item) = native.next().await {
-            let chunk = item.map_err(stream_health)?;
+            let chunk = item.map_err(|e| {
+                if response_overflow {
+                    output_limit_failure()
+                } else {
+                    response_failure(e)
+                }
+            })?;
             if chunk == "data: [DONE]\n\n" {
                 continue;
             }
@@ -1281,13 +1419,13 @@ async fn respond(
                     rejected = true;
                 }
             }
-            if rejected {
-                // Keep draining for accounting; nothing more is delivered.
-                continue;
-            }
             if response_size > MAX_INFERENCE_RESPONSE {
                 response_overflow = true;
                 delivery_complete = false;
+                continue;
+            }
+            if rejected {
+                // Keep draining for accounting; nothing more is delivered.
                 continue;
             }
             if delivery_complete && tx.try_send(Bytes::from(chunk)).is_err() {
@@ -1300,7 +1438,7 @@ async fn respond(
     } else {
         let completion = stream_openai::collect(events, stream_ctx, opts, false)
             .await
-            .map_err(stream_health)?;
+            .map_err(response_failure)?;
         rejected = !guard.allow(&completion["choices"][0]["message"]["tool_calls"]);
         completion
     };
@@ -1310,8 +1448,6 @@ async fn respond(
         .unwrap_or(0);
     if overflow.load(std::sync::atomic::Ordering::Relaxed)
         || response_overflow
-        || rejected
-        || !guard.satisfied() && !limited.load(std::sync::atomic::Ordering::Relaxed)
         || output > max_tokens
         || (!streaming
             && serde_json::to_vec(&completion)
@@ -1319,7 +1455,10 @@ async fn respond(
                 .len()
                 > MAX_INFERENCE_RESPONSE)
     {
-        return Err(Health::Unknown);
+        return Err(output_limit_failure());
+    }
+    if rejected || !guard.satisfied() && !limited.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(Health::Unknown.into());
     }
     Ok((completion, output, delivery_complete))
 }
@@ -1327,6 +1466,158 @@ async fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn outer_timeout_seals_private_idempotent_receipt() {
+        // The store and credentials use process globals; isolate this fixture
+        // from the other library tests, without introducing production knobs.
+        const CHILD: &str = "INFERX_OUTER_TIMEOUT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes_inferx::tests::outer_timeout_seals_private_idempotent_receipt",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stdout).to_string()
+                    + &String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("DASHBOARD_DATA_DIR", dir.path());
+        std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
+        store::initialize().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let runtime = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { std::future::pending::<&'static str>().await }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        std::env::set_var(
+            "KIRO_TEST_RUNTIME_URL",
+            format!("http://{}/", listener.local_addr().unwrap()),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, runtime).await.unwrap();
+        });
+        let http = reqwest::Client::new();
+        let state = Arc::new(crate::app::AppState {
+            pool: crate::pool::AccountManager::new(http.clone()),
+            transport: Arc::new(crate::upstream::http::Transport {
+                shared: http.clone(),
+            }),
+            http,
+            started_at: 0.0,
+            version: Default::default(),
+            quiesced: false.into(),
+            data_plane_paused: false.into(),
+            inflight: 0.into(),
+            drained: tokio::sync::Notify::new(),
+            data_inflight: 0.into(),
+            data_drained: tokio::sync::Notify::new(),
+        });
+        let connection = uuid::Uuid::new_v4().to_string();
+        let credential = json!({"accessToken":"private-access","refreshToken":"private-refresh","expiresAt":"2999-01-01T00:00:00Z","region":"us-east-1"});
+        store::with(|c| c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,created_at,updated_at) VALUES(?1,'seller','github','registered',?2,0,0)", rusqlite::params![connection,credential.to_string()]).map(|_|())).unwrap();
+        let body = Bytes::from(json!({"ownerId":"seller","connectionId":connection,"request":{"model":"claude-sonnet-4","messages":[{"role":"user","content":"private-input"}],"max_tokens":64,"stream":false}}).to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer fixture-control".parse().unwrap());
+        let id = uuid::Uuid::new_v4().to_string();
+        let response = post_request_with_timeout(
+            state.clone(),
+            id.clone(),
+            headers.clone(),
+            body.clone(),
+            Duration::from_secs(1),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap();
+        let receipt: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["failureCode"], "generation_timeout");
+        assert!(receipt["usage"].is_null());
+        assert!(receipt.get("response").is_none());
+        assert!(!receipt.to_string().contains("private-"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        store::initialize().unwrap();
+        let persisted = get_request(
+            Path(id.clone()),
+            Query(OwnerQuery {
+                owner_id: "seller".into(),
+            }),
+            headers.clone(),
+        )
+        .await;
+        let persisted: Value = serde_json::from_slice(
+            &axum::body::to_bytes(persisted.into_body(), 100_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted, receipt);
+        let replay =
+            post_request_with_timeout(state, id, headers, body, Duration::from_secs(1)).await;
+        let replay: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replay.into_body(), 100_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay, receipt);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn failure_classification_requires_structured_context_reason() {
+        for body in [
+            "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+            "MONTHLY_REQUEST_COUNT",
+            r#"{"message":"MONTHLY_REQUEST_COUNT"}"#,
+            r#"{"reason":"monthly_request_count"}"#,
+            "private-body",
+            "{}",
+        ] {
+            assert_eq!(inference_http_failure(400, body).code, "generation_failed");
+        }
+        assert_eq!(
+            inference_http_failure(
+                400,
+                r#"{"reason":"MONTHLY_REQUEST_COUNT","message":"private-secret"}"#
+            )
+            .code,
+            "supplier_unavailable"
+        );
+        assert_eq!(
+            inference_http_failure(404, r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#).code,
+            "generation_failed"
+        );
+        assert_eq!(
+            inference_http_failure(
+                400,
+                r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD","message":"private-secret"}"#
+            )
+            .code,
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            inference_http_failure(503, "private-secret").code,
+            "supplier_unavailable"
+        );
+    }
 
     #[test]
     fn registration_is_identity_unique_and_never_revives_cancelled_rows() {
@@ -1620,17 +1911,25 @@ mod tests {
         upstream: &'static str,
         streaming: bool,
         max_tokens: i64,
-    ) -> (Result<(Value, i64, bool), Health>, Vec<Value>, bool) {
+    ) -> (
+        Result<(Value, i64, bool), InferenceFailure>,
+        Vec<Value>,
+        bool,
+    ) {
         run_parallel(choice, upstream, streaming, max_tokens, true).await
     }
 
     async fn run_parallel(
         choice: Value,
-        upstream: &'static str,
+        upstream: &str,
         streaming: bool,
         max_tokens: i64,
         parallel_tool_calls: bool,
-    ) -> (Result<(Value, i64, bool), Health>, Vec<Value>, bool) {
+    ) -> (
+        Result<(Value, i64, bool), InferenceFailure>,
+        Vec<Value>,
+        bool,
+    ) {
         let mut request = tool_choice_request(Some(choice));
         request["stream"] = json!(streaming);
         request["parallel_tool_calls"] = json!(parallel_tool_calls);
@@ -1650,7 +1949,7 @@ mod tests {
             search_followup: None,
         };
         let body: stream_core::ByteStream = Box::pin(futures_util::stream::iter([Ok(
-            Bytes::from_static(upstream.as_bytes()),
+            Bytes::copy_from_slice(upstream.as_bytes()),
         )]));
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let result = respond(
@@ -1980,6 +2279,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_size_failures_are_not_tool_failures() {
+        // Escaping alone crosses the client JSON/SSE cap, but not the raw
+        // upstream cap or token budget. Thus each cap is independently tested.
+        let upstream = format!(
+            "{}{}",
+            json!({"content":"\n".repeat(MAX_INFERENCE_RESPONSE / 2 + 1)}),
+            r#"{"usage":1}{"stopReason":"end_turn"}"#
+        );
+        assert!(upstream.len() < MAX_INFERENCE_RESPONSE * 4);
+        for streaming in [false, true] {
+            let (result, _, _) =
+                run_parallel(json!("auto"), &upstream, streaming, 2_000_000, true).await;
+            assert_eq!(result.unwrap_err().code, "output_limit_exceeded");
+            // No content at all: only the raw input cap can trip here.
+            let raw = " ".repeat(MAX_INFERENCE_RESPONSE * 4 + 1);
+            let (result, _, _) =
+                run_parallel(json!("auto"), &raw, streaming, 2_000_000, true).await;
+            assert_eq!(result.unwrap_err().code, "output_limit_exceeded");
+        }
+    }
+
+    #[tokio::test]
     async fn tool_choice_output_is_checked_before_forwarding() {
         for (choice, upstream, accepted) in [
             (json!("auto"), TEXT, None),
@@ -2012,10 +2333,18 @@ mod tests {
             (named("weather"), UNDECLARED),
         ] {
             let (result, _, drained) = run(choice.clone(), upstream, false, 4096).await;
-            assert!(result.is_err(), "{choice} {upstream} collected");
+            assert_eq!(
+                result.unwrap_err().code,
+                "generation_failed",
+                "{choice} {upstream} collected"
+            );
             assert!(drained);
             let (result, frames, drained) = run(choice.clone(), upstream, true, 4096).await;
-            assert!(result.is_err(), "{choice} {upstream} streamed");
+            assert_eq!(
+                result.unwrap_err().code,
+                "generation_failed",
+                "{choice} {upstream} streamed"
+            );
             assert!(drained, "{choice}: provider stream drained");
             // Neither the disallowed calls nor a terminal success frame leave.
             assert!(streamed_calls(&frames).is_empty(), "{choice}: {frames:?}");
