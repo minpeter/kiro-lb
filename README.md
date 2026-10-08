@@ -260,11 +260,24 @@ contract; there is no compatibility path for earlier prototype schemas.
 
 `PUT` takes `{ownerId, provider}` with `provider` equal to `github`,
 `google`, or `builder-id`; polling takes `{ownerId}`. `GET` and `DELETE` take `ownerId` in the query.
-Responses expose only `{id, status, authorization, account, diagnostics}`. Authorization has
+Responses expose only `{id, status, authorization, account, diagnostics, models?}`. Authorization has
 `url`, `userCode`, `expiresAt` (Unix milliseconds), and `intervalSeconds`; account
 has the verified upstream `id` and nullable `email`. Both are nullable. Status is
 `pending`, `registered`, `expired`, `failed`, or `disconnected`. Neither the
 control token nor provider tokens belong in browser requests.
+
+Registered responses optionally include `models: string[]` (at most 100 unique
+IDs), discovered with that seller's authenticated `ListAvailableModels` request
+at registration and recheck. IDs are preserved verbatim, including newly released
+models; plan names, aliases and configuration fallbacks never establish access.
+Unknown discovery omits `models`; a successful empty catalogue returns `[]` and
+revokes all previous support. Successful refresh replaces, rather than merges,
+the catalogue, so downgrades remove old models. Failed, malformed, timed-out or
+oversized discovery preserves the last authoritative catalogue (or remains
+omitted if none exists). Usage diagnostics are independent of model discovery.
+GET and cooldown responses use persisted models without upstream requests.
+Models are owner-scoped, persisted via an additive SQLite column, and cleared
+on disconnect under the same cancellation/credential-refresh fence.
 
 `diagnostics` is additive and nullable (null until checked), independent of the
 lifecycle status: an unhealthy account remains `registered`. Its shape is:
@@ -286,7 +299,7 @@ lifecycle status: an unhealthy account remains `registered`. Its shape is:
 
 `POST /internal/inferx/v1/connections/{uuid}/recheck` takes `{ownerId}` and returns
 the usual connection response. It refreshes credentials as needed and calls
-Kiro's usage API without generating tokens. A persisted 60-second cooldown per
+Kiro's usage and model discovery APIs without generating tokens. A persisted 60-second cooldown per
 connection returns cached results for repeated requests, including after failed
 checks or process restarts. The cooldown runs from check completion; an initial
 claim also prevents immediate retries if the process exits mid-check.

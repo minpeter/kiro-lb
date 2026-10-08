@@ -63,6 +63,7 @@ struct Row {
     email: Option<String>,
     next_poll: i64,
     diagnostics: Option<Diagnostics>,
+    models: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
@@ -295,13 +296,35 @@ fn valid_field(value: &str, max: usize) -> bool {
 
 fn read_row(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Row>> {
     use rusqlite::OptionalExtension;
-    c.query_row("SELECT id,owner_id,provider,status,flow_id,authorization_json,credential_json,upstream_id,email,next_poll_at,diagnostics_json FROM inferx_connections WHERE id=?1", [id], |r| {
-        Ok(Row { id:r.get(0)?, owner:r.get(1)?, provider:r.get(2)?, status:r.get(3)?, flow:r.get(4)?, authorization:r.get::<_,Option<String>>(5)?.and_then(|s|serde_json::from_str(&s).ok()), upstream:r.get(7)?, email:r.get(8)?, next_poll:r.get(9)?, diagnostics:r.get::<_,Option<String>>(10)?.and_then(|s|serde_json::from_str(&s).ok()) })
+    c.query_row("SELECT id,owner_id,provider,status,flow_id,authorization_json,credential_json,upstream_id,email,next_poll_at,diagnostics_json,models_json FROM inferx_connections WHERE id=?1", [id], |r| {
+        Ok(Row { id:r.get(0)?, owner:r.get(1)?, provider:r.get(2)?, status:r.get(3)?, flow:r.get(4)?, authorization:r.get::<_,Option<String>>(5)?.and_then(|s|serde_json::from_str(&s).ok()), upstream:r.get(7)?, email:r.get(8)?, next_poll:r.get(9)?, diagnostics:r.get::<_,Option<String>>(10)?.and_then(|s|serde_json::from_str(&s).ok()), models:r.get::<_,Option<String>>(11)?.and_then(|s|serde_json::from_str(&s).ok()) })
     }).optional()
 }
 
 fn response(row: &Row) -> Value {
-    json!({"id":row.id,"status":row.status,"authorization":if row.status=="pending" {row.authorization.clone()} else {None},"account":if row.status=="registered" {Some(json!({"id":row.upstream,"email":row.email}))} else {None},"diagnostics":row.diagnostics})
+    let mut view = json!({"id":row.id,"status":row.status,"authorization":if row.status=="pending" {row.authorization.clone()} else {None},"account":if row.status=="registered" {Some(json!({"id":row.upstream,"email":row.email}))} else {None},"diagnostics":row.diagnostics});
+    if row.status == "registered" {
+        if let Some(models) = &row.models {
+            view["models"] = json!(models);
+        }
+    }
+    view
+}
+
+async fn discover_models(auth: &KiroAuth, http: &reqwest::Client) -> Option<String> {
+    let catalogue = model_catalog::fetch_available_models_authoritative(auth, http).await?;
+    let mut ids = Vec::new();
+    for model in catalogue {
+        let id = model["modelId"].as_str()?;
+        if id.chars().count() > 256 {
+            return None;
+        }
+        if !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    // Do not publish a truncated entitlement catalogue.
+    (ids.len() <= 100).then(|| serde_json::to_string(&ids).unwrap())
 }
 
 fn expired(row: &Row) -> bool {
@@ -437,14 +460,15 @@ pub async fn recheck_connection(
             &credential,
             state.http.clone(),
         );
-        let result = tokio::time::timeout(RECHECK_TIMEOUT, async {
+        let usage_check = tokio::time::timeout(RECHECK_TIMEOUT, async {
             let auth = auth.as_ref().map_err(auth_health)?;
             let mut result =
                 model_catalog::fetch_account_usage_checked(auth, &state.http, auth.profile_arn())
                     .await;
             // A rejected access token may only be stale; refresh once before
             // declaring authentication failure. Never retry a suspension.
-            if matches!(&result, Err(e @ ManagementError::Http { status: 401, .. }) if management_health(e) == Health::AuthenticationFailed) {
+            if matches!(&result, Err(e @ ManagementError::Http { status: 401, .. }) if management_health(e) == Health::AuthenticationFailed)
+            {
                 auth.force_refresh().await.map_err(|e| auth_health(&e))?;
                 result = model_catalog::fetch_account_usage_checked(
                     auth,
@@ -454,8 +478,12 @@ pub async fn recheck_connection(
                 .await;
             }
             result.map_err(|e| management_health(&e))
-        })
-        .await;
+        });
+        let model_check = tokio::time::timeout(RECHECK_TIMEOUT, async {
+            discover_models(auth.as_ref().ok()?, &state.http).await
+        });
+        let (result, models) = tokio::join!(usage_check, model_check);
+        let models = models.ok().flatten();
         let diagnostics = match result {
             Ok(Ok(u)) => Diagnostics::success(&u),
             Ok(Err(health)) => Diagnostics::failure(row.diagnostics, health),
@@ -465,8 +493,8 @@ pub async fn recheck_connection(
         let owner = p.owner_id;
         match store::run(move |c| {
             c.execute(
-                "UPDATE inferx_connections SET diagnostics_json=?3,credential_json=COALESCE(?4,credential_json),updated_at=?5,next_recheck_at=?6 WHERE id=?1 AND owner_id=?2 AND status='registered'",
-                rusqlite::params![id, owner, serde_json::to_string(&diagnostics).unwrap(), rotated, now_ms(), diagnostics.checked_at + RECHECK_COOLDOWN_MS],
+                "UPDATE inferx_connections SET diagnostics_json=?3,credential_json=COALESCE(?4,credential_json),updated_at=?5,next_recheck_at=?6,models_json=COALESCE(?7,models_json) WHERE id=?1 AND owner_id=?2 AND status='registered'",
+                rusqlite::params![id, owner, serde_json::to_string(&diagnostics).unwrap(), rotated, now_ms(), diagnostics.checked_at + RECHECK_COOLDOWN_MS, models],
             )?;
             read_row(c, &id)
         }).await {
@@ -673,6 +701,7 @@ pub async fn poll_connection(
         return fail(id).await;
     };
     let email = u["email"].as_str().map(str::to_owned);
+    let models = discover_models(&auth, &state.http).await;
     let sid = id.clone();
     let rotated = auth.credential_document();
     if rotated
@@ -686,8 +715,17 @@ pub async fn poll_connection(
     let suid = uid.clone();
     let se = email.clone();
     let diagnostics = Diagnostics::success(&u);
-    let result =
-        store::run(move |c| register_in(c, &sid, &sc, &suid, se.as_deref(), &diagnostics)).await;
+    let result = store::run(move |c| {
+        let registered = register_in(c, &sid, &sc, &suid, se.as_deref(), &diagnostics)?;
+        if registered {
+            c.execute(
+                "UPDATE inferx_connections SET models_json=?2 WHERE id=?1 AND status='registered'",
+                rusqlite::params![sid, models],
+            )?;
+        }
+        Ok(registered)
+    })
+    .await;
     if result.is_err() {
         return error(500, "internal_error", "Internal error");
     }
@@ -767,7 +805,7 @@ pub async fn delete_connection(
     let _lock = connection_lock(&id).lock_owned().await;
     let sid = id.clone();
     let owner = q.owner_id.clone();
-    let result=store::run(move|c|{if let Some(r)=read_row(c,&sid)?{if r.owner!=owner{return Ok(None)};if let Some(f)=r.flow.as_deref(){device_login::discard(f)};c.execute("UPDATE inferx_connections SET status='disconnected',flow_id=NULL,authorization_json=NULL,credential_json=NULL,upstream_id=NULL,email=NULL,diagnostics_json=NULL,next_recheck_at=0,updated_at=?2 WHERE id=?1",rusqlite::params![sid,(store::now_f64()*1000.0)as i64])?;}else{let now=(store::now_f64()*1000.0)as i64;c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,created_at,updated_at)VALUES(?1,?2,'github','disconnected',?3,?3)",rusqlite::params![sid,owner,now])?;}read_row(c,&sid)}).await;
+    let result=store::run(move|c|{if let Some(r)=read_row(c,&sid)?{if r.owner!=owner{return Ok(None)};if let Some(f)=r.flow.as_deref(){device_login::discard(f)};c.execute("UPDATE inferx_connections SET status='disconnected',flow_id=NULL,authorization_json=NULL,credential_json=NULL,upstream_id=NULL,email=NULL,diagnostics_json=NULL,models_json=NULL,next_recheck_at=0,updated_at=?2 WHERE id=?1",rusqlite::params![sid,(store::now_f64()*1000.0)as i64])?;}else{let now=(store::now_f64()*1000.0)as i64;c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,created_at,updated_at)VALUES(?1,?2,'github','disconnected',?3,?3)",rusqlite::params![sid,owner,now])?;}read_row(c,&sid)}).await;
     match result {
         Ok(Some(r)) => json_response(200, response(&r)),
         Ok(None) => error(404, "not_found", "Not found"),
