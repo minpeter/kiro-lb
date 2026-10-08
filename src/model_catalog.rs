@@ -112,6 +112,20 @@ async fn management_call(
 }
 
 pub async fn fetch_available_models(auth: &KiroAuth, http: &reqwest::Client) -> Option<Vec<Value>> {
+    fetch_models(auth, http, false)
+        .await
+        .filter(|models| !models.is_empty())
+}
+
+/// Unlike the general pool API, a valid empty catalogue is authoritative.
+pub(crate) async fn fetch_available_models_authoritative(
+    auth: &KiroAuth,
+    http: &reqwest::Client,
+) -> Option<Vec<Value>> {
+    fetch_models(auth, http, true).await
+}
+
+async fn fetch_models(auth: &KiroAuth, http: &reqwest::Client, strict: bool) -> Option<Vec<Value>> {
     match management_call(
         auth,
         http,
@@ -123,6 +137,16 @@ pub async fn fetch_available_models(auth: &KiroAuth, http: &reqwest::Client) -> 
     .await
     {
         Ok(v) => {
+            let entries = v.get("models")?.as_array()?;
+            if strict
+                && entries.iter().any(|m| {
+                    m.get("modelId")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                })
+            {
+                return None;
+            }
             let models: Vec<Value> = v
                 .get("models")?
                 .as_array()?
@@ -133,7 +157,7 @@ pub async fn fetch_available_models(auth: &KiroAuth, http: &reqwest::Client) -> 
                 })
                 .cloned()
                 .collect();
-            (!models.is_empty()).then_some(models)
+            Some(models)
         }
         Err(e) => {
             tracing::debug!("[Models] Could not list models: {e}");

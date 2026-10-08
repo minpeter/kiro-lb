@@ -17,7 +17,7 @@ pub(crate) const INFERX_SCHEMA: &str = "
         provider TEXT NOT NULL, status TEXT NOT NULL, flow_id TEXT,
         authorization_json TEXT, credential_json TEXT, upstream_id TEXT,
         email TEXT, next_poll_at INTEGER NOT NULL DEFAULT 0,
-        diagnostics_json TEXT, next_recheck_at INTEGER NOT NULL DEFAULT 0,
+        diagnostics_json TEXT, models_json TEXT, next_recheck_at INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
     );
     CREATE UNIQUE INDEX IF NOT EXISTS inferx_upstream_owner
@@ -114,6 +114,9 @@ pub fn initialize() -> rusqlite::Result<()> {
     with(|conn| {
         conn.execute_batch(INFERX_SCHEMA)?;
         let connection_columns = columns(conn, "inferx_connections")?;
+        if !connection_columns.iter().any(|c| c == "models_json") {
+            conn.execute_batch("ALTER TABLE inferx_connections ADD COLUMN models_json TEXT")?;
+        }
         if !connection_columns.iter().any(|c| c == "diagnostics_json") {
             conn.execute_batch("ALTER TABLE inferx_connections ADD COLUMN diagnostics_json TEXT")?;
         }

@@ -19,6 +19,8 @@ use tower::ServiceExt;
 
 struct Mock {
     usage: Mutex<(StatusCode, String)>,
+    models: Mutex<(StatusCode, String)>,
+    model_calls: AtomicUsize,
     refresh: Mutex<(StatusCode, String)>,
     generation: Mutex<String>,
     calls: AtomicUsize,
@@ -48,6 +50,15 @@ async fn refresh(State(mock): State<Arc<Mock>>) -> (StatusCode, String) {
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
     mock.refresh.lock().unwrap().clone()
+}
+
+async fn models(State(mock): State<Arc<Mock>>, headers: HeaderMap) -> (StatusCode, String) {
+    assert!(headers["authorization"]
+        .to_str()
+        .unwrap()
+        .starts_with("Bearer fixture-"));
+    mock.model_calls.fetch_add(1, Ordering::SeqCst);
+    mock.models.lock().unwrap().clone()
 }
 
 async fn generate(State(mock): State<Arc<Mock>>) -> String {
@@ -112,11 +123,13 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
     store::save_setting("endpoints", &endpoints).unwrap();
     kiro_lb::settings::load_endpoint_settings();
     // Exercise additive migration against a pre-diagnostics database, twice.
-    store::with(|c| c.execute_batch("ALTER TABLE inferx_connections DROP COLUMN diagnostics_json; ALTER TABLE inferx_connections DROP COLUMN next_recheck_at;")).unwrap();
+    store::with(|c| c.execute_batch("ALTER TABLE inferx_connections DROP COLUMN diagnostics_json; ALTER TABLE inferx_connections DROP COLUMN next_recheck_at; ALTER TABLE inferx_connections DROP COLUMN models_json;")).unwrap();
     store::initialize().unwrap();
     store::initialize().unwrap();
     std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
     let mock = Arc::new(Mock {
+        models: Mutex::new((StatusCode::SERVICE_UNAVAILABLE, "{}".into())),
+        model_calls: AtomicUsize::new(0),
         usage: Mutex::new((StatusCode::OK, json!({
             "subscriptionInfo":{"subscriptionTitle":"Kiro Pro+"},
             "usageBreakdownList":[{"resourceType":"AGENTIC_REQUEST","currentUsageWithPrecision":37.25,"currentUsage":37,"usageLimitWithPrecision":500.5}],
@@ -135,6 +148,7 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
     std::env::set_var("KIRO_TEST_REFRESH_URL", format!("{base}refresh"));
     std::env::set_var("KIRO_TEST_RUNTIME_URL", format!("{base}generate"));
     let mock_app = Router::new()
+        .route("/", post(models))
         .route("/getUsageLimits", get(usage))
         .route("/refresh", post(refresh))
         .route("/generate", post(generate))
@@ -165,7 +179,9 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
     assert_eq!(absent.0, StatusCode::NOT_FOUND);
     assert_eq!(call(&app, &id, "POST", "bob").await, absent);
     assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(mock.model_calls.load(Ordering::SeqCst), 0);
     let first = call(&app, &id, "POST", "alice").await;
+    assert!(first.1.get("models").is_none());
     assert_eq!(first.0, StatusCode::OK);
     assert_eq!(first.1["status"], "registered");
     let d = &first.1["diagnostics"];
@@ -204,6 +220,59 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
     })
     .unwrap();
     assert_eq!(cooldown - d["checkedAt"].as_i64().unwrap(), 60_000);
+    assert_eq!(mock.model_calls.load(Ordering::SeqCst), 1);
+
+    // The effective catalogue, not the unchanged Pro+ plan, determines access.
+    for ids in [
+        vec!["claude-sonnet-4"],
+        vec!["claude-sonnet-4", "claude-opus-new.7"],
+        vec!["claude-sonnet-4"],
+        vec![],
+    ] {
+        due(&id);
+        *mock.models.lock().unwrap() = (
+            StatusCode::OK,
+            json!({"models":ids.iter().map(|id| json!({"modelId":id})).collect::<Vec<_>>()} )
+                .to_string(),
+        );
+        let view = call(&app, &id, "POST", "alice").await;
+        assert_eq!(view.1["models"], json!(ids));
+        let count = mock.model_calls.load(Ordering::SeqCst);
+        assert_eq!(call(&app, &id, "GET", "alice").await, view);
+        assert_eq!(call(&app, &id, "POST", "alice").await, view);
+        assert_eq!(mock.model_calls.load(Ordering::SeqCst), count);
+        store::initialize().unwrap();
+        assert_eq!(call(&app, &id, "GET", "alice").await, view);
+        due(&id);
+        *mock.models.lock().unwrap() = (StatusCode::SERVICE_UNAVAILABLE, "{}".into());
+        assert_eq!(
+            call(&app, &id, "POST", "alice").await.1["models"],
+            json!(ids)
+        );
+    }
+    for (status, body) in [
+        (StatusCode::SERVICE_UNAVAILABLE, "{}".to_owned()),
+        (StatusCode::OK, "not-json".to_owned()),
+        (StatusCode::OK, "{}".to_owned()),
+        (StatusCode::OK, json!({"models":[{"modelId":"new-grant"},{}]}).to_string()),
+        (StatusCode::OK, json!({"models":[{"modelId":"x".repeat(257)}]}).to_string()),
+        (StatusCode::OK, json!({"models":(0..101).map(|i| json!({"modelId":format!("model-{i}")})).collect::<Vec<_>>()} ).to_string()),
+    ] {
+        due(&id);
+        *mock.models.lock().unwrap() = (status, body);
+        assert_eq!(call(&app, &id, "POST", "alice").await.1["models"], json!([]));
+    }
+    // Leave usage-call count assertions below independent of catalogue checks.
+    mock.calls.store(1, Ordering::SeqCst);
+    *mock.models.lock().unwrap() = (StatusCode::SERVICE_UNAVAILABLE, "{}".into());
+    store::with(|c| {
+        c.execute(
+            "UPDATE inferx_connections SET diagnostics_json=?2 WHERE id=?1",
+            rusqlite::params![id, d.to_string()],
+        )
+        .map(|_| ())
+    })
+    .unwrap();
 
     // Native HTTP-200 rejection frames must update persisted health in both
     // response modes. Similar reason strings and ordinary output cannot do so.
@@ -449,6 +518,16 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
         .unwrap()
         .unwrap();
     assert_eq!(deleted.1["status"], "disconnected");
+    assert!(deleted.1.get("models").is_none());
+    let saved_models: Option<String> = store::with(|c| {
+        c.query_row(
+            "SELECT models_json FROM inferx_connections WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+    })
+    .unwrap();
+    assert!(saved_models.is_none());
     assert!(deleted.1["diagnostics"].is_null());
     assert!(credential(&id).is_none());
     let count = mock.calls.load(Ordering::SeqCst);
