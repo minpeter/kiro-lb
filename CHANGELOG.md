@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9](https://github.com/minpeter/kiro-lb/compare/v0.2.8...v0.2.9) - 2026-10-09
+
+### Added
+
+- *(inferx)* discover account-scoped Kiro model entitlements
+- *(inferx)* add cached account diagnostics and recheck ([#111](https://github.com/minpeter/kiro-lb/pull/111))
+- classify account failures from automatic TokenHub diagnostics
+- browser sign-in for Google and GitHub that keeps earlier social accounts signed in
+- add dedicated InferX account and execution control API
+
+### Fixed
+
+- *(inferx)* preserve transport health and cover terminal failure paths
+- *(inferx)* persist safe failure receipts without replaying generation
+- *(inferx)* enforce output budgets before forwarding billable content ([#112](https://github.com/minpeter/kiro-lb/pull/112))
+- *(inferx)* accept larger agent requests and enforce tool choices ([#110](https://github.com/minpeter/kiro-lb/pull/110))
+- reject unchanged tokens after forced refresh lease timeout
+- classify refresh failures before quarantining credentials
+- preserve automatic login diagnostics across saves and pauses
+- reject unsupported models before upstream generation
+- isolate browser login requests across flow transitions
+- address review on browser sign-in
+- keep bootstrap credentials out of startup logs
+
+### Other
+
+- Add security audit workflow
+- Trigger security scan
+- Add Github Actions Security workflow
+- bound refresh lease contention regression
+- Merge main into browser sign-in and rebuild dashboard
+- Support InferX tools, inline images and durable metering provenance
+- isolate InferX SSE fixture from endpoint rotation
+
 ### Added
 
 - browser sign-in for Google and GitHub (#99): the dashboard opens Kiro's sign-in page with PKCE and takes the callback on `localhost:3128`, or from a pasted callback address when kiro-lb cannot listen there. Each account gets its own session, so a second Google/GitHub user no longer signs the first one out. The device code stays available behind "Use a device code instead"
