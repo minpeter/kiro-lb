@@ -100,6 +100,54 @@ struct Diagnostics {
     checked_at: i64,
     health: Health,
     usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh: Option<RefreshBackoff>,
+}
+
+/// Persisted refresh deferral. Each request builds a fresh auth object, so an
+/// in-memory backoff alone would let every request hit the auth host again.
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+struct RefreshBackoff {
+    retry_at: i64,
+    failures: u32,
+    rejected_status: Option<u16>,
+}
+
+const MAX_REFRESH_BACKOFF_MS: i64 = 900_000;
+
+fn defer_refresh(auth: &KiroAuth, diagnostics: Option<&Diagnostics>) {
+    if let Some(b) = diagnostics.and_then(|d| d.refresh) {
+        auth.defer_refresh(b.retry_at as f64 / 1000.0, b.rejected_status);
+    }
+}
+
+/// A rejected refresh token waits for re-login (re-asked hourly); transient
+/// refresh failures back off exponentially. A refresh or call that succeeded
+/// without refreshing clears the deferral.
+fn next_refresh(
+    auth: Option<&KiroAuth>,
+    previous: Option<RefreshBackoff>,
+    succeeded: bool,
+) -> Option<RefreshBackoff> {
+    match auth.and_then(KiroAuth::last_refresh_outcome) {
+        Some(Ok(())) => None,
+        Some(Err(rejected_status)) => {
+            let failures = previous.map_or(1, |p| p.failures.saturating_add(1)).min(16);
+            let delay = if rejected_status.is_some() {
+                (crate::auth::REJECTED_REFRESH_RETRY_SECONDS * 1000.0) as i64
+            } else {
+                (30_000_i64 << (failures - 1).min(5)).min(MAX_REFRESH_BACKOFF_MS)
+            };
+            Some(RefreshBackoff {
+                retry_at: now_ms() + delay,
+                failures,
+                rejected_status,
+            })
+        }
+        None if succeeded => None,
+        None => previous,
+    }
 }
 
 impl Diagnostics {
@@ -114,6 +162,7 @@ impl Diagnostics {
         Self {
             checked_at: now,
             health: Health::Healthy,
+            refresh: None,
             usage: Some(Usage {
                 plan: u["subscriptionTitle"]
                     .as_str()
@@ -144,6 +193,7 @@ impl Diagnostics {
         Self {
             checked_at: now_ms(),
             health,
+            refresh: previous.as_ref().and_then(|d| d.refresh),
             usage: previous.and_then(|d| d.usage),
         }
     }
@@ -215,6 +265,20 @@ impl From<Health> for InferenceFailure {
             health,
             upstream_status: None,
         }
+    }
+}
+
+impl InferenceFailure {
+    /// Upstream status that proved the account unavailable, for proxy cooldown.
+    fn supplier_status(&self) -> Option<u16> {
+        if self.code != "supplier_unavailable" {
+            return None;
+        }
+        if self.health == Health::AuthenticationFailed {
+            return Some(401);
+        }
+        self.upstream_status
+            .filter(|status| matches!(status, 401 | 403 | 429 | 500..=599))
     }
 }
 
@@ -460,6 +524,10 @@ pub async fn recheck_connection(
             &credential,
             state.http.clone(),
         );
+        let previous_refresh = row.diagnostics.as_ref().and_then(|d| d.refresh);
+        if let Ok(auth) = &auth {
+            defer_refresh(auth, row.diagnostics.as_ref());
+        }
         let usage_check = tokio::time::timeout(RECHECK_TIMEOUT, async {
             let auth = auth.as_ref().map_err(auth_health)?;
             let mut result =
@@ -484,11 +552,16 @@ pub async fn recheck_connection(
         });
         let (result, models) = tokio::join!(usage_check, model_check);
         let models = models.ok().flatten();
-        let diagnostics = match result {
+        let mut diagnostics = match result {
             Ok(Ok(u)) => Diagnostics::success(&u),
             Ok(Err(health)) => Diagnostics::failure(row.diagnostics, health),
             Err(_) => Diagnostics::failure(row.diagnostics, Health::Unknown),
         };
+        diagnostics.refresh = next_refresh(
+            auth.as_ref().ok(),
+            previous_refresh,
+            diagnostics.health == Health::Healthy,
+        );
         let rotated = auth.ok().map(|a| a.credential_document().to_string());
         let owner = p.owner_id;
         match store::run(move |c| {
@@ -833,14 +906,15 @@ struct Receipt {
     generation: Option<f64>,
     metering: Option<String>,
     failure_code: Option<String>,
+    supplier_status: Option<u16>,
 }
 
 fn read_receipt(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Receipt>> {
     use rusqlite::OptionalExtension;
     c.query_row(
-        "SELECT request_id,status,input_tokens,output_tokens,duration_ms,ttft_ms,generation_ms,metering_json,failure_code FROM inferx_requests WHERE request_id=?1",
+        "SELECT request_id,status,input_tokens,output_tokens,duration_ms,ttft_ms,generation_ms,metering_json,failure_code,supplier_status FROM inferx_requests WHERE request_id=?1",
         [id],
-        |r| Ok(Receipt { request_id:r.get(0)?, status:r.get(1)?, input:r.get(2)?, output:r.get(3)?, duration:r.get(4)?, ttft:r.get(5)?, generation:r.get(6)?, metering:r.get(7)?, failure_code:r.get(8)? }),
+        |r| Ok(Receipt { request_id:r.get(0)?, status:r.get(1)?, input:r.get(2)?, output:r.get(3)?, duration:r.get(4)?, ttft:r.get(5)?, generation:r.get(6)?, metering:r.get(7)?, failure_code:r.get(8)?, supplier_status:r.get(9)? }),
     ).optional()
 }
 
@@ -865,6 +939,11 @@ fn receipt_json(receipt: &Receipt, completion: Option<Value>) -> Value {
                     | "output_limit_exceeded"
             ))
             .unwrap_or("generation_failed"));
+        if receipt.failure_code.as_deref() == Some("supplier_unavailable") {
+            if let Some(status) = receipt.supplier_status {
+                value["supplierStatus"] = json!(status);
+            }
+        }
     }
     if receipt.status == "succeeded" {
         if let Some(metering) = &receipt.metering {
@@ -999,8 +1078,9 @@ async fn post_request_with_timeout(
             let existing_hash = c.query_row("SELECT request_hash FROM inferx_requests WHERE request_id=?1", [&request_id], |r| r.get::<_,String>(0))?;
             return Ok((if existing_hash == hash { 1 } else { 2 }, read_receipt(c, &request_id)?, None));
         }
-        let credential:Option<String> = c.query_row("SELECT credential_json FROM inferx_connections WHERE id=?1 AND owner_id=?2 AND status='registered'", rusqlite::params![connection_id,owner], |r|r.get(0)).optional()?.flatten();
-        let Some(credential)=credential else{return Ok((0,None,None))};
+        let stored:Option<(Option<String>,Option<String>)> = c.query_row("SELECT credential_json,diagnostics_json FROM inferx_connections WHERE id=?1 AND owner_id=?2 AND status='registered'", rusqlite::params![connection_id,owner], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((Some(credential),diagnostics))=stored else{return Ok((0,None,None))};
+        let credential=(credential,diagnostics.and_then(|d|serde_json::from_str::<Diagnostics>(&d).ok()));
         let now=now_ms();
         c.execute("INSERT INTO inferx_requests(request_id,request_hash,owner_id,connection_id,status,created_at,updated_at) VALUES(?1,?2,?3,?4,'running',?5,?5)",rusqlite::params![request_id,hash,owner,connection_id,now])?;
         Ok((3,read_receipt(c,&request_id)?,Some(credential)))
@@ -1017,7 +1097,9 @@ async fn post_request_with_timeout(
     }
     // A corrupt registered credential is an execution failure, not a reason
     // to strand the already-durable request in `running`.
-    let credential: Value = serde_json::from_str(&credential.unwrap()).unwrap_or(Value::Null);
+    let (credential, diagnostics) = credential.unwrap();
+    let credential: Value = serde_json::from_str(&credential).unwrap_or(Value::Null);
+    let previous_refresh = diagnostics.as_ref().and_then(|d| d.refresh);
     let (tx, rx) = tokio::sync::oneshot::channel();
     // Delivery is bounded but execution is detached from it: a slow or gone
     // client must not backpressure/cancel billable work. Saturation is tracked
@@ -1039,6 +1121,9 @@ async fn post_request_with_timeout(
         )
         .ok()
         .map(Arc::new);
+        if let Some(auth) = &auth {
+            defer_refresh(auth, diagnostics.as_ref());
+        }
         let result = tokio::time::timeout(inference_timeout, async {
             execute_inference(
                 &task_state,
@@ -1070,6 +1155,10 @@ async fn post_request_with_timeout(
             }
             _ => None,
         };
+        let supplier_status = match &result {
+            Ok(Err(failure)) => failure.supplier_status(),
+            _ => None,
+        };
         let failure_code = match &result {
             Ok(Err(failure)) => {
                 tracing::warn!(event = "inferx_generation_failed", request_id = %task_id, code = failure.code, stage = failure.stage, upstream_status = failure.upstream_status);
@@ -1085,6 +1174,7 @@ async fn post_request_with_timeout(
             Ok(Err(_)) => ("failed", None, None, true),
             Err(_) => ("failed", None, None, true),
         };
+        let refresh = next_refresh(auth.as_deref(), previous_refresh, status == "succeeded");
         // Refresh can rotate credentials even if generation subsequently fails.
         let refreshed = auth.map(|auth| auth.credential_document());
         let duration = usage.as_ref().map(|u| u.2);
@@ -1098,10 +1188,15 @@ async fn post_request_with_timeout(
         let metering = usage
             .as_ref()
             .map(|_| crate::inferx_contract::metering().to_string());
-        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9,failure_code=?10 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering,failure_code])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}
-            if let Some(health) = health {
+        let saved=store::run(move|c|{c.execute("UPDATE inferx_requests SET status=?2,input_tokens=?3,output_tokens=?4,duration_ms=?5,ttft_ms=?6,generation_ms=?7,updated_at=?8,metering_json=?9,failure_code=?10,supplier_status=?11 WHERE request_id=?1 AND status='running'",rusqlite::params![sid,status,input,output,duration,ttft,generation,now_ms(),metering,failure_code,supplier_status])?;if let Some(doc)=refreshed{c.execute("UPDATE inferx_connections SET credential_json=?3,updated_at=?4 WHERE id=?1 AND owner_id=?2 AND status='registered'",rusqlite::params![connection,owner,doc.to_string(),now_ms()])?;}
+            if health.is_some() || refresh != previous_refresh {
                 let previous = read_row(c, &connection)?.and_then(|r| r.diagnostics);
-                let diagnostics = Diagnostics::failure(previous, health);
+                let mut diagnostics = match (health, previous) {
+                    (Some(health), previous) => Diagnostics::failure(previous, health),
+                    (None, Some(previous)) => previous,
+                    (None, None) => Diagnostics::failure(None, Health::Unknown),
+                };
+                diagnostics.refresh = refresh;
                 c.execute("UPDATE inferx_connections SET diagnostics_json=?3 WHERE id=?1 AND owner_id=?2 AND status='registered'", rusqlite::params![connection, owner, serde_json::to_string(&diagnostics).unwrap()])?;
             }
             read_receipt(c,&sid)}).await.ok().flatten();
