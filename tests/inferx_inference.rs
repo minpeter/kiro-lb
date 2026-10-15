@@ -200,7 +200,7 @@ async fn rejected_refresh_token_is_not_retried_on_every_request() {
             "/",
             axum::routing::post(move || {
                 g.fetch_add(1, Ordering::SeqCst);
-                async { StatusCode::OK }
+                async { r#"{"content":"ok"}{"usage":1}{"stopReason":"end_turn"}"# }
             }),
         )
         .route(
@@ -259,6 +259,37 @@ async fn rejected_refresh_token_is_not_retried_on_every_request() {
     .unwrap();
     assert_eq!(diagnostics["health"], "authentication_failed");
     assert_eq!(diagnostics["refresh"]["rejectedStatus"], 401);
+
+    // A still-valid access token near expiry keeps serving after the refresh
+    // is rejected. Those successes must not clear the deferral, or every
+    // other request would ask the auth host again.
+    let expiring = json!({"accessToken":"expiring-access","refreshToken":"revoked-refresh","expiresAt":kiro_lb::auth::iso_from_epoch(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() + 300.0),"region":"us-east-1"});
+    store::with(|c| {
+        c.execute(
+            "UPDATE inferx_connections SET credential_json=?2,diagnostics_json=NULL WHERE id=?1",
+            rusqlite::params![connection, expiring.to_string()],
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        statuses.push(
+            call(
+                &app,
+                &uuid::Uuid::new_v4().to_string(),
+                "seller",
+                "POST",
+                Some(body.clone()),
+            )
+            .await
+            .1["status"]
+                .clone(),
+        );
+    }
+    assert_eq!(statuses, ["failed", "succeeded", "succeeded"]);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+    assert_eq!(generations.load(Ordering::SeqCst), 2);
     std::env::remove_var("KIRO_TEST_RUNTIME_URL");
     std::env::remove_var("KIRO_TEST_REFRESH_URL");
     server.abort();

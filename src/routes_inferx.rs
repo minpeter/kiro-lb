@@ -123,12 +123,13 @@ fn defer_refresh(auth: &KiroAuth, diagnostics: Option<&Diagnostics>) {
 }
 
 /// A rejected refresh token waits for re-login (re-asked hourly); transient
-/// refresh failures back off exponentially. A refresh or call that succeeded
-/// without refreshing clears the deferral.
+/// refresh failures back off exponentially. Only a successful refresh clears an
+/// active deferral: a call served by the still-valid cached token proves
+/// nothing about the refresh token, and clearing then would let the next
+/// request ask the auth host again.
 fn next_refresh(
     auth: Option<&KiroAuth>,
     previous: Option<RefreshBackoff>,
-    succeeded: bool,
 ) -> Option<RefreshBackoff> {
     match auth.and_then(KiroAuth::last_refresh_outcome) {
         Some(Ok(())) => None,
@@ -145,8 +146,7 @@ fn next_refresh(
                 rejected_status,
             })
         }
-        None if succeeded => None,
-        None => previous,
+        None => previous.filter(|p| p.retry_at > now_ms()),
     }
 }
 
@@ -557,11 +557,7 @@ pub async fn recheck_connection(
             Ok(Err(health)) => Diagnostics::failure(row.diagnostics, health),
             Err(_) => Diagnostics::failure(row.diagnostics, Health::Unknown),
         };
-        diagnostics.refresh = next_refresh(
-            auth.as_ref().ok(),
-            previous_refresh,
-            diagnostics.health == Health::Healthy,
-        );
+        diagnostics.refresh = next_refresh(auth.as_ref().ok(), previous_refresh);
         let rotated = auth.ok().map(|a| a.credential_document().to_string());
         let owner = p.owner_id;
         match store::run(move |c| {
@@ -1174,7 +1170,7 @@ async fn post_request_with_timeout(
             Ok(Err(_)) => ("failed", None, None, true),
             Err(_) => ("failed", None, None, true),
         };
-        let refresh = next_refresh(auth.as_deref(), previous_refresh, status == "succeeded");
+        let refresh = next_refresh(auth.as_deref(), previous_refresh);
         // Refresh can rotate credentials even if generation subsequently fails.
         let refreshed = auth.map(|auth| auth.credential_document());
         let duration = usage.as_ref().map(|u| u.2);
