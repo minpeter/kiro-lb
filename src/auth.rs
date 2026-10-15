@@ -111,6 +111,8 @@ fn is_credential_dead_response(status: u16, body: &str) -> bool {
 }
 
 pub const REFRESH_RETRY_SECONDS: f64 = 30.0;
+/// A rejected refresh token does not recover; ask again only rarely.
+pub const REJECTED_REFRESH_RETRY_SECONDS: f64 = 3600.0;
 
 fn refresh_backoff_error() -> AuthError {
     AuthError::Other(format!(
@@ -574,6 +576,10 @@ pub struct KiroAuth {
     source_fingerprint: Mutex<Option<String>>,
     refresh_lock: tokio::sync::Mutex<()>,
     refresh_retry_at: Mutex<f64>,
+    /// Status of a rejected refresh token; while deferred, fail without the auth host.
+    refresh_rejected: Mutex<Option<u16>>,
+    /// Outcome of this object's last refresh attempt: rejected status on failure.
+    last_refresh: Mutex<Option<Result<(), Option<u16>>>>,
     auth_type: AuthType,
     refresh_url: String,
     pub api_region: String,
@@ -649,6 +655,8 @@ impl KiroAuth {
             source_fingerprint: Mutex::new(source_fingerprint),
             refresh_lock: tokio::sync::Mutex::new(()),
             refresh_retry_at: Mutex::new(0.0),
+            refresh_rejected: Mutex::new(None),
+            last_refresh: Mutex::new(None),
             auth_type: AuthType::KiroDesktop,
             refresh_url: String::new(),
             api_region: String::new(),
@@ -887,7 +895,7 @@ impl KiroAuth {
             return Ok(t);
         }
         if self.in_refresh_backoff() {
-            return Err(refresh_backoff_error());
+            return Err(self.deferred_refresh_error());
         }
         let _guard = self.refresh_lock.lock().await;
         if !self.is_current_login() {
@@ -902,7 +910,7 @@ impl KiroAuth {
             return Ok(t);
         }
         if self.in_refresh_backoff() {
-            return Err(refresh_backoff_error());
+            return Err(self.deferred_refresh_error());
         }
         if matches!(self.source, Source::Sqlite(_)) {
             if !self.reload_raw_external() {
@@ -919,6 +927,7 @@ impl KiroAuth {
         match self.refresh_with_lease(false).await {
             Ok(()) => {}
             Err(e) if is_transient_refresh_error(&e) => {
+                *self.last_refresh.lock() = Some(Err(None));
                 *self.refresh_retry_at.lock() = now() + REFRESH_RETRY_SECONDS;
                 if let Some(t) = self.cached_token().filter(|_| !self.expired()) {
                     tracing::warn!(
@@ -930,9 +939,33 @@ impl KiroAuth {
             }
             Err(e) => return Err(self.dead(e)),
         }
-        *self.refresh_retry_at.lock() = 0.0;
+        *self.last_refresh.lock() = Some(Ok(()));
+        self.defer_refresh(0.0, None);
         self.cached_token()
             .ok_or_else(|| AuthError::Other("Failed to obtain access token".into()))
+    }
+
+    /// Carries a persisted refresh deferral into a per-request auth object so a
+    /// rejected or throttled refresh is not retried on every request.
+    pub fn defer_refresh(&self, retry_at: f64, rejected_status: Option<u16>) {
+        *self.refresh_retry_at.lock() = retry_at;
+        *self.refresh_rejected.lock() = rejected_status;
+    }
+
+    pub fn last_refresh_outcome(&self) -> Option<Result<(), Option<u16>>> {
+        *self.last_refresh.lock()
+    }
+
+    fn deferred_refresh_error(&self) -> AuthError {
+        match *self.refresh_rejected.lock() {
+            Some(status) => AuthError::CredentialDead {
+                account: self
+                    .lease_account_id()
+                    .unwrap_or_else(|| "refresh_token account".into()),
+                status,
+            },
+            None => refresh_backoff_error(),
+        }
     }
 
     fn in_refresh_backoff(&self) -> bool {
@@ -949,16 +982,18 @@ impl KiroAuth {
     pub async fn force_refresh(&self) -> Result<String, AuthError> {
         let _guard = self.refresh_lock.lock().await;
         if self.in_refresh_backoff() {
-            return Err(refresh_backoff_error());
+            return Err(self.deferred_refresh_error());
         }
         if let Err(e) = self.refresh_with_lease(true).await {
             if is_transient_refresh_error(&e) {
+                *self.last_refresh.lock() = Some(Err(None));
                 *self.refresh_retry_at.lock() = now() + REFRESH_RETRY_SECONDS;
                 return Err(e);
             }
             return Err(self.dead(e));
         }
-        *self.refresh_retry_at.lock() = 0.0;
+        *self.last_refresh.lock() = Some(Ok(()));
+        self.defer_refresh(0.0, None);
         self.cached_token()
             .ok_or_else(|| AuthError::Other("Failed to obtain access token".into()))
     }
@@ -985,6 +1020,11 @@ impl KiroAuth {
                     .unwrap_or_else(|| "refresh_token account".into());
                 let code = refresh_error_code(body).unwrap_or("unrecognized");
                 tracing::error!("Refresh token for {account} was rejected by the auth host (HTTP {status}, {code}); the credential cannot be renewed and needs a re-login.");
+                *self.last_refresh.lock() = Some(Err(Some(status)));
+                // Marketplace credentials are only replaced by a new login.
+                if matches!(self.source, Source::Ephemeral(_)) {
+                    self.defer_refresh(now() + REJECTED_REFRESH_RETRY_SECONDS, Some(status));
+                }
                 AuthError::CredentialDead { account, status }
             }
             other => other,

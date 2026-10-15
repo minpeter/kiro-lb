@@ -99,8 +99,10 @@ fn due(id: &str) {
     .unwrap();
 }
 
+/// Each case models a fresh credential, so a refresh deferral persisted by the
+/// previous case must not suppress this case's refresh attempt.
 fn expire_token(id: &str) {
-    store::with(|c| c.execute("UPDATE inferx_connections SET credential_json=json_set(credential_json,'$.expiresAt','2000-01-01T00:00:00Z') WHERE id=?1", [id]).map(|_| ())).unwrap();
+    store::with(|c| c.execute("UPDATE inferx_connections SET credential_json=json_set(credential_json,'$.expiresAt','2000-01-01T00:00:00Z'),diagnostics_json=json_remove(diagnostics_json,'$.refresh') WHERE id=?1", [id]).map(|_| ())).unwrap();
 }
 
 fn credential(id: &str) -> Option<String> {

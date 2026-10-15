@@ -183,6 +183,120 @@ async fn generic_forbidden_repairs_next_request_without_replaying_generation() {
 }
 
 #[tokio::test]
+async fn rejected_refresh_token_is_not_retried_on_every_request() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let _lock = TEST_LOCK.lock().await;
+    let dir = common::data_dir("inferx-rejected-refresh");
+    common::seed(&[]);
+    std::env::set_var("INFERX_CONTROL_TOKEN", "fixture-control");
+    let generations = Arc::new(AtomicUsize::new(0));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let (g, r) = (generations.clone(), refreshes.clone());
+    let upstream = Router::new()
+        .route(
+            "/",
+            axum::routing::post(move || {
+                g.fetch_add(1, Ordering::SeqCst);
+                async { r#"{"content":"ok"}{"usage":1}{"stopReason":"end_turn"}"# }
+            }),
+        )
+        .route(
+            "/refresh",
+            axum::routing::post(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::UNAUTHORIZED }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::env::set_var("KIRO_TEST_RUNTIME_URL", format!("{url}/"));
+    std::env::set_var("KIRO_TEST_REFRESH_URL", format!("{url}/refresh"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+    let http = reqwest::Client::new();
+    let app = Router::new()
+        .route(
+            "/requests/{id}",
+            get(api::get_request).post(api::post_request),
+        )
+        .with_state(common::state(common::pool(&http, &[]), &http, false));
+    let connection = uuid::Uuid::new_v4().to_string();
+    let credential = json!({"accessToken":"expired-access","refreshToken":"revoked-refresh","expiresAt":"2000-01-01T00:00:00Z","region":"us-east-1"});
+    store::with(|c| c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,created_at,updated_at) VALUES(?1,'seller','github','registered',?2,0,0)", rusqlite::params![connection,credential.to_string()]).map(|_|())).unwrap();
+    let body = json!({"ownerId":"seller","connectionId":connection,"request":{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":false}});
+    for _ in 0..2 {
+        let receipt = call(
+            &app,
+            &uuid::Uuid::new_v4().to_string(),
+            "seller",
+            "POST",
+            Some(body.clone()),
+        )
+        .await
+        .1;
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["failureCode"], "supplier_unavailable");
+        // The proxy cools down the whole connection on this evidence.
+        assert_eq!(receipt["supplierStatus"], 401);
+    }
+    // The second request must not ask the auth host again.
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(generations.load(Ordering::SeqCst), 0);
+    let diagnostics: Value = serde_json::from_str(
+        &store::with(|c| {
+            c.query_row(
+                "SELECT diagnostics_json FROM inferx_connections WHERE id=?1",
+                [&connection],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(diagnostics["health"], "authentication_failed");
+    assert_eq!(diagnostics["refresh"]["rejectedStatus"], 401);
+
+    // A still-valid access token near expiry keeps serving after the refresh
+    // is rejected. Those successes must not clear the deferral, or every
+    // other request would ask the auth host again.
+    let expiring = json!({"accessToken":"expiring-access","refreshToken":"revoked-refresh","expiresAt":kiro_lb::auth::iso_from_epoch(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() + 300.0),"region":"us-east-1"});
+    store::with(|c| {
+        c.execute(
+            "UPDATE inferx_connections SET credential_json=?2,diagnostics_json=NULL WHERE id=?1",
+            rusqlite::params![connection, expiring.to_string()],
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        statuses.push(
+            call(
+                &app,
+                &uuid::Uuid::new_v4().to_string(),
+                "seller",
+                "POST",
+                Some(body.clone()),
+            )
+            .await
+            .1["status"]
+                .clone(),
+        );
+    }
+    assert_eq!(statuses, ["failed", "succeeded", "succeeded"]);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+    assert_eq!(generations.load(Ordering::SeqCst), 2);
+    std::env::remove_var("KIRO_TEST_RUNTIME_URL");
+    std::env::remove_var("KIRO_TEST_REFRESH_URL");
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn failures_are_sanitized_durable_and_never_retry_generation() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
