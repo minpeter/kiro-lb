@@ -18,6 +18,7 @@ pub const NATIVE_THINKING_MODELS: &[&str] = &[
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "kimi-k3",
 ];
 const SUPPORTED: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const DISABLING: &[&str] = &["none", "off", "disabled", "0"];

@@ -86,6 +86,7 @@ pub const FALLBACK_MODELS: &[FallbackModel] = &[
     fm("claude-sonnet-5.5", 1_000_000, 128_000),
     fm("deepseek-3.2", 164_000, 64_000),
     fm("glm-5", 200_000, 64_000),
+    fm("kimi-k3", 1_048_576, 128_000),
     fm("minimax-m2.1", 196_000, 64_000),
     fm("minimax-m2.5", 196_000, 64_000),
     fm("qwen3-coder-next", 256_000, 64_000),

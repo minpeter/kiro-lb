@@ -1,4 +1,4 @@
-export type ModelFamily = "auto" | "claude" | "gpt" | "glm" | "deepseek" | "minimax" | "qwen" | "other";
+export type ModelFamily = "auto" | "claude" | "gpt" | "glm" | "deepseek" | "kimi" | "minimax" | "qwen" | "other";
 
 const PATTERNS: [ModelFamily, RegExp][] = [
   ["auto", /^auto(-kiro)?$/],
@@ -6,6 +6,7 @@ const PATTERNS: [ModelFamily, RegExp][] = [
   ["gpt", /(^|[^a-z])(gpt|o[134])([^a-z]|$)|openai/],
   ["glm", /glm|zhipu/],
   ["deepseek", /deepseek/],
+  ["kimi", /kimi|moonshot/],
   ["minimax", /minimax/],
   ["qwen", /qwen/],
 ];
@@ -15,7 +16,7 @@ export function modelFamily(model: string): ModelFamily {
   return PATTERNS.find(([, re]) => re.test(name))?.[0] ?? "other";
 }
 
-const FAMILY_ORDER: ModelFamily[] = ["claude", "gpt", "deepseek", "glm", "minimax", "qwen", "other", "auto"];
+const FAMILY_ORDER: ModelFamily[] = ["claude", "gpt", "deepseek", "kimi", "glm", "minimax", "qwen", "other", "auto"];
 
 function versionKey(model: string): number[] {
   return (model.match(/\d+(?:\.\d+)*/g) ?? []).flatMap((part) => part.split(".").map(Number));

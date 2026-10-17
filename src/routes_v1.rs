@@ -1049,6 +1049,7 @@ fn model_owner(id: &str) -> &'static str {
         ("o1", "openai"),
         ("o3", "openai"),
         ("deepseek", "deepseek"),
+        ("kimi", "moonshot"),
         ("qwen", "alibaba"),
         ("minimax", "minimax"),
         ("glm", "zhipu"),
