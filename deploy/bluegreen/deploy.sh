@@ -24,6 +24,13 @@ SLOT_FILE="$ROOT/deploy/bluegreen/active_slot"
 TEMPLATE="$ROOT/docker/haproxy-edge.cfg.template"
 GENERATED="$ROOT/docker/haproxy-edge.generated.cfg"
 EDGE=kiro-lb-edge
+# EXIT traps run after cmd_deploy has returned, so rollback state must outlive
+# the function's local scope when set -u is enabled.
+DEPLOY_SUCCEEDED=0
+LEGACY_POINT_OF_NO_RETURN=0
+DEPLOY_CURRENT=""
+DEPLOY_CUR_SVC=""
+DEPLOY_CURRENT_PORT=""
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -305,25 +312,29 @@ cmd_deploy() {
   next_svc="$(slot_service "$next")"
   current_port="$(slot_port "$current")"
   next_port="$(slot_port "$next")"
+  DEPLOY_CURRENT="$current"
+  DEPLOY_CUR_SVC="$cur_svc"
+  DEPLOY_CURRENT_PORT="$current_port"
 
-  local deploy_succeeded=0 legacy_point_of_no_return=0
+  DEPLOY_SUCCEEDED=0
+  LEGACY_POINT_OF_NO_RETURN=0
   rollback_deploy() {
     local status=$?
-    [[ "$deploy_succeeded" -eq 1 ]] && return "$status"
+    [[ "$DEPLOY_SUCCEEDED" -eq 1 ]] && return "$status"
     trap - EXIT
-    if [[ "$legacy_point_of_no_return" -eq 1 ]]; then
+    if [[ "$LEGACY_POINT_OF_NO_RETURN" -eq 1 ]]; then
       log "legacy migration passed its credential-rotation point of no return; leaving the old image stopped"
       log "fix the new slot forward, then rerun this deploy command"
       return "$status"
     fi
-    log "deploy failed: restoring writer, HAProxy, and active slot to $current"
+    log "deploy failed: restoring writer, HAProxy, and active slot to $DEPLOY_CURRENT"
     set +e
-    "${COMPOSE[@]}" up -d --no-build "$cur_svc" >/dev/null
-    set_runtime_writer "$current"
-    handoff_post "$current_port" activate >/dev/null 2>&1 || true
-    render_haproxy_cfg "$current"
+    "${COMPOSE[@]}" up -d --no-build "$DEPLOY_CUR_SVC" >/dev/null
+    set_runtime_writer "$DEPLOY_CURRENT"
+    handoff_post "$DEPLOY_CURRENT_PORT" activate >/dev/null 2>&1 || true
+    render_haproxy_cfg "$DEPLOY_CURRENT"
     soft_reload_edge
-    write_active "$current"
+    write_active "$DEPLOY_CURRENT"
     set -e
     return "$status"
   }
@@ -352,7 +363,7 @@ cmd_deploy() {
       "${COMPOSE[@]}" stop "$cur_svc" >/dev/null
       # Once the new image can refresh credentials, rolling back to an image
       # that cannot read SQLite overlays could invalidate authentication.
-      legacy_point_of_no_return=1
+      LEGACY_POINT_OF_NO_RETURN=1
       set_runtime_writer "$next"
       "${COMPOSE[@]}" up -d --no-build --force-recreate "$next_svc"
       wait_http "http://127.0.0.1:${next_port}/health" 90 || die "$next slot health failed"
@@ -363,7 +374,7 @@ cmd_deploy() {
       write_active "$next"
       wait_http http://kiro.minpeter.internal/health 15 || die "post-migration L7 failed"
       show_status
-      deploy_succeeded=1
+      DEPLOY_SUCCEEDED=1
       trap - EXIT
       log "deploy OK (legacy migration cutover)"
       return
@@ -402,7 +413,7 @@ cmd_deploy() {
   wait_http http://kiro.minpeter.internal/health 15 || die "post-stop L7 failed"
   prove_slot "$next"
   show_status
-  deploy_succeeded=1
+  DEPLOY_SUCCEEDED=1
   trap - EXIT
   log "deploy OK"
 }
