@@ -43,6 +43,17 @@ function Deepseek() {
   );
 }
 
+function Kimi() {
+  return (
+    <svg width={SIZE} height={SIZE} viewBox="0 0 24 24" aria-hidden focusable="false">
+      <path
+        fill="#4D6BFE"
+        d="M12 1.5c.55 4.55 2.95 7.05 7.5 7.5-4.55.55-7.05 2.95-7.5 7.5-.55-4.55-2.95-6.95-7.5-7.5 4.55-.45 6.95-2.95 7.5-7.5Zm7.25 12.25c.27 2.2 1.42 3.35 3.5 3.5-2.08.27-3.23 1.42-3.5 3.5-.27-2.08-1.42-3.23-3.5-3.5 2.08-.15 3.23-1.3 3.5-3.5Z"
+      />
+    </svg>
+  );
+}
+
 function Minimax() {
   return (
     <svg width={SIZE} height={SIZE} viewBox="0 0 24 24" aria-hidden focusable="false">
@@ -84,6 +95,7 @@ const MARKS: Record<ModelFamily, (() => React.JSX.Element) | null> = {
   gpt: Gpt,
   glm: Glm,
   deepseek: Deepseek,
+  kimi: Kimi,
   minimax: Minimax,
   qwen: Qwen,
   other: null,

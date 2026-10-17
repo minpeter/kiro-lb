@@ -44,6 +44,7 @@ pub fn resolve_token_profile(model: Option<&str>) -> TokenProfile {
         ("o1", GPT),
         ("o3", GPT),
         ("deepseek", MULTILINGUAL),
+        ("kimi", MULTILINGUAL),
         ("qwen", MULTILINGUAL),
         ("minimax", MULTILINGUAL),
         ("glm", MULTILINGUAL),
