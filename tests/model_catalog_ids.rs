@@ -13,6 +13,7 @@ fn one_million_models_use_the_advertised_window() {
         "claude-opus-5.5",
         "claude-sonnet-5",
         "claude-sonnet-5.5",
+        "claude-haiku-5.5",
     ] {
         assert_eq!(
             fallback_limits(id).unwrap().max_input_tokens,
@@ -72,6 +73,48 @@ fn claude_models_are_listed_with_hyphens_and_both_spellings_resolve() {
             "{spelling}"
         );
     }
+}
+
+#[test]
+fn new_models_have_cost_rows_and_haiku_uses_its_own_pricing_boundary() {
+    let rows = kiro_lb::model_costs::table();
+    let kimi = rows.iter().find(|r| r["model"] == "kimi-k3").unwrap();
+    assert_eq!(kimi["multiplier"], 2.4);
+    assert_eq!(kimi["contextTokens"], 1_048_576);
+    assert_eq!(multiplier_for(Some("kimi-k3"), Some(300_000)), Some(2.4));
+    let haiku = rows
+        .iter()
+        .find(|r| r["model"] == "claude-haiku-5.5")
+        .unwrap();
+    assert_eq!(haiku["contextTokens"], 1_000_000);
+    assert_eq!(haiku["longThresholdTokens"], 100_000);
+    assert_eq!(haiku["longMultiplier"], 0.3);
+    assert_eq!(
+        fallback_limits("claude-haiku-5.5")
+            .unwrap()
+            .max_output_tokens,
+        128_000
+    );
+    for spelling in [
+        "claude-haiku-5.5",
+        "claude-haiku-5-5",
+        "claude-haiku-5-5[1m]",
+    ] {
+        assert_eq!(get_model_id_for_kiro(spelling), "claude-haiku-5.5");
+        for (tokens, expected) in [(None, 0.06), (Some(100_000), 0.06), (Some(100_001), 0.3)] {
+            assert_eq!(multiplier_for(Some(spelling), tokens), Some(expected));
+        }
+    }
+    assert_eq!(public_model_id("claude-haiku-5.5"), "claude-haiku-5-5");
+    assert_eq!(
+        multiplier_for(Some("gpt-5.6-sol"), Some(100_001)),
+        Some(4.4)
+    );
+    assert_eq!(
+        multiplier_for(Some("gpt-5.6-sol"), Some(272_001)),
+        Some(8.8)
+    );
+    assert_eq!(multiplier_for(Some("unknown-model"), None), None);
 }
 
 #[test]

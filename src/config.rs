@@ -76,6 +76,9 @@ pub const FALLBACK_MODELS: &[FallbackModel] = &[
     fm("claude-sonnet-4.5", 200_000, 64_000),
     fm("claude-sonnet-4.6", 1_000_000, 64_000),
     fm("claude-haiku-4.5", 200_000, 64_000),
+    // Anthropic model specs; a real Kiro account catalog supersedes this fallback.
+    // https://platform.claude.com/docs/en/models/haiku-5-5/overview
+    fm("claude-haiku-5.5", 1_000_000, 128_000),
     fm("claude-opus-4.5", 200_000, 64_000),
     fm("claude-opus-4.6", 1_000_000, 64_000),
     fm("claude-opus-4.7", 1_000_000, 128_000),

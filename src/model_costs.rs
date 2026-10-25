@@ -32,7 +32,7 @@ const fn two(multiplier: f64, long: f64) -> ModelCost {
     }
 }
 
-pub static MODEL_COSTS: [(&str, ModelCost); 21] = [
+pub static MODEL_COSTS: [(&str, ModelCost); 23] = [
     ("gpt-5.6-sol", two(4.4, 8.8)),
     ("gpt-5.6-terra", two(2.2, 4.4)),
     ("gpt-5.6-luna", two(1.1, 2.2)),
@@ -49,6 +49,17 @@ pub static MODEL_COSTS: [(&str, ModelCost); 21] = [
     ("claude-sonnet-4", c(1.3, 200_000)),
     ("auto", c(1.0, 0)),
     ("claude-haiku-4.5", c(0.4, 200_000)),
+    // https://kiro.dev/docs/models/available-models/#claude-haiku-55
+    (
+        "claude-haiku-5.5",
+        ModelCost {
+            multiplier: 0.06,
+            context_tokens: 1_000_000,
+            long_multiplier: Some(0.3),
+            long_threshold: Some(100_000),
+        },
+    ),
+    ("kimi-k3", c(2.4, 1_048_576)),
     ("deepseek-3.2", c(0.25, 128_000)),
     ("minimax-m2.5", c(0.25, 200_000)),
     ("glm-5", c(0.5, 200_000)),

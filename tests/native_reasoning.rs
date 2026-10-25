@@ -93,17 +93,25 @@ fn gpt_models_use_reasoning_effort_for_every_ingress_and_mode() {
 
 #[test]
 fn claude_keeps_its_native_fields_for_every_ingress_and_mode() {
-    for facade in [Facade::Chat, Facade::Anthropic, Facade::Responses] {
-        for stream in [false, true] {
-            let payload = upstream_payload(facade, "claude-opus-4.8", Some(json!("high")), stream);
-            assert_eq!(
-                native_fields(&payload),
-                Some(&json!({
-                    "thinking": {"type": "adaptive", "display": "summarized"},
-                    "output_config": {"effort": "high"}
-                })),
-                "{facade:?}, stream={stream}"
-            );
+    for model in [
+        "claude-opus-4.8",
+        "claude-haiku-5.5",
+        "claude-haiku-5-5[1m]",
+    ] {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            for facade in [Facade::Chat, Facade::Anthropic, Facade::Responses] {
+                for stream in [false, true] {
+                    let payload = upstream_payload(facade, model, Some(json!(effort)), stream);
+                    assert_eq!(
+                        native_fields(&payload),
+                        Some(&json!({
+                            "thinking": {"type": "adaptive", "display": "summarized"},
+                            "output_config": {"effort": effort}
+                        })),
+                        "{model}, {effort}, {facade:?}, stream={stream}"
+                    );
+                }
+            }
         }
     }
 }
