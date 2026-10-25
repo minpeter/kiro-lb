@@ -107,6 +107,11 @@ fn router(state: app::Shared) -> Router {
             post(inferx::recheck_connection).layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
         .route(
+            "/internal/inferx/v1/connections/{id}/import",
+            axum::routing::put(inferx::import_connection)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
             "/internal/inferx/v1/requests/{id}",
             get(inferx::get_request)
                 .post(inferx::post_request)

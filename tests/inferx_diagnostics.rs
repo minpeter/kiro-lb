@@ -264,13 +264,15 @@ async fn diagnostics_are_owner_scoped_cached_and_fenced_with_mock_upstreams() {
         *mock.models.lock().unwrap() = (status, body);
         assert_eq!(call(&app, &id, "POST", "alice").await.1["models"], json!([]));
     }
+    // Restore model eligibility after testing an empty catalogue so the health
+    // cases below reach generation rather than failing local model admission.
     // Leave usage-call count assertions below independent of catalogue checks.
     mock.calls.store(1, Ordering::SeqCst);
     *mock.models.lock().unwrap() = (StatusCode::SERVICE_UNAVAILABLE, "{}".into());
     store::with(|c| {
         c.execute(
-            "UPDATE inferx_connections SET diagnostics_json=?2 WHERE id=?1",
-            rusqlite::params![id, d.to_string()],
+            "UPDATE inferx_connections SET diagnostics_json=?2,models_json=?3 WHERE id=?1",
+            rusqlite::params![id, d.to_string(), json!(["claude-sonnet-4"]).to_string()],
         )
         .map(|_| ())
     })

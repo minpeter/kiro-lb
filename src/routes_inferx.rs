@@ -64,6 +64,7 @@ struct Row {
     next_poll: i64,
     diagnostics: Option<Diagnostics>,
     models: Option<Vec<String>>,
+    fingerprint: Option<String>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
@@ -360,8 +361,8 @@ fn valid_field(value: &str, max: usize) -> bool {
 
 fn read_row(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Row>> {
     use rusqlite::OptionalExtension;
-    c.query_row("SELECT id,owner_id,provider,status,flow_id,authorization_json,credential_json,upstream_id,email,next_poll_at,diagnostics_json,models_json FROM inferx_connections WHERE id=?1", [id], |r| {
-        Ok(Row { id:r.get(0)?, owner:r.get(1)?, provider:r.get(2)?, status:r.get(3)?, flow:r.get(4)?, authorization:r.get::<_,Option<String>>(5)?.and_then(|s|serde_json::from_str(&s).ok()), upstream:r.get(7)?, email:r.get(8)?, next_poll:r.get(9)?, diagnostics:r.get::<_,Option<String>>(10)?.and_then(|s|serde_json::from_str(&s).ok()), models:r.get::<_,Option<String>>(11)?.and_then(|s|serde_json::from_str(&s).ok()) })
+    c.query_row("SELECT id,owner_id,provider,status,flow_id,authorization_json,credential_json,upstream_id,email,next_poll_at,diagnostics_json,models_json,import_fingerprint FROM inferx_connections WHERE id=?1", [id], |r| {
+        Ok(Row { id:r.get(0)?, owner:r.get(1)?, provider:r.get(2)?, status:r.get(3)?, flow:r.get(4)?, authorization:r.get::<_,Option<String>>(5)?.and_then(|s|serde_json::from_str(&s).ok()), upstream:r.get(7)?, email:r.get(8)?, next_poll:r.get(9)?, diagnostics:r.get::<_,Option<String>>(10)?.and_then(|s|serde_json::from_str(&s).ok()), models:r.get::<_,Option<String>>(11)?.and_then(|s|serde_json::from_str(&s).ok()), fingerprint:r.get(12)? })
     }).optional()
 }
 
@@ -434,6 +435,155 @@ struct PutBody {
 struct PollBody {
     #[serde(rename = "ownerId")]
     owner_id: String,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportedCredential {
+    access_token: String,
+    refresh_token: String,
+    expires_at_ms: i64,
+    client_id: String,
+    client_secret: String,
+    region: String,
+    start_url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImportBody {
+    owner_id: String,
+    provider: String,
+    credential: ImportedCredential,
+}
+
+fn imported_document(credential: &ImportedCredential) -> Option<Value> {
+    let fields = [
+        credential.access_token.as_str(),
+        credential.refresh_token.as_str(),
+        credential.client_id.as_str(),
+        credential.client_secret.as_str(),
+        credential.region.as_str(),
+        credential.start_url.as_str(),
+    ];
+    if fields.iter().any(|v| v.is_empty() || v.len() > 16 * 1024) || credential.expires_at_ms <= 0 {
+        return None;
+    }
+    Some(json!({
+        "accessToken": credential.access_token,
+        "refreshToken": credential.refresh_token,
+        "expiresAt": crate::auth::iso_from_epoch(credential.expires_at_ms as f64 / 1000.0),
+        "clientId": credential.client_id,
+        "clientSecret": credential.client_secret,
+        "region": credential.region,
+        "startUrl": credential.start_url,
+    }))
+}
+
+/// Imports a TokenHub Builder ID login into the isolated InferX store. Identity
+/// and model support always come from Kiro's management API, never the caller.
+pub async fn import_connection(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = guard(&headers) {
+        return r;
+    }
+    if !valid_id(&id) || body.len() > MAX_BODY {
+        return error(400, "invalid_request", "Invalid request");
+    }
+    let Ok(payload) = serde_json::from_slice::<ImportBody>(&body) else {
+        return error(400, "invalid_request", "Invalid request");
+    };
+    if uuid::Uuid::parse_str(&payload.owner_id).is_err() || payload.provider != "builder-id" {
+        return error(400, "invalid_request", "Invalid request");
+    }
+    if !state.pool.accounts().is_empty() || !store::load_account_sources().is_empty() {
+        return error(
+            409,
+            "operator_pool_not_empty",
+            "InferX requires a dedicated empty instance",
+        );
+    }
+    let Some(document) = imported_document(&payload.credential) else {
+        return error(400, "invalid_request", "Invalid credential");
+    };
+    let fingerprint = hex::encode(Sha256::digest(
+        serde_json::to_vec(&document).unwrap_or_default(),
+    ));
+    let _lock = connection_lock(&id).lock_owned().await;
+    let lookup = id.clone();
+    let existing = match store::run(move |c| read_row(c, &lookup)).await {
+        Ok(row) => row,
+        Err(_) => return error(500, "internal_error", "Internal error"),
+    };
+    if let Some(row) = existing {
+        if row.owner != payload.owner_id {
+            return error(404, "not_found", "Not found");
+        }
+        if row.status == "disconnected" {
+            return error(409, "disconnected", "Connection is disconnected");
+        }
+        if row.provider != payload.provider || row.fingerprint.as_deref() != Some(&fingerprint) {
+            return error(409, "conflict", "Connection fields or credential conflict");
+        }
+        return json_response(200, response(&row));
+    }
+
+    let temp = format!("inferx-{id}");
+    let auth = match KiroAuth::from_device_credentials(&temp, &document, state.http.clone()) {
+        Ok(auth) => auth,
+        Err(_) => return error(400, "invalid_credential", "Credential is invalid"),
+    };
+    let (usage, catalog) = tokio::join!(
+        model_catalog::fetch_account_usage(&auth, &state.http, auth.profile_arn()),
+        discover_models(&auth, &state.http)
+    );
+    let (Ok(usage), Some(saved_models)) = (usage, catalog) else {
+        return error(401, "invalid_credential", "Credential verification failed");
+    };
+    let Some(upstream_id) = usage["userId"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+    else {
+        return error(401, "invalid_credential", "Credential verification failed");
+    };
+    let email = usage["email"].as_str().map(str::to_owned);
+    if saved_models == "[]" {
+        return error(401, "invalid_credential", "Credential verification failed");
+    }
+    let credential = auth.credential_document().to_string();
+    let sid = id.clone();
+    let owner = payload.owner_id.clone();
+    let provider = payload.provider.clone();
+    let saved_fingerprint = fingerprint.clone();
+    let result = store::run(move |c| {
+        if let Some(row) = read_row(c, &sid)? {
+            return Ok(Some(row));
+        }
+        c.execute(
+            "INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,upstream_id,email,import_fingerprint,models_json,created_at,updated_at) VALUES(?1,?2,?3,'registered',?4,?5,?6,?7,?8,?9,?9)",
+            rusqlite::params![sid,owner,provider,credential,upstream_id,email,saved_fingerprint,saved_models,now_ms()],
+        )?;
+        read_row(c, &sid)
+    }).await;
+    match result {
+        Ok(Some(row)) if row.owner != payload.owner_id => error(404, "not_found", "Not found"),
+        Ok(Some(row)) if row.status == "disconnected" => {
+            error(409, "disconnected", "Connection is disconnected")
+        }
+        Ok(Some(row))
+            if row.provider != payload.provider
+                || row.fingerprint.as_deref() != Some(&fingerprint) =>
+        {
+            error(409, "conflict", "Connection fields or credential conflict")
+        }
+        Ok(Some(row)) => json_response(200, response(&row)),
+        Ok(None) | Err(_) => error(409, "conflict", "Credential or identity conflict"),
+    }
 }
 
 pub async fn get_connection(
@@ -1064,6 +1214,7 @@ async fn post_request_with_timeout(
         envelope.owner_id.clone(),
         envelope.connection_id.clone(),
     );
+    let requested_model = model.clone();
     // Registration and generation are one connection-scoped operation. This
     // closes the gap where disconnect could clear the credential after the
     // durable request row was inserted but before the owned task started.
@@ -1074,8 +1225,11 @@ async fn post_request_with_timeout(
             let existing_hash = c.query_row("SELECT request_hash FROM inferx_requests WHERE request_id=?1", [&request_id], |r| r.get::<_,String>(0))?;
             return Ok((if existing_hash == hash { 1 } else { 2 }, read_receipt(c, &request_id)?, None));
         }
-        let stored:Option<(Option<String>,Option<String>)> = c.query_row("SELECT credential_json,diagnostics_json FROM inferx_connections WHERE id=?1 AND owner_id=?2 AND status='registered'", rusqlite::params![connection_id,owner], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        let Some((Some(credential),diagnostics))=stored else{return Ok((0,None,None))};
+        let stored:Option<(Option<String>,Option<String>,Option<String>)> = c.query_row("SELECT credential_json,diagnostics_json,models_json FROM inferx_connections WHERE id=?1 AND owner_id=?2 AND status='registered'", rusqlite::params![connection_id,owner], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let Some((Some(credential),diagnostics,models_json))=stored else{return Ok((0,None,None))};
+        if models_json.is_some_and(|value| serde_json::from_str::<Vec<String>>(&value).map_or(true, |models| !models.iter().any(|candidate| candidate == &requested_model))) {
+            return Ok((4,None,None));
+        }
         let credential=(credential,diagnostics.and_then(|d|serde_json::from_str::<Diagnostics>(&d).ok()));
         let now=now_ms();
         c.execute("INSERT INTO inferx_requests(request_id,request_hash,owner_id,connection_id,status,created_at,updated_at) VALUES(?1,?2,?3,?4,'running',?5,?5)",rusqlite::params![request_id,hash,owner,connection_id,now])?;
@@ -1089,6 +1243,13 @@ async fn post_request_with_timeout(
         0 => return error(404, "not_found", "Not found"),
         1 => return json_response(200, receipt_json(&receipt.unwrap(), None)),
         2 => return error(409, "conflict", "Request ID is already registered"),
+        4 => {
+            return error(
+                400,
+                "unsupported_model",
+                "Model is not available for this connection",
+            )
+        }
         _ => {}
     }
     // A corrupt registered credential is an execution failure, not a reason

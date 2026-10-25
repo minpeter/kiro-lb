@@ -724,8 +724,23 @@ async fn receipts_fence_late_dispatch_preserve_owner_and_never_reexecute_after_r
         .with_state(state.clone());
     let connection = uuid::Uuid::new_v4().to_string();
     let credential = json!({"accessToken":"fixture-access","refreshToken":"fixture-refresh","expiresAt":"2999-01-01T00:00:00Z","region":"us-east-1"});
-    store::with(|c| c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,created_at,updated_at) VALUES(?1,'seller','github','registered',?2,0,0)", rusqlite::params![connection, credential.to_string()]).map(|_|())).unwrap();
+    store::with(|c| c.execute("INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,models_json,created_at,updated_at) VALUES(?1,'seller','builder-id','registered',?2,'[\"claude-sonnet-4\"]',0,0)", rusqlite::params![connection, credential.to_string()]).map(|_|())).unwrap();
     let body = json!({"ownerId":"seller","connectionId":connection,"request":{"model":"claude-sonnet-4","messages":[{"role":"user","content":"private input"}],"max_tokens":64,"stream":false}});
+    let unavailable_id = uuid::Uuid::new_v4().to_string();
+    let mut unavailable = body.clone();
+    unavailable["request"]["model"] = json!("not-in-imported-catalog");
+    let (status, rejected) = call(&app, &unavailable_id, "seller", "POST", Some(unavailable)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(rejected["code"], "unsupported_model");
+    let absent: i64 = store::with(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM inferx_requests WHERE request_id=?1",
+            [&unavailable_id],
+            |r| r.get(0),
+        )
+    })
+    .unwrap();
+    assert_eq!(absent, 0);
     let stream_id = uuid::Uuid::new_v4().to_string();
     let mut stream_body = body.clone();
     stream_body["request"]["stream"] = json!(true);

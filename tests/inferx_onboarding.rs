@@ -8,6 +8,7 @@ use axum::{
 };
 use kiro_lb::{routes_inferx as api, store};
 use serde_json::{json, Value};
+use sha2::Digest;
 use tower::ServiceExt;
 
 async fn call(
@@ -56,6 +57,10 @@ async fn control_api_is_owner_bound_durable_and_disconnected_accounts_never_ente
         .route(
             "/internal/inferx/v1/connections/{id}/poll",
             post(api::poll_connection),
+        )
+        .route(
+            "/internal/inferx/v1/connections/{id}/import",
+            axum::routing::put(api::import_connection),
         )
         .with_state(state.clone());
     let id = uuid::Uuid::new_v4().to_string();
@@ -146,5 +151,130 @@ async fn control_api_is_owner_bound_durable_and_disconnected_accounts_never_ente
     })
     .unwrap();
     assert_eq!(persisted, "expired");
+
+    // Imported Builder ID credentials are owner-bound, retryable without
+    // another provider call, and expose only verified identity/catalog data.
+    let imported = uuid::Uuid::new_v4().to_string();
+    let import_owner = uuid::Uuid::new_v4().to_string();
+    let credential = json!({
+        "accessToken":"import-access","refreshToken":"import-refresh",
+        "expiresAtMs":32503680000000_i64,"clientId":"import-client",
+        "clientSecret":"import-secret","region":"us-east-1",
+        "startUrl":"https://view.awsapps.com/start"
+    });
+    let initial_import =
+        json!({"ownerId":import_owner,"provider":"builder-id","credential":credential});
+    assert_eq!(
+        call(
+            &app,
+            &format!("{imported}/import"),
+            "PUT",
+            "",
+            "wrong",
+            Some(initial_import.clone())
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let mut invalid = initial_import.clone();
+    invalid["credential"]["refreshToken"] = json!("");
+    assert_eq!(
+        call(
+            &app,
+            &format!("{imported}/import"),
+            "PUT",
+            "",
+            key,
+            Some(invalid)
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let material = serde_json::to_vec(&json!({
+        "accessToken":"import-access","refreshToken":"import-refresh",
+        "expiresAt":"3000-01-01T00:00:00+00:00","clientId":"import-client",
+        "clientSecret":"import-secret","region":"us-east-1",
+        "startUrl":"https://view.awsapps.com/start"
+    }))
+    .unwrap();
+    let actual_fingerprint = hex::encode(sha2::Sha256::digest(material));
+    store::with(|c| c.execute(
+        "INSERT INTO inferx_connections(id,owner_id,provider,status,credential_json,upstream_id,email,import_fingerprint,models_json,created_at,updated_at) VALUES(?1,?2,'builder-id','registered',?3,'verified-user','verified@example.test',?4,'[\"claude-sonnet-4\"]',0,0)",
+        rusqlite::params![imported, import_owner, r#"{"refreshToken":"stored-secret"}"#, actual_fingerprint],
+    ).map(|_| ())).unwrap();
+    let import_body = initial_import;
+    let (status, imported_view) = call(
+        &app,
+        &format!("{imported}/import"),
+        "PUT",
+        "",
+        key,
+        Some(import_body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(imported_view["account"]["id"], "verified-user");
+    assert_eq!(imported_view["models"], json!(["claude-sonnet-4"]));
+    assert!(imported_view["authorization"].is_null());
+    assert!(!imported_view.to_string().contains("stored-secret"));
+    let wrong_owner = json!({"ownerId":uuid::Uuid::new_v4().to_string(),"provider":"builder-id","credential":import_body["credential"]});
+    assert_eq!(
+        call(
+            &app,
+            &format!("{imported}/import"),
+            "PUT",
+            "",
+            key,
+            Some(wrong_owner)
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let mut changed = import_body.clone();
+    changed["credential"]["refreshToken"] = json!("changed");
+    assert_eq!(
+        call(
+            &app,
+            &format!("{imported}/import"),
+            "PUT",
+            "",
+            key,
+            Some(changed)
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(&app, &imported, "DELETE", &import_owner, key, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &app,
+            &format!("{imported}/import"),
+            "PUT",
+            "",
+            key,
+            Some(import_body)
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let erased: Option<String> = store::with(|c| {
+        c.query_row(
+            "SELECT credential_json FROM inferx_connections WHERE id=?1",
+            [&imported],
+            |r| r.get(0),
+        )
+    })
+    .unwrap();
+    assert!(erased.is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
