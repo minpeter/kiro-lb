@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ComponentType } from "react";
-import { ExternalLink, Link2, LogIn, X } from "lucide-react";
+import { Building2, ExternalLink, Link2, LogIn, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { DashboardApiError, dashboardApi } from "../api";
 import { dismissAlert, pushAlert, pushError } from "../alerts";
 import { isBrowserCallback, usesBrowserSignIn, type SocialLoginMode } from "../browser-login";
 import { registrationMessage } from "../device-login-result";
-import type { BrowserLoginFlow, DeviceLoginFlow, DeviceLoginProvider } from "../types";
+import { identityCenterLoginError } from "../identity-center-login";
+import type { BrowserLoginFlow, DeviceLoginFlow, DeviceLoginProvider, IdentityCenterLoginConfig } from "../types";
 import { AwsMark, GithubMark, GoogleMark } from "./provider-marks";
 import { usePreferences } from "../preferences";
 
@@ -49,6 +51,11 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   // True while an approved flow is being registered: the pending card stays up
   // (no new sign-in can start) and polling stops.
   const [registeringFlow, setRegisteringFlow] = useState(false);
+  const [organizationOpen, setOrganizationOpen] = useState(false);
+  const [startUrl, setStartUrl] = useState("");
+  const [region, setRegion] = useState("");
+  const [organizationError, setOrganizationError] = useState<"startUrl" | "region" | null>(null);
+  const [selectedProfile, setSelectedProfile] = useState("");
   // Consume the id before registration or cancellation. Late responses from
   // either polling or a pasted callback must not revive a finished flow.
   const pendingFlowId = useRef<string | undefined>(undefined);
@@ -64,9 +71,10 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
     }
   };
 
-  const start = async (provider: DeviceLoginProvider) => {
+  const start = async (provider: DeviceLoginProvider, config?: IdentityCenterLoginConfig) => {
     setStarting(true);
     setPasted("");
+    setSelectedProfile("");
     try {
       if (usesBrowserSignIn(provider, mode)) {
         const started = await dashboardApi.startBrowserLogin(provider);
@@ -74,11 +82,13 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
         setActive({ kind: "browser", flow: started });
         setDeadline(Date.now() + started.expiresInSeconds * 1000);
       } else {
-        const started = await dashboardApi.startDeviceLogin(provider);
+        const started = await (config
+          ? dashboardApi.startDeviceLogin(provider, config)
+          : dashboardApi.startDeviceLogin(provider));
         pendingFlowId.current = started.flowId;
         setActive({ kind: "device", flow: started });
         setDeadline(Date.now() + started.expiresInSeconds * 1000);
-        await copyLink(started.verificationUriComplete);
+        await copyLink(started.verificationUriComplete || started.verificationUri);
       }
       setNow(Date.now());
     } catch (cause) {
@@ -86,6 +96,14 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
     } finally {
       setStarting(false);
     }
+  };
+
+  const startOrganization = () => {
+    if (starting || registeringFlow) return;
+    const config = { startUrl: startUrl.trim(), region: region.trim() };
+    const error = identityCenterLoginError(config);
+    setOrganizationError(error);
+    if (!error) void start("idc", config);
   };
 
   const cancel = useCallback(async () => {
@@ -100,12 +118,14 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   // clicks once. Claim the flow before awaiting, even if another response arrives
   // after registration has already finished.
   const registerApproved = useCallback(
-    async (kind: ActiveFlow["kind"], flowId: string) => {
+    async (kind: ActiveFlow["kind"], flowId: string, profileArn?: string) => {
       if (pendingFlowId.current !== flowId) return;
       pendingFlowId.current = undefined;
       setRegisteringFlow(true);
       try {
-        const result = await flowApi[kind].register(flowId);
+        const result = await (kind === "device" && profileArn
+          ? flowApi.device.register(flowId, profileArn)
+          : flowApi[kind].register(flowId));
         const registered = registrationMessage(language, result);
         pushAlert({ tone: registered.tone === "ok" ? "success" : "warning", text: registered.text });
         setActive(undefined);
@@ -129,6 +149,7 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
         return true;
       }
       setActive(next);
+      if (next.kind === "device" && next.flow.status === "selecting_profile") return true;
       if (next.flow.status !== "pending") {
         pendingFlowId.current = undefined;
         pushAlert(
@@ -207,8 +228,48 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
   const remainingLabel = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
 
   const pendingBody = () => {
+    if (active?.kind === "device" && active.flow.status === "selecting_profile") {
+      const profiles = active.flow.profiles ?? [];
+      return (
+        <form
+          className="space-y-3 rounded-lg border p-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (profiles.some((profile) => profile.arn === selectedProfile)) {
+              void registerApproved("device", active.flow.flowId, selectedProfile);
+            }
+          }}
+        >
+          <Label htmlFor={`${pasteId}-profile`}>{t("accounts.login.profile")}</Label>
+          <p className="text-xs text-muted-foreground">{t("accounts.login.profileHint")}</p>
+          <Select value={selectedProfile} onValueChange={setSelectedProfile} disabled={registeringFlow}>
+            <SelectTrigger id={`${pasteId}-profile`} className="w-full min-w-0">
+              <SelectValue placeholder={t("accounts.login.profilePlaceholder")} />
+            </SelectTrigger>
+            <SelectContent position="popper">
+              {profiles.map((profile) => (
+                <SelectItem key={profile.arn} value={profile.arn} title={profile.arn} className="whitespace-normal break-words">
+                  {profile.profileName}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="flex flex-wrap gap-2">
+            <Button type="submit" size="sm" disabled={!selectedProfile || registeringFlow}>
+              {t("accounts.login.addProfile")}
+            </Button>
+            <Button type="button" size="sm" variant="outline" disabled={registeringFlow} onClick={() => void cancel()}>
+              <X />
+              {t("accounts.cancel")}
+            </Button>
+          </div>
+        </form>
+      );
+    }
     if (!active || active.flow.status !== "pending") return null;
-    const link = active.kind === "browser" ? active.flow.authorizationUrl : active.flow.verificationUriComplete;
+    const link = active.kind === "browser"
+      ? active.flow.authorizationUrl
+      : active.flow.verificationUriComplete || active.flow.verificationUri;
     return (
       <div className="space-y-3 rounded-lg border p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -219,6 +280,12 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
           </p>
           <Badge variant="secondary">{active.flow.provider}</Badge>
         </div>
+        {active.kind === "device" ? (
+          <p className="text-sm">
+            {t("accounts.login.userCode")}{" "}
+            <code className="rounded bg-muted px-2 py-1 font-mono font-medium">{active.flow.userCode}</code>
+          </p>
+        ) : null}
         <a
           href={link}
           target="_blank"
@@ -309,6 +376,79 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
                 </Button>
               ))}
             </div>
+            <Button
+              variant="outline"
+              disabled={starting || registeringFlow}
+              aria-expanded={organizationOpen}
+              aria-controls={`${pasteId}-organization`}
+              onClick={() => setOrganizationOpen((open) => !open)}
+              className="h-11 w-full gap-2.5 font-medium"
+            >
+              <Building2 aria-hidden />
+              {t("accounts.login.organization")}
+            </Button>
+            {organizationOpen ? (
+              <form
+                id={`${pasteId}-organization`}
+                className="space-y-3 rounded-lg border p-4"
+                noValidate
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  startOrganization();
+                }}
+              >
+                <p className="text-xs text-muted-foreground">{t("accounts.login.organizationHint")}</p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor={`${pasteId}-start-url`}>{t("accounts.login.startUrl")}</Label>
+                    <Input
+                      id={`${pasteId}-start-url`}
+                      name="startUrl"
+                      type="url"
+                      required
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder="https://example.awsapps.com/start"
+                      value={startUrl}
+                      disabled={starting || registeringFlow}
+                      aria-invalid={organizationError === "startUrl"}
+                      aria-describedby={organizationError === "startUrl" ? `${pasteId}-organization-error` : undefined}
+                      onChange={(event) => {
+                        setStartUrl(event.currentTarget.value);
+                        setOrganizationError(null);
+                      }}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor={`${pasteId}-region`}>{t("accounts.login.region")}</Label>
+                    <Input
+                      id={`${pasteId}-region`}
+                      name="region"
+                      required
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder="us-east-1"
+                      value={region}
+                      disabled={starting || registeringFlow}
+                      aria-invalid={organizationError === "region"}
+                      aria-describedby={organizationError === "region" ? `${pasteId}-organization-error` : undefined}
+                      onChange={(event) => {
+                        setRegion(event.currentTarget.value);
+                        setOrganizationError(null);
+                      }}
+                    />
+                  </div>
+                </div>
+                {organizationError ? (
+                  <p id={`${pasteId}-organization-error`} role="alert" className="text-xs text-destructive">
+                    {t(organizationError === "startUrl" ? "accounts.login.startUrlInvalid" : "accounts.login.regionRequired")}
+                  </p>
+                ) : null}
+                <Button type="submit" size="sm" disabled={starting || registeringFlow}>
+                  {t("accounts.login.continueOrganization")}
+                </Button>
+              </form>
+            ) : null}
             <Button
               variant="link"
               size="sm"

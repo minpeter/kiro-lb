@@ -50,6 +50,17 @@ the callback (the redirect Kiro allows); if that port is unreachable, paste the
 address the browser ended on into the dashboard. A device code is still
 available for headless setups, but approving a second Google/GitHub user that
 way signs the first one out.
+
+For an organization account, choose **Organization (IAM Identity Center)**,
+enter your organization's HTTPS start URL and SSO region, and approve the
+device code in your browser. The dashboard discovers available Kiro profiles
+in US East (N. Virginia) and Europe (Frankfurt), as kiro-cli does. A single
+profile is selected automatically; otherwise choose a profile to finish.
+Your administrator must have assigned access to a Kiro profile. Credentials
+and the OIDC client registration are stored internally and refreshed in the
+SSO region, independently of the profile's API region; no kiro-cli database
+or filesystem mount is needed.
+
 `SHA256SUMS` in the release lists every file's checksum.
 
 At startup and every hour, the gateway checks GitHub's latest stable

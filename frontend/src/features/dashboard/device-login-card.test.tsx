@@ -1,7 +1,7 @@
 import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DashboardApiError } from "./api";
-import type { BrowserLoginFlow } from "./types";
+import type { BrowserLoginFlow, DeviceLoginFlow } from "./types";
 
 type Effect = () => void | (() => void);
 type Props = {
@@ -11,6 +11,10 @@ type Props = {
   onSubmit?: (event: { preventDefault: () => void }) => void;
   disabled?: boolean;
   type?: string;
+  name?: string;
+  href?: string;
+  onValueChange?: (value: string) => void;
+  "aria-invalid"?: boolean;
 };
 
 const harness = vi.hoisted(() => ({
@@ -82,7 +86,7 @@ const flow: BrowserLoginFlow = {
 };
 const approved: BrowserLoginFlow = { ...flow, status: "approved" };
 const onRegistered = vi.fn();
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const flush = () => vi.runAllTimersAsync();
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
@@ -131,6 +135,7 @@ function poll() {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers();
   vi.clearAllMocks();
   harness.states = [];
   harness.refs = [];
@@ -147,7 +152,7 @@ beforeEach(() => {
   });
   vi.stubGlobal("navigator", { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
 });
-afterEach(() => { vi.unstubAllGlobals(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("browser sign-in response ordering", () => {
   it.each(["approved", "pending", "failed", "error"] as const)(
@@ -374,5 +379,164 @@ describe("browser sign-in response ordering", () => {
     paste();
     await flush();
     expect(harness.api.registerBrowserLogin).toHaveBeenCalledExactlyOnceWith("second");
+  });
+});
+
+const organization: DeviceLoginFlow = {
+  flowId: "organization",
+  provider: "IdentityCenter",
+  status: "pending",
+  detail: null,
+  userCode: "ABCD-EFGH",
+  verificationUri: "https://device.example.com/",
+  verificationUriComplete: null,
+  expiresInSeconds: 600,
+};
+const profiles = [
+  { arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/first", profileName: "Development" },
+  { arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/second", profileName: "Production" },
+];
+
+function fillOrganization(startUrl = "https://example.awsapps.com/start", region = "us-east-1") {
+  button("Organization (IAM Identity Center)").onClick!();
+  for (const [name, value] of Object.entries({ startUrl, region })) {
+    find(render(), (props) => props.name === name)!.props.onChange!({ currentTarget: { value } });
+  }
+}
+
+async function submitForm() {
+  find(render(), (props) => Boolean(props.onSubmit))!.props.onSubmit!({ preventDefault: () => undefined });
+  await flush();
+}
+
+describe("organization device sign-in", () => {
+  beforeEach(() => {
+    harness.api.startDeviceLogin.mockResolvedValue(organization);
+    harness.api.pollDeviceLogin.mockResolvedValue({ ...organization, status: "approved" });
+    harness.api.registerDeviceLogin.mockResolvedValue({ accountId: "organization-account", initialized: true });
+    harness.api.cancelDeviceLogin.mockResolvedValue({ ok: true });
+  });
+
+  it.each(["browser", "device"])("submits trimmed organization configuration in %s social mode", async (mode) => {
+    if (mode === "device") button("Use a device code instead").onClick!();
+    fillOrganization(" https://example.awsapps.com/start ", " us-east-1 ");
+    expect(button("Continue with Google").disabled).toBe(false);
+    expect(button("Continue with GitHub").disabled).toBe(false);
+    expect(button("Continue with AWS Builder ID").disabled).toBe(false);
+
+    await submitForm();
+
+    expect(harness.api.startDeviceLogin).toHaveBeenCalledExactlyOnceWith("idc", {
+      startUrl: "https://example.awsapps.com/start", region: "us-east-1",
+    });
+    expect(harness.api.startBrowserLogin).not.toHaveBeenCalled();
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(organization.verificationUri);
+    expect(find(render(), (props) => props.href === organization.verificationUri)).toBeDefined();
+    expect(find(render(), (props) => Children.toArray(props.children).includes(organization.userCode))).toBeDefined();
+    await poll();
+    expect(harness.api.registerDeviceLogin).toHaveBeenCalledExactlyOnceWith("organization");
+  });
+
+  it.each([
+    ["", "us-east-1", "startUrl"],
+    ["   ", "us-east-1", "startUrl"],
+    ["not a url", "us-east-1", "startUrl"],
+    ["https:example.awsapps.com/start", "us-east-1", "startUrl"],
+    ["http://example.awsapps.com/start", "us-east-1", "startUrl"],
+    ["https://user:password@example.awsapps.com/start", "us-east-1", "startUrl"],
+    ["https://example.awsapps.com/start?org=test", "us-east-1", "startUrl"],
+    ["https://example.awsapps.com/start#org", "us-east-1", "startUrl"],
+    ["https://example.awsapps.com/start?", "us-east-1", "startUrl"],
+    ["https://example.awsapps.com/start#", "us-east-1", "startUrl"],
+    ["https://example.awsapps.com/start", "", "region"],
+    ["https://example.awsapps.com/start", "   ", "region"],
+    ["https://example.awsapps.com/start", "US-EAST-1", "region"],
+    ["https://example.awsapps.com/start", "us-east-0", "region"],
+    ["https://example.awsapps.com/start", "not-a-region", "region"],
+  ])("rejects start URL %s and region %s before starting", async (startUrl, region, field) => {
+    fillOrganization(startUrl, region);
+
+    await submitForm();
+
+    expect(harness.api.startDeviceLogin).not.toHaveBeenCalled();
+    expect(harness.api.startBrowserLogin).not.toHaveBeenCalled();
+    expect(find(render(), (props) => props.name === field)!.props["aria-invalid"]).toBe(true);
+  });
+
+  it.each(["Google", "GitHub"])("keeps %s on the chosen social device flow", async (provider) => {
+    button("Use a device code instead").onClick!();
+
+    await start(provider);
+
+    expect(harness.api.startDeviceLogin).toHaveBeenCalledExactlyOnceWith(provider.toLowerCase());
+    expect(harness.api.startBrowserLogin).not.toHaveBeenCalled();
+  });
+
+  it("pauses polling without registration until a discovered profile is selected", async () => {
+    harness.api.pollDeviceLogin.mockResolvedValue({ ...organization, status: "selecting_profile", profiles });
+    fillOrganization();
+    await submitForm();
+
+    await poll();
+
+    expect(harness.api.registerDeviceLogin).not.toHaveBeenCalled();
+    expect(harness.timers).toHaveLength(1);
+    render();
+    harness.effects[0]!();
+    expect(harness.timers).toHaveLength(1);
+    expect(find(render(), (props) => props.type === "submit")!.props.disabled).toBe(true);
+    find(render(), (props) => Boolean(props.onValueChange))!.props.onValueChange!(profiles[1].arn);
+    await submitForm();
+    expect(harness.api.registerDeviceLogin).toHaveBeenCalledExactlyOnceWith("organization", profiles[1].arn);
+    expect(onRegistered).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a profile choice without registering the account", async () => {
+    harness.api.pollDeviceLogin.mockResolvedValue({ ...organization, status: "selecting_profile", profiles });
+    fillOrganization();
+    await submitForm();
+    await poll();
+    const cancel = button("Cancel").onClick!;
+
+    cancel();
+    cancel();
+    await flush();
+
+    expect(harness.api.cancelDeviceLogin).toHaveBeenCalledExactlyOnceWith("organization");
+    expect(harness.api.registerDeviceLogin).not.toHaveBeenCalled();
+    expect(button("Continue with Google").disabled).toBe(false);
+  });
+
+  it("ignores an approved device response after cancellation starts", async () => {
+    const response = deferred<DeviceLoginFlow>();
+    harness.api.pollDeviceLogin.mockReturnValue(response.promise);
+    fillOrganization();
+    await submitForm();
+    const polling = poll();
+
+    button("Cancel").onClick!();
+    response.resolve({ ...organization, status: "approved" });
+    await polling;
+
+    expect(harness.api.cancelDeviceLogin).toHaveBeenCalledExactlyOnceWith("organization");
+    expect(harness.api.registerDeviceLogin).not.toHaveBeenCalled();
+  });
+
+  it("registers an approved organization once when old poll responses overlap", async () => {
+    const registration = deferred<{ accountId: string; initialized: boolean }>();
+    harness.api.registerDeviceLogin.mockReturnValue(registration.promise);
+    fillOrganization();
+    await submitForm();
+    render();
+    harness.effects[0]!();
+    const tick = harness.timers[0]!;
+
+    const first = tick();
+    const second = tick();
+    registration.resolve({ accountId: "organization-account", initialized: true });
+    await Promise.all([first, second]);
+
+    expect(harness.api.registerDeviceLogin).toHaveBeenCalledExactlyOnceWith("organization");
+    expect(onRegistered).toHaveBeenCalledOnce();
   });
 });

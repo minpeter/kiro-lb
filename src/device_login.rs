@@ -1,5 +1,5 @@
 //! Device-authorization login: social (Google/GitHub) on the Kiro desktop auth host,
-//! and Builder ID over AWS SSO OIDC. The two contracts are near-inverses, so the
+//! and Builder ID / IAM Identity Center over AWS SSO OIDC. The two contracts are near-inverses, so the
 //! polling logic is deliberately not shared.
 
 use parking_lot::Mutex;
@@ -20,6 +20,66 @@ const BUILDER_ID_SCOPES: [&str; 3] = [
     "codewhisperer:conversations",
 ];
 const FLOW_GRACE: f64 = 60.0;
+// The same discovery regions as kiro-cli; an organization's SSO region need
+// not be the region that hosts its CodeWhisperer profile.
+const PROFILE_ENDPOINTS: [&str; 2] = [
+    "https://q.us-east-1.amazonaws.com/",
+    "https://q.eu-central-1.amazonaws.com/",
+];
+
+pub struct IdentityCenterConfig {
+    start_url: String,
+    region: String,
+}
+
+impl IdentityCenterConfig {
+    pub fn from_payload(payload: &Value) -> Result<Self, String> {
+        let start_url = payload
+            .get("startUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .ok_or("Identity Center requires a start URL")?;
+        let url = reqwest::Url::parse(start_url)
+            .map_err(|_| "Identity Center requires an absolute HTTPS start URL")?;
+        if !start_url
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+            || url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("Identity Center requires an HTTPS start URL without credentials, query, or fragment".into());
+        }
+        let region = payload
+            .get("region")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .ok_or("Identity Center requires a region")?;
+        config::validate_region(region).map_err(|e| e.to_string())?;
+        Ok(Self {
+            start_url: start_url.to_owned(),
+            region: region.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Profile {
+    arn: String,
+    profile_name: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfilePage {
+    #[serde(default)]
+    profiles: Vec<Profile>,
+    next_token: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct DeviceFlow {
@@ -35,6 +95,9 @@ pub struct DeviceFlow {
     detail: Option<String>,
     pub token: Option<Value>,
     registration: Option<Value>,
+    profiles: Vec<Profile>,
+    next_poll_at: f64,
+    polling: bool,
 }
 
 impl DeviceFlow {
@@ -61,6 +124,7 @@ impl DeviceFlow {
             "userCode": self.user_code, "verificationUri": self.verification_uri,
             "verificationUriComplete": self.verification_uri_complete,
             "expiresInSeconds": (self.expires_at - now_f64()).max(0.0) as i64,
+            "profiles": self.profiles,
         })
     }
 }
@@ -72,7 +136,8 @@ pub fn resolve_provider(raw: &str) -> Result<&'static str, String> {
         "google" => Ok("Google"),
         "github" => Ok("Github"),
         "builder-id" | "builderid" | "builder_id" => Ok("BuilderId"),
-        _ => Err("provider must be google or github".into()),
+        "idc" => Ok("IdentityCenter"),
+        _ => Err("provider must be google, github, builder-id, or idc".into()),
     }
 }
 
@@ -141,6 +206,20 @@ async fn oidc_call(
             } else {
                 errtype
             });
+        // Error descriptions can echo private organization configuration.
+        // Diagnostics retain only AWS's machine code, never request bodies.
+        let diagnostic_code =
+            if code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                code.as_str()
+            } else {
+                "unrecognized"
+            };
+        tracing::debug!(
+            oidc_path = path,
+            http_status = status,
+            error_code = diagnostic_code,
+            "AWS SSO OIDC request rejected"
+        );
         let msg = payload
             .get("error_description")
             .or_else(|| payload.get("message"))
@@ -167,15 +246,62 @@ fn s(v: &Value, k: &str) -> String {
 }
 
 pub async fn start(http: &reqwest::Client, provider: &'static str) -> Result<Value, String> {
-    let flow = if provider == "BuilderId" {
-        let reg = oidc_call(
-            http,
-            BUILDER_ID_REGION,
-            "/client/register",
-            json!({"clientName": "kiro-cli", "clientType": "public", "scopes": BUILDER_ID_SCOPES}),
-        )
-        .await?;
-        let auth = oidc_call(http, BUILDER_ID_REGION, "/device_authorization", json!({"clientId": reg["clientId"], "clientSecret": reg["clientSecret"], "startUrl": BUILDER_ID_START_URL})).await?;
+    start_with_config(http, provider, None).await
+}
+
+pub async fn start_identity_center(
+    http: &reqwest::Client,
+    config: IdentityCenterConfig,
+) -> Result<Value, String> {
+    start_with_config(http, "IdentityCenter", Some(config))
+        .await
+        .map_err(|reason| identity_center_error(&reason))
+}
+
+fn identity_center_error(reason: &str) -> String {
+    // AWS error descriptions can echo the organization's private start URL.
+    // Preserve only a machine error code, never the upstream description.
+    let code = reason.split(':').next().unwrap_or("");
+    if !code.is_empty()
+        && code.len() <= 64
+        && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        format!("AWS SSO OIDC rejected the organization login ({code})")
+    } else {
+        "AWS SSO OIDC could not complete the organization login".into()
+    }
+}
+
+async fn start_with_config(
+    http: &reqwest::Client,
+    provider: &'static str,
+    identity_center: Option<IdentityCenterConfig>,
+) -> Result<Value, String> {
+    if provider == "IdentityCenter" && identity_center.is_none() {
+        return Err("Identity Center requires a start URL and region".into());
+    }
+    let flow = if matches!(provider, "BuilderId" | "IdentityCenter") {
+        let (region, start_url) = identity_center
+            .as_ref()
+            .map(|c| (c.region.as_str(), c.start_url.as_str()))
+            .unwrap_or((BUILDER_ID_REGION, BUILDER_ID_START_URL));
+        let mut request =
+            json!({"clientName": "kiro-cli", "clientType": "public", "scopes": BUILDER_ID_SCOPES});
+        if identity_center.is_some() {
+            request["issuerUrl"] = json!(start_url);
+            request["grantTypes"] = json!([
+                "urn:ietf:params:oauth:grant-type:device_code",
+                "refresh_token"
+            ]);
+        }
+        let reg = oidc_call(http, region, "/client/register", request).await?;
+        if ["clientId", "clientSecret"]
+            .iter()
+            .any(|k| reg.get(k).and_then(Value::as_str).is_none_or(str::is_empty))
+        {
+            return Err("AWS SSO OIDC returned an incomplete client registration".into());
+        }
+        let auth = oidc_call(http, region, "/device_authorization", json!({"clientId": reg["clientId"], "clientSecret": reg["clientSecret"], "startUrl": start_url})).await?;
         DeviceFlow {
             id: flow_id(),
             provider,
@@ -189,8 +315,11 @@ pub async fn start(http: &reqwest::Client, provider: &'static str) -> Result<Val
             detail: None,
             token: None,
             registration: Some(
-                json!({"clientId": reg["clientId"], "clientSecret": reg["clientSecret"], "region": BUILDER_ID_REGION}),
+                json!({"clientId": reg["clientId"], "clientSecret": reg["clientSecret"], "region": region, "startUrl": start_url}),
             ),
+            profiles: Vec::new(),
+            next_poll_at: now_f64() + num(&auth, "interval").unwrap_or(5.0).max(1.0),
+            polling: false,
         }
     } else {
         let p = social_post(
@@ -212,6 +341,9 @@ pub async fn start(http: &reqwest::Client, provider: &'static str) -> Result<Val
             detail: None,
             token: None,
             registration: None,
+            profiles: Vec::new(),
+            next_poll_at: 0.0,
+            polling: false,
         }
     };
     let view = flow.view();
@@ -253,23 +385,50 @@ pub fn discard(id: &str) {
 }
 
 pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String> {
-    let mut flow = get(id).ok_or("Unknown or expired login flow")?;
+    let mut flow = {
+        let mut guard = FLOWS.lock();
+        let flow = guard
+            .as_mut()
+            .and_then(|flows| flows.get_mut(id))
+            .ok_or("Unknown or expired login flow")?;
+        if flow.polling {
+            return Ok(flow.clone());
+        }
+        if flow.status == "pending" && now_f64() <= flow.expires_at {
+            if now_f64() < flow.next_poll_at {
+                return Ok(flow.clone());
+            }
+            flow.polling = true;
+        }
+        flow.clone()
+    };
     if matches!(flow.status.as_str(), "approved" | "failed" | "expired") {
         return Ok(flow);
     }
     if now_f64() > flow.expires_at {
+        flow.polling = false;
+        flow.token = None;
         flow.status = "expired".into();
         flow.detail = Some("The approval window closed before the login was confirmed".into());
         put(flow.clone());
         return Ok(flow);
     }
-    if flow.provider == "BuilderId" {
+    if flow.status == "selecting_profile" {
+        return Ok(flow);
+    }
+    if matches!(flow.provider, "BuilderId" | "IdentityCenter") {
         let reg = flow.registration.clone().unwrap_or(json!({}));
         let region = reg
             .get("region")
             .and_then(Value::as_str)
             .unwrap_or(BUILDER_ID_REGION)
             .to_owned();
+        tracing::debug!(
+            flow_id = %flow.id,
+            region,
+            interval_seconds = flow.interval,
+            "Polling AWS SSO OIDC device authorization"
+        );
         match oidc_call(http, &region, "/token", json!({"clientId": reg["clientId"], "clientSecret": reg["clientSecret"], "deviceCode": flow.device_code, "grantType": "urn:ietf:params:oauth:grant-type:device_code"})).await {
             Err(reason) => {
                 if reason.contains("authorization_pending") || reason.contains("AuthorizationPending") {
@@ -277,18 +436,37 @@ pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String
                     flow.interval += 5.0;
                 } else {
                     flow.status = if reason.contains("expired_token") || reason.contains("ExpiredToken") { "expired" } else { "failed" }.into();
-                    flow.detail = Some(reason);
+                    flow.detail = Some(if flow.provider == "IdentityCenter" { identity_center_error(&reason) } else { reason });
                 }
             }
-            Ok(p) => match p.get("accessToken").filter(|t| !t.is_null()) {
+            Ok(p) => match p.get("accessToken").filter(|t| t.as_str().is_some_and(|s| !s.is_empty())) {
                 Some(t) => {
                     flow.token = Some(json!({"accessToken": t, "refreshToken": p.get("refreshToken"), "expiresIn": p.get("expiresIn"), "profileArn": null}));
                     flow.status = "approved".into();
                     flow.detail = None;
+                    if flow.provider == "IdentityCenter" {
+                        match discover_profiles(http, &s(&p, "accessToken")).await {
+                            Ok(profiles) => {
+                                flow.profiles = profiles;
+                                if flow.profiles.len() == 1 {
+                                    if let Some(token) = flow.token.as_mut() {
+                                        token["profileArn"] = json!(flow.profiles[0].arn);
+                                    }
+                                } else {
+                                    flow.status = "selecting_profile".into();
+                                }
+                            }
+                            Err(reason) => {
+                                flow.status = "failed".into();
+                                flow.detail = Some(reason);
+                                flow.token = None;
+                            }
+                        }
+                    }
                 }
                 None => {
                     flow.status = "failed".into();
-                    flow.detail = Some("Builder ID returned no access token".into());
+                    flow.detail = Some("AWS SSO OIDC returned no access token".into());
                 }
             },
         }
@@ -334,14 +512,120 @@ pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String
             }
         }
     }
+    flow.polling = false;
+    flow.next_poll_at = now_f64() + flow.interval;
     put(flow.clone());
     Ok(flow)
+}
+
+async fn profiles_at(
+    http: &reqwest::Client,
+    endpoint: &str,
+    access_token: &str,
+) -> Result<Vec<Profile>, String> {
+    let mut profiles = Vec::new();
+    let mut next_token = None;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let mut body = json!({});
+        if let Some(token) = &next_token {
+            body["nextToken"] = json!(token);
+        }
+        let response = http
+            .post(endpoint)
+            .bearer_auth(access_token)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                "AmazonCodeWhispererService.ListAvailableProfiles",
+            )
+            .json(&body)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .map_err(|_| "Could not contact the Identity Center profile service")?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Identity Center profile discovery returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        let page: ProfilePage = response
+            .json()
+            .await
+            .map_err(|_| "Identity Center returned an invalid profile list")?;
+        for profile in page.profiles {
+            if crate::auth::region_from_arn(&profile.arn).is_none()
+                || !profile.arn.starts_with("arn:")
+                || profile.arn.split(':').nth(2) != Some("codewhisperer")
+            {
+                return Err("Identity Center returned an invalid profile ARN".into());
+            }
+            profiles.push(profile);
+        }
+        match page.next_token.filter(|t| !t.is_empty()) {
+            Some(token) => {
+                if !seen.insert(token.clone()) {
+                    return Err("Identity Center returned a repeated profile page".into());
+                }
+                next_token = Some(token);
+            }
+            None => return Ok(profiles),
+        }
+    }
+}
+
+async fn discover_profiles(http: &reqwest::Client, token: &str) -> Result<Vec<Profile>, String> {
+    let mut profiles = Vec::new();
+    let mut succeeded = false;
+    for endpoint in PROFILE_ENDPOINTS {
+        match profiles_at(http, endpoint, token).await {
+            Ok(found) => {
+                succeeded = true;
+                for profile in found {
+                    if !profiles.iter().any(|p: &Profile| p.arn == profile.arn) {
+                        profiles.push(profile);
+                    }
+                }
+            }
+            // Like kiro-cli, a regional failure does not hide profiles in the
+            // other discovery region. Never log upstream bodies or identities.
+            Err(_) => tracing::warn!("Identity Center profile discovery failed in one region"),
+        }
+    }
+    if profiles.is_empty() {
+        return Err(if succeeded {
+            "No Kiro profiles are available for this organization. Ask your administrator to assign access."
+        } else {
+            "Could not discover Identity Center profiles. Try signing in again."
+        }.into());
+    }
+    Ok(profiles)
+}
+
+pub fn select_profile(id: &str, arn: &str) -> Result<DeviceFlow, String> {
+    let mut guard = FLOWS.lock();
+    let flow = guard
+        .as_mut()
+        .and_then(|flows| flows.get_mut(id))
+        .ok_or("Unknown or expired login flow")?;
+    if flow.status != "selecting_profile" || now_f64() > flow.expires_at {
+        return Err("Login is not waiting for profile selection".into());
+    }
+    if !flow.profiles.iter().any(|p| p.arn == arn) {
+        return Err("Select a profile returned by this login".into());
+    }
+    let token = flow.token.as_mut().ok_or("Login has no approved token")?;
+    token["profileArn"] = json!(arn);
+    flow.status = "approved".into();
+    Ok(flow.clone())
 }
 
 pub fn internal_credentials(flow: &DeviceFlow) -> Result<Value, String> {
     let token = flow
         .token
         .as_ref()
+        .filter(|_| flow.status == "approved")
         .ok_or_else(|| format!("{} login is not approved", flow.provider))?;
     if token
         .get("refreshToken")
@@ -358,15 +642,26 @@ pub fn internal_credentials(flow: &DeviceFlow) -> Result<Value, String> {
     let expires =
         crate::auth::iso_from_epoch((now_f64() + expires_in).floor()).replace("+00:00", "Z");
     let mut doc = json!({"refreshToken": token.get("refreshToken"), "accessToken": token.get("accessToken"), "expiresAt": expires, "region": SOCIAL_REGION});
-    if flow.provider == "BuilderId" {
+    if matches!(flow.provider, "BuilderId" | "IdentityCenter") {
         let reg = flow
             .registration
             .as_ref()
-            .ok_or("Builder ID login has no client registration")?;
+            .ok_or("AWS SSO OIDC login has no client registration")?;
         doc["region"] = reg["region"].clone();
         doc["clientId"] = reg["clientId"].clone();
         doc["clientSecret"] = reg["clientSecret"].clone();
-        doc["startUrl"] = json!(BUILDER_ID_START_URL);
+        doc["startUrl"] = reg["startUrl"].clone();
+        if flow.provider == "IdentityCenter" {
+            let arn = token
+                .get("profileArn")
+                .and_then(Value::as_str)
+                .ok_or("Identity Center login requires a profile")?;
+            let region = crate::auth::region_from_arn(arn)
+                .ok_or("Identity Center returned an invalid profile ARN")?;
+            doc["profileArn"] = json!(arn);
+            doc["ssoRegion"] = reg["region"].clone();
+            doc["region"] = json!(region);
+        }
     } else {
         for k in ["profileArn", "identityProvider"] {
             if let Some(v) = token
@@ -400,6 +695,9 @@ mod tests {
             detail: None,
             token: None,
             registration: None,
+            profiles: Vec::new(),
+            next_poll_at: 0.0,
+            polling: false,
         }
     }
 
@@ -451,5 +749,178 @@ mod tests {
         put(in_flight);
         assert_eq!(get(id).unwrap().status, "approved");
         discard(id);
+    }
+
+    fn organization_flow(id: &str) -> DeviceFlow {
+        let mut flow = flow(id);
+        flow.provider = "IdentityCenter";
+        flow.registration = Some(json!({
+            "clientId": "client", "clientSecret": "secret",
+            "region": "us-west-2", "startUrl": "https://example.awsapps.com/start"
+        }));
+        flow.token = Some(json!({
+            "accessToken": "access", "refreshToken": "refresh", "expiresIn": 3600,
+            "profileArn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/test"
+        }));
+        flow.status = "approved".into();
+        flow
+    }
+
+    #[test]
+    fn organization_settings_reject_missing_and_unsafe_values() {
+        for payload in [
+            json!({}),
+            json!({"startUrl": "https://example.awsapps.com/start"}),
+            json!({"startUrl": 7, "region": "us-east-1"}),
+            json!({"startUrl": "http://example.awsapps.com/start", "region": "us-east-1"}),
+            json!({"startUrl": "https://user:password@example.awsapps.com/start", "region": "us-east-1"}),
+            json!({"startUrl": "https://example.awsapps.com/start?token=secret", "region": "us-east-1"}),
+            json!({"startUrl": "https://example.awsapps.com/start", "region": "us-east-1@localhost"}),
+        ] {
+            assert!(IdentityCenterConfig::from_payload(&payload).is_err());
+        }
+        let config = IdentityCenterConfig::from_payload(&json!({
+            "startUrl": " https://example.awsapps.com/start ", "region": " eu-central-1 "
+        }))
+        .unwrap();
+        assert_eq!(config.start_url, "https://example.awsapps.com/start");
+        assert_eq!(config.region, "eu-central-1");
+    }
+
+    #[test]
+    fn organization_credentials_route_api_and_refresh_to_their_own_regions() {
+        let flow = organization_flow("org-region");
+
+        let document = internal_credentials(&flow).unwrap();
+        let auth = crate::auth::KiroAuth::from_device_credentials(
+            "org-region",
+            &document,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        assert_eq!(document["ssoRegion"], "us-west-2");
+        assert_eq!(document["region"], "eu-central-1");
+        assert_eq!(document["clientId"], "client");
+        assert_eq!(document["clientSecret"], "secret");
+        assert_eq!(auth.q_host, "https://runtime.eu-central-1.kiro.dev");
+        assert_eq!(
+            auth.request_profile_arn(),
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/test".into())
+        );
+    }
+
+    #[test]
+    fn organization_login_without_profile_cannot_become_builder_id() {
+        let mut flow = organization_flow("org-no-profile");
+        flow.token.as_mut().unwrap()["profileArn"] = Value::Null;
+
+        assert!(internal_credentials(&flow).is_err());
+    }
+
+    #[test]
+    fn profile_selection_only_accepts_this_flows_discovered_profiles() {
+        let id = "org-selection";
+        let mut flow = organization_flow(id);
+        flow.status = "selecting_profile".into();
+        flow.token.as_mut().unwrap()["profileArn"] = Value::Null;
+        let arn = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/selected";
+        flow.profiles = vec![Profile {
+            arn: arn.into(),
+            profile_name: "Selected".into(),
+        }];
+        FLOWS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(id.into(), flow);
+
+        assert!(select_profile(
+            id,
+            "arn:aws:codewhisperer:us-east-1:000000000000:profile/foreign"
+        )
+        .is_err());
+        assert_eq!(get(id).unwrap().status, "selecting_profile");
+        let selected = select_profile(id, arn).unwrap();
+
+        assert_eq!(selected.status, "approved");
+        assert_eq!(internal_credentials(&selected).unwrap()["profileArn"], arn);
+        discard(id);
+    }
+
+    #[tokio::test]
+    async fn oidc_poll_interval_and_in_flight_poll_prevent_outbound_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy =
+            reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let http = reqwest::Client::builder().proxy(proxy).build().unwrap();
+        for (id, polling, next_poll_at) in [
+            ("org-not-due", false, now_f64() + 600.0),
+            ("org-in-flight", true, 0.0),
+        ] {
+            let mut flow = organization_flow(id);
+            flow.status = "pending".into();
+            flow.token = None;
+            flow.polling = polling;
+            flow.next_poll_at = next_poll_at;
+            FLOWS
+                .lock()
+                .get_or_insert_with(HashMap::new)
+                .insert(id.into(), flow);
+
+            assert_eq!(poll(&http, id).await.unwrap().status, "pending");
+            assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+            discard(id);
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_discovery_uses_bearer_auth_and_follows_pages() {
+        use axum::{body::Bytes, http::HeaderMap, routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(|headers: HeaderMap, body: Bytes| async move {
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(headers["authorization"], "Bearer test-access");
+                assert_eq!(headers["content-type"], "application/x-amz-json-1.0");
+                assert_eq!(
+                    headers["x-amz-target"],
+                    "AmazonCodeWhispererService.ListAvailableProfiles"
+                );
+                Json(if body.get("nextToken").is_none() {
+                    json!({"profiles": [{
+                        "arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/first",
+                        "profileName": "First"
+                    }], "nextToken": "second-page"})
+                } else {
+                    assert_eq!(body["nextToken"], "second-page");
+                    json!({"profiles": [{
+                        "arn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/second",
+                        "profileName": "Second"
+                    }]})
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    stopped.await.unwrap();
+                })
+                .await
+                .unwrap();
+        });
+
+        let profiles = profiles_at(&reqwest::Client::new(), &url, "test-access")
+            .await
+            .unwrap();
+
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].profile_name, "First");
+        assert_eq!(profiles[1].profile_name, "Second");
+        stop.send(()).unwrap();
+        server.await.unwrap();
     }
 }
