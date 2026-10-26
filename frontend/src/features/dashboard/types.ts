@@ -247,17 +247,23 @@ export type AccountTokenUsageEntry = {
 /** Keyed by the hashed account label, matching the accounts panel. */
 export type AccountTokenUsage = Record<string, AccountTokenUsageEntry>;
 
-export type DeviceLoginProvider = "builder-id" | "google" | "github";
+export type DeviceLoginProvider = "builder-id" | "google" | "github" | "idc";
+
+export type IdentityCenterLoginConfig = {
+  readonly startUrl: string;
+  readonly region: string;
+};
 
 export type DeviceLoginFlow = {
   flowId: string;
   provider: string;
-  status: "pending" | "approved" | "failed" | "expired";
+  status: "pending" | "selecting_profile" | "approved" | "failed" | "expired";
   detail: string | null;
   userCode: string;
   verificationUri: string;
-  verificationUriComplete: string;
+  verificationUriComplete?: string | null;
   expiresInSeconds: number;
+  profiles?: readonly { readonly arn: string; readonly profileName: string }[];
 };
 
 export type BrowserLoginFlow = {

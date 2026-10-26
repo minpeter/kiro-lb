@@ -1311,7 +1311,16 @@ pub async fn start_device_login(
         Ok(p) => p,
         Err(e) => return detail(400, e),
     };
-    match device_login::start(&state.http, provider).await {
+    let result = if provider == "IdentityCenter" {
+        let config = match device_login::IdentityCenterConfig::from_payload(&payload) {
+            Ok(config) => config,
+            Err(e) => return detail(400, e),
+        };
+        device_login::start_identity_center(&state.http, config).await
+    } else {
+        device_login::start(&state.http, provider).await
+    };
+    match result {
         Ok(v) => json_response(200, v),
         Err(e) => detail(502, format!("Kiro rejected the login request: {e}")),
     }
@@ -1333,12 +1342,23 @@ pub async fn register_device_login(
     State(state): State<Shared>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: Bytes,
 ) -> Response {
     guard!(headers);
-    let flow = match device_login::poll(&state.http, &id).await {
+    let mut flow = match device_login::poll(&state.http, &id).await {
         Ok(f) => f,
         Err(e) => return detail(404, e),
     };
+    if flow.status == "selecting_profile" {
+        let payload: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+        let Some(arn) = payload.get("profileArn").and_then(Value::as_str) else {
+            return detail(400, "Select an Identity Center profile");
+        };
+        flow = match device_login::select_profile(&id, arn) {
+            Ok(flow) => flow,
+            Err(e) => return detail(400, e),
+        };
+    }
     if flow.status != "approved" || flow.token.is_none() {
         return detail(409, format!("Login is {}, not approved yet", flow.status));
     }
@@ -1372,10 +1392,10 @@ async fn register_login(state: &Shared, provider: &str, entry: Value) -> Respons
                 o.remove("type");
             }
             v["provider"] = json!(provider);
-            let signed_out = if provider == "BuilderId" {
-                Vec::new()
-            } else {
+            let signed_out = if matches!(provider, "Google" | "Github") {
                 state.pool.probe_social_sessions(&account_id).await
+            } else {
+                Vec::new()
             };
             v["signedOut"] = json!(signed_out
                 .iter()

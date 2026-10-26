@@ -12,6 +12,7 @@ import type {
   EndpointTestResponse,
   EndpointsResponse,
   GatewayTunables,
+  IdentityCenterLoginConfig,
   KeyUsage,
   ModelCostRow,
   Overview,
@@ -141,16 +142,16 @@ export const dashboardApi = {
       method: "PATCH",
       body: JSON.stringify({ name }),
     }),
-  startDeviceLogin: (provider: DeviceLoginProvider) =>
+  startDeviceLogin: (provider: DeviceLoginProvider, config?: IdentityCenterLoginConfig) =>
     request<DeviceLoginFlow>("/api/dashboard/accounts/device-login", {
       method: "POST",
-      body: JSON.stringify({ provider }),
+      body: JSON.stringify({ provider, ...config }),
     }),
   pollDeviceLogin: (flowId: string) => request<DeviceLoginFlow>(`/api/dashboard/accounts/device-login/${flowId}`),
-  registerDeviceLogin: (flowId: string) =>
+  registerDeviceLogin: (flowId: string, profileArn?: string) =>
     request<{ accountId: string; initialized: boolean; provider: string; signedOut: string[] }>(
       `/api/dashboard/accounts/device-login/${flowId}/register`,
-      { method: "POST" },
+      { method: "POST", ...(profileArn ? { body: JSON.stringify({ profileArn }) } : {}) },
     ),
   cancelDeviceLogin: (flowId: string) =>
     request<{ ok: boolean }>(`/api/dashboard/accounts/device-login/${flowId}`, { method: "DELETE" }),
