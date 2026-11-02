@@ -122,8 +122,11 @@ pub fn valid_proxy_entry(entry: &str) -> bool {
 }
 
 fn ip_in(ip: std::net::IpAddr, entry: &str) -> bool {
+    if !valid_proxy_entry(entry) {
+        return false;
+    }
     let (addr, bits) = match entry.split_once('/') {
-        Some((a, b)) => (a, b.parse::<u32>().ok()),
+        Some((a, b)) => (a, b.trim().parse::<u32>().ok()),
         None => (entry, None),
     };
     let Ok(net) = addr.trim().parse::<std::net::IpAddr>() else {

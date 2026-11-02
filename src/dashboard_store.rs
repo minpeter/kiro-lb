@@ -352,6 +352,9 @@ pub struct KeyPatch {
 pub struct KeyPolicy {
     pub limits: KeyLimits,
     pub models: Option<HashSet<String>>,
+    /// The stored model list does not parse; the key is refused rather than
+    /// opened to every model.
+    pub unreadable: bool,
 }
 
 pub const MAX_ALLOWED_MODELS: usize = 500;
@@ -425,15 +428,34 @@ static POLICY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 #[derive(Debug)]
 pub struct PolicyUnavailable;
 
-fn stored_models(raw: Option<String>) -> Option<HashSet<String>> {
-    raw.and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
-        .map(|list| list.iter().map(|m| model_key(m)).collect())
+fn stored_models(raw: Option<String>) -> Result<Option<HashSet<String>>, ()> {
+    raw.map(|text| {
+        serde_json::from_str::<Vec<String>>(&text)
+            .map(|list| list.iter().map(|m| model_key(m)).collect())
+            .map_err(drop)
+    })
+    .transpose()
+}
+
+fn checked(policy: Arc<KeyPolicy>) -> Result<Arc<KeyPolicy>, PolicyUnavailable> {
+    if policy.unreadable {
+        return Err(PolicyUnavailable);
+    }
+    Ok(policy)
 }
 
 fn key_policy(key_id: &str) -> Result<Arc<KeyPolicy>, PolicyUnavailable> {
+    // A key missing from a fresh map may have been created by another
+    // gateway process on the same store since the load, so it reloads too;
+    // only the env root key has no row and is never restricted.
     if let Some((cache, at)) = POLICY_CACHE.lock().as_ref() {
         if at.elapsed() < POLICY_TTL {
-            return Ok(cache.get(key_id).cloned().unwrap_or_default());
+            if let Some(policy) = cache.get(key_id) {
+                return checked(policy.clone());
+            }
+            if key_id == ROOT_KEY_ID {
+                return Ok(Arc::default());
+            }
         }
     }
     let generation = POLICY_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
@@ -441,6 +463,7 @@ fn key_policy(key_id: &str) -> Result<Arc<KeyPolicy>, PolicyUnavailable> {
         let mut stmt =
             c.prepare("SELECT id, request_limit, token_limit, allowed_models FROM api_keys")?;
         let rows = stmt.query_map([], |r| {
+            let models = stored_models(r.get(3)?);
             Ok((
                 r.get::<_, String>(0)?,
                 Arc::new(KeyPolicy {
@@ -448,7 +471,8 @@ fn key_policy(key_id: &str) -> Result<Arc<KeyPolicy>, PolicyUnavailable> {
                         requests: r.get(1)?,
                         tokens: r.get(2)?,
                     },
-                    models: stored_models(r.get(3)?),
+                    models: models.clone().unwrap_or_default(),
+                    unreadable: models.is_err(),
                 }),
             ))
         })?;
@@ -465,7 +489,7 @@ fn key_policy(key_id: &str) -> Result<Arc<KeyPolicy>, PolicyUnavailable> {
     if POLICY_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == generation {
         *cache = Some((loaded, Instant::now()));
     }
-    Ok(found)
+    checked(found)
 }
 
 /// Whether the key may call `model`, under any of its spellings.
