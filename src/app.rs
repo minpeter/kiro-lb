@@ -121,6 +121,9 @@ pub fn valid_proxy_entry(entry: &str) -> bool {
     bits.is_none_or(|b| b.trim().parse::<u32>().is_ok_and(|b| b <= max))
 }
 
+/// Matches in IPv6 space: an IPv4 address or network is its v4-mapped form
+/// (`::ffff:a.b.c.d`, prefix + 96), so `10.0.0.0/8` and `::ffff:10.0.0.0/104`
+/// are the same network and a mapped peer matches a plain IPv4 entry.
 fn ip_in(ip: std::net::IpAddr, entry: &str) -> bool {
     if !valid_proxy_entry(entry) {
         return false;
@@ -132,28 +135,21 @@ fn ip_in(ip: std::net::IpAddr, entry: &str) -> bool {
     let Ok(net) = addr.trim().parse::<std::net::IpAddr>() else {
         return false;
     };
-    let (ip, net) = (ip.to_canonical(), net.to_canonical());
-    match (ip, net) {
-        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
-            let bits = bits.unwrap_or(32).min(32);
-            let mask = if bits == 0 {
-                0
-            } else {
-                u32::MAX << (32 - bits)
-            };
-            u32::from(a) & mask == u32::from(b) & mask
-        }
-        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
-            let bits = bits.unwrap_or(128).min(128);
-            let mask = if bits == 0 {
-                0
-            } else {
-                u128::MAX << (128 - bits)
-            };
-            u128::from(a) & mask == u128::from(b) & mask
-        }
-        _ => false,
+    let as_v6 = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+        std::net::IpAddr::V6(v6) => v6,
+    };
+    let bits = match net {
+        std::net::IpAddr::V4(_) => bits.unwrap_or(32) + 96,
+        std::net::IpAddr::V6(_) => bits.unwrap_or(128),
     }
+    .min(128);
+    let mask = if bits == 0 {
+        0
+    } else {
+        u128::MAX << (128 - bits)
+    };
+    u128::from(as_v6(ip)) & mask == u128::from(as_v6(net)) & mask
 }
 
 pub fn is_trusted_proxy(ip: std::net::IpAddr) -> bool {

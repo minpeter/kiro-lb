@@ -428,11 +428,10 @@ static POLICY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 #[derive(Debug)]
 pub struct PolicyUnavailable;
 
-fn stored_models(raw: Option<String>) -> Result<Option<HashSet<String>>, ()> {
+fn stored_models(raw: Option<String>) -> Result<Option<HashSet<String>>, serde_json::Error> {
     raw.map(|text| {
         serde_json::from_str::<Vec<String>>(&text)
             .map(|list| list.iter().map(|m| model_key(m)).collect())
-            .map_err(drop)
     })
     .transpose()
 }
@@ -463,16 +462,22 @@ fn key_policy(key_id: &str) -> Result<Arc<KeyPolicy>, PolicyUnavailable> {
         let mut stmt =
             c.prepare("SELECT id, request_limit, token_limit, allowed_models FROM api_keys")?;
         let rows = stmt.query_map([], |r| {
+            let id = r.get::<_, String>(0)?;
             let models = stored_models(r.get(3)?);
+            if let Err(e) = &models {
+                tracing::error!(
+                    "API key {id} has an unreadable allowed_models list and is refused until it is edited: {e}"
+                );
+            }
             Ok((
-                r.get::<_, String>(0)?,
+                id,
                 Arc::new(KeyPolicy {
                     limits: KeyLimits {
                         requests: r.get(1)?,
                         tokens: r.get(2)?,
                     },
-                    models: models.clone().unwrap_or_default(),
                     unreadable: models.is_err(),
+                    models: models.unwrap_or_default(),
                 }),
             ))
         })?;
