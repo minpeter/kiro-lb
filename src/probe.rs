@@ -41,7 +41,7 @@ async fn once(
         }
     };
     let arn = auth.request_profile_arn();
-    let mut body = json!({"conversationState": {"chatTriggerType": "MANUAL", "conversationId": uuid::Uuid::new_v4().to_string(), "currentMessage": {"userInputMessage": {"content": PROMPT, "userInputMessageContext": {"envState": {"operatingSystem": std::env::consts::OS}}, "origin": "KIRO_CLI", "modelId": model}}, "agentTaskType": "vibe"}});
+    let mut body = json!({"conversationState": {"chatTriggerType": "MANUAL", "conversationId": uuid::Uuid::new_v4().to_string(), "currentMessage": {"userInputMessage": {"content": PROMPT, "userInputMessageContext": {"envState": {"operatingSystem": std::env::consts::OS}}, "origin": crate::convert_core::ORIGIN, "modelId": model}}, "agentTaskType": crate::convert_core::AGENT_TASK_TYPE}});
     if let Some(a) = &arn {
         body["profileArn"] = json!(a);
     }

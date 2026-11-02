@@ -296,6 +296,20 @@ pub fn trim_to_limit(
         };
     };
     let original_entries = history.len();
+    // The leading system-prompt pair is the instructions, not conversation:
+    // dropping it would send the request without them. When the rest of the
+    // history cannot make room, the payload stays over the cap and the caller
+    // answers TooLarge.
+    let keep = if history.len() >= 2
+        && history[0].get("userInputMessage").is_some()
+        && history[1].pointer("/assistantResponseMessage/content")
+            == Some(&Value::String(
+                crate::convert_core::SYSTEM_PROMPT_ACK.to_owned(),
+            )) {
+        2
+    } else {
+        0
+    };
     for entry in history.iter_mut() {
         if let Some(a) = entry
             .get_mut("assistantResponseMessage")
@@ -320,7 +334,7 @@ pub fn trim_to_limit(
     };
     let (mut rem_t, mut rem_b) = (original_tokens as f64, original_bytes as f64);
     let target = max_tokens.map(|t| t as f64 * 0.97);
-    let mut index = 0;
+    let mut index = keep;
     while index < history.len() {
         let over_t = target.is_some_and(|t| rem_t > t);
         let over_b = max_bytes.is_some_and(|b| rem_b > b as f64);
@@ -335,15 +349,15 @@ pub fn trim_to_limit(
             }
         }
     }
-    history.drain(..index);
+    history.drain(keep..index);
     loop {
         let snapshot = payload.clone();
         let h = history_mut(payload).unwrap();
-        if h.is_empty() || !over_limit(&snapshot, max_bytes, max_tokens) {
+        if h.len() <= keep || !over_limit(&snapshot, max_bytes, max_tokens) {
             break;
         }
-        let n = h.len().min(2);
-        h.drain(..n);
+        let n = (h.len() - keep).min(2);
+        h.drain(keep..keep + n);
     }
     let state = payload
         .get_mut("conversationState")

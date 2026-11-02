@@ -108,6 +108,19 @@ pub fn context_overflow_error(anthropic: bool, tokens: u64, limit: u64) -> Respo
     )
 }
 
+/// Whether a TRUSTED_PROXIES entry is an IP or a CIDR this module can match.
+pub fn valid_proxy_entry(entry: &str) -> bool {
+    let (addr, bits) = match entry.split_once('/') {
+        Some((a, b)) => (a, Some(b)),
+        None => (entry, None),
+    };
+    let Ok(ip) = addr.trim().parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    bits.is_none_or(|b| b.trim().parse::<u32>().is_ok_and(|b| b <= max))
+}
+
 fn ip_in(ip: std::net::IpAddr, entry: &str) -> bool {
     let (addr, bits) = match entry.split_once('/') {
         Some((a, b)) => (a, b.parse::<u32>().ok()),

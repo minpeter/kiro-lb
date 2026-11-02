@@ -88,6 +88,7 @@ pub fn prune_rate_observations() -> usize {
 }
 
 pub fn flush_key_model_usage() -> usize {
+    let _gate = usage_tracking::FLUSH_GATE.write();
     let pending = usage_tracking::drain_pending();
     if pending.is_empty() {
         return 0;
@@ -323,7 +324,9 @@ static KEY_CACHE: Mutex<Option<HashMap<[u8; 32], (Option<String>, Instant)>>> = 
 
 pub fn invalidate_key_cache() {
     *KEY_CACHE.lock() = None;
-    *POLICY_CACHE.lock() = None;
+    let mut policies = POLICY_CACHE.lock();
+    POLICY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *policies = None;
 }
 
 /// Caps on what one key may use in total. `None` means unlimited.
@@ -409,18 +412,32 @@ pub fn parse_limit(field: &str, value: &Value) -> Result<Option<i64>, String> {
     }
 }
 
-static POLICY_CACHE: Mutex<Option<HashMap<String, Arc<KeyPolicy>>>> = Mutex::new(None);
+type PolicyMap = HashMap<String, Arc<KeyPolicy>>;
+
+/// Policies are reloaded at least this often, so an edit made by another
+/// gateway process on the same store (blue/green) reaches this one.
+const POLICY_TTL: Duration = Duration::from_secs(30);
+static POLICY_CACHE: Mutex<Option<(PolicyMap, Instant)>> = Mutex::new(None);
+static POLICY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A key's limits or model list could not be read. The caller refuses the
+/// request: serving it would drop the restriction the owner set.
+#[derive(Debug)]
+pub struct PolicyUnavailable;
 
 fn stored_models(raw: Option<String>) -> Option<HashSet<String>> {
     raw.and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
         .map(|list| list.iter().map(|m| model_key(m)).collect())
 }
 
-fn key_policy(key_id: &str) -> Arc<KeyPolicy> {
-    if let Some(cache) = POLICY_CACHE.lock().as_ref() {
-        return cache.get(key_id).cloned().unwrap_or_default();
+fn key_policy(key_id: &str) -> Result<Arc<KeyPolicy>, PolicyUnavailable> {
+    if let Some((cache, at)) = POLICY_CACHE.lock().as_ref() {
+        if at.elapsed() < POLICY_TTL {
+            return Ok(cache.get(key_id).cloned().unwrap_or_default());
+        }
     }
-    let loaded: HashMap<String, Arc<KeyPolicy>> = store::with(|c| {
+    let generation = POLICY_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    let loaded: PolicyMap = store::with(|c| {
         let mut stmt =
             c.prepare("SELECT id, request_limit, token_limit, allowed_models FROM api_keys")?;
         let rows = stmt.query_map([], |r| {
@@ -437,26 +454,38 @@ fn key_policy(key_id: &str) -> Arc<KeyPolicy> {
         })?;
         rows.collect()
     })
-    .unwrap_or_default();
+    .map_err(|e| {
+        tracing::error!("Cannot read API key policies: {e}");
+        PolicyUnavailable
+    })?;
     let found = loaded.get(key_id).cloned().unwrap_or_default();
-    *POLICY_CACHE.lock() = Some(loaded);
-    found
+    let mut cache = POLICY_CACHE.lock();
+    // A key edit that landed while this load ran bumped the generation; the
+    // stale map must not overwrite the cache it cleared.
+    if POLICY_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == generation {
+        *cache = Some((loaded, Instant::now()));
+    }
+    Ok(found)
 }
 
 /// Whether the key may call `model`, under any of its spellings.
-pub fn key_allows_model(key_id: &str, model: &str) -> bool {
-    key_policy(key_id)
+pub fn key_allows_model(key_id: &str, model: &str) -> Result<bool, PolicyUnavailable> {
+    Ok(key_policy(key_id)?
         .models
         .as_ref()
-        .is_none_or(|allowed| allowed.contains(&model_key(model)))
+        .is_none_or(|allowed| allowed.contains(&model_key(model))))
 }
 
 /// The models the key is limited to, or `None` when it may call all of them.
-pub fn key_allowed_models(key_id: &str) -> Option<HashSet<String>> {
-    key_policy(key_id).models.clone()
+pub fn key_allowed_models(key_id: &str) -> Result<Option<HashSet<String>>, PolicyUnavailable> {
+    Ok(key_policy(key_id)?.models.clone())
 }
 
-fn key_usage_totals(key_id: &str) -> (i64, i64) {
+fn key_usage_totals(key_id: &str) -> Result<(i64, i64), PolicyUnavailable> {
+    // Shared with the flush, which holds it exclusively from draining the
+    // pending batch until the rows are in SQLite: otherwise a batch could be
+    // in neither place for a moment and a key would look under its limit.
+    let _gate = usage_tracking::FLUSH_GATE.read();
     let stored = store::with(|c| {
         c.query_row(
             "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(prompt_tokens + completion_tokens), 0) FROM key_model_usage WHERE key_id = ?1",
@@ -464,34 +493,35 @@ fn key_usage_totals(key_id: &str) -> (i64, i64) {
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )
     })
-    .unwrap_or((0, 0));
-    // Read the database first: a flush that lands in between can only make the
-    // total look smaller for a moment, never push a key over its limit early.
+    .map_err(|e| {
+        tracing::error!("Cannot read API key usage: {e}");
+        PolicyUnavailable
+    })?;
     let (requests, tokens) = usage_tracking::pending_key_totals(key_id);
-    (stored.0 + requests, stored.1 + tokens)
+    Ok((stored.0 + requests, stored.1 + tokens))
 }
 
 /// The limit this key has already reached, if any. Called before a generation,
 /// so a request already running when the limit is hit can still finish.
-pub fn key_limit_hit(key_id: &str) -> Option<LimitHit> {
-    let limits = key_policy(key_id).limits;
+pub fn key_limit_hit(key_id: &str) -> Result<Option<LimitHit>, PolicyUnavailable> {
+    let limits = key_policy(key_id)?.limits;
     if limits == KeyLimits::default() {
-        return None;
+        return Ok(None);
     }
-    let (requests, tokens) = key_usage_totals(key_id);
+    let (requests, tokens) = key_usage_totals(key_id)?;
     if let Some(limit) = limits.tokens.filter(|l| tokens >= *l) {
-        return Some(LimitHit::Tokens {
+        return Ok(Some(LimitHit::Tokens {
             used: tokens,
             limit,
-        });
+        }));
     }
-    limits
+    Ok(limits
         .requests
         .filter(|l| requests >= *l)
         .map(|limit| LimitHit::Requests {
             used: requests,
             limit,
-        })
+        }))
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {

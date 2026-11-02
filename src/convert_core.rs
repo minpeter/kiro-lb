@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use crate::config;
 use crate::payload_guard::{self, PayloadTooLarge};
 
-const AGENT_TASK_TYPE: &str = "vibe";
-const ORIGIN: &str = "KIRO_CLI";
+pub const AGENT_TASK_TYPE: &str = "vibe";
+pub const ORIGIN: &str = "KIRO_CLI";
 pub const SYSTEM_PROMPT_ACK: &str = "I will fully incorporate this information when generating my responses, and explicitly acknowledge relevant parts of the summary when answering questions.";
 
 #[derive(Clone, Debug, Default)]

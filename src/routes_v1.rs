@@ -86,9 +86,6 @@ async fn authenticate(
     })
 }
 
-/// Authenticates a generation request and refuses it once its key has used up
-/// a token or request limit. The answer is the one a spent balance gets, so
-/// clients stop instead of retrying.
 /// Rejects a request with no valid key from its headers alone, before the
 /// body is read: otherwise an unauthenticated client could make the gateway
 /// buffer a 64 MiB body per connection before being told 401.
@@ -103,6 +100,19 @@ pub async fn preauthorize(headers: &HeaderMap, path: &str) -> Result<(), Respons
         .map(drop)
 }
 
+/// A key's restrictions could not be read. Retryable, and never served
+/// unrestricted.
+fn policy_unavailable(protocol: Protocol) -> Response {
+    let message = "API key policy is temporarily unavailable. Retry shortly.";
+    match protocol {
+        Protocol::Anthropic => anthropic_error(503, "api_error", message),
+        Protocol::OpenAI => openai_error(503, message),
+    }
+}
+
+/// Authenticates a generation request and refuses it once its key has used up
+/// a token or request limit. The answer is the one a spent balance gets, so
+/// clients stop instead of retrying.
 async fn authenticate_generation(
     headers: &HeaderMap,
     protocol: Protocol,
@@ -110,10 +120,10 @@ async fn authenticate_generation(
 ) -> Result<String, Response> {
     let key = authenticate(headers, protocol, allow_x_api_key).await?;
     let id = key.clone();
-    let hit = tokio::task::spawn_blocking(move || dashboard_store::key_limit_hit(&id))
-        .await
-        .ok()
-        .flatten();
+    let hit = match tokio::task::spawn_blocking(move || dashboard_store::key_limit_hit(&id)).await {
+        Ok(Ok(hit)) => hit,
+        _ => return Err(policy_unavailable(protocol)),
+    };
     let Some(hit) = hit else { return Ok(key) };
     let (what, used, limit) = match hit {
         dashboard_store::LimitHit::Tokens { used, limit } => ("token", used, limit),
@@ -138,12 +148,11 @@ async fn authenticate_generation(
 async fn forbid_model(key: Option<&str>, model: &str, protocol: Protocol) -> Option<Response> {
     let key = key?.to_owned();
     let asked = model.to_owned();
-    let allowed =
-        tokio::task::spawn_blocking(move || dashboard_store::key_allows_model(&key, &asked))
-            .await
-            .unwrap_or(true);
-    if allowed {
-        return None;
+    match tokio::task::spawn_blocking(move || dashboard_store::key_allows_model(&key, &asked)).await
+    {
+        Ok(Ok(true)) => return None,
+        Ok(Ok(false)) => {}
+        _ => return Some(policy_unavailable(protocol)),
     }
     tracing::warn!("API key refused for model {model}: not in its allowed models");
     Some(match protocol {
@@ -160,12 +169,16 @@ async fn forbid_model(key: Option<&str>, model: &str, protocol: Protocol) -> Opt
 }
 
 /// Drops from a model list what the key may not call.
-async fn retain_allowed(key: &str, views: &mut Vec<Value>) {
+async fn retain_allowed(key: &str, views: &mut Vec<Value>) -> Result<(), Response> {
     let key = key.to_owned();
-    let allowed = tokio::task::spawn_blocking(move || dashboard_store::key_allowed_models(&key))
-        .await
-        .ok()
-        .flatten();
+    let allowed = match tokio::task::spawn_blocking(move || {
+        dashboard_store::key_allowed_models(&key)
+    })
+    .await
+    {
+        Ok(Ok(allowed)) => allowed,
+        _ => return Err(policy_unavailable(Protocol::OpenAI)),
+    };
     if let Some(allowed) = allowed {
         views.retain(|m| {
             m["id"]
@@ -173,6 +186,7 @@ async fn retain_allowed(key: &str, views: &mut Vec<Value>) {
                 .is_some_and(|id| allowed.contains(&crate::settings::listing_key(id)))
         });
     }
+    Ok(())
 }
 
 fn parse_body(body: &Bytes, protocol: Protocol) -> Result<Value, Response> {
@@ -1217,7 +1231,9 @@ pub async fn models(State(state): State<Shared>, headers: HeaderMap) -> Response
         return r;
     }
     let mut data = model_views(&state);
-    retain_allowed(&key, &mut data).await;
+    if let Err(r) = retain_allowed(&key, &mut data).await {
+        return r;
+    }
     let first = data.first().map(|m| m["id"].clone()).unwrap_or(Value::Null);
     let last = data.last().map(|m| m["id"].clone()).unwrap_or(Value::Null);
     json_response(
@@ -1240,7 +1256,9 @@ pub async fn model(
     }
     let wanted = crate::model_resolver::get_model_id_for_kiro(&id);
     let mut views = model_views(&state);
-    retain_allowed(&key, &mut views).await;
+    if let Err(r) = retain_allowed(&key, &mut views).await {
+        return r;
+    }
     match views.into_iter().find(|m| {
         m["id"] == id.as_str()
             || m["id"]

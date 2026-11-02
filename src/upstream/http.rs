@@ -221,11 +221,13 @@ fn proxy_attempt_order() -> Vec<String> {
 
 /// A person reads a reply for longer than 90s, so the old idle timeout closed
 /// the connection before almost every prompt and each one paid a fresh TLS
-/// handshake to Kiro (~340ms). Idle connections are kept for 30 minutes; Kiro
-/// itself closes a silent HTTP/1.1 connection after 250–400s (measured
-/// 2026-11-01). UPSTREAM_HTTP2=true restores HTTP/2 with a PING every 20s,
-/// which holds connections longer but is not what any Kiro client sends.
+/// handshake to Kiro (~340ms). Kiro closes a silent HTTP/1.1 connection after
+/// 250–400s (measured 2026-11-01), so HTTP/1.1 connections are retired at 240s,
+/// before a request can be written to a socket Kiro is closing.
+/// UPSTREAM_HTTP2=true restores HTTP/2 with a PING every 20s, which keeps a
+/// connection alive for 30 minutes but is not what any Kiro client sends.
 pub const POOL_IDLE_SECONDS: u64 = 30 * 60;
+pub const HTTP1_POOL_IDLE_SECONDS: u64 = 240;
 pub const HTTP2_PING_SECONDS: u64 = 20;
 pub const HTTP2_PING_TIMEOUT_SECONDS: u64 = 10;
 
@@ -261,7 +263,11 @@ pub fn upstream_builder(proxy: Option<&str>) -> reqwest::ClientBuilder {
         .read_timeout(Duration::from_secs_f64(
             config::get().streaming_read_timeout.max(1.0),
         ))
-        .pool_idle_timeout(Duration::from_secs(POOL_IDLE_SECONDS))
+        .pool_idle_timeout(Duration::from_secs(if http2 {
+            POOL_IDLE_SECONDS
+        } else {
+            HTTP1_POOL_IDLE_SECONDS
+        }))
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(30))

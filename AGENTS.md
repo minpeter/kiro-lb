@@ -93,6 +93,15 @@ kiro-lb/
   send. The Sec-Fetch-Site / Origin check applies with a password too.
 - `X-Forwarded-For` counts only from a peer in `TRUSTED_PROXIES` (default
   loopback); the client is the right-most hop that is not a trusted proxy.
+- A key's limits and model list fail closed: when they or its usage cannot be
+  read, the request gets a retryable 503, never unrestricted service. The
+  policy cache reloads every 30s, is never filled from a failed read, and a
+  load that raced a key edit does not overwrite the cleared cache. The flush
+  holds `usage_tracking::FLUSH_GATE` exclusively, so a limit check never sees a
+  batch missing from both SQLite and the pending map.
+- Auto-trim keeps the leading system-prompt pair; when the rest of the history
+  cannot make room, the request fails with TooLarge instead of going upstream
+  without its instructions.
 - API key limits (`api_keys.request_limit`, `token_limit`) count the key's
   whole usage from `key_model_usage` plus the unflushed batch, are read from an
   in-memory cache that every key edit clears, and are checked before a
@@ -144,9 +153,11 @@ kiro-lb/
   conversation with the same prompt and another question costs ~0.07 instead of
   ~0.25 credits and reaches the first token ~0.5s sooner (2026-11-01).
 - Closing idle upstream connections early. Each new TLS connection to Kiro
-  costs ~340ms and a reader idles longer than 90s between prompts; the pool
-  keeps connections 30 min. Kiro closes a silent HTTP/1.1 connection after
-  250–400s; `UPSTREAM_HTTP2=true` brings back HTTP/2 with a PING every 20s.
+  costs ~340ms and a reader idles longer than 90s between prompts. Kiro closes
+  a silent HTTP/1.1 connection after 250–400s, so HTTP/1.1 connections are
+  retired at 240s, before a request can land on a socket Kiro is closing;
+  `UPSTREAM_HTTP2=true` brings back HTTP/2 with a PING every 20s and a 30 min
+  pool.
 - Shrinking the 1M window to 666667. `contextUsagePercentage` is a share of the
   advertised window for every model; the newer Claude tokenizer spends more
   tokens on Latin text (1.38x English vs Opus 4.6), while digits and Hangul

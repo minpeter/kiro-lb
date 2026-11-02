@@ -4,8 +4,12 @@ const SUFFIX: Record<string, number> = { k: 1e3, m: 1e6, b: 1e9 };
 
 /** An empty field means no limit; digits take an optional k, m or b suffix (5m = 5,000,000). */
 export function parseLimit(text: string): LimitParse {
-  const cleaned = text.trim().toLowerCase().replace(/[\s,_]/g, "");
-  if (cleaned === "") return { ok: true, value: null };
+  if (text.trim() === "") return { ok: true, value: null };
+  const cleaned = text
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]/g, "")
+    .replace(/,(?=\d{3}(?!\d))/g, "");
   const match = /^(\d+(?:\.\d+)?)([kmb]?)$/.exec(cleaned);
   if (!match) return { ok: false };
   const [, digits, suffix] = match;

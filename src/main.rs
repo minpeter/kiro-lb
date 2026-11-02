@@ -407,6 +407,15 @@ async fn serve(host: String, port: u16) -> Option<kiro_lb::update_install::Insta
             }
         );
     }
+    for entry in cfg
+        .trusted_proxies
+        .iter()
+        .filter(|e| !app::valid_proxy_entry(e))
+    {
+        tracing::warn!(
+            "TRUSTED_PROXIES entry {entry:?} is not an IP or CIDR and is ignored; X-Forwarded-For from that proxy will not be trusted"
+        );
+    }
     if cfg.first_token_timeout >= cfg.streaming_read_timeout {
         tracing::warn!(
             "FIRST_TOKEN_TIMEOUT ({}s) >= STREAMING_READ_TIMEOUT ({}s); the first should be lower",

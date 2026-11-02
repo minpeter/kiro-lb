@@ -193,6 +193,10 @@ impl LockExt for parking_lot::MutexGuard<'_, Option<HashMap<Key, PendingUsage>>>
 
 pub type UsageRow = (String, String, String, i64, i64, i64, i64, i64, Option<f64>);
 
+/// Held exclusively by the flush and shared by limit checks; see
+/// `dashboard_store::key_usage_totals`.
+pub static FLUSH_GATE: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
 pub fn drain_pending() -> Vec<UsageRow> {
     let mut guard = PENDING.lock();
     guard

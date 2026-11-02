@@ -23,11 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/v1` generation routes reject a missing or invalid key before reading the request body, and dashboard routes check the session first and cap bodies at 64 KiB (login) and 8 MiB, so unauthenticated clients can no longer make the gateway buffer 64 MiB per connection
 - `/metrics` accepts only `METRICS_TOKEN` or `PROXY_API_KEY`; dashboard-issued keys, which may be handed to other people, no longer see every key's usage
 - the dashboard refuses same-site and cross-site browser requests with a password too, and its POST/PUT/PATCH routes require `Content-Type: application/json`, so a forged form post from a sibling subdomain is rejected
-- the request log takes the client address from `X-Forwarded-For` only when the connection comes from a proxy in `TRUSTED_PROXIES` (default loopback)
+- the request log takes the client address from `X-Forwarded-For` only when the connection comes from a proxy in `TRUSTED_PROXIES` (default loopback); an entry that is not an IP or CIDR is reported at startup
+- a key's limits and model list fail closed: when they or its usage cannot be read, the request gets a retryable 503 instead of being served unrestricted
 
 ### Fixed
 
 - account quota counts Kiro's extra credits: active bonuses (first-upgrade trial credits), purchased add-ons and an active free trial are added to the plan allowance, so an account whose plan reads 978/978 with 462 bonus credits left is no longer shown or routed as out of quota
+- automatic history trimming keeps the system prompt; a request it cannot fit fails as too large instead of reaching Kiro without its instructions
+- idle HTTP/1.1 upstream connections are retired after 240s, before Kiro closes them (250–400s), so a request is not written to a closing socket
+- the API key limit fields reject separator-only input and decimal commas (`1,5m`) instead of reading them as no limit or as 15M
 - the system prompt is sent as its own leading message pair instead of being prepended to the first question, so a new conversation with the same system prompt reuses Kiro's prompt cache (~0.07 instead of ~0.25 credits on Sonnet 5.5 and ~0.5s faster to the first token)
 
 ## [0.2.10](https://github.com/minpeter/kiro-lb/compare/v0.2.9...v0.2.10) - 2026-10-25
