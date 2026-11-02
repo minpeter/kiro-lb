@@ -393,7 +393,7 @@ async fn complete_with_params(
     };
     let mut flow = flow;
     flow.provider = provider;
-    match exchange_code(exchange, &flow.machine_id(), code, &flow.verifier, &option).await {
+    match exchange_code(exchange, code, &flow.verifier, &option).await {
         Ok(token) => {
             flow.token = Some(token);
             tracing::info!("{provider} browser sign-in {} approved", flow.id);
@@ -405,7 +405,6 @@ async fn complete_with_params(
 
 async fn exchange_code(
     exchange: &Exchange,
-    machine_id: &str,
     code: &str,
     verifier: &str,
     option: &str,
@@ -414,10 +413,7 @@ async fn exchange_code(
         .http
         .post(&exchange.token_url)
         .header(reqwest::header::ACCEPT, "application/json")
-        .header(
-            reqwest::header::USER_AGENT,
-            crate::utils::refresh_user_agent(machine_id),
-        )
+        .header(reqwest::header::USER_AGENT, crate::utils::AUTH_USER_AGENT)
         .json(&json!({"code": code, "code_verifier": verifier, "redirect_uri": exchange_redirect_uri(option)}))
         .timeout(Duration::from_secs(20))
         .send()

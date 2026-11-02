@@ -7,6 +7,8 @@ use crate::config;
 use crate::payload_guard::{self, PayloadTooLarge};
 
 const AGENT_TASK_TYPE: &str = "vibe";
+const ORIGIN: &str = "KIRO_CLI";
+pub const SYSTEM_PROMPT_ACK: &str = "I will fully incorporate this information when generating my responses, and explicitly acknowledge relevant parts of the summary when answering questions.";
 
 #[derive(Clone, Debug, Default)]
 pub struct UnifiedMessage {
@@ -631,14 +633,12 @@ fn merge_adjacent_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage>
     merged
 }
 
-fn build_user_entry(msg: &UnifiedMessage, model_id: &str) -> Value {
+fn build_user_entry(msg: &UnifiedMessage) -> Value {
     let mut user = Map::new();
     user.insert(
         "content".into(),
         Value::String(extract_text_content(&msg.content)),
     );
-    user.insert("modelId".into(), json!(model_id));
-    user.insert("origin".into(), json!("AI_EDITOR"));
     let images = convert_images_to_kiro_format(&images_of(msg));
     if !images.is_empty() {
         user.insert("images".into(), Value::Array(images));
@@ -653,7 +653,19 @@ fn build_user_entry(msg: &UnifiedMessage, model_id: &str) -> Value {
             json!({"toolResults": results}),
         );
     }
+    user.insert("origin".into(), json!(ORIGIN));
     json!({"userInputMessage": user})
+}
+
+/// The system prompt travels as its own leading user/assistant pair, as both
+/// Kiro CLI engines send steering. Kiro caches at message boundaries, so a new
+/// conversation that shares the prompt but asks something else still reuses it;
+/// prepended to the first question, every first turn paid a cold prefix.
+fn system_prompt_entries(system: &str) -> [Value; 2] {
+    [
+        json!({"userInputMessage": {"content": system, "origin": ORIGIN}}),
+        json!({"assistantResponseMessage": {"content": SYSTEM_PROMPT_ACK}}),
+    ]
 }
 
 fn build_assistant_entry(msg: &UnifiedMessage) -> Result<Value, BuildError> {
@@ -678,14 +690,11 @@ fn build_assistant_entry(msg: &UnifiedMessage) -> Result<Value, BuildError> {
     Ok(json!({"assistantResponseMessage": a}))
 }
 
-pub fn build_kiro_history(
-    messages: &[UnifiedMessage],
-    model_id: &str,
-) -> Result<Vec<Value>, BuildError> {
+pub fn build_kiro_history(messages: &[UnifiedMessage]) -> Result<Vec<Value>, BuildError> {
     let mut history = Vec::with_capacity(messages.len());
     for msg in messages {
         match msg.role.as_str() {
-            "user" => history.push(build_user_entry(msg, model_id)),
+            "user" => history.push(build_user_entry(msg)),
             "assistant" => history.push(build_assistant_entry(msg)?),
             _ => {}
         }
@@ -744,35 +753,24 @@ pub fn build_kiro_payload(
     }
 
     let current = alternating.pop().unwrap();
-    let mut history_messages = alternating;
+    let mut history = Vec::with_capacity(alternating.len() + 3);
     if !full_system.is_empty() {
-        if let Some(first) = history_messages.first_mut().filter(|f| f.role == "user") {
-            first.content = Value::String(format!(
-                "{full_system}\n\n{}",
-                extract_text_content(&first.content)
-            ));
-        }
+        history.extend(system_prompt_entries(&full_system));
     }
-    let mut history = build_kiro_history(&history_messages, model_id)?;
+    history.extend(build_kiro_history(&alternating)?);
 
     let mut current_content = extract_text_content(&current.content);
-    if !full_system.is_empty() && history.is_empty() {
-        current_content = format!("{full_system}\n\n{current_content}");
-    }
     if current.role == "assistant" {
-        history.extend(build_kiro_history(
-            std::slice::from_ref(&current),
-            model_id,
-        )?);
+        history.extend(build_kiro_history(std::slice::from_ref(&current))?);
         current_content = String::new();
     }
 
     let kiro_images = convert_images_to_kiro_format(&images_of(&current));
     let mut context = Map::new();
-    let kiro_tools = convert_tools_to_kiro_format(processed_tools.as_ref());
-    if !kiro_tools.is_empty() {
-        context.insert("tools".into(), Value::Array(kiro_tools));
-    }
+    context.insert(
+        "envState".into(),
+        json!({"operatingSystem": std::env::consts::OS}),
+    );
     let results = match current.tool_results.as_ref().filter(|r| !r.is_empty()) {
         Some(r) => convert_tool_results_to_kiro_format(r),
         None => extract_tool_results_from_content(&current.content),
@@ -780,37 +778,33 @@ pub fn build_kiro_payload(
     if !results.is_empty() {
         context.insert("toolResults".into(), Value::Array(results));
     }
+    let kiro_tools = convert_tools_to_kiro_format(processed_tools.as_ref());
+    if !kiro_tools.is_empty() {
+        context.insert("tools".into(), Value::Array(kiro_tools));
+    }
 
     let mut user_input = Map::new();
     user_input.insert("content".into(), Value::String(current_content));
-    user_input.insert("modelId".into(), json!(model_id));
-    user_input.insert("origin".into(), json!("AI_EDITOR"));
     if !kiro_images.is_empty() {
         user_input.insert("images".into(), Value::Array(kiro_images));
     }
-    if !context.is_empty() {
-        user_input.insert("userInputMessageContext".into(), Value::Object(context));
-    }
+    user_input.insert("userInputMessageContext".into(), Value::Object(context));
+    user_input.insert("origin".into(), json!(ORIGIN));
+    user_input.insert("modelId".into(), json!(model_id));
 
     let mut state = Map::new();
-    state.insert("chatTriggerType".into(), json!("MANUAL"));
     state.insert("conversationId".into(), json!(conversation_id));
+    if !history.is_empty() {
+        state.insert("history".into(), Value::Array(history));
+    }
     state.insert(
         "currentMessage".into(),
         json!({"userInputMessage": user_input}),
     );
-    let mut payload = Map::new();
+    state.insert("chatTriggerType".into(), json!("MANUAL"));
     state.insert("agentTaskType".into(), json!(AGENT_TASK_TYPE));
-    state.insert(
-        "agentContinuationId".into(),
-        json!(uuid::Uuid::new_v4().to_string()),
-    );
-    state.insert("rootConversationId".into(), json!(conversation_id));
-    if !history.is_empty() {
-        state.insert("history".into(), Value::Array(history));
-    }
+    let mut payload = Map::new();
     payload.insert("conversationState".into(), Value::Object(state));
-    payload.insert("agentMode".into(), json!(AGENT_TASK_TYPE));
     if !profile_arn.is_empty() {
         payload.insert("profileArn".into(), json!(profile_arn));
     }

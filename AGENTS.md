@@ -83,7 +83,21 @@ kiro-lb/
   `timed_completion_tokens` adds `completion - 1` so the `/metrics` ratio
   matches. Non-streaming responses have no per-token timing and record no speed.
 - Control and data planes stay separate: dashboard sessions cannot call `/v1`,
-  `/v1` keys cannot call `/api/dashboard`. `/metrics` takes a `/v1` bearer key.
+  `/v1` keys cannot call `/api/dashboard`. `/metrics` takes `METRICS_TOKEN` or
+  the env `PROXY_API_KEY` only: it lists every key's name and usage, and a
+  dashboard-issued key may belong to someone else.
+- Before a body is read: `/v1` generation routes check the key from the
+  headers (`routes_v1::preauthorize`), and `dashboard_guard` checks the session
+  and the site, caps bodies (64 KiB login, 8 MiB otherwise) and requires
+  `Content-Type: application/json` on POST/PUT/PATCH, which an HTML form cannot
+  send. The Sec-Fetch-Site / Origin check applies with a password too.
+- `X-Forwarded-For` counts only from a peer in `TRUSTED_PROXIES` (default
+  loopback); the client is the right-most hop that is not a trusted proxy.
+- API key limits (`api_keys.request_limit`, `token_limit`) count the key's
+  whole usage from `key_model_usage` plus the unflushed batch, are read from an
+  in-memory cache that every key edit clears, and are checked before a
+  generation only (`/v1/models` and `count_tokens` stay open). A request
+  already running when the limit is hit still finishes.
 - The SQLite store never holds prompts, completions or raw client keys. New
   columns arrive by additive `PRAGMA table_info` + `ALTER TABLE`.
 - Request bodies have no axum size limit (`DefaultBodyLimit::disable`); the
@@ -97,6 +111,7 @@ kiro-lb/
   (eslint `react-refresh/only-export-components`). UI strings go through
   `usePreferences().t` with catalogs in `frontend/src/features/dashboard/i18n/`;
   en-US text must stay identical to what tests assert.
+- A key's `allowed_models` is stored by Kiro id and compared through `listing_key`, so every spelling of a model matches. The gate runs in `messages`, `count_tokens` and `openai_plan` (403), and `/v1/models` filters by it.
 - Code, comments and identifiers are English only.
 
 ## ANTI-PATTERNS (THIS PROJECT)
@@ -118,14 +133,20 @@ kiro-lb/
   attestations, and one session's signatures measured 794k tokens while
   contextUsage reported ~19% (#93).
 - Hoisting a mid-conversation `system`/`developer` message into the system
-  prompt. The system prompt is prepended to the first history turn, so a
-  message that changes every turn (Claude Code's `<total_tokens>`) changed the
-  prompt prefix and defeated Kiro's per-account prompt cache. Only leading
-  system messages become the system prompt; later ones stay in place as
-  `<system-reminder>` user text.
+  prompt. The system prompt opens the history, so a message that changes
+  every turn (Claude Code's `<total_tokens>`) changed the prompt prefix and
+  defeated Kiro's per-account prompt cache. Only leading system messages
+  become the system prompt; later ones stay in place as `<system-reminder>`
+  user text.
+- Prepending the system prompt to the first user message. It travels as its
+  own leading user/assistant pair (`SYSTEM_PROMPT_ACK`), as both Kiro CLI
+  engines send steering: Kiro caches at message boundaries, so a new
+  conversation with the same prompt and another question costs ~0.07 instead of
+  ~0.25 credits and reaches the first token ~0.5s sooner (2026-11-01).
 - Closing idle upstream connections early. Each new TLS connection to Kiro
   costs ~340ms and a reader idles longer than 90s between prompts; the pool
-  keeps connections 30 min with an HTTP/2 PING every 20s.
+  keeps connections 30 min. Kiro closes a silent HTTP/1.1 connection after
+  250–400s; `UPSTREAM_HTTP2=true` brings back HTTP/2 with a PING every 20s.
 - Shrinking the 1M window to 666667. `contextUsagePercentage` is a share of the
   advertised window for every model; the newer Claude tokenizer spends more
   tokens on Latin text (1.38x English vs Opus 4.6), while digits and Hangul
@@ -157,6 +178,8 @@ kiro-lb/
 - Sending `access-control-allow-origin: *` on `/api/dashboard`. Only `/v1`
   answers any origin; with `DASHBOARD_AUTH=false` the dashboard also refuses
   cross-site requests, since no cookie stands in the way.
+- Answering a key over its limit with 429 or 5xx. Clients retry those; it gets
+  the same 402 as a spent balance.
 - Answering a spent pool with 503. Clients retry 5xx; a missing model, an
   exhausted monthly quota or a suspended pool gets 404/402/403 instead.
 - Sending a model absent from an account's catalog to that account, even as a
@@ -167,9 +190,15 @@ kiro-lb/
   failed refreshes preserve their successful timestamp and retry after 60s.
   `/v1/models` lists only supported IDs and aliases with supported targets.
 - Labelling a Prometheus series with a raw model name.
-- Sharing one machine id across accounts, or mixing CLI markers into the IDE
-  user agent. Headers mirror a captured Kiro IDE (`src/utils.rs`), and each
-  account's machine id derives from its login lineage (`KiroAuth::machine_id`).
+- Mixing Kiro IDE markers into the request identity. Generation and management
+  calls mirror a captured Kiro CLI 2.37.0 classic engine (`src/utils.rs`):
+  `aws-sdk-rust` user agents, `origin: KIRO_CLI`, the
+  `AmazonCodeWhispererStreamingService` target, HTTP/1.1 with no ALPN, and no
+  machine id, client attribution, `agentMode`, `agentContinuationId` or
+  `rootConversationId`. Auth calls send `User-Agent: Kiro-CLI`. The IDE 1.4.62
+  and CLI `--v3` (KAS) chat through `/v1/responses` instead, so no IDE identity
+  matches `GenerateAssistantResponse` any more. Remaining divergence: rustls
+  with ring offers no `X25519MLKEM768`, which needs the aws-lc provider.
 - Sending Builder ID generation to `q.{region}.amazonaws.com`. Keep the
   request-scoped fallback profile out of persisted credentials.
 - Weighting selection by absolute remaining quota, or letting a weight exclude

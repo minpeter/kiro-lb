@@ -128,10 +128,7 @@ async fn browser_sign_in_exchanges_the_code_with_the_registered_redirect() {
     let lineage = cred["_kiroLbLoginIdentity"].as_str().unwrap().to_owned();
     assert!(lineage.starts_with("lineage:"));
     // The exchange already speaks as the account kiro-lb is about to register.
-    assert_eq!(
-        body["_userAgent"],
-        kiro_lb::utils::refresh_user_agent(&flow.machine_id())
-    );
+    assert_eq!(body["_userAgent"], kiro_lb::utils::AUTH_USER_AGENT);
     let dir = std::env::temp_dir().join(format!(
         "kirolb-browser-login-{}",
         uuid::Uuid::new_v4().simple()

@@ -1,6 +1,6 @@
 [package]
 name = "kiro-lb"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Private Kiro API load balancer. OpenAI and Anthropic compatible."
@@ -13,7 +13,9 @@ path = "src/main.rs"
 axum = { version = "=0.8.4", default-features = false, features = ["http1", "http2", "tokio", "json", "query"] }
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "process", "io-util"] }
 tokio-util = { version = "=0.7.19", features = ["io"] }
-reqwest = { version = "=0.12.23", default-features = false, features = ["rustls-tls", "http2", "stream", "socks", "json"] }
+reqwest = { version = "=0.12.23", default-features = false, features = ["rustls-tls", "http2", "stream", "socks", "json", "gzip"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["preserve_order"] }

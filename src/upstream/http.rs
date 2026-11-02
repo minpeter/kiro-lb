@@ -221,9 +221,10 @@ fn proxy_attempt_order() -> Vec<String> {
 
 /// A person reads a reply for longer than 90s, so the old idle timeout closed
 /// the connection before almost every prompt and each one paid a fresh TLS
-/// handshake to Kiro (~340ms). Idle connections are kept for 30 minutes and
-/// an HTTP/2 PING every 20s stops Kiro from closing them first (it drops
-/// silent connections after 200–400s).
+/// handshake to Kiro (~340ms). Idle connections are kept for 30 minutes; Kiro
+/// itself closes a silent HTTP/1.1 connection after 250–400s (measured
+/// 2026-11-01). UPSTREAM_HTTP2=true restores HTTP/2 with a PING every 20s,
+/// which holds connections longer but is not what any Kiro client sends.
 pub const POOL_IDLE_SECONDS: u64 = 30 * 60;
 pub const HTTP2_PING_SECONDS: u64 = 20;
 pub const HTTP2_PING_TIMEOUT_SECONDS: u64 = 10;
@@ -232,23 +233,47 @@ pub fn build_client(proxy: Option<&str>) -> reqwest::Client {
     upstream_builder(proxy).build().expect("http client")
 }
 
+/// The Kiro CLI speaks HTTP/1.1 and offers no ALPN at all, so the TLS config is
+/// built here instead of letting the HTTP client advertise `http/1.1`.
+fn tls_config(http2: bool) -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("tls protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    if http2 {
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    }
+    config
+}
+
 /// The upstream client settings, exposed so tests can build the same client
 /// against a local server.
 pub fn upstream_builder(proxy: Option<&str>) -> reqwest::ClientBuilder {
+    let http2 = config::get().upstream_http2;
     let mut b = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs_f64(
             config::get().streaming_read_timeout.max(1.0),
         ))
         .pool_idle_timeout(Duration::from_secs(POOL_IDLE_SECONDS))
-        .http2_keep_alive_interval(Duration::from_secs(HTTP2_PING_SECONDS))
-        .http2_keep_alive_timeout(Duration::from_secs(HTTP2_PING_TIMEOUT_SECONDS))
-        .http2_keep_alive_while_idle(true)
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(30))
-        .http2_adaptive_window(true)
-        .use_rustls_tls();
+        .use_preconfigured_tls(tls_config(http2));
+    b = if http2 {
+        b.http2_keep_alive_interval(Duration::from_secs(HTTP2_PING_SECONDS))
+            .http2_keep_alive_timeout(Duration::from_secs(HTTP2_PING_TIMEOUT_SECONDS))
+            .http2_keep_alive_while_idle(true)
+            .http2_adaptive_window(true)
+    } else {
+        b.http1_only()
+    };
     if let Some(p) = proxy {
         if let Ok(px) = reqwest::Proxy::all(p) {
             b = b.proxy(px);
@@ -528,7 +553,7 @@ impl Transport {
                 .await
                 .map_err(|e| Err(TransportError::Auth(e)))?;
             let mut req = client.request(method.clone(), url);
-            let mut headers = utils::kiro_headers(&token, &auth.machine_id());
+            let mut headers = utils::kiro_headers(&token);
             for (k, v) in overrides {
                 if let Some(h) = headers
                     .iter_mut()
@@ -760,7 +785,7 @@ impl Transport {
         let proxy = proxies.first().map(String::as_str);
         let client = client_for_once(proxy)?;
         let mut request = client.post(auth.generation_url()).body(body);
-        for (name, value) in utils::kiro_headers(&token, &auth.machine_id()) {
+        for (name, value) in utils::kiro_headers(&token) {
             request = request.header(name, value);
         }
         let response = send_once(request, proxy).await?;
@@ -835,7 +860,7 @@ impl Transport {
                         &[],
                         stream,
                         retry_rate_limits,
-                        &ep.header_overrides(&auth.machine_id()),
+                        &ep.header_overrides(),
                     )
                     .await
                 {

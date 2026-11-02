@@ -5,7 +5,8 @@ use parking_lot::Mutex;
 use rusqlite::{params, OptionalExtension, Row};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::model_resolver::normalize_model_name;
@@ -322,6 +323,175 @@ static KEY_CACHE: Mutex<Option<HashMap<[u8; 32], (Option<String>, Instant)>>> = 
 
 pub fn invalidate_key_cache() {
     *KEY_CACHE.lock() = None;
+    *POLICY_CACHE.lock() = None;
+}
+
+/// Caps on what one key may use in total. `None` means unlimited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyLimits {
+    pub requests: Option<i64>,
+    pub tokens: Option<i64>,
+}
+
+/// A limit change from the dashboard: the outer `Option` says whether the
+/// field was sent, the inner one whether it is a number or `null` (unlimited).
+#[derive(Debug, Default)]
+pub struct KeyPatch {
+    pub name: Option<String>,
+    pub requests: Option<Option<i64>>,
+    pub tokens: Option<Option<i64>>,
+    pub models: Option<Option<Vec<String>>>,
+}
+
+/// What a key may do besides authenticate: its usage caps and, when set, the
+/// only models it may call. `models: None` allows every model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyPolicy {
+    pub limits: KeyLimits,
+    pub models: Option<HashSet<String>>,
+}
+
+pub const MAX_ALLOWED_MODELS: usize = 500;
+
+fn model_key(model: &str) -> String {
+    crate::settings::listing_key(model)
+}
+
+/// A key's model list as stored: Kiro ids, no duplicates. `null` is every
+/// model; an empty list is refused, because a key that can call nothing is a
+/// mistake rather than a policy.
+pub fn parse_allowed_models(value: &Value) -> Result<Option<Vec<String>>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let invalid = || {
+        format!(
+            "allowedModels must be a list of 1 to {MAX_ALLOWED_MODELS} model ids, or null for all models"
+        )
+    };
+    let list = value.as_array().ok_or_else(invalid)?;
+    if list.is_empty() || list.len() > MAX_ALLOWED_MODELS {
+        return Err(invalid());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for item in list {
+        let id = item
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.chars().count() <= 100)
+            .ok_or_else(invalid)?;
+        let key = model_key(id);
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    Ok(Some(out))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitHit {
+    Requests { used: i64, limit: i64 },
+    Tokens { used: i64, limit: i64 },
+}
+
+/// Largest limit the dashboard can send and read back as a JSON number.
+pub const MAX_KEY_LIMIT: i64 = 9_007_199_254_740_991;
+
+pub fn parse_limit(field: &str, value: &Value) -> Result<Option<i64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    match value.as_i64() {
+        Some(n) if (1..=MAX_KEY_LIMIT).contains(&n) => Ok(Some(n)),
+        _ => Err(format!(
+            "{field} must be a whole number from 1 to {MAX_KEY_LIMIT}, or null for no limit"
+        )),
+    }
+}
+
+static POLICY_CACHE: Mutex<Option<HashMap<String, Arc<KeyPolicy>>>> = Mutex::new(None);
+
+fn stored_models(raw: Option<String>) -> Option<HashSet<String>> {
+    raw.and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+        .map(|list| list.iter().map(|m| model_key(m)).collect())
+}
+
+fn key_policy(key_id: &str) -> Arc<KeyPolicy> {
+    if let Some(cache) = POLICY_CACHE.lock().as_ref() {
+        return cache.get(key_id).cloned().unwrap_or_default();
+    }
+    let loaded: HashMap<String, Arc<KeyPolicy>> = store::with(|c| {
+        let mut stmt =
+            c.prepare("SELECT id, request_limit, token_limit, allowed_models FROM api_keys")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Arc::new(KeyPolicy {
+                    limits: KeyLimits {
+                        requests: r.get(1)?,
+                        tokens: r.get(2)?,
+                    },
+                    models: stored_models(r.get(3)?),
+                }),
+            ))
+        })?;
+        rows.collect()
+    })
+    .unwrap_or_default();
+    let found = loaded.get(key_id).cloned().unwrap_or_default();
+    *POLICY_CACHE.lock() = Some(loaded);
+    found
+}
+
+/// Whether the key may call `model`, under any of its spellings.
+pub fn key_allows_model(key_id: &str, model: &str) -> bool {
+    key_policy(key_id)
+        .models
+        .as_ref()
+        .is_none_or(|allowed| allowed.contains(&model_key(model)))
+}
+
+/// The models the key is limited to, or `None` when it may call all of them.
+pub fn key_allowed_models(key_id: &str) -> Option<HashSet<String>> {
+    key_policy(key_id).models.clone()
+}
+
+fn key_usage_totals(key_id: &str) -> (i64, i64) {
+    let stored = store::with(|c| {
+        c.query_row(
+            "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(prompt_tokens + completion_tokens), 0) FROM key_model_usage WHERE key_id = ?1",
+            [key_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+    })
+    .unwrap_or((0, 0));
+    // Read the database first: a flush that lands in between can only make the
+    // total look smaller for a moment, never push a key over its limit early.
+    let (requests, tokens) = usage_tracking::pending_key_totals(key_id);
+    (stored.0 + requests, stored.1 + tokens)
+}
+
+/// The limit this key has already reached, if any. Called before a generation,
+/// so a request already running when the limit is hit can still finish.
+pub fn key_limit_hit(key_id: &str) -> Option<LimitHit> {
+    let limits = key_policy(key_id).limits;
+    if limits == KeyLimits::default() {
+        return None;
+    }
+    let (requests, tokens) = key_usage_totals(key_id);
+    if let Some(limit) = limits.tokens.filter(|l| tokens >= *l) {
+        return Some(LimitHit::Tokens {
+            used: tokens,
+            limit,
+        });
+    }
+    limits
+        .requests
+        .filter(|l| requests >= *l)
+        .map(|limit| LimitHit::Requests {
+            used: requests,
+            limit,
+        })
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -378,7 +548,11 @@ pub async fn identify_async(value: String) -> Option<String> {
         .flatten()
 }
 
-pub fn create_data_api_key(name: &str) -> rusqlite::Result<(String, Value)> {
+pub fn create_data_api_key(
+    name: &str,
+    limits: KeyLimits,
+    models: Option<Vec<String>>,
+) -> rusqlite::Result<(String, Value)> {
     use base64::Engine;
     use rand::RngCore;
     let mut raw = [0u8; 32];
@@ -402,22 +576,22 @@ pub fn create_data_api_key(name: &str) -> rusqlite::Result<(String, Value)> {
     let hash = hash_key(&raw_key, &salt);
     store::with(|c| {
         c.execute(
-            "INSERT INTO api_keys(id, name, key_prefix, salt, key_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![key_id, name, prefix, salt.to_vec(), hash, created],
+            "INSERT INTO api_keys(id, name, key_prefix, salt, key_hash, created_at, request_limit, token_limit, allowed_models) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![key_id, name, prefix, salt.to_vec(), hash, created, limits.requests, limits.tokens, models_json(models.as_deref())],
         )
     })?;
     invalidate_key_cache();
     Ok((
         raw_key,
-        json!({"id": key_id, "name": name, "prefix": prefix, "createdAt": created, "revokedAt": null}),
+        json!({"id": key_id, "name": name, "prefix": prefix, "createdAt": created, "revokedAt": null, "requestLimit": limits.requests, "tokenLimit": limits.tokens, "allowedModels": models}),
     ))
 }
 
 pub fn list_data_api_keys() -> Vec<Value> {
     store::with(|c| {
-        let mut stmt = c.prepare("SELECT id, name, key_prefix, created_at, revoked_at FROM api_keys ORDER BY created_at DESC")?;
+        let mut stmt = c.prepare("SELECT id, name, key_prefix, created_at, revoked_at, request_limit, token_limit, allowed_models FROM api_keys ORDER BY created_at DESC")?;
         let rows = stmt.query_map([], |r| {
-            Ok(json!({"id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "prefix": r.get::<_, String>(2)?, "createdAt": r.get::<_, i64>(3)?, "revokedAt": r.get::<_, Option<i64>>(4)?}))
+            Ok(json!({"id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "prefix": r.get::<_, String>(2)?, "createdAt": r.get::<_, i64>(3)?, "revokedAt": r.get::<_, Option<i64>>(4)?, "requestLimit": r.get::<_, Option<i64>>(5)?, "tokenLimit": r.get::<_, Option<i64>>(6)?, "allowedModels": r.get::<_, Option<String>>(7)?.and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())}))
         })?;
         rows.collect()
     })
@@ -438,22 +612,55 @@ pub fn delete_data_api_key(id: &str) -> bool {
     n > 0
 }
 
-pub fn rename_data_api_key(id: &str, name: &str) -> Result<bool, String> {
-    let cleaned = name.trim();
-    if cleaned.is_empty() {
-        return Err("name cannot be empty".into());
-    }
-    if cleaned.chars().count() > 80 {
-        return Err("name must be 80 characters or fewer".into());
-    }
-    Ok(store::with(|c| {
-        c.execute(
-            "UPDATE api_keys SET name = ?1 WHERE id = ?2",
-            params![cleaned, id],
-        )
+fn models_json(models: Option<&[String]>) -> Option<String> {
+    models.and_then(|list| serde_json::to_string(list).ok())
+}
+
+pub fn update_data_api_key(id: &str, patch: &KeyPatch) -> Result<bool, String> {
+    let name = match &patch.name {
+        None => None,
+        Some(raw) => {
+            let cleaned = raw.trim();
+            if cleaned.is_empty() {
+                return Err("name cannot be empty".into());
+            }
+            if cleaned.chars().count() > 80 {
+                return Err("name must be 80 characters or fewer".into());
+            }
+            Some(cleaned.to_owned())
+        }
+    };
+    let updated = store::with(|c| {
+        let mut changed = 0;
+        if let Some(name) = &name {
+            changed += c.execute(
+                "UPDATE api_keys SET name = ?1 WHERE id = ?2",
+                params![name, id],
+            )?;
+        }
+        if let Some(requests) = patch.requests {
+            changed += c.execute(
+                "UPDATE api_keys SET request_limit = ?1 WHERE id = ?2",
+                params![requests, id],
+            )?;
+        }
+        if let Some(tokens) = patch.tokens {
+            changed += c.execute(
+                "UPDATE api_keys SET token_limit = ?1 WHERE id = ?2",
+                params![tokens, id],
+            )?;
+        }
+        if let Some(models) = &patch.models {
+            changed += c.execute(
+                "UPDATE api_keys SET allowed_models = ?1 WHERE id = ?2",
+                params![models_json(models.as_deref()), id],
+            )?;
+        }
+        Ok(changed)
     })
-    .unwrap_or(0)
-        > 0)
+    .map_err(|e| e.to_string())?;
+    invalidate_key_cache();
+    Ok(updated > 0)
 }
 
 pub fn normalized_model_filter(model: &str) -> Vec<String> {

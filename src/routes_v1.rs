@@ -86,6 +86,95 @@ async fn authenticate(
     })
 }
 
+/// Authenticates a generation request and refuses it once its key has used up
+/// a token or request limit. The answer is the one a spent balance gets, so
+/// clients stop instead of retrying.
+/// Rejects a request with no valid key from its headers alone, before the
+/// body is read: otherwise an unauthenticated client could make the gateway
+/// buffer a 64 MiB body per connection before being told 401.
+pub async fn preauthorize(headers: &HeaderMap, path: &str) -> Result<(), Response> {
+    let (protocol, allow_x_api_key) = if path.starts_with("/v1/messages") {
+        (Protocol::Anthropic, true)
+    } else {
+        (Protocol::OpenAI, false)
+    };
+    authenticate(headers, protocol, allow_x_api_key)
+        .await
+        .map(drop)
+}
+
+async fn authenticate_generation(
+    headers: &HeaderMap,
+    protocol: Protocol,
+    allow_x_api_key: bool,
+) -> Result<String, Response> {
+    let key = authenticate(headers, protocol, allow_x_api_key).await?;
+    let id = key.clone();
+    let hit = tokio::task::spawn_blocking(move || dashboard_store::key_limit_hit(&id))
+        .await
+        .ok()
+        .flatten();
+    let Some(hit) = hit else { return Ok(key) };
+    let (what, used, limit) = match hit {
+        dashboard_store::LimitHit::Tokens { used, limit } => ("token", used, limit),
+        dashboard_store::LimitHit::Requests { used, limit } => ("request", used, limit),
+    };
+    tracing::warn!("API key {key} reached its {what} limit ({used} of {limit})");
+    Err(match protocol {
+        Protocol::Anthropic => anthropic_error(
+            402,
+            "billing_error",
+            format!("Your credit balance is too low: this API key has used its {what} limit ({used} of {limit}). Ask the gateway owner to raise it."),
+        ),
+        Protocol::OpenAI => json_response(
+            402,
+            json!({"error": {"message": format!("You exceeded your current quota: this API key has used its {what} limit ({used} of {limit}). Ask the gateway owner to raise it."), "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}}),
+        ),
+    })
+}
+
+/// Refuses a model the key is not allowed to call. Not retryable: a 403 stays
+/// a 403 until the key's model list changes.
+async fn forbid_model(key: Option<&str>, model: &str, protocol: Protocol) -> Option<Response> {
+    let key = key?.to_owned();
+    let asked = model.to_owned();
+    let allowed =
+        tokio::task::spawn_blocking(move || dashboard_store::key_allows_model(&key, &asked))
+            .await
+            .unwrap_or(true);
+    if allowed {
+        return None;
+    }
+    tracing::warn!("API key refused for model {model}: not in its allowed models");
+    Some(match protocol {
+        Protocol::Anthropic => anthropic_error(
+            403,
+            "permission_error",
+            format!("This API key does not have access to model {model}."),
+        ),
+        Protocol::OpenAI => json_response(
+            403,
+            json!({"error": {"message": format!("This API key does not have access to the model `{model}`."), "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}),
+        ),
+    })
+}
+
+/// Drops from a model list what the key may not call.
+async fn retain_allowed(key: &str, views: &mut Vec<Value>) {
+    let key = key.to_owned();
+    let allowed = tokio::task::spawn_blocking(move || dashboard_store::key_allowed_models(&key))
+        .await
+        .ok()
+        .flatten();
+    if let Some(allowed) = allowed {
+        views.retain(|m| {
+            m["id"]
+                .as_str()
+                .is_some_and(|id| allowed.contains(&crate::settings::listing_key(id)))
+        });
+    }
+}
+
 fn parse_body(body: &Bytes, protocol: Protocol) -> Result<Value, Response> {
     match sonic_rs::from_slice::<Value>(body) {
         Ok(v) if v.is_object() => Ok(v),
@@ -790,7 +879,7 @@ pub async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let key = match authenticate(&headers, Protocol::Anthropic, true).await {
+    let key = match authenticate_generation(&headers, Protocol::Anthropic, true).await {
         Ok(k) => k,
         Err(r) => return r,
     };
@@ -806,6 +895,9 @@ pub async fn messages(
         .unwrap_or("")
         .to_owned();
     ctx.note_model(&model);
+    if let Some(r) = forbid_model(ctx.api_key_id.as_deref(), &model, Protocol::Anthropic).await {
+        return r;
+    }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     tracing::info!("Request to /v1/messages (model={model}, stream={stream})");
     inject_web_search(&mut req, Protocol::Anthropic);
@@ -916,9 +1008,10 @@ pub async fn count_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = authenticate(&headers, Protocol::Anthropic, true).await {
-        return r;
-    }
+    let key = match authenticate(&headers, Protocol::Anthropic, true).await {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
     let req = match parse_body(&body, Protocol::Anthropic) {
         Ok(v) => v,
         Err(r) => return r,
@@ -929,6 +1022,9 @@ pub async fn count_tokens(
         .unwrap_or("")
         .to_owned();
     ctx.note_model(&model);
+    if let Some(r) = forbid_model(Some(&key), &model, Protocol::Anthropic).await {
+        return r;
+    }
     let counted_model = model.clone();
     let tokens = tokio::task::spawn_blocking(move || {
         let messages = req["messages"].as_array().cloned().unwrap_or_default();
@@ -953,7 +1049,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let key = match authenticate(&headers, Protocol::OpenAI, false).await {
+    let key = match authenticate_generation(&headers, Protocol::OpenAI, false).await {
         Ok(k) => k,
         Err(r) => return r,
     };
@@ -978,6 +1074,9 @@ async fn openai_plan(
         .unwrap_or("")
         .to_owned();
     ctx.note_model(&model);
+    if let Some(r) = forbid_model(ctx.api_key_id.as_deref(), &model, Protocol::OpenAI).await {
+        return r;
+    }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     tracing::info!("Request to /v1/chat/completions (model={model}, stream={stream})");
     inject_web_search(req, Protocol::OpenAI);
@@ -1010,7 +1109,7 @@ pub async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let key = match authenticate(&headers, Protocol::OpenAI, false).await {
+    let key = match authenticate_generation(&headers, Protocol::OpenAI, false).await {
         Ok(k) => k,
         Err(r) => return r,
     };
@@ -1110,13 +1209,15 @@ async fn catalog_unavailable(state: &Shared, protocol: Protocol) -> Option<Respo
 }
 
 pub async fn models(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if let Err(r) = authenticate(&headers, Protocol::OpenAI, true).await {
-        return r;
-    }
+    let key = match authenticate(&headers, Protocol::OpenAI, true).await {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
     if let Some(r) = catalog_unavailable(&state, Protocol::OpenAI).await {
         return r;
     }
-    let data = model_views(&state);
+    let mut data = model_views(&state);
+    retain_allowed(&key, &mut data).await;
     let first = data.first().map(|m| m["id"].clone()).unwrap_or(Value::Null);
     let last = data.last().map(|m| m["id"].clone()).unwrap_or(Value::Null);
     json_response(
@@ -1130,14 +1231,17 @@ pub async fn model(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authenticate(&headers, Protocol::OpenAI, true).await {
-        return r;
-    }
+    let key = match authenticate(&headers, Protocol::OpenAI, true).await {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
     if let Some(r) = catalog_unavailable(&state, Protocol::OpenAI).await {
         return r;
     }
     let wanted = crate::model_resolver::get_model_id_for_kiro(&id);
-    match model_views(&state).into_iter().find(|m| {
+    let mut views = model_views(&state);
+    retain_allowed(&key, &mut views).await;
+    match views.into_iter().find(|m| {
         m["id"] == id.as_str()
             || m["id"]
                 .as_str()

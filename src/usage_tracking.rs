@@ -206,6 +206,21 @@ pub fn drain_pending() -> Vec<UsageRow> {
         .collect()
 }
 
+/// Requests and tokens recorded for a key but not yet flushed to the database.
+pub fn pending_key_totals(key_id: &str) -> (i64, i64) {
+    PENDING.lock().as_ref().map_or((0, 0), |pending| {
+        pending
+            .iter()
+            .filter(|((key, _, _), _)| key == key_id)
+            .fold((0, 0), |(requests, tokens), (_, usage)| {
+                (
+                    requests + usage.counts[2],
+                    tokens + usage.counts[0] + usage.counts[1],
+                )
+            })
+    })
+}
+
 pub fn restore_pending(rows: Vec<UsageRow>) {
     let mut guard = PENDING.lock();
     for (k, a, m, p, c, r, g, t, credits) in rows {

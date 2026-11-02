@@ -108,14 +108,67 @@ pub fn context_overflow_error(anthropic: bool, tokens: u64, limit: u64) -> Respo
     )
 }
 
+fn ip_in(ip: std::net::IpAddr, entry: &str) -> bool {
+    let (addr, bits) = match entry.split_once('/') {
+        Some((a, b)) => (a, b.parse::<u32>().ok()),
+        None => (entry, None),
+    };
+    let Ok(net) = addr.trim().parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let (ip, net) = (ip.to_canonical(), net.to_canonical());
+    match (ip, net) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+            let bits = bits.unwrap_or(32).min(32);
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            u32::from(a) & mask == u32::from(b) & mask
+        }
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+            let bits = bits.unwrap_or(128).min(128);
+            let mask = if bits == 0 {
+                0
+            } else {
+                u128::MAX << (128 - bits)
+            };
+            u128::from(a) & mask == u128::from(b) & mask
+        }
+        _ => false,
+    }
+}
+
+pub fn is_trusted_proxy(ip: std::net::IpAddr) -> bool {
+    crate::config::get()
+        .trusted_proxies
+        .iter()
+        .any(|entry| ip_in(ip, entry))
+}
+
+/// `X-Forwarded-For` is only believed when the connection comes from a proxy
+/// listed in TRUSTED_PROXIES; the client is then the right-most hop that is not
+/// itself a trusted proxy. Anyone else could write any address into it.
 pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .or_else(|| peer.map(|p| p.ip().to_string()))
+    let peer_ip = peer.map(|p| p.ip());
+    if !peer_ip.is_some_and(is_trusted_proxy) {
+        return peer_ip.map(|ip| ip.to_string());
+    }
+    let hops: Vec<std::net::IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    hops.iter()
+        .rev()
+        .find(|ip| !is_trusted_proxy(**ip))
+        .or(hops.first())
+        .copied()
+        .or(peer_ip)
+        .map(|ip| ip.to_string())
 }
 
 /// Records every /v1 request once its body finishes, off the runtime, and
@@ -193,6 +246,15 @@ pub async fn data_plane_middleware(
         complete: false,
     };
     let mut req = req;
+    if req.method() == axum::http::Method::POST
+        && PREAUTHORIZED_ROUTES.contains(&log.route.as_str())
+    {
+        if let Err(response) = crate::routes_v1::preauthorize(req.headers(), &log.route).await {
+            log.status = response.status().as_u16();
+            log.delivered();
+            return response;
+        }
+    }
     if let Some(capture) = capture {
         let (parts, body) = req.into_parts();
         let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
@@ -239,6 +301,12 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// captured for `kirolb replay` when DEBUG_MODE is on, as in Python.
 pub const GENERATION_ROUTES: [&str; 3] = ["/v1/chat/completions", "/v1/messages", "/v1/responses"];
 const CAPTURED_ROUTES: [&str; 3] = GENERATION_ROUTES;
+const PREAUTHORIZED_ROUTES: [&str; 4] = [
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/responses",
+];
 
 /// Writes exactly one request-log row when it drops: after the body is fully
 /// delivered, or when the handler or relay is cancelled by a disconnect. A

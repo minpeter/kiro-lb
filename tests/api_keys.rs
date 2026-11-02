@@ -5,7 +5,8 @@ fn a_failed_insert_returns_an_error_instead_of_an_unusable_key() {
     std::env::set_var("DASHBOARD_DATA_DIR", &dir);
     kiro_lb::store::initialize().unwrap();
 
-    let (raw, _) = kiro_lb::dashboard_store::create_data_api_key("healthy").unwrap();
+    let (raw, _) =
+        kiro_lb::dashboard_store::create_data_api_key("healthy", Default::default(), None).unwrap();
     assert!(raw.starts_with("klb_"));
 
     kiro_lb::store::with(|c| {
@@ -14,7 +15,7 @@ fn a_failed_insert_returns_an_error_instead_of_an_unusable_key() {
         )
     })
     .unwrap();
-    let result = kiro_lb::dashboard_store::create_data_api_key("broken");
+    let result = kiro_lb::dashboard_store::create_data_api_key("broken", Default::default(), None);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(result.is_err());
 }

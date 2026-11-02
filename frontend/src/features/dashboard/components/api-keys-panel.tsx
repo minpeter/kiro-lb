@@ -17,7 +17,10 @@ import { EmptyState } from "@/components/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatKeyPrefix } from "../api-key-display";
 import { exactTokens, formatTimestamp, formatTokens } from "../format";
-import type { ApiKey, KeyModelUsage, KeyUsage } from "../types";
+import { keyLimitReached, limitFieldValue, limitReached, parseLimit } from "../key-limits";
+import type { ApiKey, ApiKeyPatch, KeyModelUsage, KeyUsage } from "../types";
+import { KeyLimitFields } from "./key-limit-fields";
+import { KeyModelFields } from "./key-model-fields";
 import { TableSkeleton } from "./skeletons";
 import { usePreferences } from "../preferences";
 
@@ -28,8 +31,13 @@ export type ApiKeysPanelProps = {
   isMutating: boolean;
   onCreate: () => void;
   onDelete: (id: string) => void;
-  onRename: (id: string, name: string) => void;
+  onUpdate: (id: string, patch: ApiKeyPatch) => void;
 };
+
+function sameModels(a: string[] | null, b: string[] | null) {
+  if (a === null || b === null) return a === b;
+  return a.length === b.length && a.every((m) => b.includes(m));
+}
 
 function totals(rows: KeyModelUsage[]) {
   return rows.reduce(
@@ -89,13 +97,41 @@ export function ApiKeysPanel({
   isMutating,
   onCreate,
   onDelete,
-  onRename,
+  onUpdate,
 }: ApiKeysPanelProps) {
   const { t } = usePreferences();
   const [expanded, setExpanded] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<ApiKey | null>(null);
-  const [renaming, setRenaming] = useState<ApiKey | null>(null);
+  const [editing, setEditing] = useState<ApiKey | null>(null);
   const [newName, setNewName] = useState("");
+  const [requestLimit, setRequestLimit] = useState("");
+  const [tokenLimit, setTokenLimit] = useState("");
+  const [allowedModels, setAllowedModels] = useState<string[] | null>(null);
+
+  const openEditor = (key: ApiKey) => {
+    setNewName(key.name);
+    setRequestLimit(limitFieldValue(key.requestLimit));
+    setTokenLimit(limitFieldValue(key.tokenLimit));
+    setAllowedModels(key.allowedModels ?? null);
+    setEditing(key);
+  };
+
+  const editedRequests = parseLimit(requestLimit);
+  const editedTokens = parseLimit(tokenLimit);
+  const editPatch: ApiKeyPatch | null =
+    editing && editedRequests.ok && editedTokens.ok && newName.trim() && !(allowedModels !== null && allowedModels.length === 0)
+      ? {
+          ...(newName.trim() !== editing.name ? { name: newName.trim() } : {}),
+          ...(editedRequests.value !== (editing.requestLimit ?? null) ? { requestLimit: editedRequests.value } : {}),
+          ...(editedTokens.value !== (editing.tokenLimit ?? null) ? { tokenLimit: editedTokens.value } : {}),
+          ...(!sameModels(allowedModels, editing.allowedModels ?? null) ? { allowedModels } : {}),
+        }
+      : null;
+  const canSave = editPatch !== null && Object.keys(editPatch).length > 0;
+  const saveEdit = () => {
+    if (editing && editPatch && canSave) onUpdate(editing.id, editPatch);
+    setEditing(null);
+  };
   const [copiedPrefixId, setCopiedPrefixId] = useState<string | null>(null);
   const copyTimer = useRef<number | null>(null);
 
@@ -153,6 +189,7 @@ export function ApiKeysPanel({
               {apiKeys.map((key) => {
                 const rows = keyUsage[key.id] ?? [];
                 const { tokens, requests } = totals(rows);
+                const atLimit = keyLimitReached({ tokens, requests }, key);
                 const isOpen = expanded === key.id;
                 const usageRegionId = `api-key-usage-${key.id}`;
                 const toggleExpanded = () => setExpanded(isOpen ? null : key.id);
@@ -214,15 +251,37 @@ export function ApiKeysPanel({
                       </Button>
                     </TableCell>
                     <TableCell>
-                      <Badge variant={key.readOnly ? "default" : key.revokedAt ? "outline" : "secondary"}>
-                        {t(key.readOnly ? "keys.status.root" : key.revokedAt ? "keys.status.revoked" : "keys.status.active")}
-                      </Badge>
+                      <span className="flex flex-wrap items-center gap-1">
+                        <Badge variant={key.readOnly ? "default" : key.revokedAt ? "outline" : "secondary"}>
+                          {t(key.readOnly ? "keys.status.root" : key.revokedAt ? "keys.status.revoked" : "keys.status.active")}
+                        </Badge>
+                        {atLimit && <Badge variant="destructive">{t("keys.status.limit")}</Badge>}
+                        {key.allowedModels && (
+                          <Badge variant="outline" title={key.allowedModels.join(", ")}>
+                            {t("keys.models.count", { n: key.allowedModels.length })}
+                          </Badge>
+                        )}
+                      </span>
                     </TableCell>
-                    <TableCell className="hidden text-right tabular-nums md:table-cell">
+                    <TableCell
+                      className={`hidden text-right tabular-nums md:table-cell ${limitReached(requests, key.requestLimit) ? "text-destructive" : ""}`}
+                    >
                       {requests ? requests.toLocaleString() : "—"}
+                      {key.requestLimit != null && (
+                        <span className="text-muted-foreground"> / {key.requestLimit.toLocaleString()}</span>
+                      )}
                     </TableCell>
-                    <TableCell className="text-right tabular-nums" title={tokens ? exactTokens(tokens) : undefined}>
+                    <TableCell
+                      className={`text-right tabular-nums ${limitReached(tokens, key.tokenLimit) ? "text-destructive" : ""}`}
+                      title={tokens ? exactTokens(tokens) : undefined}
+                    >
                       {tokens ? formatTokens(tokens) : "—"}
+                      {key.tokenLimit != null && (
+                        <span className="text-muted-foreground" title={exactTokens(key.tokenLimit)}>
+                          {" "}
+                          / {formatTokens(key.tokenLimit)}
+                        </span>
+                      )}
                     </TableCell>
                     <TableCell className="hidden text-xs text-muted-foreground md:table-cell">
                       {key.readOnly ? "—" : formatTimestamp(key.createdAt)}
@@ -235,12 +294,11 @@ export function ApiKeysPanel({
                             variant="ghost"
                             className="text-muted-foreground hover:text-foreground"
                             disabled={isMutating}
-                            aria-label={t("keys.renameAria", { name: key.name })}
-                            title={t("keys.rename")}
+                            aria-label={t("keys.editAria", { name: key.name })}
+                            title={t("keys.edit")}
                             onClick={(event) => {
                               event.stopPropagation();
-                              setNewName(key.name);
-                              setRenaming(key);
+                              openEditor(key);
                             }}
                           >
                             <Pencil size={14} />
@@ -307,11 +365,11 @@ export function ApiKeysPanel({
         </DialogContent>
       </Dialog>
 
-      <Dialog open={renaming !== null} onOpenChange={(open) => !open && setRenaming(null)}>
+      <Dialog open={editing !== null} onOpenChange={(open) => !open && setEditing(null)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>{t("keys.renameTitle")}</DialogTitle>
-            <DialogDescription>{t("keys.renameDescription")}</DialogDescription>
+            <DialogTitle>{t("keys.editTitle")}</DialogTitle>
+            <DialogDescription>{t("keys.editDescription")}</DialogDescription>
           </DialogHeader>
           <div className="space-y-1">
             <Label htmlFor="key-name">{t("keys.col.name")}</Label>
@@ -322,24 +380,24 @@ export function ApiKeysPanel({
               disabled={isMutating}
               onChange={(event) => setNewName(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && newName.trim() && renaming) {
-                  onRename(renaming.id, newName.trim());
-                  setRenaming(null);
-                }
+                if (event.key === "Enter" && canSave) saveEdit();
               }}
             />
           </div>
+          <KeyLimitFields
+            idPrefix="edit-key"
+            requestLimit={requestLimit}
+            tokenLimit={tokenLimit}
+            disabled={isMutating}
+            onRequestLimitChange={setRequestLimit}
+            onTokenLimitChange={setTokenLimit}
+          />
+          <KeyModelFields idPrefix="edit-key" value={allowedModels} disabled={isMutating} onChange={setAllowedModels} />
           <DialogFooter>
-            <Button variant="outline" disabled={isMutating} onClick={() => setRenaming(null)}>
+            <Button variant="outline" disabled={isMutating} onClick={() => setEditing(null)}>
               {t("keys.cancel")}
             </Button>
-            <Button
-              disabled={isMutating || !newName.trim() || newName.trim() === renaming?.name}
-              onClick={() => {
-                if (renaming) onRename(renaming.id, newName.trim());
-                setRenaming(null);
-              }}
-            >
+            <Button disabled={isMutating || !canSave} onClick={saveEdit}>
               {t("keys.save")}
             </Button>
           </DialogFooter>

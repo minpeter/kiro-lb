@@ -100,6 +100,8 @@ async fn send(router: &Router, path: &str, body: Value) -> String {
         .oneshot(
             Request::post(path)
                 .header("content-type", "application/json")
+                .header("x-api-key", "capture-test-key")
+                .header("authorization", "Bearer capture-test-key")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -127,6 +129,7 @@ async fn capture_uses_stream_outcome_even_after_the_byte_cap() {
     std::env::set_var("DEBUG_CAPTURE_MAX_BYTES", "65536");
     std::env::set_var("DEBUG_DIR", &debug_dir);
     std::env::set_var("DASHBOARD_DATA_DIR", &data_dir);
+    std::env::set_var("PROXY_API_KEY", "capture-test-key");
     kiro_lb::store::initialize().unwrap();
 
     let s = state();

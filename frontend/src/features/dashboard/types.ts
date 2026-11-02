@@ -206,7 +206,18 @@ export type RequestLogPage = {
   order?: RequestLogOrder;
 };
 
+export type KeyLimitsPatch = {
+  requestLimit?: number | null;
+  tokenLimit?: number | null;
+  allowedModels?: string[] | null;
+};
+
+export type ApiKeyPatch = KeyLimitsPatch & { name?: string };
+
 export type ApiKey = {
+  allowedModels?: string[] | null;
+  requestLimit?: number | null;
+  tokenLimit?: number | null;
   id: string;
   name: string;
   prefix: string;

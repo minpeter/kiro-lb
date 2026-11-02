@@ -41,7 +41,7 @@ async fn once(
         }
     };
     let arn = auth.request_profile_arn();
-    let mut body = json!({"conversationState": {"chatTriggerType": "MANUAL", "conversationId": uuid::Uuid::new_v4().to_string(), "currentMessage": {"userInputMessage": {"content": PROMPT, "modelId": model, "origin": "AI_EDITOR"}}, "history": []}});
+    let mut body = json!({"conversationState": {"chatTriggerType": "MANUAL", "conversationId": uuid::Uuid::new_v4().to_string(), "currentMessage": {"userInputMessage": {"content": PROMPT, "userInputMessageContext": {"envState": {"operatingSystem": std::env::consts::OS}}, "origin": "KIRO_CLI", "modelId": model}}, "agentTaskType": "vibe"}});
     if let Some(a) = &arn {
         body["profileArn"] = json!(a);
     }
@@ -50,9 +50,8 @@ async fn once(
         .post(url)
         .timeout(Duration::from_secs(45))
         .json(&body);
-    let machine_id = auth.machine_id();
-    let mut headers = kiro_headers(&token, &machine_id);
-    for (k, v) in ep.header_overrides(&machine_id) {
+    let mut headers = kiro_headers(&token);
+    for (k, v) in ep.header_overrides() {
         headers.retain(|(h, _)| !h.eq_ignore_ascii_case(k));
         headers.push((k, v));
     }

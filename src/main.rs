@@ -126,7 +126,7 @@ fn router(state: app::Shared) -> Router {
         .route("/api/dashboard/keys/usage", get(d::key_usage))
         .route(
             "/api/dashboard/keys/{id}",
-            delete(d::delete_key).patch(d::rename_key),
+            delete(d::delete_key).patch(d::update_key),
         )
         .route("/api/dashboard/accounts/usage", get(d::account_usage))
         .route("/api/dashboard/overview", get(d::overview))
@@ -226,6 +226,7 @@ fn router(state: app::Shared) -> Router {
             }
         })
         .layer(axum::extract::DefaultBodyLimit::max(app::MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(d::dashboard_guard))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             app::data_plane_middleware,
