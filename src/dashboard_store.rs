@@ -483,13 +483,17 @@ fn key_policy(key_id: &str) -> Result<Arc<KeyPolicy>, PolicyUnavailable> {
         PolicyUnavailable
     })?;
     let found = loaded.get(key_id).cloned().unwrap_or_default();
+    publish_policies(generation, loaded);
+    checked(found)
+}
+
+/// Stores what a load read unless a key edit invalidated the cache since the
+/// load began: the stale map must not overwrite the cache the edit cleared.
+fn publish_policies(generation: u64, loaded: PolicyMap) {
     let mut cache = POLICY_CACHE.lock();
-    // A key edit that landed while this load ran bumped the generation; the
-    // stale map must not overwrite the cache it cleared.
     if POLICY_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == generation {
         *cache = Some((loaded, Instant::now()));
     }
-    checked(found)
 }
 
 /// Whether the key may call `model`, under any of its spellings.
@@ -748,4 +752,29 @@ pub fn grouped_models(known: &[String]) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_policy_load_that_began_before_an_invalidation_is_not_published() {
+        let stale = POLICY_GENERATION.load(Ordering::SeqCst);
+        invalidate_key_cache();
+        let read = PolicyMap::from([("key".to_owned(), Arc::new(KeyPolicy::default()))]);
+        publish_policies(stale, read);
+        assert!(
+            POLICY_CACHE.lock().is_none(),
+            "the edit wins over the stale read"
+        );
+
+        publish_policies(POLICY_GENERATION.load(Ordering::SeqCst), PolicyMap::new());
+        assert!(
+            POLICY_CACHE.lock().is_some(),
+            "a read with no edit in between is kept"
+        );
+        invalidate_key_cache();
+    }
 }
