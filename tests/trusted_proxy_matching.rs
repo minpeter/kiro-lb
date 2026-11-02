@@ -4,7 +4,7 @@ fn init() {
     INIT.call_once(|| {
         std::env::set_var(
             "TRUSTED_PROXIES",
-            "127.0.0.1/x,10.0.0.0/33,192.168.0.0/16,::ffff:10.1.0.0/112",
+            "127.0.0.1/x,10.0.0.0/33,192.168.0.0/16,::ffff:10.1.0.0/112,::ffff:0.0.0.0/8",
         );
         assert!(!kiro_lb::config::get().trusted_proxies.is_empty());
     });
@@ -42,4 +42,9 @@ fn v4_mapped_entries_cover_the_whole_network() {
     assert_eq!(from("10.1.200.3").as_deref(), Some("6.6.6.6"));
     assert_eq!(from("::ffff:10.1.9.9").as_deref(), Some("6.6.6.6"));
     assert_eq!(from("10.2.0.1").as_deref(), Some("10.2.0.1"));
+    assert_eq!(
+        from("203.0.113.5").as_deref(),
+        Some("203.0.113.5"),
+        "::ffff:0.0.0.0/8 is refused instead of trusting every IPv4 client"
+    );
 }

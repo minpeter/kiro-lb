@@ -77,6 +77,8 @@ fn trusted_proxy_entries_are_validated() {
         "10.0.0",
         "::1/129",
         "1.2.3.4/x",
+        "::ffff:10.0.0.0/8",
+        "::ffff:10.0.0.0/95",
         "",
     ] {
         assert!(!kiro_lb::app::valid_proxy_entry(bad), "{bad}");

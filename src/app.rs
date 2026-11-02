@@ -117,8 +117,18 @@ pub fn valid_proxy_entry(entry: &str) -> bool {
     let Ok(ip) = addr.trim().parse::<std::net::IpAddr>() else {
         return false;
     };
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    bits.is_none_or(|b| b.trim().parse::<u32>().is_ok_and(|b| b <= max))
+    let (min, max) = match ip {
+        std::net::IpAddr::V4(_) => (0, 32),
+        // A v4-mapped network shorter than /96 masks away the ::ffff marker
+        // and would cover every IPv4 client, so it is refused, not widened.
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => (96, 128),
+        std::net::IpAddr::V6(_) => (0, 128),
+    };
+    bits.is_none_or(|b| {
+        b.trim()
+            .parse::<u32>()
+            .is_ok_and(|b| (min..=max).contains(&b))
+    })
 }
 
 /// Matches in IPv6 space: an IPv4 address or network is its v4-mapped form
