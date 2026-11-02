@@ -62,6 +62,8 @@ async fn send(router: &Router, path: &str, body: Value) {
         .oneshot(
             Request::post(path)
                 .header("content-type", "application/json")
+                .header("x-api-key", "capture-test-key")
+                .header("authorization", "Bearer capture-test-key")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -97,6 +99,7 @@ async fn content_capture_off_redacts_every_prompt_string() {
     std::env::set_var("DEBUG_CAPTURE_CONTENT", "false");
     std::env::set_var("DEBUG_DIR", &debug_dir);
     std::env::set_var("DASHBOARD_DATA_DIR", &data_dir);
+    std::env::set_var("PROXY_API_KEY", "capture-test-key");
     kiro_lb::store::initialize().unwrap();
 
     let s = state();

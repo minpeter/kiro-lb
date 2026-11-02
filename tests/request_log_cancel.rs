@@ -11,6 +11,7 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 static INIT: Once = Once::new();
+const KEY: &str = "request-log-test-key";
 
 fn init() {
     INIT.call_once(|| {
@@ -18,6 +19,7 @@ fn init() {
             std::env::temp_dir().join(format!("kirolb-reqlog-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("DASHBOARD_DATA_DIR", &dir);
+        std::env::set_var("PROXY_API_KEY", KEY);
         kiro_lb::store::initialize().unwrap();
     });
 }
@@ -83,6 +85,7 @@ async fn a_cancelled_request_is_logged_once_as_client_closed() {
     init();
     let call = app(state()).oneshot(
         Request::post("/v1/chat/completions")
+            .header("authorization", format!("Bearer {KEY}"))
             .body(Body::empty())
             .unwrap(),
     );
@@ -96,7 +99,12 @@ async fn a_cancelled_request_is_logged_once_as_client_closed() {
 async fn a_delivered_request_is_logged_once_with_its_status() {
     init();
     let res = app(state())
-        .oneshot(Request::post("/v1/messages").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", KEY)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let body = axum::body::to_bytes(res.into_body(), usize::MAX)

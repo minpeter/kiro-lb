@@ -35,7 +35,7 @@ const fn two(multiplier: f64, long: f64) -> ModelCost {
 pub static MODEL_COSTS: [(&str, ModelCost); 23] = [
     ("gpt-5.6-sol", two(4.4, 8.8)),
     ("gpt-5.6-terra", two(2.2, 4.4)),
-    ("gpt-5.6-luna", two(1.1, 2.2)),
+    ("gpt-5.6-luna", two(0.6, 1.2)),
     ("claude-opus-5.5", c(2.0, 1_000_000)),
     ("claude-opus-5", c(2.2, 1_000_000)),
     ("claude-opus-4.8", c(2.2, 1_000_000)),
@@ -60,10 +60,10 @@ pub static MODEL_COSTS: [(&str, ModelCost); 23] = [
         },
     ),
     ("kimi-k3", c(2.4, 1_048_576)),
-    ("deepseek-3.2", c(0.25, 128_000)),
-    ("minimax-m2.5", c(0.25, 200_000)),
+    ("deepseek-3.2", c(0.25, 164_000)),
+    ("minimax-m2.5", c(0.25, 196_000)),
     ("glm-5", c(0.5, 200_000)),
-    ("minimax-m2.1", c(0.15, 200_000)),
+    ("minimax-m2.1", c(0.15, 196_000)),
     ("qwen3-coder-next", c(0.05, 256_000)),
 ];
 

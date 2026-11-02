@@ -3,6 +3,8 @@ import type {
   Account,
   AccountTokenUsage,
   ApiKey,
+  ApiKeyPatch,
+  KeyLimitsPatch,
   BrowserLoginFlow,
   DataOverview,
   DeviceLoginFlow,
@@ -134,12 +136,13 @@ export const dashboardApi = {
   keyUsage: () => request<{ usage: KeyUsage }>("/api/dashboard/keys/usage"),
   accountTokenUsage: () => request<{ usage: AccountTokenUsage }>("/api/dashboard/accounts/usage"),
   refreshUsage: () => request<{ accounts: unknown[] }>("/api/dashboard/accounts/refresh-usage", { method: "POST" }),
-  createApiKey: (name: string) => request<{ apiKey: string }>("/api/dashboard/keys", { method: "POST", body: JSON.stringify({ name }) }),
+  createApiKey: (name: string, limits: KeyLimitsPatch = {}) =>
+    request<{ apiKey: string }>("/api/dashboard/keys", { method: "POST", body: JSON.stringify({ name, ...limits }) }),
   deleteApiKey: (id: string) => request<{ ok: boolean }>(`/api/dashboard/keys/${id}`, { method: "DELETE" }),
-  renameApiKey: (id: string, name: string) =>
-    request<{ ok: boolean; name: string }>(`/api/dashboard/keys/${id}`, {
+  updateApiKey: (id: string, patch: ApiKeyPatch) =>
+    request<{ ok: boolean; name: string | null }>(`/api/dashboard/keys/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(patch),
     }),
   startDeviceLogin: (provider: DeviceLoginProvider) =>
     request<DeviceLoginFlow>("/api/dashboard/accounts/device-login", {

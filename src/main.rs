@@ -126,7 +126,7 @@ fn router(state: app::Shared) -> Router {
         .route("/api/dashboard/keys/usage", get(d::key_usage))
         .route(
             "/api/dashboard/keys/{id}",
-            delete(d::delete_key).patch(d::rename_key),
+            delete(d::delete_key).patch(d::update_key),
         )
         .route("/api/dashboard/accounts/usage", get(d::account_usage))
         .route("/api/dashboard/overview", get(d::overview))
@@ -226,6 +226,7 @@ fn router(state: app::Shared) -> Router {
             }
         })
         .layer(axum::extract::DefaultBodyLimit::max(app::MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(d::dashboard_guard))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             app::data_plane_middleware,
@@ -404,6 +405,15 @@ async fn serve(host: String, port: u16) -> Option<kiro_lb::update_install::Insta
             } else {
                 " and this gateway listens beyond loopback; publish it only on 127.0.0.1 (Docker: -p 127.0.0.1:8000:8000)"
             }
+        );
+    }
+    for entry in cfg
+        .trusted_proxies
+        .iter()
+        .filter(|e| !app::valid_proxy_entry(e))
+    {
+        tracing::warn!(
+            "TRUSTED_PROXIES entry {entry:?} is not an IP or CIDR and is ignored; X-Forwarded-For from that proxy will not be trusted"
         );
     }
     if cfg.first_token_timeout >= cfg.streaming_read_timeout {

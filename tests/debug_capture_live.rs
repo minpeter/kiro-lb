@@ -57,6 +57,7 @@ async fn a_live_failed_request_is_captured_and_redacted() {
     std::env::set_var("DEBUG_MODE", "all");
     std::env::set_var("DEBUG_DIR", &debug_dir);
     std::env::set_var("DASHBOARD_DATA_DIR", &data_dir);
+    std::env::set_var("PROXY_API_KEY", "capture-test-key");
     kiro_lb::store::initialize().unwrap();
 
     let s = state();
@@ -87,6 +88,8 @@ async fn a_live_failed_request_is_captured_and_redacted() {
         .oneshot(
             Request::post("/v1/messages")
                 .header("content-type", "application/json")
+                .header("x-api-key", "capture-test-key")
+                .header("authorization", "Bearer capture-test-key")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )

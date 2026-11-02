@@ -35,6 +35,8 @@ const PREFIXES: [string, string][] = [
   ["Kiro rejected the login request", "error.loginRejected"],
   ["Login is ", "error.loginNotApproved"],
   ["Could not persist", "error.persist"],
+  ["requestLimit must", "error.invalidLimit"],
+  ["tokenLimit must", "error.invalidLimit"],
   ["Expected ", "error.invalidRequest"],
   ["Runtime state write skipped", "error.slot"],
   ["slot ", "error.slot"],

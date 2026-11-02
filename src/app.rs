@@ -108,14 +108,89 @@ pub fn context_overflow_error(anthropic: bool, tokens: u64, limit: u64) -> Respo
     )
 }
 
+/// Whether a TRUSTED_PROXIES entry is an IP or a CIDR this module can match.
+pub fn valid_proxy_entry(entry: &str) -> bool {
+    let (addr, bits) = match entry.split_once('/') {
+        Some((a, b)) => (a, Some(b)),
+        None => (entry, None),
+    };
+    let Ok(ip) = addr.trim().parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let (min, max) = match ip {
+        std::net::IpAddr::V4(_) => (0, 32),
+        // A v4-mapped network shorter than /96 masks away the ::ffff marker
+        // and would cover every IPv4 client, so it is refused, not widened.
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => (96, 128),
+        std::net::IpAddr::V6(_) => (0, 128),
+    };
+    bits.is_none_or(|b| {
+        b.trim()
+            .parse::<u32>()
+            .is_ok_and(|b| (min..=max).contains(&b))
+    })
+}
+
+/// Matches in IPv6 space: an IPv4 address or network is its v4-mapped form
+/// (`::ffff:a.b.c.d`, prefix + 96), so `10.0.0.0/8` and `::ffff:10.0.0.0/104`
+/// are the same network and a mapped peer matches a plain IPv4 entry.
+fn ip_in(ip: std::net::IpAddr, entry: &str) -> bool {
+    if !valid_proxy_entry(entry) {
+        return false;
+    }
+    let (addr, bits) = match entry.split_once('/') {
+        Some((a, b)) => (a, b.trim().parse::<u32>().ok()),
+        None => (entry, None),
+    };
+    let Ok(net) = addr.trim().parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let as_v6 = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+        std::net::IpAddr::V6(v6) => v6,
+    };
+    let bits = match net {
+        std::net::IpAddr::V4(_) => bits.unwrap_or(32) + 96,
+        std::net::IpAddr::V6(_) => bits.unwrap_or(128),
+    }
+    .min(128);
+    let mask = if bits == 0 {
+        0
+    } else {
+        u128::MAX << (128 - bits)
+    };
+    u128::from(as_v6(ip)) & mask == u128::from(as_v6(net)) & mask
+}
+
+pub fn is_trusted_proxy(ip: std::net::IpAddr) -> bool {
+    crate::config::get()
+        .trusted_proxies
+        .iter()
+        .any(|entry| ip_in(ip, entry))
+}
+
+/// `X-Forwarded-For` is only believed when the connection comes from a proxy
+/// listed in TRUSTED_PROXIES; the client is then the right-most hop that is not
+/// itself a trusted proxy. Anyone else could write any address into it.
 pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .or_else(|| peer.map(|p| p.ip().to_string()))
+    let peer_ip = peer.map(|p| p.ip());
+    if !peer_ip.is_some_and(is_trusted_proxy) {
+        return peer_ip.map(|ip| ip.to_string());
+    }
+    let hops: Vec<std::net::IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    hops.iter()
+        .rev()
+        .find(|ip| !is_trusted_proxy(**ip))
+        .or(hops.first())
+        .copied()
+        .or(peer_ip)
+        .map(|ip| ip.to_string())
 }
 
 /// Records every /v1 request once its body finishes, off the runtime, and
@@ -193,6 +268,15 @@ pub async fn data_plane_middleware(
         complete: false,
     };
     let mut req = req;
+    if req.method() == axum::http::Method::POST
+        && PREAUTHORIZED_ROUTES.contains(&log.route.as_str())
+    {
+        if let Err(response) = crate::routes_v1::preauthorize(req.headers(), &log.route).await {
+            log.status = response.status().as_u16();
+            log.delivered();
+            return response;
+        }
+    }
     if let Some(capture) = capture {
         let (parts, body) = req.into_parts();
         let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
@@ -239,6 +323,12 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// captured for `kirolb replay` when DEBUG_MODE is on, as in Python.
 pub const GENERATION_ROUTES: [&str; 3] = ["/v1/chat/completions", "/v1/messages", "/v1/responses"];
 const CAPTURED_ROUTES: [&str; 3] = GENERATION_ROUTES;
+const PREAUTHORIZED_ROUTES: [&str; 4] = [
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/responses",
+];
 
 /// Writes exactly one request-log row when it drops: after the body is fully
 /// delivered, or when the handler or relay is cancelled by a disconnect. A

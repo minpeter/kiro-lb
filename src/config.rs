@@ -108,6 +108,7 @@ pub enum DebugMode {
 pub struct Config {
     pub server_host: String,
     pub server_port: u16,
+    pub upstream_http2: bool,
     pub proxy_api_key: String,
     pub vpn_proxy_url: String,
     pub token_refresh_threshold: i64,
@@ -160,6 +161,8 @@ pub struct Config {
     pub data_dir: String,
     pub kiro_slot: String,
     pub handoff_secret: String,
+    pub metrics_token: String,
+    pub trusted_proxies: Vec<String>,
     /// Subscription types (case-insensitive) that count as free tier.
     pub free_tier_subscription_types: Vec<String>,
 }
@@ -174,6 +177,7 @@ impl Config {
         Config {
             server_host: env_str("SERVER_HOST", "0.0.0.0"),
             server_port: env_parse("SERVER_PORT", 8000),
+            upstream_http2: env_str("UPSTREAM_HTTP2", "false").eq_ignore_ascii_case("true"),
             proxy_api_key: env_str("PROXY_API_KEY", ""),
             vpn_proxy_url: env_str("VPN_PROXY_URL", ""),
             token_refresh_threshold: env_parse("TOKEN_REFRESH_THRESHOLD", 960),
@@ -242,6 +246,8 @@ impl Config {
             data_dir: env_str("DASHBOARD_DATA_DIR", "data"),
             kiro_slot: env_str("KIRO_SLOT", ""),
             handoff_secret: env_str("HANDOFF_SECRET", ""),
+            metrics_token: env_str("METRICS_TOKEN", ""),
+            trusted_proxies: env_list("TRUSTED_PROXIES", "127.0.0.1,::1"),
             // Kiro's free plan reports Q_DEVELOPER_STANDALONE_FREE; "Free" keeps a
             // registration hint recognised until the first usage refresh replaces it.
             free_tier_subscription_types: env_list(

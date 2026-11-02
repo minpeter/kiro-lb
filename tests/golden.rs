@@ -1,5 +1,5 @@
 use flate2::read::GzDecoder;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -131,12 +131,82 @@ fn count_tokens() {
     report("count_tokens", total, &failures, 0.95);
 }
 
+fn strip_identity(entry: &mut Value) {
+    let Some(user) = entry.as_object_mut() else {
+        return;
+    };
+    user.remove("origin");
+    user.remove("modelId");
+    let empty = user
+        .get_mut("userInputMessageContext")
+        .and_then(Value::as_object_mut)
+        .map(|ctx| {
+            ctx.remove("envState");
+            ctx.is_empty()
+        })
+        .unwrap_or(false);
+    if empty {
+        user.remove("userInputMessageContext");
+    }
+}
+
+fn fold_system_pair(state: &mut serde_json::Map<String, Value>) {
+    let ack = kiro_lb::convert_core::SYSTEM_PROMPT_ACK;
+    let Some(history) = state.get_mut("history").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let is_pair = history.len() >= 2
+        && history[0].get("userInputMessage").is_some()
+        && history[1].pointer("/assistantResponseMessage/content") == Some(&json!(ack));
+    if !is_pair {
+        return;
+    }
+    let system = history[0]
+        .pointer("/userInputMessage/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    history.drain(..2);
+    let target = if history.is_empty() {
+        state.remove("history");
+        state
+            .get_mut("currentMessage")
+            .and_then(|c| c.pointer_mut("/userInputMessage/content"))
+    } else {
+        state
+            .get_mut("history")
+            .and_then(|h| h.pointer_mut("/0/userInputMessage/content"))
+    };
+    if let Some(content) = target {
+        let rest = content.as_str().unwrap_or_default();
+        *content = json!(format!("{system}\n\n{rest}"));
+    }
+}
+
 fn strip_volatile(v: &mut Value) {
+    if let Some(top) = v.as_object_mut() {
+        top.remove("agentMode");
+    }
     if let Some(state) = v
         .pointer_mut("/conversationState")
         .and_then(Value::as_object_mut)
     {
         state.remove("agentContinuationId");
+        state.remove("rootConversationId");
+        fold_system_pair(state);
+        if let Some(current) = state
+            .get_mut("currentMessage")
+            .and_then(|c| c.get_mut("userInputMessage"))
+        {
+            strip_identity(current);
+        }
+        if let Some(history) = state.get_mut("history").and_then(Value::as_array_mut) {
+            for entry in history {
+                if let Some(user) = entry.get_mut("userInputMessage") {
+                    strip_identity(user);
+                }
+            }
+        }
     }
 }
 

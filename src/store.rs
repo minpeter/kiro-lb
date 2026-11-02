@@ -273,6 +273,15 @@ pub fn initialize() -> rusqlite::Result<()> {
                 PRIMARY KEY (key_id, model)
             );",
         )?;
+        let key_cols = columns(conn, "api_keys")?;
+        for col in ["request_limit", "token_limit"] {
+            if !key_cols.iter().any(|c| c == col) {
+                conn.execute_batch(&format!("ALTER TABLE api_keys ADD COLUMN {col} INTEGER"))?;
+            }
+        }
+        if !key_cols.iter().any(|c| c == "allowed_models") {
+            conn.execute_batch("ALTER TABLE api_keys ADD COLUMN allowed_models TEXT")?;
+        }
         let usage_cols = columns(conn, "key_model_usage")?;
         for col in ["generation_ms", "timed_completion_tokens"] {
             if !usage_cols.iter().any(|c| c == col) {

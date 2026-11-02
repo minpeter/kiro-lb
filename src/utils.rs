@@ -1,11 +1,12 @@
 use sha2::{Digest, Sha256};
 
-pub const IDE_VERSION: &str = "1.1.70";
-pub const KAS_VERSION: &str = "0.66.7";
-const IDE_PLATFORM: &str = "ua/2.1 os/win32#10.0.26200 lang/js md/nodejs#24.18.0";
-pub const RUNTIME_API: &str = "kiroruntime";
-pub const CONTROL_PLANE_API: &str = "kirocontrolplanebearer";
-pub const CODEWHISPERER_API: &str = "codewhispererruntime";
+pub const CLI_VERSION: &str = "2.37.0";
+const SDK: &str = "aws-sdk-rust/1.6.0 ua/2.1";
+const RUST: &str = "lang/rust/1.94.1";
+pub const RUNTIME_API: &str = "codewhispererstreaming/0.1.19636";
+pub const CONTROL_PLANE_API: &str = "kirocontrolplanebearer/0.1.0";
+pub const CODEWHISPERER_API: &str = "codewhispererruntime/0.1.0";
+pub const AUTH_USER_AGENT: &str = "Kiro-CLI";
 
 pub fn account_machine_id(account_key: &str) -> String {
     hex::encode(Sha256::digest(
@@ -13,74 +14,58 @@ pub fn account_machine_id(account_key: &str) -> String {
     ))
 }
 
-fn ide_build(api_label: &str, machine_id: &str) -> String {
-    if api_label == CODEWHISPERER_API {
-        format!("KiroIDE-{IDE_VERSION}-{machine_id}")
-    } else {
-        format!("KiroIDE-{IDE_VERSION}-{machine_id}-KAS/{KAS_VERSION}")
-    }
+fn os() -> &'static str {
+    std::env::consts::OS
 }
 
-pub fn ide_short_user_agent(api_label: &str, machine_id: &str) -> String {
-    format!("aws-sdk-js/1.0.0 {}", ide_build(api_label, machine_id))
-}
-
-pub fn ide_user_agent(api_label: &str, machine_id: &str) -> String {
-    let features = if api_label == RUNTIME_API {
-        "m/N"
-    } else {
-        "m/N,E"
-    };
+pub fn cli_user_agent(api: &str) -> String {
     format!(
-        "aws-sdk-js/1.0.0 {IDE_PLATFORM} api/{api_label}#1.0.0 {features} {}",
-        ide_build(api_label, machine_id)
+        "{SDK} api/{api} os/{} {RUST} md/appVersion-{CLI_VERSION} app/AmazonQ-For-CLI",
+        os()
     )
 }
 
-pub fn refresh_user_agent(machine_id: &str) -> String {
-    format!("KiroIDE-{IDE_VERSION}-{machine_id}")
+pub fn cli_short_user_agent(api: &str) -> String {
+    let features = if api == CONTROL_PLANE_API { "F,C" } else { "F" };
+    format!(
+        "{SDK} api/{api} os/{} {RUST} m/{features} app/AmazonQ-For-CLI",
+        os()
+    )
 }
 
-pub fn kiro_headers(token: &str, machine_id: &str) -> Vec<(&'static str, String)> {
-    vec![
-        ("Authorization", format!("Bearer {token}")),
-        ("Content-Type", "application/x-amz-json-1.0".into()),
-        (
-            "x-amz-target",
-            "KiroRuntimeService.GenerateAssistantResponse".into(),
-        ),
-        ("x-amzn-kiro-client-attribution", "kiro-ide".into()),
-        ("User-Agent", ide_user_agent(RUNTIME_API, machine_id)),
-        (
-            "x-amz-user-agent",
-            ide_short_user_agent(RUNTIME_API, machine_id),
-        ),
-        ("x-amzn-codewhisperer-optout", "true".into()),
-        ("x-kiro-attempt", "1;max=3".into()),
-        ("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string()),
-        ("amz-sdk-request", "attempt=1; max=3".into()),
-    ]
+fn sdk_headers(token: &str, target: Option<&str>, api: &str) -> Vec<(&'static str, String)> {
+    let mut out = Vec::with_capacity(10);
+    if let Some(t) = target {
+        out.push(("Content-Type", "application/x-amz-json-1.0".into()));
+        out.push(("x-amz-target", t.to_owned()));
+    }
+    out.push(("User-Agent", cli_user_agent(api)));
+    out.push(("x-amz-user-agent", cli_short_user_agent(api)));
+    out.push(("x-amzn-codewhisperer-optout", "true".into()));
+    if api == RUNTIME_API {
+        out.push(("x-kiro-attempt", "1;max=3".into()));
+    }
+    out.push(("Authorization", format!("Bearer {token}")));
+    out.push(("amz-sdk-request", "attempt=1; max=3".into()));
+    out.push(("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string()));
+    out.push(("Accept", "*/*".into()));
+    out
+}
+
+pub fn kiro_headers(token: &str) -> Vec<(&'static str, String)> {
+    sdk_headers(
+        token,
+        Some(crate::upstream::endpoints::GENERATE_TARGET),
+        RUNTIME_API,
+    )
 }
 
 pub fn management_headers(
     token: &str,
     target: Option<&str>,
-    api_label: &str,
-    machine_id: &str,
+    api: &str,
 ) -> Vec<(&'static str, String)> {
-    let mut out = vec![("Authorization", format!("Bearer {token}"))];
-    if let Some(t) = target {
-        out.push(("Content-Type", "application/x-amz-json-1.0".into()));
-        out.push(("x-amz-target", t.to_owned()));
-    }
-    out.push(("User-Agent", ide_user_agent(api_label, machine_id)));
-    out.push((
-        "x-amz-user-agent",
-        ide_short_user_agent(api_label, machine_id),
-    ));
-    out.push(("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string()));
-    out.push(("amz-sdk-request", "attempt=1; max=3".into()));
-    out
+    sdk_headers(token, target, api)
 }
 
 pub fn completion_id() -> String {

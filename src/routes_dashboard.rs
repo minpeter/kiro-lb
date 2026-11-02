@@ -65,17 +65,74 @@ fn authenticated(headers: &HeaderMap) -> bool {
 }
 
 fn require(headers: &HeaderMap) -> Result<(), Response> {
-    if config::get().dashboard_auth {
-        return if authenticated(headers) {
-            Ok(())
-        } else {
-            Err(detail(401, "Dashboard authentication required"))
-        };
-    }
+    // A session cookie still travels on requests from same-site origins (a
+    // sibling subdomain), so the browser's own site check applies with a
+    // password too.
     if is_cross_site(headers) {
         return Err(detail(403, "Cross-site dashboard request rejected"));
     }
+    if config::get().dashboard_auth && !authenticated(headers) {
+        return Err(detail(401, "Dashboard authentication required"));
+    }
     Ok(())
+}
+
+const LOGIN_BODY_LIMIT: usize = 64 * 1024;
+const DASHBOARD_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// Runs before any dashboard handler reads its body: the session (or the
+/// cross-site check) is verified from the headers alone, bodies are capped,
+/// and a state-changing request must declare JSON. A plain HTML form can only
+/// send text/plain, url-encoded or multipart bodies, so this also stops a
+/// forged form post from another page.
+pub async fn dashboard_guard(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path();
+    if !path.starts_with("/api/dashboard/") {
+        return next.run(req).await;
+    }
+    let login = path == "/api/dashboard/login" || path == "/api/dashboard/logout";
+    if login {
+        if is_cross_site(req.headers()) {
+            return detail(403, "Cross-site dashboard request rejected");
+        }
+    } else if let Err(r) = require(req.headers()) {
+        return r;
+    }
+    let mutating = matches!(
+        *req.method(),
+        axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::PATCH
+    );
+    if !mutating {
+        return next.run(req).await;
+    }
+    if !is_json(req.headers()) {
+        return detail(415, "Content-Type must be application/json");
+    }
+    let limit = if login {
+        LOGIN_BODY_LIMIT
+    } else {
+        DASHBOARD_BODY_LIMIT
+    };
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, limit).await else {
+        return detail(413, "Request body is too large");
+    };
+    next.run(axum::http::Request::from_parts(
+        parts,
+        axum::body::Body::from(bytes),
+    ))
+    .await
 }
 
 /// Without a password the browser's own origin checks are the only guard, so
@@ -237,11 +294,39 @@ pub async fn account_usage(headers: HeaderMap) -> Response {
     json_response(200, json!({"usage": grouped}))
 }
 
+fn models_field(payload: &Value) -> Result<Option<Option<Vec<String>>>, String> {
+    payload
+        .get("allowedModels")
+        .map(ds::parse_allowed_models)
+        .transpose()
+}
+
+fn limit_field(payload: &Value, field: &str) -> Result<Option<Option<i64>>, String> {
+    payload
+        .get(field)
+        .map(|value| ds::parse_limit(field, value))
+        .transpose()
+}
+
 pub async fn create_key(headers: HeaderMap, body: Bytes) -> Response {
     guard!(headers);
     let payload = match json_body(&body) {
         Ok(v) => v,
         Err(r) => return r,
+    };
+    let (limits, models) = match (
+        limit_field(&payload, "requestLimit"),
+        limit_field(&payload, "tokenLimit"),
+        models_field(&payload),
+    ) {
+        (Ok(requests), Ok(tokens), Ok(models)) => (
+            ds::KeyLimits {
+                requests: requests.flatten(),
+                tokens: tokens.flatten(),
+            },
+            models.flatten(),
+        ),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return detail(400, e),
     };
     let name = payload
         .get("name")
@@ -251,7 +336,8 @@ pub async fn create_key(headers: HeaderMap, body: Bytes) -> Response {
                 .unwrap_or_else(|| n.to_string())
         })
         .unwrap_or_default();
-    match tokio::task::spawn_blocking(move || ds::create_data_api_key(&name)).await {
+    match tokio::task::spawn_blocking(move || ds::create_data_api_key(&name, limits, models)).await
+    {
         Ok(Ok((raw, meta))) => json_response(200, json!({"apiKey": raw, "metadata": meta})),
         Ok(Err(e)) => {
             tracing::error!("Could not persist API key: {e}");
@@ -278,28 +364,53 @@ pub async fn delete_key(headers: HeaderMap, Path(id): Path<String>) -> Response 
     json_response(200, json!({"ok": true}))
 }
 
-pub async fn rename_key(headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> Response {
+pub async fn update_key(headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> Response {
     guard!(headers);
     if id == ROOT_KEY_ID {
         return detail(
             400,
-            "The root key is set in the environment and cannot be renamed here",
+            "The root key is set in the environment and cannot be changed here",
         );
     }
     let payload = match json_body(&body) {
-        Ok(Value::Object(m)) if m.contains_key("name") => m,
-        Ok(_) => return detail(400, "Expected {\"name\": \"...\"}"),
+        Ok(Value::Object(m))
+            if ["name", "requestLimit", "tokenLimit", "allowedModels"]
+                .iter()
+                .any(|field| m.contains_key(*field)) =>
+        {
+            Value::Object(m)
+        }
+        Ok(_) => {
+            return detail(
+                400,
+                "Expected {\"name\": \"...\", \"requestLimit\": 1000|null, \"tokenLimit\": 1000000|null, \"allowedModels\": [\"...\"]|null}",
+            )
+        }
         Err(r) => return r,
     };
-    let name = payload["name"].as_str().unwrap_or("").to_owned();
-    let n2 = name.clone();
-    match tokio::task::spawn_blocking(move || ds::rename_data_api_key(&id, &n2))
+    let patch = match (
+        limit_field(&payload, "requestLimit"),
+        limit_field(&payload, "tokenLimit"),
+        models_field(&payload),
+    ) {
+        (Ok(requests), Ok(tokens), Ok(models)) => ds::KeyPatch {
+            name: payload
+                .get("name")
+                .map(|n| n.as_str().unwrap_or("").to_owned()),
+            requests,
+            tokens,
+            models,
+        },
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return detail(400, e),
+    };
+    let name = patch.name.as_ref().map(|n| n.trim().to_owned());
+    match tokio::task::spawn_blocking(move || ds::update_data_api_key(&id, &patch))
         .await
         .unwrap()
     {
         Err(e) => detail(400, e),
         Ok(false) => detail(404, "API key not found"),
-        Ok(true) => json_response(200, json!({"ok": true, "name": name.trim()})),
+        Ok(true) => json_response(200, json!({"ok": true, "name": name})),
     }
 }
 
@@ -1939,6 +2050,20 @@ pub async fn put_dashboard_models(headers: HeaderMap, body: Bytes) -> Response {
     }
 }
 
+/// Usage, key names and quota of the whole pool: only the env root key or
+/// METRICS_TOKEN may read them. A dashboard-issued key is often handed to
+/// someone else, and its holder would otherwise see every other key's usage.
+fn metrics_authorized(token: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let cfg = config::get();
+    let matches = |expected: &str| {
+        !expected.is_empty()
+            && token.len() == expected.len()
+            && bool::from(token.as_bytes().ct_eq(expected.as_bytes()))
+    };
+    matches(&cfg.metrics_token) || matches(&cfg.proxy_api_key)
+}
+
 pub async fn metrics(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let token = headers
         .get("authorization")
@@ -1946,7 +2071,7 @@ pub async fn metrics(State(state): State<Shared>, headers: HeaderMap) -> Respons
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
         .to_owned();
-    if token.is_empty() || ds::identify_async(token).await.is_none() {
+    if !metrics_authorized(&token) {
         let mut r = detail(401, "Invalid or missing API Key");
         r.headers_mut()
             .insert("www-authenticate", "Bearer".parse().unwrap());

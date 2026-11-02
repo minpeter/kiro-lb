@@ -1220,7 +1220,7 @@ impl KiroAuth {
             .clone()
             .ok_or_else(|| AuthError::Other("Refresh token is not set".into()))?;
         tracing::info!("Refreshing Kiro token via Kiro Desktop Auth...");
-        let ua = crate::utils::refresh_user_agent(&self.machine_id());
+        let ua = crate::utils::AUTH_USER_AGENT.to_owned();
         let response = self
             .post(
                 &self.refresh_url,

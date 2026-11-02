@@ -30,7 +30,11 @@ pub async fn openapi() -> Response {
         ("/api/dashboard/keys", "post", "Create API key"),
         ("/api/dashboard/keys/usage", "get", "API key usage"),
         ("/api/dashboard/keys/{key_id}", "delete", "Delete API key"),
-        ("/api/dashboard/keys/{key_id}", "patch", "Rename API key"),
+        (
+            "/api/dashboard/keys/{key_id}",
+            "patch",
+            "Rename an API key or change its limits",
+        ),
         ("/api/dashboard/overview", "get", "Overview"),
         ("/api/dashboard/accounts", "get", "List accounts"),
         ("/api/dashboard/accounts", "post", "Register account"),

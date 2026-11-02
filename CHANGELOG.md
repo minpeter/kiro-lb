@@ -5,7 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.11](https://github.com/minpeter/kiro-lb/compare/v0.2.10...v0.2.11) - 2026-11-02
+
+### Added
+
+- request and token limits on API keys, set when creating or editing a key in the dashboard (`requestLimit` and `tokenLimit` on `POST /api/dashboard/keys` and `PATCH /api/dashboard/keys/{id}`; `null` removes a limit). Limits count a key's whole usage and are checked before each generation; a key that has reached one gets the spent-balance answer (402 `billing_error` "Your credit balance is too low" on Anthropic, `insufficient_quota` on OpenAI), so clients stop instead of retrying
+- per-key model access: when creating or editing a key, choose all models or a list (`allowedModels` on `POST /api/dashboard/keys` and `PATCH /api/dashboard/keys/{id}`; `null` is every model). A key asking for another model gets 403 (`permission_error` / `model_not_found`) and `/v1/models` lists only its models
+- credit cost table: `gpt-5.6-luna` 1.1x → 0.6x (1.2x above 272K), `deepseek-3.2` window 164K, `minimax-m2.5` and `minimax-m2.1` window 196K
+
+### Changed
+
+- requests to Kiro present the captured Kiro CLI 2.37.0 instead of the Kiro IDE 1.1.70: `aws-sdk-rust` user agents, `origin: KIRO_CLI`, the `AmazonCodeWhispererStreamingService.GenerateAssistantResponse` target, `envState`, and no machine id, client attribution, `agentMode`, `agentContinuationId` or `rootConversationId`; token refresh and the browser sign-in exchange send `User-Agent: Kiro-CLI`
+- upstream connections use HTTP/1.1 without ALPN, as the CLI does; `UPSTREAM_HTTP2=true` restores HTTP/2 with keepalive pings
+
+### Security
+
+- `/v1` generation routes reject a missing or invalid key before reading the request body, and dashboard routes check the session first and cap bodies at 64 KiB (login) and 8 MiB, so unauthenticated clients can no longer make the gateway buffer 64 MiB per connection
+- `/metrics` accepts only `METRICS_TOKEN` or `PROXY_API_KEY`; dashboard-issued keys, which may be handed to other people, no longer see every key's usage
+- the dashboard refuses same-site and cross-site browser requests with a password too, and its POST/PUT/PATCH routes require `Content-Type: application/json`, so a forged form post from a sibling subdomain is rejected
+- the request log takes the client address from `X-Forwarded-For` only when the connection comes from a proxy in `TRUSTED_PROXIES` (default loopback); an entry that is not an IP or CIDR is reported at startup
+- a key's limits and model list fail closed: when they or its usage cannot be read, the request gets a retryable 503 instead of being served unrestricted
+
+### Fixed
+
+- account quota counts Kiro's extra credits: active bonuses (first-upgrade trial credits), purchased add-ons and an active free trial are added to the plan allowance, so an account whose plan reads 978/978 with 462 bonus credits left is no longer shown or routed as out of quota
+- automatic history trimming keeps the system prompt; a request it cannot fit fails as too large instead of reaching Kiro without its instructions
+- idle HTTP/1.1 upstream connections are retired after 240s, before Kiro closes them (250–400s), so a request is not written to a closing socket
+- the API key limit fields reject separator-only input and decimal commas (`1,5m`) instead of reading them as no limit or as 15M
+- the system prompt is sent as its own leading message pair instead of being prepended to the first question, so a new conversation with the same system prompt reuses Kiro's prompt cache (~0.07 instead of ~0.25 credits on Sonnet 5.5 and ~0.5s faster to the first token)
 
 ## [0.2.10](https://github.com/minpeter/kiro-lb/compare/v0.2.9...v0.2.10) - 2026-10-25
 

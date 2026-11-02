@@ -13,13 +13,17 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { API_KEY_NAME_MAX, normalizeKeyName } from "../api-key-display";
 import { localizeError } from "../error-text";
+import { parseLimit } from "../key-limits";
+import type { KeyLimitsPatch } from "../types";
+import { KeyLimitFields } from "./key-limit-fields";
+import { KeyModelFields } from "./key-model-fields";
 import { usePreferences } from "../preferences";
 
 export type CreateKeyDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Creates the key; resolves with the one-time plaintext value. */
-  onCreate: (name: string) => Promise<string>;
+  onCreate: (name: string, limits: KeyLimitsPatch) => Promise<string>;
 };
 
 /**
@@ -30,6 +34,9 @@ export type CreateKeyDialogProps = {
 export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialogProps) {
   const { t, language } = usePreferences();
   const [name, setName] = useState("");
+  const [requestLimit, setRequestLimit] = useState("");
+  const [tokenLimit, setTokenLimit] = useState("");
+  const [allowedModels, setAllowedModels] = useState<string[] | null>(null);
   const [isPending, setIsPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
@@ -41,6 +48,9 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
   useEffect(() => {
     if (!open) return;
     setName("");
+    setRequestLimit("");
+    setTokenLimit("");
+    setAllowedModels(null);
     setIsPending(false);
     setError(null);
     setCreatedKey(null);
@@ -62,10 +72,16 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
       setError(t("keys.create.nameRequired"));
       return;
     }
+    const requests = parseLimit(requestLimit);
+    const tokens = parseLimit(tokenLimit);
+    if (!requests.ok || !tokens.ok) {
+      setError(t("keys.limit.invalid"));
+      return;
+    }
     setIsPending(true);
     setError(null);
     try {
-      setCreatedKey(await onCreate(normalized));
+      setCreatedKey(await onCreate(normalized, { requestLimit: requests.value, tokenLimit: tokens.value, allowedModels }));
     } catch (err) {
       // Keep the entered name so a retry is one click.
       setError(err instanceof Error ? localizeError(language, err.message) : t("keys.create.failed"));
@@ -122,11 +138,23 @@ export function CreateKeyDialog({ open, onOpenChange, onCreate }: CreateKeyDialo
                 </p>
               )}
             </div>
+            <KeyLimitFields
+              idPrefix="create-key"
+              requestLimit={requestLimit}
+              tokenLimit={tokenLimit}
+              disabled={isPending}
+              onRequestLimitChange={setRequestLimit}
+              onTokenLimitChange={setTokenLimit}
+            />
+            <KeyModelFields idPrefix="create-key" value={allowedModels} disabled={isPending} onChange={setAllowedModels} />
             <DialogFooter>
               <Button type="button" variant="outline" disabled={isPending} onClick={() => onOpenChange(false)}>
                 {t("keys.cancel")}
               </Button>
-              <Button type="submit" disabled={isPending || normalizeKeyName(name) === null}>
+              <Button
+                type="submit"
+                disabled={isPending || (allowedModels !== null && allowedModels.length === 0) || normalizeKeyName(name) === null || !parseLimit(requestLimit).ok || !parseLimit(tokenLimit).ok}
+              >
                 {isPending ? t("keys.create.creating") : t("keys.create.create")}
               </Button>
             </DialogFooter>

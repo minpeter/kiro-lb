@@ -193,6 +193,10 @@ impl LockExt for parking_lot::MutexGuard<'_, Option<HashMap<Key, PendingUsage>>>
 
 pub type UsageRow = (String, String, String, i64, i64, i64, i64, i64, Option<f64>);
 
+/// Held exclusively by the flush and shared by limit checks; see
+/// `dashboard_store::key_usage_totals`.
+pub static FLUSH_GATE: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
 pub fn drain_pending() -> Vec<UsageRow> {
     let mut guard = PENDING.lock();
     guard
@@ -204,6 +208,21 @@ pub fn drain_pending() -> Vec<UsageRow> {
             (k, a, m, c[0], c[1], c[2], c[3], c[4], usage.credits)
         })
         .collect()
+}
+
+/// Requests and tokens recorded for a key but not yet flushed to the database.
+pub fn pending_key_totals(key_id: &str) -> (i64, i64) {
+    PENDING.lock().as_ref().map_or((0, 0), |pending| {
+        pending
+            .iter()
+            .filter(|((key, _, _), _)| key == key_id)
+            .fold((0, 0), |(requests, tokens), (_, usage)| {
+                (
+                    requests + usage.counts[2],
+                    tokens + usage.counts[0] + usage.counts[1],
+                )
+            })
+    })
 }
 
 pub fn restore_pending(rows: Vec<UsageRow>) {

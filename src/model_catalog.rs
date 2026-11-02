@@ -62,14 +62,16 @@ async fn management_call(
     let base = std::env::var("KIRO_TEST_MANAGEMENT_URL").unwrap_or(base);
     let (mut req, target) = match call {
         ManagementCall::Json { target } => {
-            let mut body = json!({"origin": "AI_EDITOR"});
+            let mut body = json!({"origin": "KIRO_CLI"});
+            let mut params: Vec<(&str, String)> = vec![("origin", "KIRO_CLI".into())];
             if let Some(a) = &arn {
                 body["profileArn"] = json!(a);
+                params.push(("profileArn", a.clone()));
             }
-            (http.post(base).json(&body), Some(target))
+            (http.post(base).query(&params).json(&body), Some(target))
         }
         ManagementCall::Get { path, query } => {
-            let mut params: Vec<(&str, String)> = vec![("origin", "AI_EDITOR".into())];
+            let mut params: Vec<(&str, String)> = vec![("origin", "KIRO_CLI".into())];
             if let Some(a) = &arn {
                 params.push(("profileArn", a.clone()));
             }
@@ -78,7 +80,7 @@ async fn management_call(
         }
     };
     req = req.timeout(Duration::from_secs(20));
-    for (k, v) in management_headers(&token, target, label, &auth.machine_id()) {
+    for (k, v) in management_headers(&token, target, label) {
         req = req.header(k, v);
     }
     let resp = req
@@ -225,8 +227,13 @@ pub(crate) async fn fetch_account_usage_checked(
         .get("overageConfiguration")
         .cloned()
         .unwrap_or(json!({}));
-    let current = number(b.get("currentUsageWithPrecision")).or(number(b.get("currentUsage")));
-    let limit = number(b.get("usageLimitWithPrecision")).or(number(b.get("usageLimit")));
+    let (base_current, base_limit) = (
+        number(b.get("currentUsageWithPrecision")).or(number(b.get("currentUsage"))),
+        number(b.get("usageLimitWithPrecision")).or(number(b.get("usageLimit"))),
+    );
+    let (extra_used, extra_limit) = extra_allowance(&b, crate::store::now_f64());
+    let current = base_current.map(|c| c + extra_used);
+    let limit = base_limit.map(|l| l + extra_limit);
     let pick = |v: Option<&Value>| {
         v.and_then(Value::as_str)
             .filter(|s| !s.is_empty())
@@ -250,12 +257,103 @@ pub(crate) async fn fetch_account_usage_checked(
     }))
 }
 
+/// Credits Kiro grants on top of the plan: bonuses (first-upgrade trial
+/// credits and the like), purchased add-ons and a free trial. Kiro reports the
+/// plan's own allowance in `usageLimit` alone, so a plan at 1000/1000 with an
+/// active 500-credit bonus still has credits left and keeps serving.
+fn extra_allowance(b: &Value, now: f64) -> (f64, f64) {
+    let precise = |v: &Value, key: &str| {
+        number(v.get(format!("{key}WithPrecision").as_str())).or(number(v.get(key)))
+    };
+    let live = |v: &Value, status: &str, expiry: &str| {
+        let active = v
+            .get(status)
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.eq_ignore_ascii_case("ACTIVE"));
+        let unexpired = number(v.get(expiry)).is_none_or(|t| t <= 0.0 || t > now);
+        active && unexpired
+    };
+    let mut used = 0.0;
+    let mut limit = 0.0;
+    let mut add = |u: Option<f64>, l: Option<f64>| {
+        if let Some(l) = l.filter(|l| *l > 0.0) {
+            limit += l;
+            used += u.unwrap_or(0.0).clamp(0.0, l);
+        }
+    };
+    for bonus in b
+        .get("bonuses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|v| live(v, "status", "expiresAt"))
+    {
+        add(precise(bonus, "currentUsage"), precise(bonus, "usageLimit"));
+    }
+    if let Some(meta) = b.get("addOnMetadata").filter(|m| m.is_object()) {
+        let total = (
+            number(meta.get("addOnTotalUsage")),
+            number(meta.get("addOnTotalLimit")),
+        );
+        if total.1.is_some() {
+            add(total.0, total.1);
+        } else {
+            for addon in meta
+                .get("addOns")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|v| live(v, "status", "expiresAt"))
+            {
+                add(precise(addon, "usage"), precise(addon, "limit"));
+            }
+        }
+    }
+    if let Some(trial) = b
+        .get("freeTrialInfo")
+        .filter(|t| t.is_object() && live(t, "freeTrialStatus", "freeTrialExpiry"))
+    {
+        add(precise(trial, "currentUsage"), precise(trial, "usageLimit"));
+    }
+    (used, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::Source;
     use std::io::ErrorKind;
     use std::net::TcpListener;
+
+    #[test]
+    fn active_bonuses_add_ons_and_trials_extend_the_plan_allowance() {
+        let now = 1_800_000_000.0;
+        let captured = json!({
+            "currentUsageWithPrecision": 978.0,
+            "usageLimitWithPrecision": 978.0,
+            "bonuses": [
+                {"status": "ACTIVE", "currentUsage": 37.36, "usageLimit": 500.0, "expiresAt": 1825086847.468},
+                {"status": "EXPIRED", "currentUsage": 10.0, "usageLimit": 100.0, "expiresAt": 1825086847.0},
+                {"status": "ACTIVE", "currentUsage": 1.0, "usageLimit": 50.0, "expiresAt": 1700000000.0}
+            ],
+            "addOnMetadata": null,
+            "freeTrialInfo": null
+        });
+        let (used, limit) = extra_allowance(&captured, now);
+        assert!((used - 37.36).abs() < 1e-9);
+        assert_eq!(limit, 500.0);
+
+        let add_ons = json!({
+            "addOnMetadata": {"addOnTotalUsage": 120.0, "addOnTotalLimit": 1000.0, "addOns": []},
+            "freeTrialInfo": {"freeTrialStatus": "ACTIVE", "currentUsageWithPrecision": 5.0, "usageLimitWithPrecision": 50.0, "freeTrialExpiry": 1900000000.0}
+        });
+        assert_eq!(extra_allowance(&add_ons, now), (125.0, 1050.0));
+
+        let over_used =
+            json!({"bonuses": [{"status": "ACTIVE", "currentUsage": 600.0, "usageLimit": 500.0}]});
+        assert_eq!(extra_allowance(&over_used, now), (500.0, 500.0));
+        assert_eq!(extra_allowance(&json!({}), now), (0.0, 0.0));
+    }
 
     #[tokio::test]
     async fn management_rejects_an_invalid_region_before_refresh_or_request() {

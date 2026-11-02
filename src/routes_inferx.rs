@@ -2109,14 +2109,10 @@ mod tests {
         let auto = tool_choice_request(Some(json!("auto")));
         let (prepared, _, built) = build(&auto, "cid", "").unwrap();
         assert_eq!(prepared, auto);
-        let random = "/conversationState/agentContinuationId";
-        let mut payload = built.payload.clone();
-        let mut direct = convert_openai::openai_to_kiro(&auto, "cid", "")
+        let direct = convert_openai::openai_to_kiro(&auto, "cid", "")
             .unwrap()
             .payload;
-        *payload.pointer_mut(random).unwrap() = Value::Null;
-        *direct.pointer_mut(random).unwrap() = Value::Null;
-        assert_eq!(payload, direct);
+        assert_eq!(built.payload, direct);
         assert!(!built.serialized.contains("Tool choice for this turn"));
         let unset = tool_choice_request(None);
         assert_eq!(build(&unset, "cid", "").unwrap().0, unset);

@@ -19,6 +19,7 @@ import { dashboardApi } from "@/features/dashboard/api";
 import { exactTokens, formatTokens, summarizeUsage } from "@/features/dashboard/format";
 import { creditTotals } from "@/features/dashboard/credit-totals";
 import { deriveOverviewKpis } from "@/features/dashboard/overview-kpis";
+import type { KeyLimitsPatch } from "@/features/dashboard/types";
 import { useDashboard } from "@/features/dashboard/use-dashboard";
 import { useTabHash } from "@/features/dashboard/use-tab-hash";
 import { AccountsPanel } from "@/features/dashboard/components/accounts-panel";
@@ -125,8 +126,8 @@ export default function App() {
     );
   }
 
-  const createKey = async (name: string) => {
-    const created = await dashboardApi.createApiKey(name);
+  const createKey = async (name: string, limits: KeyLimitsPatch) => {
+    const created = await dashboardApi.createApiKey(name, limits);
     await dashboard.reload();
     return created.apiKey;
   };
@@ -315,7 +316,7 @@ export default function App() {
               isMutating={isMutating}
               onCreate={() => setIsCreateKeyOpen(true)}
               onDelete={(id) => void runAction(() => dashboardApi.deleteApiKey(id))}
-              onRename={(id, name) => void runAction(() => dashboardApi.renameApiKey(id, name))}
+              onUpdate={(id, patch) => void runAction(() => dashboardApi.updateApiKey(id, patch))}
             />
           </TabsContent>
 
