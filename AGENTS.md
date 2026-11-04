@@ -71,6 +71,14 @@ kiro-lb/
   shell is a `custom` freeform tool. It is bridged as a function with one string
   field and unwrapped back into `custom_tool_call`. Dropping it made the model
   invent command output.
+- Responses `namespace` entries only scope names; Kiro has none. A local name
+  that more than one declared tool uses gets a request-scoped alias
+  (`namespace__name`, sanitized, at most 64 characters, collision-free) for each
+  namespaced tool, and a top-level tool keeps the bare name; a tool whose name
+  is unique keeps it. History calls and `tool_choice` go through the same
+  `ToolMap`, and output items get the local `name` and `namespace` back.
+  Identical declarations are sent once; conflicting ones, an ambiguous
+  `tool_choice`, and duplicate names on any protocol are a local 400.
 - Each protocol's usage object carries only the fields that protocol defines.
 - Token counting: `cl100k_base` for Claude and unknown names, `o200k_base` for
   GPT/o-series and deepseek/qwen/minimax/glm. The CJK correction is a property of

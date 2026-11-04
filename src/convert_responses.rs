@@ -5,9 +5,16 @@
 //! entries, and its shell is a `custom` grammar tool. Kiro needs a JSON schema, so a
 //! freeform tool is bridged as a one-string-field function and unwrapped back into
 //! a `custom_tool_call` item. Dropping it instead left the model inventing output.
+//!
+//! A namespace only scopes its tools' names, and Kiro has no namespaces: two tools
+//! with the same local name in different namespaces reached Kiro under one name,
+//! which it rejects (`REQUEST_BODY_INVALID`). Such tools get a request-scoped
+//! alias (`ToolMap`); history and `tool_choice` are rewritten with it, and output
+//! items get their local name and namespace back.
 
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 
 pub const FREEFORM_BODY_FIELD: &str = "input";
 const FORWARDABLE: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -93,8 +100,152 @@ fn call_id(item: &Value, generate: bool) -> String {
         })
 }
 
-fn flatten_tools(entries: Option<&Value>) -> Vec<Value> {
-    let mut flat = Vec::new();
+/// Kiro's limit on a tool name; an alias never exceeds it.
+const MAX_TOOL_NAME: usize = 64;
+
+fn namespace_of(item: &Value) -> Option<&str> {
+    s(item, "namespace")
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+}
+
+/// Where a tool Kiro sees came from: its local name, its namespace, and whether
+/// it is a freeform (`custom`) tool bridged as a one-field function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolOrigin {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub freeform: bool,
+}
+
+/// The request-scoped mapping between declared tools and the names Kiro sees.
+/// A tool keeps its own name unless another declared tool shares it; then every
+/// namespaced one gets an alias, and a top-level tool keeps the bare name.
+#[derive(Clone, Debug, Default)]
+pub struct ToolMap {
+    upstream: HashMap<(Option<String>, String), String>,
+    origins: HashMap<String, ToolOrigin>,
+}
+
+enum Resolved {
+    Declared(String),
+    Undeclared(String),
+    Ambiguous,
+}
+
+impl ToolMap {
+    fn insert(
+        &mut self,
+        namespace: Option<String>,
+        name: String,
+        upstream: String,
+        freeform: bool,
+    ) {
+        self.upstream
+            .insert((namespace.clone(), name.clone()), upstream.clone());
+        self.origins.insert(
+            upstream,
+            ToolOrigin {
+                name,
+                namespace,
+                freeform,
+            },
+        );
+    }
+
+    fn resolve(&self, namespace: Option<&str>, name: &str) -> Resolved {
+        if let Some(up) = self
+            .upstream
+            .get(&(namespace.map(str::to_owned), name.to_owned()))
+        {
+            return Resolved::Declared(up.clone());
+        }
+        let mut same_name: Vec<&String> = self
+            .upstream
+            .iter()
+            .filter(|((_, local), _)| local == name)
+            .map(|(_, up)| up)
+            .collect();
+        match (namespace, same_name.len()) {
+            (_, 0) => Resolved::Undeclared(name.to_owned()),
+            (None, 1) => Resolved::Declared(same_name.remove(0).clone()),
+            (None, _) => Resolved::Ambiguous,
+            (Some(ns), _) => {
+                let mut taken: HashSet<String> = self.origins.keys().cloned().collect();
+                Resolved::Undeclared(alias_for(ns, name, &mut taken))
+            }
+        }
+    }
+
+    /// The name a historical call is replayed under. A call that names no
+    /// namespace while several declare that name keeps its local name, which
+    /// matches no declared tool: mislabelling it as one of them would be worse,
+    /// and refusing it would break every later turn of the conversation.
+    fn history_name(&self, namespace: Option<&str>, name: &str) -> String {
+        match self.resolve(namespace, name) {
+            Resolved::Declared(up) | Resolved::Undeclared(up) => up,
+            Resolved::Ambiguous => name.to_owned(),
+        }
+    }
+
+    fn choice_name(&self, namespace: Option<&str>, name: &str) -> Result<String, String> {
+        match self.resolve(namespace, name) {
+            Resolved::Declared(up) | Resolved::Undeclared(up) => Ok(up),
+            Resolved::Ambiguous => Err(format!(
+                "tool_choice names `{name}`, which several namespaces declare; add its `namespace`"
+            )),
+        }
+    }
+
+    /// The local name, namespace and kind of a tool Kiro called.
+    pub fn origin(&self, upstream: &str) -> ToolOrigin {
+        self.origins.get(upstream).cloned().unwrap_or(ToolOrigin {
+            name: upstream.to_owned(),
+            namespace: None,
+            freeform: false,
+        })
+    }
+}
+
+/// `namespace__name` with characters outside `[A-Za-z0-9_-]` replaced, cut to
+/// Kiro's 64-character limit with a hash of the identity when it is longer, and
+/// suffixed until it collides with no name already taken.
+fn alias_for(namespace: &str, name: &str, taken: &mut HashSet<String>) -> String {
+    let base: String = format!("{namespace}__{name}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let digest = hex::encode(&Sha256::digest(format!("{namespace}\0{name}").as_bytes())[..4]);
+    let mut attempt = 0usize;
+    loop {
+        let suffix = match attempt {
+            0 if base.len() <= MAX_TOOL_NAME => String::new(),
+            0 => format!("_{digest}"),
+            n => format!("_{digest}_{n}"),
+        };
+        let candidate = format!(
+            "{}{suffix}",
+            &base[..base.len().min(MAX_TOOL_NAME - suffix.len())]
+        );
+        if taken.insert(candidate.clone()) {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+struct Declared {
+    namespace: Option<String>,
+    entry: Value,
+}
+
+fn collect_declarations(entries: Option<&Value>, namespace: Option<&str>, out: &mut Vec<Declared>) {
     for entry in entries
         .and_then(Value::as_array)
         .into_iter()
@@ -105,17 +256,38 @@ fn flatten_tools(entries: Option<&Value>) -> Vec<Value> {
             .unwrap_or("")
             .eq_ignore_ascii_case("namespace")
         {
-            flat.extend(flatten_tools(entry.get("tools")));
+            let own = s(entry, "name").map(str::trim).filter(|n| !n.is_empty());
+            let path = match (namespace, own) {
+                (Some(outer), Some(inner)) => Some(format!("{outer}.{inner}")),
+                (outer, inner) => inner.or(outer).map(str::to_owned),
+            };
+            collect_declarations(entry.get("tools"), path.as_deref(), out);
         } else {
-            flat.push(entry.clone());
+            out.push(Declared {
+                namespace: namespace.map(str::to_owned),
+                entry: entry.clone(),
+            });
         }
     }
-    flat
 }
 
-fn convert_input(input: Option<&Value>) -> (Vec<Value>, Vec<Value>) {
+fn declarations(req: &Value) -> Vec<Declared> {
+    let mut declared = Vec::new();
+    collect_declarations(req.get("tools"), None, &mut declared);
+    for item in req
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|i| s(i, "type") == Some("additional_tools"))
+    {
+        collect_declarations(item.get("tools"), None, &mut declared);
+    }
+    declared
+}
+
+fn convert_input(input: Option<&Value>, tools: &ToolMap) -> Vec<Value> {
     let mut messages = Vec::new();
-    let mut inline_tools = Vec::new();
     match input {
         None | Some(Value::Null) => {}
         Some(Value::String(text)) => {
@@ -159,10 +331,12 @@ fn convert_input(input: Option<&Value>) -> (Vec<Value>, Vec<Value>) {
                             }
                             _ => "{}".into(),
                         };
+                        let name =
+                            tools.history_name(namespace_of(item), s(item, "name").unwrap_or(""));
                         messages.push(json!({
                             "role": "assistant",
                             "content": null,
-                            "tool_calls": [{"id": call_id(item, true), "type": "function", "function": {"name": s(item, "name").unwrap_or(""), "arguments": arguments}}],
+                            "tool_calls": [{"id": call_id(item, true), "type": "function", "function": {"name": name, "arguments": arguments}}],
                         }));
                     }
                     "function_call_output" | "custom_tool_call_output" => {
@@ -184,7 +358,7 @@ fn convert_input(input: Option<&Value>) -> (Vec<Value>, Vec<Value>) {
                         };
                         messages.push(json!({"role": "tool", "content": content, "tool_call_id": call_id(item, false)}));
                     }
-                    "additional_tools" => inline_tools.extend(flatten_tools(item.get("tools"))),
+                    "additional_tools" => {}
                     "reasoning" => tracing::debug!(
                         "Dropping reasoning item: reasoning is never replayed upstream"
                     ),
@@ -197,7 +371,7 @@ fn convert_input(input: Option<&Value>) -> (Vec<Value>, Vec<Value>) {
         }
         _ => {}
     }
-    (messages, inline_tools)
+    messages
 }
 
 fn freeform_description(entry: &Value) -> String {
@@ -225,78 +399,99 @@ fn freeform_description(entry: &Value) -> String {
     format!("{}{note}", description.trim_end())
 }
 
-pub fn freeform_tool_names(req: &Value) -> HashSet<String> {
-    let mut declared: Vec<Value> = req
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for item in req
-        .get("input")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if s(item, "type") == Some("additional_tools") {
-            declared.extend(flatten_tools(item.get("tools")));
-        }
+/// One declaration as a chat tool, with its local name and whether it is a
+/// freeform tool. The chat tool still carries the local name.
+fn chat_tool(entry: &Value) -> Option<(String, bool, Value)> {
+    let kind = s(entry, "type")
+        .filter(|k| !k.is_empty())
+        .unwrap_or("function")
+        .to_lowercase();
+    if kind == "custom" {
+        let name = entry.get("name").filter(|n| truthy(n)).map(py_str)?;
+        let tool = json!({"type": "function", "function": {
+            "name": name,
+            "description": freeform_description(entry),
+            "parameters": {"type": "object", "properties": {FREEFORM_BODY_FIELD: {"type": "string", "description": "The complete tool body, verbatim."}}, "required": [FREEFORM_BODY_FIELD]},
+        }});
+        return Some((name, true, tool));
     }
-    flatten_tools(Some(&Value::Array(declared)))
-        .iter()
-        .filter(|e| s(e, "type").unwrap_or("").eq_ignore_ascii_case("custom"))
-        .filter_map(|e| e.get("name").filter(|n| truthy(n)).map(py_str))
-        .collect()
+    if kind != "function" {
+        return None;
+    }
+    let nested = entry
+        .get("function")
+        .filter(|f| f.is_object())
+        .cloned()
+        .unwrap_or(json!({}));
+    let name = entry
+        .get("name")
+        .filter(|n| truthy(n))
+        .or_else(|| nested.get("name").filter(|n| truthy(n)))
+        .map(py_str)?;
+    let description = entry
+        .get("description")
+        .filter(|d| !d.is_null())
+        .or_else(|| nested.get("description"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let parameters = entry
+        .get("parameters")
+        .filter(|d| !d.is_null())
+        .or_else(|| nested.get("parameters"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let tool = json!({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}});
+    Some((name, false, tool))
 }
 
-fn convert_tools(declared: Vec<Value>) -> Option<Vec<Value>> {
-    let mut out = Vec::new();
-    for entry in flatten_tools(Some(&Value::Array(declared))) {
-        let kind = s(&entry, "type")
-            .filter(|k| !k.is_empty())
-            .unwrap_or("function")
-            .to_lowercase();
-        if kind == "custom" {
-            let Some(name) = entry.get("name").filter(|n| truthy(n)).map(py_str) else {
-                continue;
-            };
-            out.push(json!({"type": "function", "function": {
-                "name": name,
-                "description": freeform_description(&entry),
-                "parameters": {"type": "object", "properties": {FREEFORM_BODY_FIELD: {"type": "string", "description": "The complete tool body, verbatim."}}, "required": [FREEFORM_BODY_FIELD]},
-            }}));
-            continue;
-        }
-        if kind != "function" {
-            continue;
-        }
-        let nested = entry
-            .get("function")
-            .filter(|f| f.is_object())
-            .cloned()
-            .unwrap_or(json!({}));
-        let Some(name) = entry
-            .get("name")
-            .filter(|n| truthy(n))
-            .or_else(|| nested.get("name").filter(|n| truthy(n)))
-            .cloned()
-        else {
+/// Chat tools with names Kiro accepts, and the map that undoes them. A
+/// declaration repeated verbatim is sent once; one repeated with a different
+/// definition is refused, since either choice would run the wrong tool.
+fn build_tools(declared: Vec<Declared>) -> Result<(Vec<Value>, ToolMap), String> {
+    let mut unique: Vec<(Option<String>, String, bool, Value)> = Vec::new();
+    let mut seen: HashMap<(Option<String>, String), usize> = HashMap::new();
+    for d in declared {
+        let Some((name, freeform, tool)) = chat_tool(&d.entry) else {
             continue;
         };
-        let description = entry
-            .get("description")
-            .filter(|d| !d.is_null())
-            .or_else(|| nested.get("description"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let parameters = entry
-            .get("parameters")
-            .filter(|d| !d.is_null())
-            .or_else(|| nested.get("parameters"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        out.push(json!({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}));
+        let key = (d.namespace.clone(), name.clone());
+        if let Some(&i) = seen.get(&key) {
+            if unique[i].2 == freeform && unique[i].3 == tool {
+                continue;
+            }
+            return Err(match &d.namespace {
+                Some(ns) => format!(
+                    "tool `{name}` is declared twice in namespace `{ns}` with different definitions"
+                ),
+                None => format!("tool `{name}` is declared twice with different definitions"),
+            });
+        }
+        seen.insert(key, unique.len());
+        unique.push((d.namespace, name, freeform, tool));
     }
-    (!out.is_empty()).then_some(out)
+    let mut identities: HashMap<String, usize> = HashMap::new();
+    for (_, name, _, _) in &unique {
+        *identities.entry(name.clone()).or_default() += 1;
+    }
+    let keeps_name =
+        |namespace: &Option<String>, name: &str| namespace.is_none() || identities[name] == 1;
+    let mut taken: HashSet<String> = unique
+        .iter()
+        .filter(|(ns, name, _, _)| keeps_name(ns, name))
+        .map(|(_, name, _, _)| name.clone())
+        .collect();
+    let mut map = ToolMap::default();
+    let mut out = Vec::with_capacity(unique.len());
+    for (namespace, name, freeform, mut tool) in unique {
+        let upstream = match &namespace {
+            Some(ns) if !keeps_name(&namespace, &name) => alias_for(ns, &name, &mut taken),
+            _ => name.clone(),
+        };
+        tool["function"]["name"] = json!(upstream);
+        map.insert(namespace, name, upstream, freeform);
+        out.push(tool);
+    }
+    Ok((out, map))
 }
 
 pub fn normalize_effort(effort: Option<&str>) -> Option<String> {
@@ -314,15 +509,20 @@ pub fn normalize_effort(effort: Option<&str>) -> Option<String> {
 }
 
 pub fn responses_request_to_chat(req: &Value) -> Result<Value, String> {
+    responses_request_to_chat_with_tools(req).map(|(chat, _)| chat)
+}
+
+/// The chat request and the tool map its output must be translated back with.
+pub fn responses_request_to_chat_with_tools(req: &Value) -> Result<(Value, ToolMap), String> {
     if req.get("previous_response_id").is_some_and(truthy) {
         return Err("previous_response_id is not supported: this gateway stores no responses. Send the full conversation in `input` with store=false.".into());
     }
+    let (tools, map) = build_tools(declarations(req))?;
     let mut messages = Vec::new();
     if let Some(i) = req.get("instructions").filter(|v| truthy(v)) {
         messages.push(json!({"role": "system", "content": i}));
     }
-    let (converted, inline_tools) = convert_input(req.get("input"));
-    messages.extend(converted);
+    messages.extend(convert_input(req.get("input"), &map));
     if messages.is_empty() {
         return Err("`input` must contain at least one message".into());
     }
@@ -336,13 +536,7 @@ pub fn responses_request_to_chat(req: &Value) -> Result<Value, String> {
         "stream".into(),
         json!(req.get("stream").is_some_and(truthy)),
     );
-    let mut declared: Vec<Value> = req
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    declared.extend(inline_tools);
-    if let Some(tools) = convert_tools(declared) {
+    if !tools.is_empty() {
         payload.insert("tools".into(), Value::Array(tools));
     }
     match req.get("tool_choice") {
@@ -353,14 +547,26 @@ pub fn responses_request_to_chat(req: &Value) -> Result<Value, String> {
             let name = c
                 .get("name")
                 .filter(|n| truthy(n))
-                .or_else(|| c.get("function").and_then(|f| f.get("name")));
-            if c.get("type").and_then(Value::as_str) == Some("function") && name.is_some() {
-                payload.insert(
-                    "tool_choice".into(),
-                    json!({"type": "function", "function": {"name": name}}),
-                );
-            } else {
-                payload.insert("tool_choice".into(), Value::Object(c.clone()));
+                .or_else(|| c.get("function").and_then(|f| f.get("name")))
+                .filter(|n| truthy(n))
+                .map(py_str);
+            let kind = c.get("type").and_then(Value::as_str);
+            match (kind, name) {
+                (Some("function" | "custom"), Some(name)) => {
+                    let ns = c
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty());
+                    let upstream = map.choice_name(ns, &name)?;
+                    payload.insert(
+                        "tool_choice".into(),
+                        json!({"type": "function", "function": {"name": upstream}}),
+                    );
+                }
+                _ => {
+                    payload.insert("tool_choice".into(), Value::Object(c.clone()));
+                }
             }
         }
         _ => {}
@@ -380,7 +586,7 @@ pub fn responses_request_to_chat(req: &Value) -> Result<Value, String> {
     if let Some(e) = normalize_effort(req.pointer("/reasoning/effort").and_then(Value::as_str)) {
         payload.insert("reasoning_effort".into(), json!(e));
     }
-    Ok(Value::Object(payload))
+    Ok((Value::Object(payload), map))
 }
 
 pub fn usage_block(usage: Option<&Value>) -> Value {
@@ -442,18 +648,22 @@ pub fn freeform_body(arguments: Option<&Value>) -> String {
     }
 }
 
-pub fn output_item_for(call: &Value, id: &str, freeform: &HashSet<String>) -> Value {
+pub fn output_item_for(call: &Value, id: &str, tools: &ToolMap) -> Value {
     let f = call.get("function").cloned().unwrap_or(json!({}));
-    let name = s(&f, "name").unwrap_or("").to_owned();
+    let origin = tools.origin(s(&f, "name").unwrap_or(""));
     let cid = s(call, "id")
         .filter(|v| !v.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| new_item_id("call"));
-    if freeform.contains(&name) {
-        json!({"id": id, "type": "custom_tool_call", "status": "completed", "name": name, "input": freeform_body(f.get("arguments")), "call_id": cid})
+    let mut item = if origin.freeform {
+        json!({"id": id, "type": "custom_tool_call", "status": "completed", "name": origin.name, "input": freeform_body(f.get("arguments")), "call_id": cid})
     } else {
-        json!({"id": id, "type": "function_call", "status": "completed", "name": name, "arguments": args_string(f.get("arguments")), "call_id": cid})
+        json!({"id": id, "type": "function_call", "status": "completed", "name": origin.name, "arguments": args_string(f.get("arguments")), "call_id": cid})
+    };
+    if let Some(ns) = origin.namespace {
+        item["namespace"] = json!(ns);
     }
+    item
 }
 
 pub fn response_envelope(
@@ -478,11 +688,7 @@ pub fn response_envelope(
     env
 }
 
-pub fn chat_completion_to_responses(
-    body: &Value,
-    model: &str,
-    freeform: &HashSet<String>,
-) -> Value {
+pub fn chat_completion_to_responses(body: &Value, model: &str, tools: &ToolMap) -> Value {
     let choice = body.pointer("/choices/0").cloned().unwrap_or(json!({}));
     let message = choice.get("message").cloned().unwrap_or(json!({}));
     let mut output = Vec::new();
@@ -508,7 +714,7 @@ pub fn chat_completion_to_responses(
         .flatten()
         .filter(|c| c.is_object())
     {
-        output.push(output_item_for(call, &new_item_id("fc"), freeform));
+        output.push(output_item_for(call, &new_item_id("fc"), tools));
     }
     let finish = choice
         .get("finish_reason")

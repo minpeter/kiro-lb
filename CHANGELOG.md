@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `/v1/responses` keeps tools with the same name in different namespaces apart (#122): each gets a collision-free alias of at most 64 characters, history calls and `tool_choice` use the same mapping, and output items carry the original `name` and `namespace` again, streaming and not. Kiro no longer rejects such requests with `REQUEST_BODY_INVALID`
+- a tool declared twice identically is sent once; two different definitions under one name, or a `tool_choice` that matches several namespaces, get a clear 400 before Kiro is called
+- duplicate tool names on chat completions and messages get a local 400 naming the tool instead of Kiro's opaque `REQUEST_BODY_INVALID`
+
 ## [0.2.11](https://github.com/minpeter/kiro-lb/compare/v0.2.10...v0.2.11) - 2026-11-02
 
 ### Added

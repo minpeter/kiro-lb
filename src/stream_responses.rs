@@ -3,11 +3,11 @@
 
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
 use std::pin::Pin;
 
 use crate::convert_responses::{
     message_item, new_item_id, output_item_for, reasoning_item, response_envelope, usage_block,
+    ToolMap,
 };
 use crate::stream_core::StreamError;
 
@@ -27,7 +27,7 @@ pub fn translate(
     mut chat: Pin<Box<dyn Stream<Item = Result<String, StreamError>> + Send>>,
     model: String,
     response_id: String,
-    freeform: HashSet<String>,
+    tools: ToolMap,
 ) -> Pin<Box<dyn Stream<Item = Result<String, StreamError>> + Send>> {
     Box::pin(async_stream::stream! {
         let mut seq: i64 = -1;
@@ -126,7 +126,7 @@ pub fn translate(
         let base = output.len() as i64;
         for (i, call) in tool_calls.iter().enumerate() {
             let index = base + i as i64;
-            let item = output_item_for(call, &new_item_id("fc"), &freeform);
+            let item = output_item_for(call, &new_item_id("fc"), &tools);
             let freeform_call = item["type"] == "custom_tool_call";
             let field = if freeform_call { "input" } else { "arguments" };
             let (delta_event, done_event) = if freeform_call {
@@ -163,7 +163,7 @@ mod tests {
     fn run(err: StreamError) -> Vec<Result<String, StreamError>> {
         let chat: Pin<Box<dyn Stream<Item = Result<String, StreamError>> + Send>> =
             Box::pin(futures_util::stream::iter(vec![Err(err)]));
-        let out = translate(chat, "m".into(), "resp_1".into(), HashSet::new());
+        let out = translate(chat, "m".into(), "resp_1".into(), ToolMap::default());
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
