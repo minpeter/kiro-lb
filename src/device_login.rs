@@ -20,6 +20,11 @@ const BUILDER_ID_SCOPES: [&str; 3] = [
     "codewhisperer:conversations",
 ];
 const FLOW_GRACE: f64 = 60.0;
+/// Time to pick a profile once AWS approved the login. The device code's own
+/// window may be nearly spent by then, and the approved token outlives it.
+const PROFILE_SELECTION_WINDOW: f64 = 600.0;
+/// Ceiling on the poll interval AWS can raise with `slow_down`.
+const MAX_POLL_INTERVAL: f64 = 60.0;
 // The same discovery regions as kiro-cli; an organization's SSO region need
 // not be the region that hosts its CodeWhisperer profile.
 const PROFILE_ENDPOINTS: [&str; 2] = [
@@ -384,7 +389,31 @@ pub fn discard(id: &str) {
     }
 }
 
+fn slowed_interval(interval: f64) -> f64 {
+    (interval + 5.0).min(MAX_POLL_INTERVAL)
+}
+
+fn await_profile_choice(flow: &mut DeviceFlow) {
+    flow.status = "selecting_profile".into();
+    flow.expires_at = now_f64() + PROFILE_SELECTION_WINDOW;
+}
+
+/// Clears the in-flight mark if the poll future is dropped before it publishes
+/// its result, as when the dashboard request is cancelled during profile
+/// discovery: a mark left set would make every later poll return early and
+/// the flow could never be registered.
+struct PollMark(String);
+
+impl Drop for PollMark {
+    fn drop(&mut self) {
+        if let Some(flow) = FLOWS.lock().as_mut().and_then(|f| f.get_mut(&self.0)) {
+            flow.polling = false;
+        }
+    }
+}
+
 pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String> {
+    let _mark = PollMark(id.to_owned());
     let mut flow = {
         let mut guard = FLOWS.lock();
         let flow = guard
@@ -433,7 +462,7 @@ pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String
             Err(reason) => {
                 if reason.contains("authorization_pending") || reason.contains("AuthorizationPending") {
                 } else if reason.contains("slow_down") || reason.contains("SlowDown") {
-                    flow.interval += 5.0;
+                    flow.interval = slowed_interval(flow.interval);
                 } else {
                     flow.status = if reason.contains("expired_token") || reason.contains("ExpiredToken") { "expired" } else { "failed" }.into();
                     flow.detail = Some(if flow.provider == "IdentityCenter" { identity_center_error(&reason) } else { reason });
@@ -453,7 +482,7 @@ pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String
                                         token["profileArn"] = json!(flow.profiles[0].arn);
                                     }
                                 } else {
-                                    flow.status = "selecting_profile".into();
+                                    await_profile_choice(&mut flow);
                                 }
                             }
                             Err(reason) => {
@@ -531,14 +560,15 @@ async fn profiles_at(
         if let Some(token) = &next_token {
             body["nextToken"] = json!(token);
         }
-        let response = http
-            .post(endpoint)
-            .bearer_auth(access_token)
-            .header("content-type", "application/x-amz-json-1.0")
-            .header(
-                "x-amz-target",
-                "AmazonCodeWhispererService.ListAvailableProfiles",
-            )
+        let mut request = http.post(endpoint);
+        for (name, value) in crate::utils::management_headers(
+            access_token,
+            Some("AmazonCodeWhispererService.ListAvailableProfiles"),
+            crate::utils::CODEWHISPERER_API,
+        ) {
+            request = request.header(name, value);
+        }
+        let response = request
             .json(&body)
             .timeout(Duration::from_secs(20))
             .send()
@@ -848,6 +878,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_poll_does_not_leave_the_flow_marked_in_flight() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy =
+            reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let http = reqwest::Client::builder().proxy(proxy).build().unwrap();
+        let id = "org-cancelled-poll";
+        let mut flow = organization_flow(id);
+        flow.status = "pending".into();
+        flow.token = None;
+        FLOWS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(id.into(), flow);
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(300), poll(&http, id)).await;
+        assert!(
+            cancelled.is_err(),
+            "the proxy never answers, so the poll is dropped"
+        );
+        assert!(
+            !get(id).unwrap().polling,
+            "the next poll can reach AWS again"
+        );
+        drop(listener);
+        discard(id);
+    }
+
+    #[test]
+    fn profile_selection_gets_its_own_window_and_slow_down_is_capped() {
+        let mut flow = organization_flow("org-window");
+        flow.expires_at = now_f64() + 1.0;
+        await_profile_choice(&mut flow);
+        assert_eq!(flow.status, "selecting_profile");
+        assert!(flow.expires_at > now_f64() + PROFILE_SELECTION_WINDOW - 5.0);
+
+        let mut interval = 5.0;
+        for _ in 0..50 {
+            interval = slowed_interval(interval);
+        }
+        assert_eq!(interval, MAX_POLL_INTERVAL);
+        assert_eq!(slowed_interval(5.0), 10.0);
+    }
+
+    #[tokio::test]
     async fn oidc_poll_interval_and_in_flight_poll_prevent_outbound_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -882,6 +956,10 @@ mod tests {
             post(|headers: HeaderMap, body: Bytes| async move {
                 let body: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(headers["authorization"], "Bearer test-access");
+                assert!(headers["user-agent"]
+                    .to_str()
+                    .unwrap()
+                    .contains("app/AmazonQ-For-CLI"));
                 assert_eq!(headers["content-type"], "application/x-amz-json-1.0");
                 assert_eq!(
                     headers["x-amz-target"],

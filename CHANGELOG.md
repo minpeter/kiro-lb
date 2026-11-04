@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- dashboard sign-in for organization accounts (IAM Identity Center, #116): enter the organization's start URL and SSO region, approve the device code, and pick a Kiro profile when the organization has more than one (a single profile is chosen automatically). The account refreshes through its SSO region and calls the API in its profile's region. Implemented by @madrobotnet (#120), proposed by @yelixir-dev
+
+### Fixed
+
+- an organization login whose dashboard request is cancelled while profiles are discovered can still be polled and registered; choosing a profile has its own 10-minute window instead of the device code's, a wrong choice keeps the approved login, AWS `slow_down` raises the poll interval to at most 60s, profile discovery presents the Kiro CLI identity, and its errors are translated
+
 ## [0.2.11](https://github.com/minpeter/kiro-lb/compare/v0.2.10...v0.2.11) - 2026-11-02
 
 ### Added

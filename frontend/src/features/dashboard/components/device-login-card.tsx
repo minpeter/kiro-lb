@@ -11,7 +11,7 @@ import { DashboardApiError, dashboardApi } from "../api";
 import { dismissAlert, pushAlert, pushError } from "../alerts";
 import { isBrowserCallback, usesBrowserSignIn, type SocialLoginMode } from "../browser-login";
 import { registrationMessage } from "../device-login-result";
-import { identityCenterLoginError } from "../identity-center-login";
+import { identityCenterLoginError, isProfileChoiceError } from "../identity-center-login";
 import type { BrowserLoginFlow, DeviceLoginFlow, DeviceLoginProvider, IdentityCenterLoginConfig } from "../types";
 import { AwsMark, GithubMark, GoogleMark } from "./provider-marks";
 import { usePreferences } from "../preferences";
@@ -132,7 +132,11 @@ export function DeviceLoginCard({ onRegistered }: { onRegistered: () => Promise<
         await onRegistered();
       } catch (cause) {
         pushError(cause);
-        setActive(undefined);
+        if (profileArn && isProfileChoiceError(cause)) {
+          pendingFlowId.current = flowId;
+        } else {
+          setActive(undefined);
+        }
       } finally {
         setRegisteringFlow(false);
       }
