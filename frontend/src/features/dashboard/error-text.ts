@@ -43,6 +43,7 @@ const PREFIXES: [string, string][] = [
   ["Kiro rejected the login request", "error.loginRejected"],
   ["Login is ", "error.loginNotApproved"],
   ["Identity Center requires", "error.orgSettings"],
+  ["invalid region: ", "error.invalidRegion"],
   ["Identity Center profile discovery", "error.orgProfileDiscovery"],
   ["Identity Center returned ", "error.orgProfileDiscovery"],
   ["AWS SSO OIDC rejected the organization login", "error.orgLoginRejected"],

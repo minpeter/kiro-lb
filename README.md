@@ -56,10 +56,11 @@ enter your organization's HTTPS start URL and SSO region, and approve the
 device code in your browser. The dashboard discovers available Kiro profiles
 in US East (N. Virginia) and Europe (Frankfurt), as kiro-cli does. A single
 profile is selected automatically; otherwise choose a profile to finish.
-Your administrator must have assigned access to a Kiro profile. Credentials
-and the OIDC client registration are stored internally and refreshed in the
-SSO region, independently of the profile's API region; no kiro-cli database
-or filesystem mount is needed.
+Your administrator must have assigned access to a Kiro profile. The access
+token is refreshed in the SSO region, independently of the profile's API
+region, using the stored OIDC client registration. That registration is kept
+as issued and is not renewed: when it expires, sign the account in again. No
+kiro-cli database or filesystem mount is needed.
 
 `SHA256SUMS` in the release lists every file's checksum.
 

@@ -491,6 +491,43 @@ describe("organization device sign-in", () => {
     expect(onRegistered).toHaveBeenCalledOnce();
   });
 
+  it("keeps the approved login selectable after the server refuses a profile choice", async () => {
+    harness.api.pollDeviceLogin.mockResolvedValue({ ...organization, status: "selecting_profile", profiles });
+    harness.api.registerDeviceLogin
+      .mockRejectedValueOnce(new DashboardApiError("Select a profile returned by this login", 400))
+      .mockResolvedValueOnce({ accountId: "organization-account", initialized: true });
+    fillOrganization();
+    await submitForm();
+    await poll();
+
+    find(render(), (props) => Boolean(props.onValueChange))!.props.onValueChange!(profiles[0].arn);
+    await submitForm();
+    expect(harness.pushError).toHaveBeenCalledOnce();
+    expect(onRegistered).not.toHaveBeenCalled();
+
+    find(render(), (props) => Boolean(props.onValueChange))!.props.onValueChange!(profiles[1].arn);
+    await submitForm();
+    expect(harness.api.registerDeviceLogin).toHaveBeenNthCalledWith(2, "organization", profiles[1].arn);
+    expect(onRegistered).toHaveBeenCalledOnce();
+  });
+
+  it("drops the login when the server says it no longer waits for a profile", async () => {
+    harness.api.pollDeviceLogin.mockResolvedValue({ ...organization, status: "selecting_profile", profiles });
+    harness.api.registerDeviceLogin.mockRejectedValueOnce(
+      new DashboardApiError("Login is not waiting for profile selection", 400),
+    );
+    fillOrganization();
+    await submitForm();
+    await poll();
+
+    find(render(), (props) => Boolean(props.onValueChange))!.props.onValueChange!(profiles[0].arn);
+    await submitForm();
+
+    expect(harness.api.registerDeviceLogin).toHaveBeenCalledOnce();
+    expect(find(render(), (props) => Boolean(props.onValueChange))).toBeUndefined();
+    expect(button("Continue with Google").disabled).toBe(false);
+  });
+
   it("cancels a profile choice without registering the account", async () => {
     harness.api.pollDeviceLogin.mockResolvedValue({ ...organization, status: "selecting_profile", profiles });
     fillOrganization();

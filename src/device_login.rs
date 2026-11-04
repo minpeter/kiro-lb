@@ -402,19 +402,27 @@ fn await_profile_choice(flow: &mut DeviceFlow) {
 /// its result, as when the dashboard request is cancelled during profile
 /// discovery: a mark left set would make every later poll return early and
 /// the flow could never be registered.
-struct PollMark(String);
+/// Only the poll that set the mark holds one, and it is released before the
+/// result is published, so it can never clear another poll's mark.
+struct PollMark(Option<String>);
+
+impl PollMark {
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
 
 impl Drop for PollMark {
     fn drop(&mut self) {
-        if let Some(flow) = FLOWS.lock().as_mut().and_then(|f| f.get_mut(&self.0)) {
+        let Some(id) = self.0.take() else { return };
+        if let Some(flow) = FLOWS.lock().as_mut().and_then(|f| f.get_mut(&id)) {
             flow.polling = false;
         }
     }
 }
 
 pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String> {
-    let _mark = PollMark(id.to_owned());
-    let mut flow = {
+    let (mut flow, mut mark) = {
         let mut guard = FLOWS.lock();
         let flow = guard
             .as_mut()
@@ -423,18 +431,21 @@ pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String
         if flow.polling {
             return Ok(flow.clone());
         }
+        let mut mark = PollMark(None);
         if flow.status == "pending" && now_f64() <= flow.expires_at {
             if now_f64() < flow.next_poll_at {
                 return Ok(flow.clone());
             }
             flow.polling = true;
+            mark = PollMark(Some(id.to_owned()));
         }
-        flow.clone()
+        (flow.clone(), mark)
     };
     if matches!(flow.status.as_str(), "approved" | "failed" | "expired") {
         return Ok(flow);
     }
     if now_f64() > flow.expires_at {
+        mark.release();
         flow.polling = false;
         flow.token = None;
         flow.status = "expired".into();
@@ -445,7 +456,9 @@ pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String
     if flow.status == "selecting_profile" {
         return Ok(flow);
     }
-    if matches!(flow.provider, "BuilderId" | "IdentityCenter") {
+    if flow.provider == "IdentityCenter" && flow.token.is_some() {
+        discover_into(http, &mut flow).await;
+    } else if matches!(flow.provider, "BuilderId" | "IdentityCenter") {
         let reg = flow.registration.clone().unwrap_or(json!({}));
         let region = reg
             .get("region")
@@ -471,26 +484,17 @@ pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String
             Ok(p) => match p.get("accessToken").filter(|t| t.as_str().is_some_and(|s| !s.is_empty())) {
                 Some(t) => {
                     flow.token = Some(json!({"accessToken": t, "refreshToken": p.get("refreshToken"), "expiresIn": p.get("expiresIn"), "profileArn": null}));
-                    flow.status = "approved".into();
                     flow.detail = None;
                     if flow.provider == "IdentityCenter" {
-                        match discover_profiles(http, &s(&p, "accessToken")).await {
-                            Ok(profiles) => {
-                                flow.profiles = profiles;
-                                if flow.profiles.len() == 1 {
-                                    if let Some(token) = flow.token.as_mut() {
-                                        token["profileArn"] = json!(flow.profiles[0].arn);
-                                    }
-                                } else {
-                                    await_profile_choice(&mut flow);
-                                }
-                            }
-                            Err(reason) => {
-                                flow.status = "failed".into();
-                                flow.detail = Some(reason);
-                                flow.token = None;
-                            }
-                        }
+                        // AWS hands the token out once for a device code, so it
+                        // is kept in the shared flow before the slow discovery:
+                        // a cancelled request leaves it there and the next poll
+                        // resumes discovery with it instead of a spent code.
+                        flow.expires_at = now_f64() + PROFILE_SELECTION_WINDOW;
+                        put(flow.clone());
+                        discover_into(http, &mut flow).await;
+                    } else {
+                        flow.status = "approved".into();
                     }
                 }
                 None => {
@@ -541,10 +545,42 @@ pub async fn poll(http: &reqwest::Client, id: &str) -> Result<DeviceFlow, String
             }
         }
     }
+    mark.release();
     flow.polling = false;
     flow.next_poll_at = now_f64() + flow.interval;
     put(flow.clone());
     Ok(flow)
+}
+
+/// Lists the approved login's profiles: one is selected at once, several wait
+/// for the operator, and none ends the login.
+async fn discover_into(http: &reqwest::Client, flow: &mut DeviceFlow) {
+    let access = flow
+        .token
+        .as_ref()
+        .and_then(|t| t.get("accessToken"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match discover_profiles(http, &access).await {
+        Ok(profiles) => {
+            flow.profiles = profiles;
+            if flow.profiles.len() == 1 {
+                let arn = flow.profiles[0].arn.clone();
+                if let Some(token) = flow.token.as_mut() {
+                    token["profileArn"] = json!(arn);
+                }
+                flow.status = "approved".into();
+            } else {
+                await_profile_choice(flow);
+            }
+        }
+        Err(reason) => {
+            flow.status = "failed".into();
+            flow.detail = Some(reason);
+            flow.token = None;
+        }
+    }
 }
 
 async fn profiles_at(
@@ -905,6 +941,38 @@ mod tests {
         discard(id);
     }
 
+    #[tokio::test]
+    async fn a_cancelled_profile_discovery_keeps_the_approved_token_for_the_next_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy =
+            reqwest::Proxy::all(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let http = reqwest::Client::builder().proxy(proxy).build().unwrap();
+        let id = "org-cancelled-discovery";
+        let mut flow = organization_flow(id);
+        flow.status = "pending".into();
+        flow.token.as_mut().unwrap()["profileArn"] = Value::Null;
+        FLOWS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(id.into(), flow);
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(300), poll(&http, id)).await;
+        assert!(
+            cancelled.is_err(),
+            "discovery never answers, so the poll is dropped"
+        );
+        let kept = get(id).unwrap();
+        assert_eq!(kept.status, "pending");
+        assert!(!kept.polling);
+        assert_eq!(
+            kept.token.as_ref().unwrap()["refreshToken"],
+            "refresh",
+            "the spent device code is not needed again: the next poll resumes discovery"
+        );
+        drop(listener);
+        discard(id);
+    }
+
     #[test]
     fn profile_selection_gets_its_own_window_and_slow_down_is_capped() {
         let mut flow = organization_flow("org-window");
@@ -944,6 +1012,11 @@ mod tests {
 
             assert_eq!(poll(&http, id).await.unwrap().status, "pending");
             assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+            assert_eq!(
+                get(id).unwrap().polling,
+                polling,
+                "a poll that found another in flight leaves its mark alone"
+            );
             discard(id);
         }
     }

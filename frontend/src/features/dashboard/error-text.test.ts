@@ -24,6 +24,7 @@ describe("localizeError", () => {
       "Identity Center requires an HTTPS start URL without credentials, query, or fragment",
       "Identity Center requires a region",
       "Identity Center requires a start URL and region",
+      "invalid region: expected a lowercase AWS region such as us-east-1 or us-gov-west-1",
       "Could not contact the Identity Center profile service",
       "Identity Center profile discovery returned HTTP 403",
       "Identity Center returned an invalid profile list",
