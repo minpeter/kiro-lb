@@ -148,6 +148,7 @@ struct Creds {
     expires_at: Option<f64>,
     bound_identity: Option<String>,
     invalid_region_type: bool,
+    invalid_sso_region_type: bool,
     invalid_profile_arn_type: bool,
 }
 
@@ -294,6 +295,18 @@ impl Creds {
         }
         if let Some(h) = s(data, "clientIdHash") {
             self.load_enterprise_registration(&h);
+        }
+        // Organization profiles can live outside the region that issued the
+        // SSO client. Keep refresh routing separate from the API region.
+        if let Some(region) = data.get("ssoRegion") {
+            match region {
+                Value::String(region) => {
+                    self.sso_region = Some(region.to_owned());
+                    self.invalid_sso_region_type = false;
+                }
+                Value::Null => self.invalid_sso_region_type = false,
+                _ => self.invalid_sso_region_type = true,
+            }
         }
         if let Some(v) = s(data, "clientId") {
             self.client_id = Some(v);
@@ -530,7 +543,7 @@ fn validate_named_region(kind: &str, region: &str) -> Result<(), AuthError> {
 }
 
 fn validate_credential_regions(c: &Creds) -> Result<(), AuthError> {
-    if c.invalid_region_type {
+    if c.invalid_region_type || c.invalid_sso_region_type {
         return Err(AuthError::Other(
             "invalid credential region: expected a string containing a lowercase AWS region".into(),
         ));
@@ -1839,6 +1852,44 @@ mod tests {
         assert!(creds.sso_region.is_none());
         assert!(creds.profile_arn.is_none());
         assert!(validate_credential_regions(&creds).is_ok());
+    }
+
+    #[test]
+    fn organization_credentials_keep_sso_and_profile_regions_across_export() {
+        // Given a profile hosted outside the organization's SSO region.
+        let document = json!({
+            "refreshToken": "refresh",
+            "accessToken": "access",
+            "clientId": "client",
+            "clientSecret": "secret",
+            "region": "eu-central-1",
+            "ssoRegion": "us-west-2",
+            "profileArn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/test"
+        });
+        let http = reqwest::Client::new();
+        let auth = KiroAuth::from_device_credentials("org", &document, http.clone()).unwrap();
+
+        // When the credential is exported and loaded again.
+        let reloaded =
+            KiroAuth::from_device_credentials("org", &auth.credential_document(), http).unwrap();
+
+        // Then API routing follows the profile and refresh follows the issuer.
+        assert_eq!(reloaded.auth_type, AuthType::AwsSsoOidc);
+        assert_eq!(reloaded.api_region, "eu-central-1");
+        assert_eq!(reloaded.q_host, "https://runtime.eu-central-1.kiro.dev");
+        assert_eq!(
+            reloaded.creds.lock().sso_region.as_deref(),
+            Some("us-west-2")
+        );
+    }
+
+    #[test]
+    fn malformed_sso_region_cannot_override_valid_api_region() {
+        for sso_region in [json!(7), json!("us-east-1@localhost")] {
+            let mut creds = Creds::default();
+            creds.replace_document(&json!({"region": "eu-central-1", "ssoRegion": sso_region}));
+            assert!(validate_credential_regions(&creds).is_err());
+        }
     }
 
     #[test]

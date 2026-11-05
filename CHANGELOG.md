@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- dashboard sign-in for organization accounts (IAM Identity Center, #116): enter the organization's start URL and SSO region, approve the device code, and pick a Kiro profile when the organization has more than one (a single profile is chosen automatically). The account refreshes through its SSO region and calls the API in its profile's region. Implemented by @madrobotnet (#120), proposed by @yelixir-dev
+
 ### Fixed
 
+- an organization login whose dashboard request is cancelled while profiles are discovered can still be polled and registered; choosing a profile has its own 10-minute window instead of the device code's, a wrong choice keeps the approved login, AWS `slow_down` raises the poll interval to at most 60s, profile discovery presents the Kiro CLI identity, and its errors are translated
 - `/v1/responses` keeps tools with the same name in different namespaces apart (#122): each gets a collision-free alias of at most 64 characters, history calls and `tool_choice` use the same mapping, and output items carry the original `name` and `namespace` again, streaming and not. Kiro no longer rejects such requests with `REQUEST_BODY_INVALID`
 - a tool declared twice identically is sent once; two different definitions under one name, or a `tool_choice` that matches several namespaces, get a clear 400 before Kiro is called
 - duplicate tool names on chat completions and messages get a local 400 naming the tool instead of Kiro's opaque `REQUEST_BODY_INVALID`

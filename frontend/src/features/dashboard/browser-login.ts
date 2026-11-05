@@ -4,7 +4,7 @@ export type SocialLoginMode = "browser" | "device";
 
 /** Google and GitHub use browser sign-in unless the operator picks a device code. */
 export function usesBrowserSignIn(provider: DeviceLoginProvider, mode: SocialLoginMode): provider is "google" | "github" {
-  return provider !== "builder-id" && mode === "browser";
+  return (provider === "google" || provider === "github") && mode === "browser";
 }
 
 /**

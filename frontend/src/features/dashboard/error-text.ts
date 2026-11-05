@@ -26,6 +26,14 @@ const EXACT: Record<string, string> = {
   "Unknown request log": "error.unknownLog",
   "Could not read the request log": "error.readLog",
   "Not Found": "error.notFound",
+  "No Kiro profiles are available for this organization. Ask your administrator to assign access.":
+    "error.noOrgProfiles",
+  "Could not discover Identity Center profiles. Try signing in again.": "error.orgProfileDiscovery",
+  "Could not contact the Identity Center profile service": "error.orgProfileDiscovery",
+  "Select an Identity Center profile": "error.selectOrgProfile",
+  "Select a profile returned by this login": "error.selectOrgProfile",
+  "Identity Center login requires a profile": "error.selectOrgProfile",
+  "Login is not waiting for profile selection": "error.profileSelectionClosed",
 };
 
 const PREFIXES: [string, string][] = [
@@ -34,6 +42,12 @@ const PREFIXES: [string, string][] = [
   ["Account registration failed", "error.registerAccount"],
   ["Kiro rejected the login request", "error.loginRejected"],
   ["Login is ", "error.loginNotApproved"],
+  ["Identity Center requires", "error.orgSettings"],
+  ["invalid region: ", "error.invalidRegion"],
+  ["Identity Center profile discovery", "error.orgProfileDiscovery"],
+  ["Identity Center returned ", "error.orgProfileDiscovery"],
+  ["AWS SSO OIDC rejected the organization login", "error.orgLoginRejected"],
+  ["AWS SSO OIDC could not complete the organization login", "error.orgLoginRejected"],
   ["Could not persist", "error.persist"],
   ["requestLimit must", "error.invalidLimit"],
   ["tokenLimit must", "error.invalidLimit"],
