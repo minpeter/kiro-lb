@@ -11,6 +11,10 @@ describe("usesBrowserSignIn", () => {
   it("keeps Builder ID on the device flow", () => {
     expect(usesBrowserSignIn("builder-id", "browser")).toBe(false);
   });
+
+  it.each(["browser", "device"] as const)("keeps Identity Center on the device flow in %s mode", (mode) => {
+    expect(usesBrowserSignIn("idc", mode)).toBe(false);
+  });
 });
 
 describe("isBrowserCallback", () => {
