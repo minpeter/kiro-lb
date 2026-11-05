@@ -254,12 +254,27 @@ pub fn validate_tool_names(tools: Option<&Vec<UnifiedTool>>) -> Result<(), Build
         .filter(|t| t.name.chars().count() > 64)
         .map(|t| format!("  - '{}' ({} characters)", t.name, t.name.chars().count()))
         .collect();
-    if bad.is_empty() {
+    if !bad.is_empty() {
+        return Err(BuildError::Invalid(format!(
+            "Tool name(s) exceed Kiro API limit of 64 characters:\n{}\n\nSolution: Use shorter tool names (max 64 characters).\nExample: 'get_user_data' instead of 'get_authenticated_user_profile_data_with_extended_information_about_it'",
+            bad.join("\n")
+        )));
+    }
+    // Kiro rejects a request whose tools share a name with an opaque
+    // REQUEST_BODY_INVALID; saying which name is repeated lets the client fix it.
+    let mut seen = std::collections::HashSet::new();
+    let mut repeated: Vec<&str> = Vec::new();
+    for tool in tools {
+        if !seen.insert(tool.name.as_str()) && !repeated.contains(&tool.name.as_str()) {
+            repeated.push(&tool.name);
+        }
+    }
+    if repeated.is_empty() {
         return Ok(());
     }
     Err(BuildError::Invalid(format!(
-        "Tool name(s) exceed Kiro API limit of 64 characters:\n{}\n\nSolution: Use shorter tool names (max 64 characters).\nExample: 'get_user_data' instead of 'get_authenticated_user_profile_data_with_extended_information_about_it'",
-        bad.join("\n")
+        "Tool names must be unique; declared more than once: {}",
+        repeated.join(", ")
     )))
 }
 

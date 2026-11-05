@@ -1,7 +1,6 @@
 use futures_util::StreamExt;
 use kiro_lb::routes_v1::sse_body;
 use kiro_lb::stream_core::StreamError;
-use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +26,7 @@ async fn a_failed_responses_turn_is_not_an_account_success() {
         StreamError::UpstreamStatus(429),
     )]));
     let translated =
-        kiro_lb::stream_responses::translate(chat, "m".into(), "resp_1".into(), HashSet::new());
+        kiro_lb::stream_responses::translate(chat, "m".into(), "resp_1".into(), Default::default());
     let (text, ok) = outcome(translated).await;
     assert!(text.contains("response.failed"));
     assert!(text.contains("rate_limit_exceeded"));
@@ -41,7 +40,7 @@ async fn a_completed_turn_is_an_account_success() {
             .to_owned(),
     )]));
     let translated =
-        kiro_lb::stream_responses::translate(chat, "m".into(), "resp_1".into(), HashSet::new());
+        kiro_lb::stream_responses::translate(chat, "m".into(), "resp_1".into(), Default::default());
     let (text, ok) = outcome(translated).await;
     assert!(text.contains("response.completed"));
     assert_eq!(ok, Some(true));

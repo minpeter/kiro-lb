@@ -300,7 +300,7 @@ struct Plan {
     session: Option<u64>,
     ctx: RequestCtx,
     openai: Option<(bool, bool, bool)>,
-    responses: Option<(String, HashSet<String>)>,
+    responses: Option<(String, convert_responses::ToolMap)>,
 }
 
 fn build(plan: &Plan, conversation_id: &str, arn: &str) -> Result<KiroPayloadResult, BuildError> {
@@ -529,12 +529,12 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             };
             if plan.stream {
                 let s = stream_openai::stream(events, sctx, opts);
-                if let Some((response_id, freeform)) = plan.responses.clone() {
+                if let Some((response_id, tools)) = plan.responses.clone() {
                     let s = crate::stream_responses::translate(
                         s,
                         plan.model.clone(),
                         response_id,
-                        freeform,
+                        tools,
                     );
                     return Attempt::Done(sse_response(
                         s,
@@ -560,12 +560,12 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
                     Ok(v) => {
                         pool.commit_success(&account, &model, plan.session);
                         match &plan.responses {
-                            Some((_, freeform)) => Attempt::Done(json_response(
+                            Some((_, tools)) => Attempt::Done(json_response(
                                 200,
                                 convert_responses::chat_completion_to_responses(
                                     &v,
                                     &plan.model,
-                                    freeform,
+                                    tools,
                                 ),
                             )),
                             None => Attempt::Done(json_response(200, v)),
@@ -1080,7 +1080,7 @@ async fn openai_plan(
     state: Shared,
     req: &mut Value,
     ctx: RequestCtx,
-    responses: Option<(String, HashSet<String>)>,
+    responses: Option<(String, convert_responses::ToolMap)>,
 ) -> Response {
     let model = req
         .get("model")
@@ -1140,16 +1140,15 @@ pub async fn responses(
         .to_owned();
     ctx.note_model(&model);
     tracing::info!("Request to /v1/responses (model={model})");
-    let mut chat = match convert_responses::responses_request_to_chat(&req) {
+    let (mut chat, tools) = match convert_responses::responses_request_to_chat_with_tools(&req) {
         Ok(c) => c,
         Err(e) => return openai_error(400, e),
     };
-    let freeform = convert_responses::freeform_tool_names(&req);
     openai_plan(
         state,
         &mut chat,
         ctx,
-        Some((convert_responses::new_response_id(), freeform)),
+        Some((convert_responses::new_response_id(), tools)),
     )
     .await
 }
