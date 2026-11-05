@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12](https://github.com/minpeter/kiro-lb/compare/v0.2.11...v0.2.12) - 2026-11-05
+
+### Added
+
+- add IAM Identity Center dashboard login
+
+### Fixed
+
+- resume organization discovery after a cancelled poll
+- keep organization logins recoverable and translate their errors
+
+### Other
+
+- Merge main into Responses namespace fix
+
 ### Added
 
 - dashboard sign-in for organization accounts (IAM Identity Center, #116): enter the organization's start URL and SSO region, approve the device code, and pick a Kiro profile when the organization has more than one (a single profile is chosen automatically). The account refreshes through its SSO region and calls the API in its profile's region. Implemented by @madrobotnet (#120), proposed by @yelixir-dev
