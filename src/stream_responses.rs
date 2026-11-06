@@ -7,9 +7,10 @@ use std::pin::Pin;
 
 use crate::convert_responses::{
     message_item, new_item_id, output_item_for, reasoning_item, response_envelope, usage_block,
-    ToolMap,
+    ResponsesShape,
 };
 use crate::stream_core::StreamError;
+use crate::stream_openai::strip_json_code_fence;
 
 fn sse(event: &str, payload: Value) -> String {
     let mut body = Map::new();
@@ -27,7 +28,7 @@ pub fn translate(
     mut chat: Pin<Box<dyn Stream<Item = Result<String, StreamError>> + Send>>,
     model: String,
     response_id: String,
-    tools: ToolMap,
+    shape: ResponsesShape,
 ) -> Pin<Box<dyn Stream<Item = Result<String, StreamError>> + Send>> {
     Box::pin(async_stream::stream! {
         let mut seq: i64 = -1;
@@ -83,7 +84,9 @@ pub fn translate(
                             reasoning_parts.push_str(r);
                             yield Ok(sse("response.reasoning_summary_text.delta", json!({"sequence_number": next(), "item_id": reasoning_id, "output_index": reasoning_index, "summary_index": 0, "delta": r})));
                         }
-                        if let Some(c) = delta.get("content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        if let Some(c) = delta.get("content").and_then(Value::as_str).filter(|s| !s.is_empty()).filter(|_| shape.json_text) {
+                            text_parts.push_str(c);
+                        } else if let Some(c) = delta.get("content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                             if reasoning_open {
                                 reasoning_open = false;
                                 yield Ok(sse("response.reasoning_summary_text.done", json!({"sequence_number": next(), "item_id": reasoning_id, "output_index": reasoning_index, "summary_index": 0, "text": reasoning_parts})));
@@ -117,6 +120,16 @@ pub fn translate(
         if !reasoning_parts.is_empty() {
             output.push(reasoning_item(&reasoning_parts, &reasoning_id));
         }
+        // Structured output is read whole by the client, so it is held back and
+        // sent once without the markdown fence a model may wrap it in.
+        if shape.json_text && !text_parts.is_empty() {
+            text_parts = strip_json_code_fence(&text_parts);
+            message_open = true;
+            message_index = next_index;
+            yield Ok(sse("response.output_item.added", json!({"sequence_number": next(), "output_index": message_index, "item": {"id": message_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}})));
+            yield Ok(sse("response.content_part.added", json!({"sequence_number": next(), "item_id": message_id, "output_index": message_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})));
+            yield Ok(sse("response.output_text.delta", json!({"sequence_number": next(), "item_id": message_id, "output_index": message_index, "content_index": 0, "delta": text_parts})));
+        }
         if message_open {
             yield Ok(sse("response.output_text.done", json!({"sequence_number": next(), "item_id": message_id, "output_index": message_index, "content_index": 0, "text": text_parts})));
             yield Ok(sse("response.content_part.done", json!({"sequence_number": next(), "item_id": message_id, "output_index": message_index, "content_index": 0, "part": {"type": "output_text", "text": text_parts, "annotations": []}})));
@@ -126,7 +139,7 @@ pub fn translate(
         let base = output.len() as i64;
         for (i, call) in tool_calls.iter().enumerate() {
             let index = base + i as i64;
-            let item = output_item_for(call, &new_item_id("fc"), &tools);
+            let item = output_item_for(call, &new_item_id("fc"), &shape.tools);
             let freeform_call = item["type"] == "custom_tool_call";
             let field = if freeform_call { "input" } else { "arguments" };
             let (delta_event, done_event) = if freeform_call {
@@ -163,7 +176,7 @@ mod tests {
     fn run(err: StreamError) -> Vec<Result<String, StreamError>> {
         let chat: Pin<Box<dyn Stream<Item = Result<String, StreamError>> + Send>> =
             Box::pin(futures_util::stream::iter(vec![Err(err)]));
-        let out = translate(chat, "m".into(), "resp_1".into(), ToolMap::default());
+        let out = translate(chat, "m".into(), "resp_1".into(), ResponsesShape::default());
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()

@@ -121,6 +121,44 @@ pub struct ToolOrigin {
 /// The request-scoped mapping between declared tools and the names Kiro sees.
 /// A tool keeps its own name unless another declared tool shares it; then every
 /// namespaced one gets an alias, and a top-level tool keeps the bare name.
+/// What the Responses output needs from its request: the tool mapping, and
+/// whether `text.format` asked for JSON, so the text is delivered as one bare
+/// JSON value rather than streamed through a markdown fence.
+#[derive(Clone, Debug, Default)]
+pub struct ResponsesShape {
+    pub tools: ToolMap,
+    pub json_text: bool,
+}
+
+impl From<ToolMap> for ResponsesShape {
+    fn from(tools: ToolMap) -> Self {
+        Self {
+            tools,
+            json_text: false,
+        }
+    }
+}
+
+/// Chat Completions' `response_format` for a Responses `text.format`. Responses
+/// puts the schema options on the format itself; chat nests them under
+/// `json_schema`.
+fn response_format(text: Option<&Value>) -> Option<Value> {
+    let format = text?.get("format").filter(|f| f.is_object())?;
+    match s(format, "type")? {
+        "json_object" => Some(json!({"type": "json_object"})),
+        "json_schema" => {
+            let mut spec = Map::new();
+            for key in ["name", "description", "schema", "strict"] {
+                if let Some(v) = format.get(key).filter(|v| !v.is_null()) {
+                    spec.insert(key.into(), v.clone());
+                }
+            }
+            Some(json!({"type": "json_schema", "json_schema": spec}))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ToolMap {
     upstream: HashMap<(Option<String>, String), String>,
@@ -513,7 +551,9 @@ pub fn responses_request_to_chat(req: &Value) -> Result<Value, String> {
 }
 
 /// The chat request and the tool map its output must be translated back with.
-pub fn responses_request_to_chat_with_tools(req: &Value) -> Result<(Value, ToolMap), String> {
+pub fn responses_request_to_chat_with_tools(
+    req: &Value,
+) -> Result<(Value, ResponsesShape), String> {
     if req.get("previous_response_id").is_some_and(truthy) {
         return Err("previous_response_id is not supported: this gateway stores no responses. Send the full conversation in `input` with store=false.".into());
     }
@@ -586,7 +626,18 @@ pub fn responses_request_to_chat_with_tools(req: &Value) -> Result<(Value, ToolM
     if let Some(e) = normalize_effort(req.pointer("/reasoning/effort").and_then(Value::as_str)) {
         payload.insert("reasoning_effort".into(), json!(e));
     }
-    Ok((Value::Object(payload), map))
+    let format = response_format(req.get("text"));
+    let json_text = format.is_some();
+    if let Some(f) = format {
+        payload.insert("response_format".into(), f);
+    }
+    Ok((
+        Value::Object(payload),
+        ResponsesShape {
+            tools: map,
+            json_text,
+        },
+    ))
 }
 
 pub fn usage_block(usage: Option<&Value>) -> Value {
@@ -688,7 +739,7 @@ pub fn response_envelope(
     env
 }
 
-pub fn chat_completion_to_responses(body: &Value, model: &str, tools: &ToolMap) -> Value {
+pub fn chat_completion_to_responses(body: &Value, model: &str, shape: &ResponsesShape) -> Value {
     let choice = body.pointer("/choices/0").cloned().unwrap_or(json!({}));
     let message = choice.get("message").cloned().unwrap_or(json!({}));
     let mut output = Vec::new();
@@ -714,7 +765,7 @@ pub fn chat_completion_to_responses(body: &Value, model: &str, tools: &ToolMap) 
         .flatten()
         .filter(|c| c.is_object())
     {
-        output.push(output_item_for(call, &new_item_id("fc"), tools));
+        output.push(output_item_for(call, &new_item_id("fc"), &shape.tools));
     }
     let finish = choice
         .get("finish_reason")
