@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use kiro_lb::convert_responses::{
-    chat_completion_to_responses, responses_request_to_chat_with_tools, ToolMap,
+    chat_completion_to_responses, responses_request_to_chat_with_tools, ResponsesShape,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -92,10 +92,10 @@ fn a_top_level_tool_keeps_the_bare_name_and_aliases_avoid_taken_names() {
         names[2]
     );
     assert_eq!(names.iter().collect::<HashSet<_>>().len(), 3);
-    let origin = tools.origin(&names[2]);
+    let origin = tools.tools.origin(&names[2]);
     assert_eq!(origin.name, "lookup");
     assert_eq!(origin.namespace.as_deref(), Some("group_a"));
-    assert_eq!(tools.origin("lookup").namespace, None);
+    assert_eq!(tools.tools.origin("lookup").namespace, None);
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn tool_choice_follows_the_mapping_and_refuses_ambiguity() {
     assert_eq!(chat["tool_choice"], "required");
 }
 
-fn mapped_tools() -> ToolMap {
+fn mapped_tools() -> ResponsesShape {
     let req = request(
         vec![
             namespace("group_a", vec![function("lookup")]),

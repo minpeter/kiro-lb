@@ -71,6 +71,10 @@ kiro-lb/
   shell is a `custom` freeform tool. It is bridged as a function with one string
   field and unwrapped back into `custom_tool_call`. Dropping it made the model
   invent command output.
+- Responses `text.format` (`json_schema`, `json_object`) becomes the chat
+  `response_format`, with the schema fields nested under `json_schema`. A JSON
+  format stream buffers the message text and emits it once with any code fence
+  stripped; reasoning still streams live. Dropping it broke Codex thread titles.
 - Responses `namespace` entries only scope names; Kiro has none. A local name
   that more than one declared tool uses gets a request-scoped alias
   (`namespace__name`, sanitized, at most 64 characters, collision-free) for each

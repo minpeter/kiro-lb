@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- honour `text.format` on `/v1/responses` so Codex thread titles parse (#128)
+
 ## [0.2.12](https://github.com/minpeter/kiro-lb/compare/v0.2.11...v0.2.12) - 2026-11-05
 
 ### Added

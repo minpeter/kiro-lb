@@ -300,7 +300,7 @@ struct Plan {
     session: Option<u64>,
     ctx: RequestCtx,
     openai: Option<(bool, bool, bool)>,
-    responses: Option<(String, convert_responses::ToolMap)>,
+    responses: Option<(String, convert_responses::ResponsesShape)>,
 }
 
 fn build(plan: &Plan, conversation_id: &str, arn: &str) -> Result<KiroPayloadResult, BuildError> {
@@ -1080,7 +1080,7 @@ async fn openai_plan(
     state: Shared,
     req: &mut Value,
     ctx: RequestCtx,
-    responses: Option<(String, convert_responses::ToolMap)>,
+    responses: Option<(String, convert_responses::ResponsesShape)>,
 ) -> Response {
     let model = req
         .get("model")
