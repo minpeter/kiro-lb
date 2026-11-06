@@ -1,8 +1,17 @@
 use futures_util::StreamExt;
+use kiro_lb::auth::{KiroAuth, Source};
+use kiro_lb::convert_openai::response_format_requests_json;
 use kiro_lb::convert_responses::{
     chat_completion_to_responses, responses_request_to_chat_with_tools, ResponsesShape,
 };
+use kiro_lb::model_resolver::ModelInfoCache;
+use kiro_lb::stream_anthropic::StreamCtx;
+use kiro_lb::stream_core::{EventStream, KiroEvent};
+use kiro_lb::stream_openai::{self, OpenAIOptions};
+use kiro_lb::upstream::http::Transport;
+use kiro_lb::usage_tracking::RequestCtx;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 fn title_request(stream: bool) -> Value {
     json!({
@@ -75,14 +84,62 @@ fn json_object_and_plain_text_formats_map_as_expected() {
     }
 }
 
-#[test]
-fn non_streaming_structured_output_arrives_without_a_fence() {
-    let (_, shape) = shape(&title_request(false));
-    let body = json!({"choices": [{"message": {"content": "{\"title\":\"Fix login\"}"}, "finish_reason": "stop"}]});
-    let out = chat_completion_to_responses(&body, "m", &shape);
-    assert_eq!(out["output_text"], "{\"title\":\"Fix login\"}");
+fn stream_ctx() -> StreamCtx {
+    let http = reqwest::Client::new();
+    StreamCtx {
+        model: "m".into(),
+        models: Arc::new(ModelInfoCache::new()),
+        auth: Arc::new(
+            KiroAuth::new(
+                Source::File("/nonexistent/creds.json".into()),
+                "us-east-1",
+                None,
+                http.clone(),
+            )
+            .unwrap(),
+        ),
+        transport: Arc::new(Transport { shared: http }),
+        input_tokens: 1,
+        request: RequestCtx::new(None),
+        search_followup: None,
+    }
+}
+
+async fn non_streaming(req: &Value, upstream: &str) -> Value {
+    let (chat, shape) = shape(req);
+    let strip = response_format_requests_json(chat.get("response_format"));
+    let events: EventStream = Box::pin(futures_util::stream::iter(vec![
+        Ok(KiroEvent::Content(upstream.into())),
+        Ok(KiroEvent::StopReason("end_turn".into())),
+    ]));
+    let opts = OpenAIOptions {
+        execute_web_search: false,
+        include_reasoning: true,
+        parallel_tool_calls: true,
+        request_messages: vec![],
+        request_tools: vec![],
+    };
+    let body = stream_openai::collect(events, stream_ctx(), opts, strip)
+        .await
+        .unwrap();
+    chat_completion_to_responses(&body, "m", &shape)
+}
+
+#[tokio::test]
+async fn non_streaming_structured_output_arrives_without_a_fence() {
+    let fenced = "```json\n{\"title\": \"Fix login\"}\n```";
+    let out = non_streaming(&title_request(false), fenced).await;
+    assert_eq!(out["output_text"], "{\"title\": \"Fix login\"}");
     let parsed: Value = serde_json::from_str(out["output_text"].as_str().unwrap()).unwrap();
     assert_eq!(parsed["title"], "Fix login");
+
+    let mut plain = title_request(false);
+    plain["text"] = json!({"format": {"type": "text"}});
+    let out = non_streaming(&plain, fenced).await;
+    assert_eq!(
+        out["output_text"], fenced,
+        "plain text keeps the model's markdown"
+    );
 }
 
 fn stream_events(shape: ResponsesShape, pieces: &[&str]) -> Vec<Value> {
