@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.13](https://github.com/minpeter/kiro-lb/compare/v0.2.12...v0.2.13) - 2026-11-06
+
+### Fixed
+
+- *(responses)* honour text.format structured output
+
+### Other
+
+- *(responses)* run non-streaming text.format through collect
+
 ### Fixed
 
 - honour `text.format` on `/v1/responses` so Codex thread titles parse (#128)
