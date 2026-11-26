@@ -19,7 +19,7 @@ fn os() -> &'static str {
 fn user_agents_match_the_captured_kiro_cli() {
     assert_eq!(
         cli_user_agent(RUNTIME_API),
-        format!("aws-sdk-rust/1.6.0 ua/2.1 api/codewhispererstreaming/0.1.19636 os/{} lang/rust/1.94.1 md/appVersion-2.37.0 app/AmazonQ-For-CLI", os())
+        format!("aws-sdk-rust/1.6.0 ua/2.1 api/codewhispererstreaming/0.1.19636 os/{} lang/rust/1.94.1 md/appVersion-3.6.2 app/AmazonQ-For-CLI", os())
     );
     assert_eq!(
         cli_short_user_agent(RUNTIME_API),
@@ -27,7 +27,7 @@ fn user_agents_match_the_captured_kiro_cli() {
     );
     assert_eq!(
         cli_user_agent(CONTROL_PLANE_API),
-        format!("aws-sdk-rust/1.6.0 ua/2.1 api/kirocontrolplanebearer/0.1.0 os/{} lang/rust/1.94.1 md/appVersion-2.37.0 app/AmazonQ-For-CLI", os())
+        format!("aws-sdk-rust/1.6.0 ua/2.1 api/kirocontrolplanebearer/0.1.0 os/{} lang/rust/1.94.1 md/appVersion-3.6.2 app/AmazonQ-For-CLI", os())
     );
     assert_eq!(
         cli_short_user_agent(CONTROL_PLANE_API),

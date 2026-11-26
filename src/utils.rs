@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-pub const CLI_VERSION: &str = "2.37.0";
+pub const CLI_VERSION: &str = "3.6.2";
 const SDK: &str = "aws-sdk-rust/1.6.0 ua/2.1";
 const RUST: &str = "lang/rust/1.94.1";
 pub const RUNTIME_API: &str = "codewhispererstreaming/0.1.19636";
