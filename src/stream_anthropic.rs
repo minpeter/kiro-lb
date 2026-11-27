@@ -142,6 +142,7 @@ pub fn stream(
         let mut intercepted: HashSet<String> = HashSet::new();
         let mut stop_reason: Option<String> = None;
         let mut context_usage: Option<f64> = None;
+        let mut metering_or_usage_reported = false;
         let mut upstream_usage = UpstreamTokenUsage::default();
         let mut full_content = String::new();
         let mut full_thinking = String::new();
@@ -284,6 +285,7 @@ pub fn stream(
                                     current = followup(id.clone(), query.clone(), web_search::summary(&query, &results)).await?;
                                     stop_reason = None;
                                     context_usage = None;
+                                    metering_or_usage_reported = false;
                                     upstream_usage = UpstreamTokenUsage::default();
                                     continue 'outer;
                                 } else {
@@ -299,9 +301,11 @@ pub fn stream(
                     }
                     KiroEvent::ContextUsage(p) => context_usage = Some(p),
                     KiroEvent::Metering(m) => {
+                        metering_or_usage_reported = true;
                         upstream_usage.merge_from(m.raw());
                     }
                     KiroEvent::Usage(u) => {
+                        metering_or_usage_reported = true;
                         upstream_usage.merge_from(&u);
                     }
                     KiroEvent::StopReason(s) => if !s.is_empty() { stop_reason = Some(s) },
@@ -310,7 +314,7 @@ pub fn stream(
             break;
         }
         if !received { Err(StreamError::Protocol(stream_core::NO_EVENTS))?; }
-        let completed = context_usage.is_some();
+        let completed = context_usage.is_some() || metering_or_usage_reported;
         if !pending.is_empty() {
             if thinking_open {
                 yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": thinking_index}))?;
@@ -471,13 +475,7 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
         let next = followup(id, query.clone(), web_search::summary(&query, &results)).await?;
         result = stream_core::collect(next).await?;
     }
-    let mut upstream_usage = UpstreamTokenUsage::default();
-    if let Some(u) = &result.usage {
-        upstream_usage.merge_from(u);
-    }
-    if let Some(metering) = &result.metering {
-        upstream_usage.merge_from(metering.raw());
-    }
+    let upstream_usage = result.upstream_usage;
     let mut content = Vec::new();
     for b in &native {
         match b["type"].as_str() {
@@ -535,7 +533,9 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
         ctx.request
             .observe_reported_input(&ctx.model, total_input_tokens);
     }
-    let completed = result.context_usage_percentage.is_some();
+    let completed = result.context_usage_percentage.is_some()
+        || result.metering.is_some()
+        || result.usage.is_some();
     let truncated = !completed && !result.content.is_empty() && result.tool_calls.is_empty();
     let mapped = stop_reasons::to_anthropic(result.stop_reason.as_deref());
     let has_tools = native.iter().any(|b| b["type"] == "tool_use");

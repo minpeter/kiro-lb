@@ -629,18 +629,38 @@ fn merge_adjacent_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage>
             if let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) {
                 last.tool_calls.get_or_insert_with(Vec::new).extend(calls);
             }
-            if msg.reasoning.as_deref().is_some_and(|r| !r.is_empty()) {
+            let msg_has_signed = msg.reasoning.as_deref().is_some_and(|r| !r.is_empty())
+                && msg
+                    .reasoning_signature
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty());
+            let msg_has_redacted = msg
+                .redacted_reasoning
+                .as_deref()
+                .is_some_and(|d| !d.is_empty());
+            let last_has_signed = last.reasoning.as_deref().is_some_and(|r| !r.is_empty())
+                && last
+                    .reasoning_signature
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty());
+            let last_has_redacted = last
+                .redacted_reasoning
+                .as_deref()
+                .is_some_and(|d| !d.is_empty());
+            if msg_has_signed {
                 last.reasoning = msg.reasoning;
                 last.reasoning_signature = msg.reasoning_signature;
                 last.redacted_reasoning = None;
-            } else if msg
-                .redacted_reasoning
-                .as_deref()
-                .is_some_and(|d| !d.is_empty())
-            {
+            } else if msg_has_redacted {
                 last.redacted_reasoning = msg.redacted_reasoning;
                 last.reasoning = None;
                 last.reasoning_signature = None;
+            } else if msg.reasoning.as_deref().is_some_and(|r| !r.is_empty())
+                && !last_has_signed
+                && !last_has_redacted
+            {
+                last.reasoning = msg.reasoning;
+                last.reasoning_signature = msg.reasoning_signature;
             }
         }
         if msg.role == "user" {

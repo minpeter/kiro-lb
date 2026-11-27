@@ -231,11 +231,18 @@ kiro-lb/
   an account. Every account keeps a nonzero chance.
 - Persisting `quota_headroom`, `quota_resets_at` or `quota_overage_enabled` with
   runtime state; they are re-seeded from usage rows.
-- Ending a 402 quarantine on a fixed timer; it runs to the reported reset.
+- Ending a 402 monthly quarantine on a fixed timer; `MONTHLY_REQUEST_COUNT` runs
+  to the reported reset, while `DAILY_REQUEST_COUNT` uses a bounded quarantine
+  until next UTC midnight (at most `ACCOUNT_QUOTA_QUARANTINE`, never shortening
+  a longer active monthly deadline).
 - Removing the quota last-resort pass in account selection; it still requires
   model eligibility.
-- Escalating a burst into a long exclusion: `USER_REQUEST_RATE_EXCEEDED` parks
-  an account for 10s; only `MONTHLY_REQUEST_COUNT` quarantines it (6h).
+- Escalating a burst or consent error into a long account-wide exclusion:
+  `USER_REQUEST_RATE_EXCEEDED`, `CREDIT_CONSUMPTION_RATE_EXCEEDED`, and
+  `INSUFFICIENT_MODEL_CAPACITY` park an account for 10s; `CONSENT_REQUIRED` /
+  `RECONSENT_REQUIRED` mark only that model unsupported on the account without
+  penalizing other models; only `MONTHLY_REQUEST_COUNT` and
+  `DAILY_REQUEST_COUNT` enter quota quarantine.
 - Assuming cache metadata exists.
 
 ## COMMANDS

@@ -1684,7 +1684,9 @@ impl AccountManager {
                 );
                 Some("suspended")
             } else if reason == Some("MONTHLY_REQUEST_COUNT") {
-                s.quota_exhausted_until = Self::quota_quarantine_until(&s, now);
+                s.quota_exhausted_until = s
+                    .quota_exhausted_until
+                    .max(Self::quota_quarantine_until(&s, now));
                 s.stats.total += 1;
                 s.stats.failed += 1;
                 tracing::warn!(
@@ -1694,7 +1696,9 @@ impl AccountManager {
                 );
                 Some("quota_exhausted")
             } else if reason == Some("DAILY_REQUEST_COUNT") {
-                s.quota_exhausted_until = Self::daily_quota_quarantine_until(now);
+                s.quota_exhausted_until = s
+                    .quota_exhausted_until
+                    .max(Self::daily_quota_quarantine_until(now));
                 s.stats.total += 1;
                 s.stats.failed += 1;
                 tracing::warn!(
@@ -2262,6 +2266,74 @@ mod tests {
             ModelSupport::Unknown
         );
         assert_eq!(consent.state.lock().failures, 0);
+    }
+
+    #[tokio::test]
+    async fn daily_quota_selection_skips_quarantined_account_and_never_shortens_monthly_quarantine()
+    {
+        let http = reqwest::Client::new();
+        let pool = AccountManager::new(http.clone());
+        let a = serving(account("acct-a"), &["claude-sonnet-5.5"]);
+        let b = serving(account("acct-b"), &["claude-sonnet-5.5"]);
+        for acct in [&a, &b] {
+            *acct.auth.lock() = Some(Arc::new(
+                KiroAuth::new(
+                    Source::Ephemeral("test".into()),
+                    "us-east-1",
+                    None,
+                    http.clone(),
+                )
+                .unwrap(),
+            ));
+        }
+        {
+            let mut inner = pool.inner.lock();
+            for acct in [&a, &b] {
+                inner.order.push(acct.id.clone());
+                inner.accounts.insert(acct.id.clone(), acct.clone());
+            }
+        }
+
+        // Pin a session to acct-a, then exhaust its daily quota.
+        pool.pin_session(Some(42), "acct-a");
+        assert!(pool.commit_failure(
+            &a,
+            "claude-sonnet-5.5",
+            ErrorType::Recoverable,
+            429,
+            Some("DAILY_REQUEST_COUNT"),
+            Some("daily quota exceeded"),
+        ));
+        let daily_until = a.state.lock().quota_exhausted_until;
+        assert!(daily_until > store::now_f64());
+
+        // Selection in a multi-account pool skips the daily-quarantined account and picks acct-b.
+        let excluded = HashSet::new();
+        let picked = pool
+            .select("claude-sonnet-5.5", &excluded, Some(42), false)
+            .await
+            .expect("healthy sibling should be selected");
+        assert_eq!(picked.id, "acct-b");
+
+        // A longer monthly quarantine must not be shortened by a subsequent DAILY_REQUEST_COUNT.
+        let monthly_reset = store::now_f64() + 10.0 * 86_400.0;
+        {
+            let mut s = b.state.lock();
+            s.quota_resets_at = monthly_reset;
+            s.quota_exhausted_until = monthly_reset;
+        }
+        assert!(pool.commit_failure(
+            &b,
+            "claude-sonnet-5.5",
+            ErrorType::Recoverable,
+            429,
+            Some("DAILY_REQUEST_COUNT"),
+            Some("daily quota exceeded"),
+        ));
+        assert!(
+            b.state.lock().quota_exhausted_until >= monthly_reset,
+            "DAILY_REQUEST_COUNT must never shorten an active monthly quarantine"
+        );
     }
 
     fn tiered(id: &str, tier: Option<&str>) -> Arc<Account> {

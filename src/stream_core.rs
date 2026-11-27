@@ -295,6 +295,7 @@ pub struct StreamResult {
     pub tool_calls: Vec<Value>,
     pub usage: Option<Value>,
     pub metering: Option<MeteringEvent>,
+    pub upstream_usage: UpstreamTokenUsage,
     pub context_usage_percentage: Option<f64>,
     pub stop_reason: Option<String>,
 }
@@ -352,6 +353,7 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                     .push(json!({"type": "tool_use", "tool": t}));
             }
             KiroEvent::Usage(u) if !is_zero(&u) => {
+                r.upstream_usage.merge_from(&u);
                 if let (Some(Value::Object(existing)), Value::Object(incoming)) =
                     (r.usage.as_mut(), &u)
                 {
@@ -363,6 +365,7 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                 }
             }
             KiroEvent::Metering(m) => {
+                r.upstream_usage.merge_from(m.raw());
                 let mut raw = m
                     .raw()
                     .as_object()
@@ -476,12 +479,14 @@ impl UpstreamTokenUsage {
     }
 
     pub fn cache_total(&self) -> i64 {
-        self.cache_read_input_tokens.unwrap_or(0) + self.cache_write_input_tokens.unwrap_or(0)
+        self.cache_read_input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_write_input_tokens.unwrap_or(0))
     }
 
     pub fn total_input_tokens(&self) -> Option<i64> {
         self.uncached_input_tokens
-            .map(|uncached| uncached + self.cache_total())
+            .map(|uncached| uncached.saturating_add(self.cache_total()))
     }
 }
 

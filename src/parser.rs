@@ -261,7 +261,8 @@ impl AwsEventStreamParser {
         let mut next_hit: [Option<Option<usize>>; PATTERNS.len()] = [None; PATTERNS.len()];
         let mut keep_from = None;
         loop {
-            let (earliest_pos, kind, scan_from, depth, in_string);
+            let (mut earliest_pos, kind, scan_from, depth, in_string);
+            let mut fallback_pos = None;
             if let Some((k, resume, d, s)) = self.pending_frame.take() {
                 earliest_pos = pos;
                 kind = k;
@@ -287,28 +288,66 @@ impl AwsEventStreamParser {
                     }
                 }
                 let Some((p, k)) = best else { break };
-                earliest_pos = p;
+                if let Some(outer) = enclosing_object_start(bytes, pos, p) {
+                    earliest_pos = outer;
+                    fallback_pos = Some(p);
+                } else {
+                    earliest_pos = p;
+                }
                 kind = k;
-                scan_from = p;
+                scan_from = earliest_pos;
                 depth = 0;
                 in_string = false;
             }
             let (end, resume, d, s) = scan_braces(bytes, scan_from, depth, in_string);
-            let Some(end) = end else {
+            let Some(mut end) = end else {
+                if let Some(inner) = fallback_pos {
+                    if !is_json_container_prefix(bytes, earliest_pos, inner) {
+                        earliest_pos = inner;
+                        let (inner_end, inner_resume, inner_d, inner_s) =
+                            scan_braces(bytes, inner, 0, false);
+                        if let Some(inner_end) = inner_end {
+                            let json_str = &buffer[earliest_pos..=inner_end];
+                            pos = inner_end + 1;
+                            match sonic_rs::from_str::<Value>(json_str) {
+                                Ok(data) => self.dispatch_parsed(data, kind, &mut events),
+                                Err(_) => tracing::warn!(
+                                    "Failed to parse JSON: {}",
+                                    json_str.chars().take(100).collect::<String>()
+                                ),
+                            }
+                            continue;
+                        }
+                        self.pending_frame =
+                            Some((kind, inner_resume - earliest_pos, inner_d, inner_s));
+                        keep_from = Some(earliest_pos);
+                        break;
+                    }
+                }
                 self.pending_frame = Some((kind, resume - earliest_pos, d, s));
                 keep_from = Some(earliest_pos);
                 break;
             };
-            let json_str = &buffer[earliest_pos..=end];
-            pos = end + 1;
-            match sonic_rs::from_str::<Value>(json_str) {
-                Ok(data) => {
-                    if kind.starts_with("native_thinking") {
-                        events.extend(self.thinking_events(&data));
-                    } else if let Some(e) = self.process_event(data, kind) {
-                        events.push(e);
-                    }
+            let mut json_str = &buffer[earliest_pos..=end];
+            let mut parsed = sonic_rs::from_str::<Value>(json_str);
+            if parsed.is_err() {
+                if let Some(inner) = fallback_pos {
+                    let (inner_end, inner_resume, inner_d, inner_s) =
+                        scan_braces(bytes, inner, 0, false);
+                    let Some(inner_end) = inner_end else {
+                        self.pending_frame = Some((kind, inner_resume - inner, inner_d, inner_s));
+                        keep_from = Some(inner);
+                        break;
+                    };
+                    earliest_pos = inner;
+                    end = inner_end;
+                    json_str = &buffer[earliest_pos..=end];
+                    parsed = sonic_rs::from_str::<Value>(json_str);
                 }
+            }
+            pos = end + 1;
+            match parsed {
+                Ok(data) => self.dispatch_parsed(data, kind, &mut events),
                 Err(_) => tracing::warn!(
                     "Failed to parse JSON: {}",
                     json_str.chars().take(100).collect::<String>()
@@ -323,7 +362,15 @@ impl AwsEventStreamParser {
         events
     }
 
-    fn process_event(&mut self, data: Value, kind: &str) -> Option<ParsedEvent> {
+    fn dispatch_parsed(&mut self, data: Value, kind: &str, events: &mut Vec<ParsedEvent>) {
+        if kind.starts_with("native_thinking") {
+            events.extend(self.thinking_events(&data));
+        } else {
+            events.extend(self.process_event(data, kind));
+        }
+    }
+
+    fn process_event(&mut self, data: Value, kind: &str) -> Vec<ParsedEvent> {
         let current_id = self
             .current_tool_call
             .as_ref()
@@ -333,92 +380,62 @@ impl AwsEventStreamParser {
         if data.get("input").is_some() && self.current_tool_call.is_some() && frame_matches {
             self.append_input(&data);
             if truthy(data.get("stop")) {
-                return self.stop_tool(&data);
+                return self.stop_tool(&data).into_iter().collect();
             }
-            return None;
+            return Vec::new();
         }
         if truthy(data.get("stop")) && self.current_tool_call.is_some() {
-            return self.stop_tool(&data);
+            return self.stop_tool(&data).into_iter().collect();
         }
         match kind {
             "content" => {
                 if truthy(data.get("followupPrompt")) {
-                    return None;
+                    return Vec::new();
                 }
-                Some(ParsedEvent::Content(
+                vec![ParsedEvent::Content(
                     data.get("content")
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_owned(),
-                ))
+                )]
             }
-            "tool_start" => self.start_tool(&data),
+            "tool_start" => self.start_tool(&data).into_iter().collect(),
             "tool_input" => {
                 self.append_input(&data);
-                None
+                Vec::new()
             }
-            "tool_stop" => self.stop_tool(&data),
+            "tool_stop" => self.stop_tool(&data).into_iter().collect(),
             "metering" => {
                 let unit_bearing = data.get("unit").is_some()
                     || data.get("unitPlural").is_some()
                     || data.get("amount").is_some();
                 match MeteringEvent::parse(data.clone()) {
-                    Some(event) => Some(ParsedEvent::Metering(event)),
-                    None if !unit_bearing => Some(ParsedEvent::Usage(
+                    Some(event) => vec![ParsedEvent::Metering(event)],
+                    None if !unit_bearing => vec![ParsedEvent::Usage(
                         data.get("usage").cloned().unwrap_or(json!(0)),
-                    )),
+                    )],
                     None => {
                         tracing::warn!("Ignored invalid Kiro metering event payload");
-                        None
+                        Vec::new()
                     }
                 }
             }
-            "context_usage" => Some(ParsedEvent::ContextUsage(
+            "context_usage" => vec![ParsedEvent::ContextUsage(
                 data.get("contextUsagePercentage")
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0),
-            )),
-            "stop_reason" => {
-                let r = data
-                    .get("stopReason")
-                    .filter(|v| truthy(Some(v)))
-                    .or_else(|| data.get("stop_reason"))
-                    .and_then(Value::as_str)?;
-                (!r.is_empty()).then(|| ParsedEvent::StopReason(r.to_owned()))
-            }
-            "token_usage" => {
-                if data.get("toolUseId").is_some()
-                    || data.get("name").is_some()
-                    || data.get("input").is_some()
-                {
-                    return None;
+            )],
+            "stop_reason" | "token_usage" => {
+                let mut out = Vec::new();
+                if let Some(usage) = extract_token_usage(&data) {
+                    out.push(ParsedEvent::Usage(usage));
                 }
-                let usage = data
-                    .get("tokenUsage")
-                    .filter(|v| v.is_object())
-                    .cloned()
-                    .unwrap_or(data);
-                let has_token_key = usage.as_object().is_some_and(|obj| {
-                    [
-                        "uncachedInputTokens",
-                        "uncached_input_tokens",
-                        "inputTokens",
-                        "outputTokens",
-                        "output_tokens",
-                        "totalTokens",
-                        "cacheReadInputTokens",
-                        "cache_read_input_tokens",
-                        "cacheWriteInputTokens",
-                        "cache_write_input_tokens",
-                        "cacheCreationInputTokens",
-                        "cache_creation_input_tokens",
-                    ]
-                    .iter()
-                    .any(|k| obj.get(*k).is_some_and(Value::is_number))
-                });
-                has_token_key.then_some(ParsedEvent::Usage(usage))
+                if let Some(reason) = extract_stop_reason(&data) {
+                    out.push(ParsedEvent::StopReason(reason));
+                }
+                out
             }
-            "upstream_error" => Some(ParsedEvent::UpstreamError {
+            "upstream_error" => vec![ParsedEvent::UpstreamError {
                 reason: data
                     .get("reason")
                     .and_then(Value::as_str)
@@ -429,8 +446,8 @@ impl AwsEventStreamParser {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
-            }),
-            _ => None,
+            }],
+            _ => Vec::new(),
         }
     }
 
@@ -439,6 +456,9 @@ impl AwsEventStreamParser {
     /// and matching on the leading key alone dropped that text. Text comes first so
     /// a signature in the same frame closes the block it belongs to.
     fn thinking_events(&mut self, data: &Value) -> Vec<ParsedEvent> {
+        if has_non_metadata_envelope_keys(data) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         if let Some(text) = data.get("text").and_then(Value::as_str) {
             out.push(ParsedEvent::Thinking {
@@ -451,19 +471,17 @@ impl AwsEventStreamParser {
             self.thinking_started = false;
             out.push(ParsedEvent::ThinkingSignature(signature.to_owned()));
         }
-        if data.get("toolUseId").is_none()
-            && data.get("name").is_none()
-            && data.get("input").is_none()
-            && data.get("content").is_none()
+        if let Some(redacted) = data
+            .get("redactedContent")
+            .or_else(|| {
+                data.get("reasoningContent")
+                    .and_then(|r| r.get("redactedContent"))
+            })
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
         {
-            if let Some(redacted) = data
-                .get("redactedContent")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                self.thinking_started = false;
-                out.push(ParsedEvent::RedactedThinking(redacted.to_owned()));
-            }
+            self.thinking_started = false;
+            out.push(ParsedEvent::RedactedThinking(redacted.to_owned()));
         }
         out
     }
@@ -585,6 +603,122 @@ impl AwsEventStreamParser {
         }
         deduplicate_tool_calls(&self.tool_calls[self.emitted.min(self.tool_calls.len())..])
     }
+}
+
+fn enclosing_object_start(bytes: &[u8], pos: usize, target: usize) -> Option<usize> {
+    if target <= pos {
+        return None;
+    }
+    let seg_start = bytes[pos..target]
+        .iter()
+        .rposition(|&b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
+        .map_or(pos, |idx| pos + idx + 1);
+    let mut stack: Vec<usize> = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for (offset, &b) in bytes[seg_start..target].iter().enumerate() {
+        let i = seg_start + offset;
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => stack.push(i),
+            b'}' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    if in_string {
+        return None;
+    }
+    let outer = *stack.first()?;
+    let next_non_ws = bytes[outer + 1..target]
+        .iter()
+        .copied()
+        .find(|b| !b.is_ascii_whitespace())?;
+    (next_non_ws == b'"').then_some(outer)
+}
+
+fn is_json_container_prefix(bytes: &[u8], start: usize, target: usize) -> bool {
+    if target <= start {
+        return false;
+    }
+    bytes[start..target]
+        .iter()
+        .rev()
+        .copied()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| matches!(b, b':' | b',' | b'['))
+}
+
+fn has_non_metadata_envelope_keys(data: &Value) -> bool {
+    data.get("toolUseId").is_some()
+        || data.get("name").is_some()
+        || data.get("input").is_some()
+        || data.get("content").is_some()
+        || data.get("toolUse").is_some()
+        || data.get("toolUses").is_some()
+}
+
+fn extract_token_usage(data: &Value) -> Option<Value> {
+    if has_non_metadata_envelope_keys(data) {
+        return None;
+    }
+    let usage = data
+        .get("tokenUsage")
+        .filter(|v| v.is_object())
+        .or_else(|| {
+            data.get("messageMetadataEvent")
+                .and_then(|m| m.get("tokenUsage"))
+                .filter(|v| v.is_object())
+        })
+        .unwrap_or(data);
+    let has_token_key = usage.as_object().is_some_and(|obj| {
+        [
+            "uncachedInputTokens",
+            "uncached_input_tokens",
+            "inputTokens",
+            "outputTokens",
+            "output_tokens",
+            "totalTokens",
+            "cacheReadInputTokens",
+            "cache_read_input_tokens",
+            "cacheWriteInputTokens",
+            "cache_write_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .any(|k| obj.get(*k).is_some_and(Value::is_number))
+    });
+    has_token_key.then(|| usage.clone())
+}
+
+fn extract_stop_reason(data: &Value) -> Option<String> {
+    if has_non_metadata_envelope_keys(data) {
+        return None;
+    }
+    fn read(obj: &Value) -> Option<&str> {
+        obj.get("stopReason")
+            .filter(|v| truthy(Some(v)))
+            .or_else(|| obj.get("stop_reason"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+    read(data)
+        .or_else(|| data.get("messageMetadataEvent").and_then(read))
+        .map(str::to_owned)
 }
 
 fn memfind(hay: &[u8], needle: &[u8]) -> Option<usize> {

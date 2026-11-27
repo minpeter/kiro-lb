@@ -16,7 +16,7 @@ use kiro_lb::errors::{
 #[cfg(debug_assertions)]
 use kiro_lb::model_catalog::fetch_available_models;
 use kiro_lb::model_resolver::ModelInfoCache;
-use kiro_lb::parser::{AwsEventStreamParser, ParsedEvent};
+use kiro_lb::parser::{AwsEventStreamParser, MeteringEvent, ParsedEvent};
 use kiro_lb::payload_guard;
 use kiro_lb::stream_anthropic::{self, StreamCtx};
 use kiro_lb::stream_core::{self, KiroEvent, StreamError};
@@ -751,4 +751,152 @@ async fn retries_keep_invocation_id_increment_attempt_and_honor_ms_retry_after_a
     server.abort();
     assert_eq!(resp.status, 403);
     assert_eq!(*consent_calls.lock().unwrap(), 1);
+}
+
+#[test]
+fn parser_preserves_enclosing_frame_for_nested_usage_stop_reason_and_redacted_thinking() {
+    let mut parser = AwsEventStreamParser::new();
+
+    // Unrecognized tool envelope containing nested tokenUsage and redactedContent must be ignored.
+    let tool_envelope = concat!(
+        r#"{"toolUseId":"t1","name":"stats","extra":{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":5}}}"#,
+        r#"{"customWrapper":{"payload":{"outputTokens":7}}}"#,
+        r#"{"toolUseId":"t2","name":"secret","extra":{"redactedContent":"not-thinking"}}"#,
+    );
+    let ignored = parser.feed(tool_envelope.as_bytes());
+    assert!(
+        ignored.is_empty(),
+        "nested usage/redactedContent inside non-metadata envelopes must not emit events: {ignored:?}"
+    );
+
+    // Sibling stopReason + tokenUsage in either key order must emit BOTH events.
+    let sibling_events = parser.feed(
+        br#"{"stopReason":"END_TURN","tokenUsage":{"uncachedInputTokens":120,"cacheReadInputTokens":800,"outputTokens":42}}"#,
+    );
+    assert!(
+        sibling_events.iter().any(|e| matches!(
+            e,
+            ParsedEvent::Usage(u)
+                if u["uncachedInputTokens"] == 120
+                    && u["cacheReadInputTokens"] == 800
+                    && u["outputTokens"] == 42
+        )),
+        "expected Usage from stopReason+tokenUsage frame: {sibling_events:?}"
+    );
+    assert!(
+        sibling_events
+            .iter()
+            .any(|e| matches!(e, ParsedEvent::StopReason(r) if r == "END_TURN")),
+        "expected StopReason from stopReason+tokenUsage frame: {sibling_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_metadata_only_turn_completes_as_end_turn_and_matches_arrival_order() {
+    // 1. Text + tokenUsage + END_TURN without contextUsagePercentage must NOT report max_tokens.
+    let make_events = || {
+        event_stream(vec![
+            Ok(KiroEvent::Content("Done.".into())),
+            Ok(KiroEvent::Usage(json!({
+                "uncachedInputTokens": 40,
+                "cacheReadInputTokens": 60,
+                "outputTokens": 7
+            }))),
+            Ok(KiroEvent::StopReason("END_TURN".into())),
+        ])
+    };
+
+    let mut streamed = stream_anthropic::stream(make_events(), stream_ctx());
+    let mut delta_event = None;
+    while let Some(item) = streamed.next().await {
+        let sse = item.expect("valid anthropic SSE");
+        if sse.starts_with("event: message_delta\n") {
+            let data = sse.split("data: ").nth(1).unwrap().trim();
+            delta_event = Some(serde_json::from_str::<Value>(data).unwrap());
+        }
+    }
+    let delta = delta_event.expect("message_delta present");
+    assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+    assert_eq!(delta["usage"]["input_tokens"], 40);
+    assert_eq!(delta["usage"]["cache_read_input_tokens"], 60);
+    assert_eq!(delta["usage"]["output_tokens"], 7);
+
+    let collected = stream_anthropic::collect(make_events(), stream_ctx())
+        .await
+        .expect("collect succeeds");
+    assert_eq!(collected["stop_reason"], "end_turn");
+    assert_eq!(collected["usage"]["input_tokens"], 40);
+    assert_eq!(collected["usage"]["cache_read_input_tokens"], 60);
+    assert_eq!(collected["usage"]["output_tokens"], 7);
+
+    // 2. Arrival order must match between streaming and non-streaming when metering precedes usage.
+    let make_ordered = || {
+        let metering = MeteringEvent::parse(json!({
+            "unit": "credit",
+            "usage": 0.1,
+            "cacheReadInputTokens": 60
+        }))
+        .expect("valid metering event");
+        event_stream(vec![
+            Ok(KiroEvent::Content("Hi".into())),
+            Ok(KiroEvent::Metering(metering)),
+            Ok(KiroEvent::Usage(
+                json!({"cacheReadInputTokens": 80, "uncachedInputTokens": 20}),
+            )),
+            Ok(KiroEvent::StopReason("END_TURN".into())),
+        ])
+    };
+    let mut streamed = stream_anthropic::stream(make_ordered(), stream_ctx());
+    let mut stream_cache_read = None;
+    while let Some(item) = streamed.next().await {
+        let sse = item.expect("valid SSE");
+        if sse.starts_with("event: message_delta\n") {
+            let data = sse.split("data: ").nth(1).unwrap().trim();
+            let v: Value = serde_json::from_str(data).unwrap();
+            stream_cache_read = v["usage"]["cache_read_input_tokens"].as_i64();
+        }
+    }
+    let collected = stream_anthropic::collect(make_ordered(), stream_ctx())
+        .await
+        .expect("collect succeeds");
+    assert_eq!(stream_cache_read, Some(80));
+    assert_eq!(collected["usage"]["cache_read_input_tokens"], 80);
+}
+
+#[test]
+fn merge_adjacent_messages_keeps_redacted_thinking_when_later_reasoning_is_unsigned() {
+    let req = json!({
+        "model": "claude-sonnet-5.5",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": "opaque-keep"},
+                    {"type": "text", "text": "part 1"}
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "unsigned thought"},
+                    {"type": "text", "text": "part 2"}
+                ]
+            },
+            {"role": "user", "content": "next"}
+        ]
+    });
+    let built = anthropic_to_kiro(&req, "conv-unsigned", "").unwrap();
+    let history = built.payload["conversationState"]["history"]
+        .as_array()
+        .unwrap();
+    let assistant_entry = history
+        .iter()
+        .find_map(|entry| entry.get("assistantResponseMessage"))
+        .expect("assistant history entry");
+    assert_eq!(
+        assistant_entry["reasoningContent"],
+        json!({"redactedContent": "opaque-keep"}),
+        "unsigned thinking must not discard an earlier replayable redacted_thinking block"
+    );
 }
