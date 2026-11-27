@@ -19,6 +19,7 @@ pub struct UnifiedMessage {
     pub images: Option<Vec<Value>>,
     pub reasoning: Option<String>,
     pub reasoning_signature: Option<String>,
+    pub redacted_reasoning: Option<String>,
 }
 
 impl UnifiedMessage {
@@ -521,6 +522,7 @@ fn strip_all_tool_content(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> 
                 images: msg.images,
                 reasoning: msg.reasoning,
                 reasoning_signature: msg.reasoning_signature,
+                redacted_reasoning: msg.redacted_reasoning,
             }
         })
         .collect()
@@ -627,7 +629,36 @@ fn merge_adjacent_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage>
             if let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) {
                 last.tool_calls.get_or_insert_with(Vec::new).extend(calls);
             }
-            if msg.reasoning.as_deref().is_some_and(|r| !r.is_empty()) {
+            let msg_has_signed = msg.reasoning.as_deref().is_some_and(|r| !r.is_empty())
+                && msg
+                    .reasoning_signature
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty());
+            let msg_has_redacted = msg
+                .redacted_reasoning
+                .as_deref()
+                .is_some_and(|d| !d.is_empty());
+            let last_has_signed = last.reasoning.as_deref().is_some_and(|r| !r.is_empty())
+                && last
+                    .reasoning_signature
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty());
+            let last_has_redacted = last
+                .redacted_reasoning
+                .as_deref()
+                .is_some_and(|d| !d.is_empty());
+            if msg_has_signed {
+                last.reasoning = msg.reasoning;
+                last.reasoning_signature = msg.reasoning_signature;
+                last.redacted_reasoning = None;
+            } else if msg_has_redacted {
+                last.redacted_reasoning = msg.redacted_reasoning;
+                last.reasoning = None;
+                last.reasoning_signature = None;
+            } else if msg.reasoning.as_deref().is_some_and(|r| !r.is_empty())
+                && !last_has_signed
+                && !last_has_redacted
+            {
                 last.reasoning = msg.reasoning;
                 last.reasoning_signature = msg.reasoning_signature;
             }
@@ -693,10 +724,21 @@ fn build_assistant_entry(msg: &UnifiedMessage) -> Result<Value, BuildError> {
         msg.reasoning.as_deref().filter(|r| !r.is_empty()),
         msg.reasoning_signature.as_deref().filter(|s| !s.is_empty()),
     ) {
+        if msg
+            .redacted_reasoning
+            .as_deref()
+            .is_some_and(|d| !d.is_empty())
+        {
+            tracing::debug!(
+                "Omitting redacted_thinking from history entry because Kiro reasoningContent carries a single union variant and signed thinking is present"
+            );
+        }
         a.insert(
             "reasoningContent".into(),
             json!({"reasoningText": {"text": r, "signature": s}}),
         );
+    } else if let Some(d) = msg.redacted_reasoning.as_deref().filter(|d| !d.is_empty()) {
+        a.insert("reasoningContent".into(), json!({"redactedContent": d}));
     }
     let uses = extract_tool_uses_from_message(&msg.content, msg.tool_calls.as_ref())?;
     if !uses.is_empty() {

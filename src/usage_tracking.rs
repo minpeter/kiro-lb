@@ -138,12 +138,12 @@ impl RequestCtx {
         let completion = completion.max(0);
         let mut pending = PENDING.lock();
         let entry = pending.entry((key, account, model)).or_default();
-        entry.counts[0] += prompt.max(0);
-        entry.counts[1] += completion;
-        entry.counts[2] += 1;
+        entry.counts[0] = entry.counts[0].saturating_add(prompt.max(0));
+        entry.counts[1] = entry.counts[1].saturating_add(completion);
+        entry.counts[2] = entry.counts[2].saturating_add(1);
         if let Some(g) = generation_seconds.filter(|_| completion > 1) {
-            entry.counts[3] += (g * 1000.0) as i64;
-            entry.counts[4] += completion - 1;
+            entry.counts[3] = entry.counts[3].saturating_add((g * 1000.0) as i64);
+            entry.counts[4] = entry.counts[4].saturating_add(completion - 1);
         }
     }
 }
@@ -216,10 +216,12 @@ pub fn pending_key_totals(key_id: &str) -> (i64, i64) {
         pending
             .iter()
             .filter(|((key, _, _), _)| key == key_id)
-            .fold((0, 0), |(requests, tokens), (_, usage)| {
+            .fold((0i64, 0i64), |(requests, tokens), (_, usage)| {
                 (
-                    requests + usage.counts[2],
-                    tokens + usage.counts[0] + usage.counts[1],
+                    requests.saturating_add(usage.counts[2]),
+                    tokens
+                        .saturating_add(usage.counts[0])
+                        .saturating_add(usage.counts[1]),
                 )
             })
     })
@@ -230,7 +232,7 @@ pub fn restore_pending(rows: Vec<UsageRow>) {
     for (k, a, m, p, c, r, g, t, credits) in rows {
         let e = guard.entry((k, a, m)).or_default();
         for (i, v) in [p, c, r, g, t].into_iter().enumerate() {
-            e.counts[i] += v;
+            e.counts[i] = e.counts[i].saturating_add(v);
         }
         if let Some(credits) = credits {
             e.credits = Some(e.credits.unwrap_or(0.0) + credits);

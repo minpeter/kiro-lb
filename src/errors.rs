@@ -16,13 +16,40 @@ pub enum ErrorType {
     Recoverable,
 }
 
+pub fn is_context_overflow_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD") | Some("PROMPT_TOO_LONG")
+    )
+}
+
+pub fn is_rate_limit_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("USER_REQUEST_RATE_EXCEEDED")
+            | Some("CREDIT_CONSUMPTION_RATE_EXCEEDED")
+            | Some("INSUFFICIENT_MODEL_CAPACITY")
+    )
+}
+
+pub fn is_consent_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("CONSENT_REQUIRED") | Some("RECONSENT_REQUIRED")
+    )
+}
+
 pub fn classify_error(status: u16, reason: Option<&str>) -> ErrorType {
     match status {
         402 | 403 | 429 | 502 | 503 | 504 => ErrorType::Recoverable,
-        400 if matches!(
-            reason,
-            Some("MONTHLY_REQUEST_COUNT") | Some("INVALID_MODEL_ID")
-        ) =>
+        400 if is_rate_limit_reason(reason)
+            || is_consent_reason(reason)
+            || matches!(
+                reason,
+                Some("MONTHLY_REQUEST_COUNT")
+                    | Some("DAILY_REQUEST_COUNT")
+                    | Some("INVALID_MODEL_ID")
+            ) =>
         {
             ErrorType::Recoverable
         }
@@ -80,9 +107,30 @@ pub fn enhance_kiro_error(error_json: &Value, status: Option<u16>) -> KiroErrorI
         }
     }
     let user_message = match reason.as_str() {
-        "CONTENT_LENGTH_EXCEEDS_THRESHOLD" => "Model context limit reached. Conversation size exceeds model capacity.".into(),
-        "MONTHLY_REQUEST_COUNT" => "Monthly request limit exceeded. Account has reached its monthly quota.".into(),
-        "INVALID_MODEL_ID" => "Invalid model ID or insufficient subscription level to use it.".into(),
+        "CONTENT_LENGTH_EXCEEDS_THRESHOLD" | "PROMPT_TOO_LONG" => {
+            "Model context limit reached. Conversation size exceeds model capacity.".into()
+        }
+        "MONTHLY_REQUEST_COUNT" => {
+            "Monthly request limit exceeded. Account has reached its monthly quota.".into()
+        }
+        "DAILY_REQUEST_COUNT" => {
+            "Daily request limit exceeded. Account has reached its daily quota.".into()
+        }
+        "CREDIT_CONSUMPTION_RATE_EXCEEDED" => {
+            "Credit consumption rate exceeded. Please retry shortly.".into()
+        }
+        "INSUFFICIENT_MODEL_CAPACITY" => {
+            "Insufficient upstream model capacity. Please retry shortly.".into()
+        }
+        "THINKING_SIGNATURE_INVALID" => {
+            "Thinking block signature is invalid for this model or session.".into()
+        }
+        "CONSENT_REQUIRED" | "RECONSENT_REQUIRED" => {
+            "Model consent is required for this account in Kiro.".into()
+        }
+        "INVALID_MODEL_ID" => {
+            "Invalid model ID or insufficient subscription level to use it.".into()
+        }
         r if original == "Improperly formed request." && matches!(r, "UNKNOWN" | "null") => {
             "Kiro API rejected the request. If problem persists, open issue with info and attached debug logs at:https://github.com/minpeter/kiro-lb/issues".into()
         }

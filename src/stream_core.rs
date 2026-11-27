@@ -18,6 +18,7 @@ pub enum KiroEvent {
     Content(String),
     Thinking { text: String, is_first: bool },
     ThinkingSignature(String),
+    RedactedThinking(String),
     ToolUse(Value),
     Usage(Value),
     Metering(MeteringEvent),
@@ -129,6 +130,7 @@ fn convert(e: ParsedEvent, cut: &mut CutTracker) -> Result<Option<KiroEvent>, St
         ParsedEvent::Content(c) => !c.is_empty(),
         ParsedEvent::Thinking { text, .. } => !text.is_empty(),
         ParsedEvent::ThinkingSignature(s) => !s.is_empty(),
+        ParsedEvent::RedactedThinking(d) => !d.is_empty(),
         _ => false,
     };
     if produced {
@@ -147,6 +149,12 @@ fn convert(e: ParsedEvent, cut: &mut CutTracker) -> Result<Option<KiroEvent>, St
             KiroEvent::Thinking { text, is_first }
         }
         ParsedEvent::ThinkingSignature(s) => KiroEvent::ThinkingSignature(s),
+        ParsedEvent::RedactedThinking(d) => {
+            if d.is_empty() {
+                return Ok(None);
+            }
+            KiroEvent::RedactedThinking(d)
+        }
         ParsedEvent::ToolUse(t) => return cut.tool(t),
         ParsedEvent::UpstreamError { reason, message } => {
             return cut.upstream_error(reason, message)
@@ -286,7 +294,9 @@ pub struct StreamResult {
     pub content_blocks: Vec<Value>,
     pub tool_calls: Vec<Value>,
     pub usage: Option<Value>,
+    pub usage_reported: bool,
     pub metering: Option<MeteringEvent>,
+    pub upstream_usage: UpstreamTokenUsage,
     pub context_usage_percentage: Option<f64>,
     pub stop_reason: Option<String>,
 }
@@ -334,13 +344,32 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                     b["signature"] = json!(s);
                 }
             }
+            KiroEvent::RedactedThinking(d) if !d.is_empty() => {
+                r.content_blocks
+                    .push(json!({"type": "redacted_thinking", "data": d}));
+            }
             KiroEvent::ToolUse(t) => {
                 r.tool_calls.push(t.clone());
                 r.content_blocks
                     .push(json!({"type": "tool_use", "tool": t}));
             }
-            KiroEvent::Usage(u) if !is_zero(&u) => r.usage = Some(u),
+            KiroEvent::Usage(u) => {
+                r.usage_reported = true;
+                if !is_zero(&u) {
+                    r.upstream_usage.merge_from(&u);
+                    if let (Some(Value::Object(existing)), Value::Object(incoming)) =
+                        (r.usage.as_mut(), &u)
+                    {
+                        for (k, v) in incoming {
+                            existing.insert(k.clone(), v.clone());
+                        }
+                    } else if !matches!(r.usage, Some(Value::Object(_))) {
+                        r.usage = Some(u);
+                    }
+                }
+            }
             KiroEvent::Metering(m) => {
+                r.upstream_usage.merge_from(m.raw());
                 let mut raw = m
                     .raw()
                     .as_object()
@@ -404,6 +433,67 @@ pub fn is_zero(v: &Value) -> bool {
     }
 }
 
+/// Parsed upstream token and cache usage reported by `messageMetadataEvent` or
+/// legacy metering frames. Fields remain `None` unless explicitly reported.
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamTokenUsage {
+    pub uncached_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
+}
+
+impl UpstreamTokenUsage {
+    pub fn merge_from(&mut self, value: &Value) {
+        let source = value
+            .get("tokenUsage")
+            .filter(|v| v.is_object())
+            .unwrap_or(value);
+        let read = |keys: &[&str]| {
+            keys.iter().find_map(|k| {
+                source
+                    .get(*k)
+                    .filter(|v| v.is_number())
+                    .and_then(Value::as_f64)
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .map(|n| n as i64)
+            })
+        };
+        if let Some(n) = read(&["uncachedInputTokens", "uncached_input_tokens"]) {
+            self.uncached_input_tokens = Some(n);
+        }
+        if let Some(n) = read(&["outputTokens", "output_tokens"]) {
+            self.output_tokens = Some(n);
+        }
+        if let Some(n) = read(&["cacheReadInputTokens", "cache_read_input_tokens"]) {
+            self.cache_read_input_tokens = Some(n);
+        }
+        if let Some(n) = read(&[
+            "cacheWriteInputTokens",
+            "cache_write_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_creation_input_tokens",
+        ]) {
+            self.cache_write_input_tokens = Some(n);
+        }
+    }
+
+    pub fn has_cache_fields(&self) -> bool {
+        self.cache_read_input_tokens.is_some() || self.cache_write_input_tokens.is_some()
+    }
+
+    pub fn cache_total(&self) -> i64 {
+        self.cache_read_input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_write_input_tokens.unwrap_or(0))
+    }
+
+    pub fn total_input_tokens(&self) -> Option<i64> {
+        self.uncached_input_tokens
+            .map(|uncached| uncached.saturating_add(self.cache_total()))
+    }
+}
+
 pub fn tokens_from_context_usage(
     pct: Option<f64>,
     completion: i64,
@@ -411,7 +501,7 @@ pub fn tokens_from_context_usage(
 ) -> Option<(i64, i64)> {
     let p = pct.filter(|p| *p > 0.0)?;
     let total = (p / 100.0 * max_input_tokens as f64) as i64;
-    Some(((total - completion).max(0), total))
+    Some((total.saturating_sub(completion).max(0), total))
 }
 
 pub mod stop_reasons {

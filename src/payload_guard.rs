@@ -58,6 +58,11 @@ pub fn measure(payload: &Value) -> (usize, usize) {
             {
                 *signature = Value::String(String::new());
             }
+            if let Some(redacted @ Value::String(_)) =
+                entry.pointer_mut("/assistantResponseMessage/reasoningContent/redactedContent")
+            {
+                *redacted = Value::String(String::new());
+            }
         }
     }
     let (tokens, bytes) = measure_text(&compact_json(&text));

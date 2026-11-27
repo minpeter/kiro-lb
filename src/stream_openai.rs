@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use crate::parser::{deduplicate_tool_calls, parse_bracket_tool_calls, tool_call_signature};
 use crate::stream_anthropic::StreamCtx;
 use crate::stream_core::{
-    self, stop_reasons, EventStream, KiroEvent, OpenAIValidator, StreamError,
+    self, stop_reasons, EventStream, KiroEvent, OpenAIValidator, StreamError, UpstreamTokenUsage,
 };
 use crate::tokenizer::{count_message_tokens, count_tokens, count_tools_tokens};
 use crate::usage_tracking::GenerationTimer;
@@ -96,6 +96,7 @@ pub fn stream(
         let mut metering: Option<f64> = None;
         let mut metering_reported = false;
         let mut legacy_usage_reported = false;
+        let mut upstream_usage = UpstreamTokenUsage::default();
         let mut context_usage: Option<f64> = None;
         let mut full = String::new();
         let mut thinking = String::new();
@@ -152,8 +153,12 @@ pub fn stream(
                     if let Some(credits) = m.credits() {
                         metering = Some(metering.unwrap_or(0.0) + credits);
                     }
+                    upstream_usage.merge_from(m.raw());
                 }
-                KiroEvent::Usage(_) => legacy_usage_reported = true,
+                KiroEvent::Usage(u) => {
+                    legacy_usage_reported = true;
+                    upstream_usage.merge_from(&u);
+                }
                 KiroEvent::ContextUsage(p) => context_usage = Some(p),
                 KiroEvent::StopReason(s) if !s.is_empty() => stop = Some(s),
                 _ => {}
@@ -186,24 +191,41 @@ pub fn stream(
         let tool_text = projected_tool_text(&all);
         let output_text = format!("{full}{thinking}{tool_text}");
         let model = ctx.model.clone();
-        let completion = if output_text.len() >= 8192 {
+        let local_completion = if output_text.len() >= 8192 {
             tokio::task::spawn_blocking(move || count_tokens(&output_text, true, Some(&model))).await.unwrap_or(0)
         } else {
             count_tokens(&output_text, true, Some(&model))
         } as i64;
+        let completion = upstream_usage
+            .output_tokens
+            .filter(|n| *n > 0)
+            .unwrap_or(local_completion);
         let (mut prompt, mut total) = (0i64, completion);
-        match stream_core::tokens_from_context_usage(context_usage, completion, ctx.models.max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model))) {
-            Some((p, t)) => { prompt = p; total = t; ctx.request.observe_reported_input(&ctx.model, p); }
-            None if ctx.input_tokens > 0 => {
-                prompt = ctx.input_tokens;
-                total = prompt + completion;
+        if let Some(p) = upstream_usage.total_input_tokens() {
+            prompt = p;
+            total = prompt.saturating_add(completion);
+            ctx.request.observe_reported_input(&ctx.model, p);
+        } else {
+            match stream_core::tokens_from_context_usage(context_usage, completion, ctx.models.max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model))) {
+                Some((p, t)) => { prompt = p; total = t; ctx.request.observe_reported_input(&ctx.model, p); }
+                None if ctx.input_tokens > 0 => {
+                    prompt = ctx.input_tokens;
+                    total = prompt.saturating_add(completion);
+                }
+                None if !opts.request_messages.is_empty() => {
+                    let (msgs, tls, model) = (opts.request_messages.clone(), opts.request_tools.clone(), ctx.model.clone());
+                    prompt = tokio::task::spawn_blocking(move || count_message_tokens(&msgs, false, Some(&model)) + count_tools_tokens(&tls, false, Some(&model))).await.unwrap_or(0) as i64;
+                    total = prompt.saturating_add(completion);
+                }
+                None => {}
             }
-            None if !opts.request_messages.is_empty() => {
-                let (msgs, tls, model) = (opts.request_messages.clone(), opts.request_tools.clone(), ctx.model.clone());
-                prompt = tokio::task::spawn_blocking(move || count_message_tokens(&msgs, false, Some(&model)) + count_tools_tokens(&tls, false, Some(&model))).await.unwrap_or(0) as i64;
-                total = prompt + completion;
+            if upstream_usage.has_cache_fields() {
+                let cache_total = upstream_usage.cache_total();
+                if prompt < cache_total {
+                    prompt = cache_total;
+                    total = prompt.saturating_add(completion);
+                }
             }
-            None => {}
         }
         if !all.is_empty() {
             let indexed: Vec<Value> = all.iter().enumerate().map(|(i, tc)| {
@@ -216,10 +238,15 @@ pub fn stream(
             yield data(&p);
         }
         let mut last = chunk(json!({}), json!(finish));
-        last["usage"] = json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total});
-        if let Some(credits) = metering {
-            last["usage"]["credits_used"] = json!(credits);
+        let mut usage =
+            json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total});
+        if let Some(cached) = upstream_usage.cache_read_input_tokens {
+            usage["prompt_tokens_details"] = json!({"cached_tokens": cached.min(prompt)});
         }
+        if let Some(credits) = metering {
+            usage["credits_used"] = json!(credits);
+        }
+        last["usage"] = usage;
         ctx.request.record_tokens(&ctx.model, prompt, completion, Some(&timer));
         v.accept(Some(&last), false)?;
         yield data(&last);

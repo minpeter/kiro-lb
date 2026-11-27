@@ -33,7 +33,20 @@ pub fn cli_short_user_agent(api: &str) -> String {
     )
 }
 
-fn sdk_headers(token: &str, target: Option<&str>, api: &str) -> Vec<(&'static str, String)> {
+fn sdk_headers(
+    token: &str,
+    target: Option<&str>,
+    api: &str,
+    attempt: usize,
+    max_attempts: usize,
+    invocation_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let attempt = attempt.max(1);
+    let max_attempts = max_attempts.max(attempt);
+    let invocation_id = invocation_id
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut out = Vec::with_capacity(10);
     if let Some(t) = target {
         out.push(("Content-Type", "application/x-amz-json-1.0".into()));
@@ -43,20 +56,53 @@ fn sdk_headers(token: &str, target: Option<&str>, api: &str) -> Vec<(&'static st
     out.push(("x-amz-user-agent", cli_short_user_agent(api)));
     out.push(("x-amzn-codewhisperer-optout", "true".into()));
     if api == RUNTIME_API {
-        out.push(("x-kiro-attempt", "1;max=3".into()));
+        out.push((
+            "x-amzn-kiro-attempt",
+            format!("{attempt};max={max_attempts}"),
+        ));
     }
     out.push(("Authorization", format!("Bearer {token}")));
-    out.push(("amz-sdk-request", "attempt=1; max=3".into()));
-    out.push(("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string()));
+    out.push((
+        "amz-sdk-request",
+        format!("attempt={attempt}; max={max_attempts}"),
+    ));
+    out.push(("amz-sdk-invocation-id", invocation_id));
     out.push(("Accept", "*/*".into()));
     out
 }
 
 pub fn kiro_headers(token: &str) -> Vec<(&'static str, String)> {
+    kiro_headers_for_attempt(token, 1, 3)
+}
+
+pub fn kiro_headers_for_attempt(
+    token: &str,
+    attempt: usize,
+    max_attempts: usize,
+) -> Vec<(&'static str, String)> {
     sdk_headers(
         token,
         Some(crate::upstream::endpoints::GENERATE_TARGET),
         RUNTIME_API,
+        attempt,
+        max_attempts,
+        None,
+    )
+}
+
+pub fn kiro_headers_for_retry(
+    token: &str,
+    attempt: usize,
+    max_attempts: usize,
+    invocation_id: &str,
+) -> Vec<(&'static str, String)> {
+    sdk_headers(
+        token,
+        Some(crate::upstream::endpoints::GENERATE_TARGET),
+        RUNTIME_API,
+        attempt,
+        max_attempts,
+        Some(invocation_id),
     )
 }
 
@@ -65,7 +111,7 @@ pub fn management_headers(
     target: Option<&str>,
     api: &str,
 ) -> Vec<(&'static str, String)> {
-    sdk_headers(token, target, api)
+    sdk_headers(token, target, api, 1, 3, None)
 }
 
 pub fn completion_id() -> String {

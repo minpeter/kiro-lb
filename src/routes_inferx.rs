@@ -285,13 +285,17 @@ impl InferenceFailure {
 
 fn inference_http_failure(status: u16, body: &str) -> InferenceFailure {
     let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let reason = value["reason"].as_str();
     InferenceFailure {
         // A bare 400/404 does not prove that the buyer's input is wrong.
-        code: if status == 400
-            && value["reason"].as_str() == Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
-        {
+        code: if status == 400 && crate::errors::is_context_overflow_reason(reason) {
             "context_length_exceeded"
-        } else if (status == 400 && value["reason"].as_str() == Some("MONTHLY_REQUEST_COUNT"))
+        } else if (status == 400
+            && (matches!(
+                reason,
+                Some("MONTHLY_REQUEST_COUNT") | Some("DAILY_REQUEST_COUNT")
+            ) || crate::errors::is_rate_limit_reason(reason)
+                || crate::errors::is_consent_reason(reason)))
             || matches!(status, 401 | 403 | 429 | 500..=599)
         {
             "supplier_unavailable"
@@ -1482,12 +1486,10 @@ async fn execute_inference(
         let status = response.status;
         let body = response.text().await;
         let failure = inference_http_failure(status, &body);
+        let reason = crate::errors::reason_of(&body);
         if status == 403
-            && !crate::errors::is_suspension_error(
-                status,
-                Some(&body),
-                crate::errors::reason_of(&body).as_deref(),
-            )
+            && !crate::errors::is_suspension_error(status, Some(&body), reason.as_deref())
+            && !crate::errors::is_consent_reason(reason.as_deref())
         {
             // Repair only the next request's credentials. Never replay this
             // generation; post_request persists any rotated credential document.
@@ -1693,8 +1695,16 @@ async fn respond(
                 .map(str::trim)
                 .and_then(|data| serde_json::from_str::<Value>(data).ok())
             {
-                if value.get("usage").is_some() {
-                    usage = value.get("usage").cloned();
+                if let Some(u) = value.get("usage") {
+                    usage = Some(u.clone());
+                    if u.get("completion_tokens")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|n| n > max_tokens)
+                    {
+                        response_overflow = true;
+                        delivery_complete = false;
+                        continue;
+                    }
                 }
                 // Tool calls arrive fully assembled; check them, and the
                 // terminal chunk, before either is forwarded.
@@ -2637,5 +2647,22 @@ mod tests {
             assert!(!terminal(&frames), "{choice}: {frames:?}");
             assert!(frames.iter().all(|f| f.get("usage").is_none()));
         }
+    }
+
+    #[tokio::test]
+    async fn upstream_output_tokens_exceeding_max_tokens_never_forwards_terminal_chunk() {
+        const EXCEEDS: &str = r#"{"content":"ok"}{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":25}}{"stopReason":"END_TURN"}"#;
+        let (result, frames, drained) = run(json!("auto"), EXCEEDS, true, 10).await;
+        assert_eq!(result.unwrap_err().code, "output_limit_exceeded");
+        assert!(drained);
+        assert!(
+            !terminal(&frames),
+            "terminal chunk must not be forwarded when usage exceeds max_tokens: {frames:?}"
+        );
+        assert!(frames.iter().all(|f| f.get("usage").is_none()));
+
+        let (result, _, drained) = run(json!("auto"), EXCEEDS, false, 10).await;
+        assert_eq!(result.unwrap_err().code, "output_limit_exceeded");
+        assert!(drained);
     }
 }

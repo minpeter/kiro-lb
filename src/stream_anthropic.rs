@@ -11,7 +11,7 @@ use crate::auth::KiroAuth;
 use crate::model_resolver::ModelInfoCache;
 use crate::parser::{parse_bracket_tool_calls, tool_call_signature};
 use crate::stream_core::{
-    self, stop_reasons, AnthropicValidator, EventStream, KiroEvent, StreamError,
+    self, stop_reasons, AnthropicValidator, EventStream, KiroEvent, StreamError, UpstreamTokenUsage,
 };
 use crate::tokenizer::count_tokens;
 use crate::upstream::http::Transport;
@@ -50,23 +50,41 @@ pub fn sse(event: &str, data: &Value) -> String {
     )
 }
 
-fn cache_fields(usage: &Value) -> serde_json::Map<String, Value> {
+fn anthropic_cache_map(upstream: &UpstreamTokenUsage) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
-    for (src, dst) in [
-        ("cache_read_input_tokens", "cache_read_input_tokens"),
-        ("cacheReadInputTokens", "cache_read_input_tokens"),
-        ("cache_creation_input_tokens", "cache_creation_input_tokens"),
-        ("cacheCreationInputTokens", "cache_creation_input_tokens"),
-    ] {
-        if let Some(n) = usage
-            .get(src)
-            .filter(|v| v.is_number())
-            .and_then(Value::as_f64)
-        {
-            out.insert(dst.into(), json!(n as i64));
-        }
+    if let Some(n) = upstream.cache_read_input_tokens {
+        out.insert("cache_read_input_tokens".into(), json!(n));
+    }
+    if let Some(n) = upstream.cache_write_input_tokens {
+        out.insert("cache_creation_input_tokens".into(), json!(n));
     }
     out
+}
+
+/// Resolve `(anthropic_input_tokens, total_input_for_accounting, from_upstream)`.
+/// In Anthropic's usage schema, `input_tokens` excludes cached tokens, whereas
+/// `contextUsagePercentage` and gateway accounting track total input tokens.
+fn resolve_anthropic_input(
+    upstream: &UpstreamTokenUsage,
+    estimated_total: i64,
+    reported_total: Option<i64>,
+) -> (i64, i64, bool) {
+    if let Some(uncached) = upstream.uncached_input_tokens {
+        let total = uncached.saturating_add(upstream.cache_total());
+        return (uncached, total, true);
+    }
+    let (base_total, mut from_upstream) = match reported_total {
+        Some(p) => (p, true),
+        None => (estimated_total, false),
+    };
+    if upstream.has_cache_fields() {
+        let cache_total = upstream.cache_total();
+        let uncached = base_total.saturating_sub(cache_total).max(0);
+        let total = base_total.max(cache_total);
+        from_upstream = true;
+        return (uncached, total, from_upstream);
+    }
+    (base_total, base_total, from_upstream)
 }
 
 fn tool_input(tool: &Value) -> Result<Value, StreamError> {
@@ -124,7 +142,8 @@ pub fn stream(
         let mut intercepted: HashSet<String> = HashSet::new();
         let mut stop_reason: Option<String> = None;
         let mut context_usage: Option<f64> = None;
-        let mut cache_usage = serde_json::Map::new();
+        let mut metering_or_usage_reported = false;
+        let mut upstream_usage = UpstreamTokenUsage::default();
         let mut full_content = String::new();
         let mut full_thinking = String::new();
         let mut received = false;
@@ -153,7 +172,13 @@ pub fn stream(
                         yield em.emit("content_block_delta", json!({"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": t}}))?;
                     }
                 }
-                if matches!(ev, KiroEvent::Content(_) | KiroEvent::Thinking { .. } | KiroEvent::ToolUse(_)) {
+                if matches!(
+                    ev,
+                    KiroEvent::Content(_)
+                        | KiroEvent::Thinking { .. }
+                        | KiroEvent::RedactedThinking(_)
+                        | KiroEvent::ToolUse(_)
+                ) {
                     timer.mark();
                 }
                 match ev {
@@ -191,6 +216,22 @@ pub fn stream(
                                 yield em.emit("content_block_delta", json!({"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": t}}))?;
                             }
                         }
+                    }
+                    KiroEvent::RedactedThinking(data) => {
+                        if data.is_empty() { continue; }
+                        if thinking_open {
+                            yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": thinking_index}))?;
+                            thinking_open = false;
+                            index += 1;
+                        }
+                        if text_open {
+                            yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": text_index}))?;
+                            text_open = false;
+                            index += 1;
+                        }
+                        yield em.emit("content_block_start", json!({"type": "content_block_start", "index": index, "content_block": {"type": "redacted_thinking", "data": data}}))?;
+                        yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": index}))?;
+                        index += 1;
                     }
                     KiroEvent::Content(c) => {
                         if c.is_empty() { continue; }
@@ -244,7 +285,8 @@ pub fn stream(
                                     current = followup(id.clone(), query.clone(), web_search::summary(&query, &results)).await?;
                                     stop_reason = None;
                                     context_usage = None;
-                                    cache_usage.clear();
+                                    metering_or_usage_reported = false;
+                                    upstream_usage = UpstreamTokenUsage::default();
                                     continue 'outer;
                                 } else {
                                     tracing::error!("MCP API call failed for web_search");
@@ -259,10 +301,12 @@ pub fn stream(
                     }
                     KiroEvent::ContextUsage(p) => context_usage = Some(p),
                     KiroEvent::Metering(m) => {
-                        cache_usage.extend(cache_fields(m.raw()));
+                        metering_or_usage_reported = true;
+                        upstream_usage.merge_from(m.raw());
                     }
                     KiroEvent::Usage(u) => {
-                        cache_usage.extend(cache_fields(&u));
+                        metering_or_usage_reported = true;
+                        upstream_usage.merge_from(&u);
                     }
                     KiroEvent::StopReason(s) => if !s.is_empty() { stop_reason = Some(s) },
                 }
@@ -270,7 +314,7 @@ pub fn stream(
             break;
         }
         if !received { Err(StreamError::Protocol(stream_core::NO_EVENTS))?; }
-        let completed = context_usage.is_some();
+        let completed = context_usage.is_some() || metering_or_usage_reported;
         if !pending.is_empty() {
             if thinking_open {
                 yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": thinking_index}))?;
@@ -325,17 +369,25 @@ pub fn stream(
         let tool_text = crate::usage_tracking::tool_call_text(tool_blocks[..native_tools].iter().map(|(_, n, i)| (n.as_str(), pyjson::dumps(i))));
         let output_text = format!("{full_content}{full_thinking}{tool_text}");
         let model = ctx.model.clone();
-        let output_tokens = if output_text.len() >= 8192 {
+        let local_output_tokens = if output_text.len() >= 8192 {
             tokio::task::spawn_blocking(move || count_tokens(&output_text, true, Some(&model))).await.unwrap_or(0)
         } else {
             count_tokens(&output_text, true, Some(&model))
         } as i64;
-        let mut input_tokens = ctx.input_tokens;
-        let mut from_upstream = false;
-        if let Some((p, _)) = stream_core::tokens_from_context_usage(context_usage, output_tokens, ctx.models.max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model))) {
-            input_tokens = p;
-            from_upstream = true;
-            ctx.request.observe_reported_input(&ctx.model, p);
+        let output_tokens = upstream_usage
+            .output_tokens
+            .filter(|n| *n > 0)
+            .unwrap_or(local_output_tokens);
+        let reported_total = stream_core::tokens_from_context_usage(
+            context_usage,
+            output_tokens,
+            ctx.models.max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model)),
+        )
+        .map(|(p, _)| p);
+        let (anthropic_input_tokens, total_input_tokens, from_upstream) =
+            resolve_anthropic_input(&upstream_usage, ctx.input_tokens, reported_total);
+        if upstream_usage.total_input_tokens().is_some() || reported_total.is_some() {
+            ctx.request.observe_reported_input(&ctx.model, total_input_tokens);
         }
         let mapped = stop_reasons::to_anthropic(stop_reason.as_deref());
         let final_reason = if truncated || stop_reasons::is_truncated(stop_reason.as_deref()) {
@@ -347,13 +399,13 @@ pub fn stream(
         };
         let mut usage = serde_json::Map::new();
         usage.insert("output_tokens".into(), json!(output_tokens));
-        usage.extend(cache_usage);
+        usage.extend(anthropic_cache_map(&upstream_usage));
         if from_upstream {
-            usage.insert("input_tokens".into(), json!(input_tokens));
+            usage.insert("input_tokens".into(), json!(anthropic_input_tokens));
         }
         yield em.emit("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": final_reason, "stop_sequence": null}, "usage": usage}))?;
         yield em.emit("message_stop", json!({"type": "message_stop"}))?;
-        ctx.request.record_tokens(&ctx.model, input_tokens, output_tokens, Some(&timer));
+        ctx.request.record_tokens(&ctx.model, total_input_tokens, output_tokens, Some(&timer));
     })
 }
 
@@ -423,16 +475,16 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
         let next = followup(id, query.clone(), web_search::summary(&query, &results)).await?;
         result = stream_core::collect(next).await?;
     }
-    let mut cache = result.usage.as_ref().map(cache_fields).unwrap_or_default();
-    if let Some(metering) = &result.metering {
-        cache.extend(cache_fields(metering.raw()));
-    }
+    let upstream_usage = result.upstream_usage;
     let mut content = Vec::new();
     for b in &native {
         match b["type"].as_str() {
             Some("thinking") => content.push(
                 json!({"type": "thinking", "thinking": b["thinking"], "signature": b["signature"]}),
             ),
+            Some("redacted_thinking") => {
+                content.push(json!({"type": "redacted_thinking", "data": b["data"]}))
+            }
             Some("text") => content.push(json!({"type": "text", "text": b["text"]})),
             Some("server_tool_use") | Some("web_search_tool_result") => content.push(b.clone()),
             _ => {
@@ -457,24 +509,33 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
     );
     let output_text = format!("{acc_content}{acc_thinking}{tool_text}");
     let model = ctx.model.clone();
-    let output_tokens = if output_text.len() >= 8192 {
+    let local_output_tokens = if output_text.len() >= 8192 {
         tokio::task::spawn_blocking(move || count_tokens(&output_text, true, Some(&model)))
             .await
             .unwrap_or(0)
     } else {
         count_tokens(&output_text, true, Some(&model))
     } as i64;
-    let mut input_tokens = ctx.input_tokens;
-    if let Some((p, _)) = stream_core::tokens_from_context_usage(
+    let output_tokens = upstream_usage
+        .output_tokens
+        .filter(|n| *n > 0)
+        .unwrap_or(local_output_tokens);
+    let reported_total = stream_core::tokens_from_context_usage(
         result.context_usage_percentage,
         output_tokens,
         ctx.models
             .max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&ctx.model)),
-    ) {
-        input_tokens = p;
-        ctx.request.observe_reported_input(&ctx.model, p);
+    )
+    .map(|(p, _)| p);
+    let (anthropic_input_tokens, total_input_tokens, _) =
+        resolve_anthropic_input(&upstream_usage, ctx.input_tokens, reported_total);
+    if upstream_usage.total_input_tokens().is_some() || reported_total.is_some() {
+        ctx.request
+            .observe_reported_input(&ctx.model, total_input_tokens);
     }
-    let completed = result.context_usage_percentage.is_some();
+    let completed = result.context_usage_percentage.is_some()
+        || result.metering.is_some()
+        || result.usage_reported;
     let truncated = !completed && !result.content.is_empty() && result.tool_calls.is_empty();
     let mapped = stop_reasons::to_anthropic(result.stop_reason.as_deref());
     let has_tools = native.iter().any(|b| b["type"] == "tool_use");
@@ -486,11 +547,11 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
         mapped.unwrap_or("end_turn")
     };
     ctx.request
-        .record_tokens(&ctx.model, input_tokens, output_tokens, None);
+        .record_tokens(&ctx.model, total_input_tokens, output_tokens, None);
     let mut usage = serde_json::Map::new();
-    usage.insert("input_tokens".into(), json!(input_tokens));
+    usage.insert("input_tokens".into(), json!(anthropic_input_tokens));
     usage.insert("output_tokens".into(), json!(output_tokens));
-    usage.extend(cache);
+    usage.extend(anthropic_cache_map(&upstream_usage));
     Ok(
         json!({"id": message_id, "type": "message", "role": "assistant", "content": content, "model": ctx.model, "stop_reason": reason, "stop_sequence": null, "usage": usage}),
     )

@@ -531,7 +531,10 @@ fn key_usage_totals(key_id: &str) -> Result<(i64, i64), PolicyUnavailable> {
         PolicyUnavailable
     })?;
     let (requests, tokens) = usage_tracking::pending_key_totals(key_id);
-    Ok((stored.0 + requests, stored.1 + tokens))
+    Ok((
+        stored.0.saturating_add(requests),
+        stored.1.saturating_add(tokens),
+    ))
 }
 
 /// The limit this key has already reached, if any. Called before a generation,

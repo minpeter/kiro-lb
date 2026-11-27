@@ -51,6 +51,15 @@ fn reasoning_signature(content: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn redacted_reasoning(content: &Value) -> Option<String> {
+    blocks(content)
+        .iter()
+        .filter(|b| block_type(b) == Some("redacted_thinking"))
+        .filter_map(|b| b.get("data").and_then(Value::as_str))
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 pub fn extract_system_prompt(system: &Value) -> String {
     match system {
         Value::Null => String::new(),
@@ -150,6 +159,7 @@ pub fn convert_messages(messages: &[Value]) -> Vec<UnifiedMessage> {
                 msg.tool_calls = Some(tool_uses(&content)).filter(|c| !c.is_empty());
                 msg.reasoning = reasoning(&content);
                 msg.reasoning_signature = reasoning_signature(&content);
+                msg.redacted_reasoning = redacted_reasoning(&content);
             } else if role == "user" {
                 msg.tool_results = Some(tool_results(&content)).filter(|r| !r.is_empty());
                 let mut images = extract_images_from_content(&content);

@@ -1,7 +1,8 @@
 //! Account model catalogue and quota usage, both served by the management host
-//! with the same calls and headers the Kiro IDE uses.
+//! with the same calls and headers the Kiro CLI uses.
 
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::auth::{region_from_arn, AuthError, KiroAuth};
@@ -38,9 +39,12 @@ fn region(auth: &KiroAuth) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+const MAX_MODEL_PAGES: usize = 20;
+
 enum ManagementCall<'a> {
     Json {
         target: &'a str,
+        next_token: Option<&'a str>,
     },
     Get {
         path: &'a str,
@@ -61,12 +65,15 @@ async fn management_call(
     #[cfg(debug_assertions)]
     let base = std::env::var("KIRO_TEST_MANAGEMENT_URL").unwrap_or(base);
     let (mut req, target) = match call {
-        ManagementCall::Json { target } => {
+        ManagementCall::Json { target, next_token } => {
             let mut body = json!({"origin": "KIRO_CLI"});
             let mut params: Vec<(&str, String)> = vec![("origin", "KIRO_CLI".into())];
             if let Some(a) = &arn {
                 body["profileArn"] = json!(a);
                 params.push(("profileArn", a.clone()));
+            }
+            if let Some(next) = next_token {
+                body["nextToken"] = json!(next);
             }
             (http.post(base).query(&params).json(&body), Some(target))
         }
@@ -128,44 +135,64 @@ pub(crate) async fn fetch_available_models_authoritative(
 }
 
 async fn fetch_models(auth: &KiroAuth, http: &reqwest::Client, strict: bool) -> Option<Vec<Value>> {
-    match management_call(
-        auth,
-        http,
-        ManagementCall::Json {
-            target: "KiroControlPlaneBearerService.ListAvailableModels",
-        },
-        CONTROL_PLANE_API,
-    )
-    .await
-    {
-        Ok(v) => {
-            let entries = v.get("models")?.as_array()?;
-            if strict
-                && entries.iter().any(|m| {
-                    m.get("modelId")
-                        .and_then(Value::as_str)
-                        .is_none_or(str::is_empty)
-                })
-            {
+    let mut models = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_tokens = HashSet::new();
+    let mut next_token: Option<String> = None;
+
+    for page in 0..MAX_MODEL_PAGES {
+        let v = match management_call(
+            auth,
+            http,
+            ManagementCall::Json {
+                target: "KiroControlPlaneBearerService.ListAvailableModels",
+                next_token: next_token.as_deref(),
+            },
+            CONTROL_PLANE_API,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("[Models] Could not list models (page {}): {e}", page + 1);
                 return None;
             }
-            let models: Vec<Value> = v
-                .get("models")?
-                .as_array()?
-                .iter()
-                .filter(|m| {
-                    m.get("modelId")
-                        .is_some_and(|x| x.as_str().is_some_and(|s| !s.is_empty()))
-                })
-                .cloned()
-                .collect();
-            Some(models)
+        };
+        let entries = v.get("models")?.as_array()?;
+        if strict
+            && entries.iter().any(|m| {
+                m.get("modelId")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            })
+        {
+            return None;
         }
-        Err(e) => {
-            tracing::debug!("[Models] Could not list models: {e}");
-            None
+        for model in entries {
+            if let Some(id) = model.get("modelId").and_then(Value::as_str) {
+                if !id.is_empty() && seen_ids.insert(id.to_owned()) {
+                    models.push(model.clone());
+                }
+            }
         }
+        let token = match v.get("nextToken") {
+            None | Some(Value::Null) => return Some(models),
+            Some(Value::String(s)) if s.is_empty() => return Some(models),
+            Some(Value::String(s)) => s.as_str(),
+            Some(_) => {
+                tracing::warn!("[Models] Rejecting malformed non-string nextToken");
+                return None;
+            }
+        };
+        if !seen_tokens.insert(token.to_owned()) || page + 1 >= MAX_MODEL_PAGES {
+            tracing::warn!(
+                "[Models] Stopping model pagination early due to repeated or excessive nextToken"
+            );
+            return None;
+        }
+        next_token = Some(token.to_owned());
     }
+    None
 }
 
 fn number(v: Option<&Value>) -> Option<f64> {
@@ -270,7 +297,12 @@ fn extra_allowance(b: &Value, now: f64) -> (f64, f64) {
             .get(status)
             .and_then(Value::as_str)
             .is_none_or(|s| s.eq_ignore_ascii_case("ACTIVE"));
-        let unexpired = number(v.get(expiry)).is_none_or(|t| t <= 0.0 || t > now);
+        let unexpired = match v.get(expiry) {
+            None | Some(Value::Null) => true,
+            Some(val) => number(Some(val))
+                .filter(|t| t.is_finite())
+                .is_some_and(|t| t <= 0.0 || t > now),
+        };
         active && unexpired
     };
     let mut used = 0.0;
@@ -308,6 +340,18 @@ fn extra_allowance(b: &Value, now: f64) -> (f64, f64) {
                 add(precise(addon, "usage"), precise(addon, "limit"));
             }
         }
+    }
+    for credit in b
+        .get("overageCredits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|v| live(v, "status", "expiresAt"))
+    {
+        add(
+            precise(credit, "currentUsage"),
+            precise(credit, "usageLimit"),
+        );
     }
     if let Some(trial) = b
         .get("freeTrialInfo")
@@ -352,6 +396,16 @@ mod tests {
         let over_used =
             json!({"bonuses": [{"status": "ACTIVE", "currentUsage": 600.0, "usageLimit": 500.0}]});
         assert_eq!(extra_allowance(&over_used, now), (500.0, 500.0));
+
+        let overage_credits = json!({
+            "overageCredits": [
+                {"status": "ACTIVE", "currentUsage": 12.5, "usageLimit": 100.0, "expiresAt": 1900000000.0},
+                {"status": "EXPIRED", "currentUsage": 5.0, "usageLimit": 50.0, "expiresAt": 1900000000.0},
+                {"status": "ACTIVE", "currentUsage": 1.0, "usageLimit": 25.0, "expiresAt": 1700000000.0},
+                {"status": "ACTIVE", "currentUsage": 1.0, "usageLimit": 25.0, "expiresAt": "malformed"}
+            ]
+        });
+        assert_eq!(extra_allowance(&overage_credits, now), (12.5, 100.0));
         assert_eq!(extra_allowance(&json!({}), now), (0.0, 0.0));
     }
 
@@ -374,7 +428,10 @@ mod tests {
         let error = management_call(
             &auth,
             &http,
-            ManagementCall::Json { target: "unused" },
+            ManagementCall::Json {
+                target: "unused",
+                next_token: None,
+            },
             "unused",
         )
         .await
