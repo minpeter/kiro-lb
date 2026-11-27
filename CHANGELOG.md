@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.14](https://github.com/minpeter/kiro-lb/compare/v0.2.13...v0.2.14) - 2026-11-27
+
+### Added
+
+- align headers, pagination, errors, cache usage, and redacted thinking with Kiro CLI 3.6.2
+
+### Fixed
+
+- address council round 4 review findings
+- address council round 3 review findings
+- address council round 2 review findings
+- address council review findings on retry-after units, usage totals, pagination, and failover
+- update Kiro CLI identity to 3.6.2
+
+### Other
+
+- update Kiro CLI version in AGENTS.md to 3.6.2
+
 ## [0.2.13](https://github.com/minpeter/kiro-lb/compare/v0.2.12...v0.2.13) - 2026-11-06
 
 ### Fixed
