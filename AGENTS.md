@@ -217,7 +217,7 @@ kiro-lb/
   `/v1/models` lists only supported IDs and aliases with supported targets.
 - Labelling a Prometheus series with a raw model name.
 - Mixing Kiro IDE markers into the request identity. Generation and management
-  calls mirror a captured Kiro CLI 2.37.0 classic engine (`src/utils.rs`):
+  calls mirror a captured Kiro CLI 3.6.2 classic engine (`src/utils.rs`):
   `aws-sdk-rust` user agents, `origin: KIRO_CLI`, the
   `AmazonCodeWhispererStreamingService` target, HTTP/1.1 with no ALPN, and no
   machine id, client attribution, `agentMode`, `agentContinuationId` or
