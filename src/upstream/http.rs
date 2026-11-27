@@ -531,6 +531,22 @@ fn network_detail(e: &reqwest::Error) -> (u16, String) {
     (status, kind.to_owned())
 }
 
+const MAX_RETRY_AFTER_SECONDS: f64 = 30.0;
+
+pub(crate) fn parse_retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    for name in ["x-amz-retry-after", "retry-after"] {
+        let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) else {
+            continue;
+        };
+        if let Ok(seconds) = raw.trim().parse::<f64>() {
+            if seconds.is_finite() && seconds > 0.0 {
+                return Some(seconds.min(MAX_RETRY_AFTER_SECONDS));
+            }
+        }
+    }
+    None
+}
+
 impl Transport {
     #[allow(clippy::too_many_arguments)]
     async fn attempt_endpoint(
@@ -559,7 +575,11 @@ impl Transport {
                 .await
                 .map_err(|e| Err(TransportError::Auth(e)))?;
             let mut req = client.request(method.clone(), url);
-            let mut headers = utils::kiro_headers(&token);
+            let mut headers = utils::kiro_headers_for_attempt(
+                &token,
+                (attempt + 1) as usize,
+                max_retries as usize,
+            );
             for (k, v) in overrides {
                 if let Some(h) = headers
                     .iter_mut()
@@ -653,11 +673,12 @@ impl Transport {
                     tracing::info!("Received 429; returning immediately for account failover");
                     return Ok(buffered);
                 }
+                let delay = parse_retry_after_seconds(&buffered.headers)
+                    .unwrap_or_else(|| config::BASE_RETRY_DELAY * 2f64.powi(attempt as i32));
                 last_response = Some(buffered);
                 if attempt + 1 >= max_retries {
                     break;
                 }
-                let delay = config::BASE_RETRY_DELAY * 2f64.powi(attempt as i32);
                 tracing::warn!(
                     "Received 429, waiting {delay}s (attempt {}/{max_retries})",
                     attempt + 1
@@ -666,11 +687,12 @@ impl Transport {
                 continue;
             }
             if (500..600).contains(&status) {
+                let delay = parse_retry_after_seconds(&buffered.headers)
+                    .unwrap_or_else(|| config::BASE_RETRY_DELAY * 2f64.powi(attempt as i32));
                 last_response = Some(buffered);
                 if attempt + 1 >= max_retries {
                     break;
                 }
-                let delay = config::BASE_RETRY_DELAY * 2f64.powi(attempt as i32);
                 tracing::warn!(
                     "Received {status}, waiting {delay}s (attempt {}/{max_retries})",
                     attempt + 1
@@ -1029,5 +1051,30 @@ mod once_tests {
         });
         bad_server.await.unwrap();
         good_server.await.unwrap();
+    }
+
+    #[test]
+    fn parse_retry_after_prefers_amz_header_and_clamps() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after_seconds(&headers), None);
+
+        headers.insert("retry-after", "2.5".parse().unwrap());
+        assert_eq!(parse_retry_after_seconds(&headers), Some(2.5));
+
+        headers.insert("x-amz-retry-after", "1.25".parse().unwrap());
+        assert_eq!(parse_retry_after_seconds(&headers), Some(1.25));
+
+        headers.insert("x-amz-retry-after", "999".parse().unwrap());
+        assert_eq!(
+            parse_retry_after_seconds(&headers),
+            Some(MAX_RETRY_AFTER_SECONDS)
+        );
+
+        headers.insert("x-amz-retry-after", "0".parse().unwrap());
+        assert_eq!(parse_retry_after_seconds(&headers), Some(2.5));
+
+        headers.clear();
+        headers.insert("x-amz-retry-after", "not-a-number".parse().unwrap());
+        assert_eq!(parse_retry_after_seconds(&headers), None);
     }
 }

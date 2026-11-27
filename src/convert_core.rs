@@ -19,6 +19,7 @@ pub struct UnifiedMessage {
     pub images: Option<Vec<Value>>,
     pub reasoning: Option<String>,
     pub reasoning_signature: Option<String>,
+    pub redacted_reasoning: Option<String>,
 }
 
 impl UnifiedMessage {
@@ -521,6 +522,7 @@ fn strip_all_tool_content(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> 
                 images: msg.images,
                 reasoning: msg.reasoning,
                 reasoning_signature: msg.reasoning_signature,
+                redacted_reasoning: msg.redacted_reasoning,
             }
         })
         .collect()
@@ -631,6 +633,13 @@ fn merge_adjacent_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage>
                 last.reasoning = msg.reasoning;
                 last.reasoning_signature = msg.reasoning_signature;
             }
+            if msg
+                .redacted_reasoning
+                .as_deref()
+                .is_some_and(|d| !d.is_empty())
+            {
+                last.redacted_reasoning = msg.redacted_reasoning;
+            }
         }
         if msg.role == "user" {
             if let Some(results) = msg.tool_results.filter(|r| !r.is_empty()) {
@@ -697,6 +706,8 @@ fn build_assistant_entry(msg: &UnifiedMessage) -> Result<Value, BuildError> {
             "reasoningContent".into(),
             json!({"reasoningText": {"text": r, "signature": s}}),
         );
+    } else if let Some(d) = msg.redacted_reasoning.as_deref().filter(|d| !d.is_empty()) {
+        a.insert("reasoningContent".into(), json!({"redactedContent": d}));
     }
     let uses = extract_tool_uses_from_message(&msg.content, msg.tool_calls.as_ref())?;
     if !uses.is_empty() {

@@ -653,7 +653,11 @@ pub fn usage_block(usage: Option<&Value>) -> Value {
         .and_then(Value::as_i64)
         .filter(|t| *t != 0)
         .unwrap_or(p + c);
-    json!({"input_tokens": p, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": c, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": total})
+    let cached = usage
+        .and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    json!({"input_tokens": p, "input_tokens_details": {"cached_tokens": cached}, "output_tokens": c, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": total})
 }
 
 pub fn message_item(text: &str, id: &str, status: &str) -> Value {

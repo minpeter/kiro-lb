@@ -18,6 +18,7 @@ pub enum KiroEvent {
     Content(String),
     Thinking { text: String, is_first: bool },
     ThinkingSignature(String),
+    RedactedThinking(String),
     ToolUse(Value),
     Usage(Value),
     Metering(MeteringEvent),
@@ -129,6 +130,7 @@ fn convert(e: ParsedEvent, cut: &mut CutTracker) -> Result<Option<KiroEvent>, St
         ParsedEvent::Content(c) => !c.is_empty(),
         ParsedEvent::Thinking { text, .. } => !text.is_empty(),
         ParsedEvent::ThinkingSignature(s) => !s.is_empty(),
+        ParsedEvent::RedactedThinking(d) => !d.is_empty(),
         _ => false,
     };
     if produced {
@@ -147,6 +149,12 @@ fn convert(e: ParsedEvent, cut: &mut CutTracker) -> Result<Option<KiroEvent>, St
             KiroEvent::Thinking { text, is_first }
         }
         ParsedEvent::ThinkingSignature(s) => KiroEvent::ThinkingSignature(s),
+        ParsedEvent::RedactedThinking(d) => {
+            if d.is_empty() {
+                return Ok(None);
+            }
+            KiroEvent::RedactedThinking(d)
+        }
         ParsedEvent::ToolUse(t) => return cut.tool(t),
         ParsedEvent::UpstreamError { reason, message } => {
             return cut.upstream_error(reason, message)
@@ -334,12 +342,26 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                     b["signature"] = json!(s);
                 }
             }
+            KiroEvent::RedactedThinking(d) if !d.is_empty() => {
+                r.content_blocks
+                    .push(json!({"type": "redacted_thinking", "data": d}));
+            }
             KiroEvent::ToolUse(t) => {
                 r.tool_calls.push(t.clone());
                 r.content_blocks
                     .push(json!({"type": "tool_use", "tool": t}));
             }
-            KiroEvent::Usage(u) if !is_zero(&u) => r.usage = Some(u),
+            KiroEvent::Usage(u) if !is_zero(&u) => {
+                if let (Some(Value::Object(existing)), Value::Object(incoming)) =
+                    (r.usage.as_mut(), &u)
+                {
+                    for (k, v) in incoming {
+                        existing.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    r.usage = Some(u);
+                }
+            }
             KiroEvent::Metering(m) => {
                 let mut raw = m
                     .raw()

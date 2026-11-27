@@ -414,7 +414,7 @@ async fn attempt(state: &Shared, plan: &Arc<Plan>, account: Arc<Account>) -> Att
             reason.as_deref(),
             Some(&upstream_message),
         );
-        if reason.as_deref() == Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        if crate::errors::is_context_overflow_reason(reason.as_deref()) {
             let limit = account
                 .models
                 .max_input_tokens(&crate::model_resolver::get_model_id_for_kiro(&plan.model));

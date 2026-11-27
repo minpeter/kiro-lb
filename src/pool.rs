@@ -1650,11 +1650,17 @@ impl AccountManager {
                 s.stats.total += 1;
                 tracing::warn!("Model '{model}' not available on account {}: status={status}, reason=INVALID_MODEL_ID", a.id);
                 None
-            } else if reason == Some("USER_REQUEST_RATE_EXCEEDED") {
+            } else if crate::errors::is_rate_limit_reason(reason) {
                 s.rate_limited_until = now + cfg.account_rate_limit_cooldown as f64;
                 s.stats.total += 1;
                 s.stats.failed += 1;
-                tracing::warn!("Account {} rate limited: status={status}, cooldown={} (failures unchanged at {})", a.id, format_duration(cfg.account_rate_limit_cooldown as f64), s.failures);
+                tracing::warn!(
+                    "Account {} rate limited: status={status}, reason={}, cooldown={} (failures unchanged at {})",
+                    a.id,
+                    reason.unwrap_or("UNKNOWN"),
+                    format_duration(cfg.account_rate_limit_cooldown as f64),
+                    s.failures
+                );
                 Some("rate_limited")
             } else if is_suspension_error(status, message, reason) {
                 s.suspended_until = now + cfg.account_suspension_quarantine as f64;
@@ -2163,6 +2169,36 @@ mod tests {
         drop(state);
         assert_eq!(replacement.models.support("model"), ModelSupport::Unknown);
         assert!(pool.inner.lock().observations.is_empty());
+    }
+
+    #[test]
+    fn cli_3_6_2_rate_limit_reasons_apply_short_cooldown_without_monthly_quarantine() {
+        let pool = AccountManager::new(reqwest::Client::new());
+        let acct = account("acct-1");
+        {
+            let mut inner = pool.inner.lock();
+            inner.order.push("acct-1".into());
+            inner.accounts.insert("acct-1".into(), acct.clone());
+        }
+
+        for reason in [
+            "CREDIT_CONSUMPTION_RATE_EXCEEDED",
+            "DAILY_REQUEST_COUNT",
+            "INSUFFICIENT_MODEL_CAPACITY",
+        ] {
+            assert!(pool.commit_failure(
+                &acct,
+                "claude-sonnet-5.5",
+                ErrorType::Recoverable,
+                429,
+                Some(reason),
+                Some("throttled"),
+            ));
+            let state = acct.state.lock();
+            assert!(state.rate_limited_until > 0.0, "{reason}");
+            assert_eq!(state.quota_exhausted_until, 0.0, "{reason}");
+            assert_eq!(state.failures, 0, "{reason}");
+        }
     }
 
     fn tiered(id: &str, tier: Option<&str>) -> Arc<Account> {

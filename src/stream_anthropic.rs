@@ -52,16 +52,23 @@ pub fn sse(event: &str, data: &Value) -> String {
 
 fn cache_fields(usage: &Value) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
+    let source = usage
+        .get("tokenUsage")
+        .filter(|v| v.is_object())
+        .unwrap_or(usage);
     for (src, dst) in [
         ("cache_read_input_tokens", "cache_read_input_tokens"),
         ("cacheReadInputTokens", "cache_read_input_tokens"),
         ("cache_creation_input_tokens", "cache_creation_input_tokens"),
         ("cacheCreationInputTokens", "cache_creation_input_tokens"),
+        ("cache_write_input_tokens", "cache_creation_input_tokens"),
+        ("cacheWriteInputTokens", "cache_creation_input_tokens"),
     ] {
-        if let Some(n) = usage
+        if let Some(n) = source
             .get(src)
             .filter(|v| v.is_number())
             .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n >= 0.0)
         {
             out.insert(dst.into(), json!(n as i64));
         }
@@ -153,7 +160,13 @@ pub fn stream(
                         yield em.emit("content_block_delta", json!({"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": t}}))?;
                     }
                 }
-                if matches!(ev, KiroEvent::Content(_) | KiroEvent::Thinking { .. } | KiroEvent::ToolUse(_)) {
+                if matches!(
+                    ev,
+                    KiroEvent::Content(_)
+                        | KiroEvent::Thinking { .. }
+                        | KiroEvent::RedactedThinking(_)
+                        | KiroEvent::ToolUse(_)
+                ) {
                     timer.mark();
                 }
                 match ev {
@@ -191,6 +204,22 @@ pub fn stream(
                                 yield em.emit("content_block_delta", json!({"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": t}}))?;
                             }
                         }
+                    }
+                    KiroEvent::RedactedThinking(data) => {
+                        if data.is_empty() { continue; }
+                        if thinking_open {
+                            yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": thinking_index}))?;
+                            thinking_open = false;
+                            index += 1;
+                        }
+                        if text_open {
+                            yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": text_index}))?;
+                            text_open = false;
+                            index += 1;
+                        }
+                        yield em.emit("content_block_start", json!({"type": "content_block_start", "index": index, "content_block": {"type": "redacted_thinking", "data": data}}))?;
+                        yield em.emit("content_block_stop", json!({"type": "content_block_stop", "index": index}))?;
+                        index += 1;
                     }
                     KiroEvent::Content(c) => {
                         if c.is_empty() { continue; }
@@ -433,6 +462,9 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
             Some("thinking") => content.push(
                 json!({"type": "thinking", "thinking": b["thinking"], "signature": b["signature"]}),
             ),
+            Some("redacted_thinking") => {
+                content.push(json!({"type": "redacted_thinking", "data": b["data"]}))
+            }
             Some("text") => content.push(json!({"type": "text", "text": b["text"]})),
             Some("server_tool_use") | Some("web_search_tool_result") => content.push(b.clone()),
             _ => {

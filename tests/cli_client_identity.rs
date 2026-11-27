@@ -1,6 +1,7 @@
 use kiro_lb::utils::{
-    account_machine_id, cli_short_user_agent, cli_user_agent, kiro_headers, management_headers,
-    AUTH_USER_AGENT, CODEWHISPERER_API, CONTROL_PLANE_API, RUNTIME_API,
+    account_machine_id, cli_short_user_agent, cli_user_agent, kiro_headers,
+    kiro_headers_for_attempt, management_headers, AUTH_USER_AGENT, CODEWHISPERER_API,
+    CONTROL_PLANE_API, RUNTIME_API,
 };
 use serde_json::json;
 
@@ -79,7 +80,7 @@ fn generation_headers_follow_the_cli_order() {
             "user-agent",
             "x-amz-user-agent",
             "x-amzn-codewhisperer-optout",
-            "x-kiro-attempt",
+            "x-amzn-kiro-attempt",
             "authorization",
             "amz-sdk-request",
             "amz-sdk-invocation-id",
@@ -90,11 +91,15 @@ fn generation_headers_follow_the_cli_order() {
         header(&headers, "x-amz-target"),
         Some("AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
     );
-    assert_eq!(header(&headers, "x-kiro-attempt"), Some("1;max=3"));
+    assert_eq!(header(&headers, "x-amzn-kiro-attempt"), Some("1;max=3"));
+    assert!(header(&headers, "x-kiro-attempt").is_none());
     assert_eq!(
         header(&headers, "amz-sdk-request"),
         Some("attempt=1; max=3")
     );
+    let retry = kiro_headers_for_attempt("tok", 2, 3);
+    assert_eq!(header(&retry, "x-amzn-kiro-attempt"), Some("2;max=3"));
+    assert_eq!(header(&retry, "amz-sdk-request"), Some("attempt=2; max=3"));
 }
 
 #[test]
@@ -108,6 +113,7 @@ fn management_headers_match_the_cli_control_plane_calls() {
         header(&json_call, "x-amz-target"),
         Some("KiroControlPlaneBearerService.ListAvailableModels")
     );
+    assert!(header(&json_call, "x-amzn-kiro-attempt").is_none());
     assert!(header(&json_call, "x-kiro-attempt").is_none());
     let get_call = management_headers("tok", None, CODEWHISPERER_API);
     assert!(header(&get_call, "x-amz-target").is_none());

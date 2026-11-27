@@ -75,6 +75,24 @@ pub(crate) fn projected_tool_text(calls: &[Value]) -> String {
     ))
 }
 
+fn cached_prompt_tokens(usage: &Value) -> Option<i64> {
+    let source = usage
+        .get("tokenUsage")
+        .filter(|v| v.is_object())
+        .unwrap_or(usage);
+    for key in ["cacheReadInputTokens", "cache_read_input_tokens"] {
+        if let Some(n) = source
+            .get(key)
+            .filter(|v| v.is_number())
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n >= 0.0)
+        {
+            return Some(n as i64);
+        }
+    }
+    None
+}
+
 fn data(v: &Value) -> String {
     format!("data: {}\n\n", serde_json::to_string(v).unwrap_or_default())
 }
@@ -96,6 +114,7 @@ pub fn stream(
         let mut metering: Option<f64> = None;
         let mut metering_reported = false;
         let mut legacy_usage_reported = false;
+        let mut cached_tokens: Option<i64> = None;
         let mut context_usage: Option<f64> = None;
         let mut full = String::new();
         let mut thinking = String::new();
@@ -152,8 +171,16 @@ pub fn stream(
                     if let Some(credits) = m.credits() {
                         metering = Some(metering.unwrap_or(0.0) + credits);
                     }
+                    if let Some(cached) = cached_prompt_tokens(m.raw()) {
+                        cached_tokens = Some(cached);
+                    }
                 }
-                KiroEvent::Usage(_) => legacy_usage_reported = true,
+                KiroEvent::Usage(u) => {
+                    legacy_usage_reported = true;
+                    if let Some(cached) = cached_prompt_tokens(&u) {
+                        cached_tokens = Some(cached);
+                    }
+                }
                 KiroEvent::ContextUsage(p) => context_usage = Some(p),
                 KiroEvent::StopReason(s) if !s.is_empty() => stop = Some(s),
                 _ => {}
@@ -216,10 +243,15 @@ pub fn stream(
             yield data(&p);
         }
         let mut last = chunk(json!({}), json!(finish));
-        last["usage"] = json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total});
-        if let Some(credits) = metering {
-            last["usage"]["credits_used"] = json!(credits);
+        let mut usage =
+            json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total});
+        if let Some(cached) = cached_tokens {
+            usage["prompt_tokens_details"] = json!({"cached_tokens": cached});
         }
+        if let Some(credits) = metering {
+            usage["credits_used"] = json!(credits);
+        }
+        last["usage"] = usage;
         ctx.request.record_tokens(&ctx.model, prompt, completion, Some(&timer));
         v.accept(Some(&last), false)?;
         yield data(&last);

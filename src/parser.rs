@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use crate::pyjson;
 use crate::utils::tool_call_id;
 
-const PATTERNS: [(&str, &str); 13] = [
+const PATTERNS: [(&str, &str); 16] = [
     ("{\"content\":", "content"),
     ("{\"name\":", "tool_start"),
     ("{\"input\":", "tool_input"),
@@ -23,6 +23,9 @@ const PATTERNS: [(&str, &str); 13] = [
     ("{\"stopReason\":", "stop_reason"),
     ("{\"text\":", "native_thinking"),
     ("{\"signature\":", "native_thinking_signature"),
+    ("{\"redactedContent\":", "native_thinking_redacted"),
+    ("{\"tokenUsage\":", "token_usage"),
+    ("{\"uncachedInputTokens\":", "token_usage"),
     ("{\"reason\":", "upstream_error"),
 ];
 
@@ -36,6 +39,7 @@ pub enum ParsedEvent {
     StopReason(String),
     Thinking { text: String, is_first: bool },
     ThinkingSignature(String),
+    RedactedThinking(String),
     UpstreamError { reason: String, message: String },
 }
 
@@ -53,6 +57,9 @@ impl ParsedEvent {
             }
             ParsedEvent::ThinkingSignature(s) => {
                 json!({"type": "native_thinking_signature", "data": s})
+            }
+            ParsedEvent::RedactedThinking(d) => {
+                json!({"type": "native_thinking_redacted", "data": d})
             }
             ParsedEvent::UpstreamError { reason, message } => {
                 json!({"type": "upstream_error", "reason": reason, "message": message})
@@ -246,7 +253,7 @@ impl AwsEventStreamParser {
         let bytes = buffer.as_bytes();
         let mut events = Vec::new();
         let mut pos = 0usize;
-        let mut next_hit: [Option<Option<usize>>; 13] = [None; 13];
+        let mut next_hit: [Option<Option<usize>>; PATTERNS.len()] = [None; PATTERNS.len()];
         let mut keep_from = None;
         loop {
             let (earliest_pos, kind, scan_from, depth, in_string);
@@ -374,6 +381,14 @@ impl AwsEventStreamParser {
                     .and_then(Value::as_str)?;
                 (!r.is_empty()).then(|| ParsedEvent::StopReason(r.to_owned()))
             }
+            "token_usage" => {
+                let usage = data
+                    .get("tokenUsage")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or(data);
+                usage.is_object().then_some(ParsedEvent::Usage(usage))
+            }
             "upstream_error" => Some(ParsedEvent::UpstreamError {
                 reason: data
                     .get("reason")
@@ -406,6 +421,14 @@ impl AwsEventStreamParser {
         if let Some(signature) = data.get("signature").and_then(Value::as_str) {
             self.thinking_started = false;
             out.push(ParsedEvent::ThinkingSignature(signature.to_owned()));
+        }
+        if let Some(redacted) = data
+            .get("redactedContent")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            self.thinking_started = false;
+            out.push(ParsedEvent::RedactedThinking(redacted.to_owned()));
         }
         out
     }
