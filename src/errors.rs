@@ -28,8 +28,14 @@ pub fn is_rate_limit_reason(reason: Option<&str>) -> bool {
         reason,
         Some("USER_REQUEST_RATE_EXCEEDED")
             | Some("CREDIT_CONSUMPTION_RATE_EXCEEDED")
-            | Some("DAILY_REQUEST_COUNT")
             | Some("INSUFFICIENT_MODEL_CAPACITY")
+    )
+}
+
+pub fn is_consent_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("CONSENT_REQUIRED") | Some("RECONSENT_REQUIRED")
     )
 }
 
@@ -37,12 +43,12 @@ pub fn classify_error(status: u16, reason: Option<&str>) -> ErrorType {
     match status {
         402 | 403 | 429 | 502 | 503 | 504 => ErrorType::Recoverable,
         400 if is_rate_limit_reason(reason)
+            || is_consent_reason(reason)
             || matches!(
                 reason,
                 Some("MONTHLY_REQUEST_COUNT")
+                    | Some("DAILY_REQUEST_COUNT")
                     | Some("INVALID_MODEL_ID")
-                    | Some("CONSENT_REQUIRED")
-                    | Some("RECONSENT_REQUIRED")
             ) =>
         {
             ErrorType::Recoverable

@@ -531,13 +531,23 @@ fn network_detail(e: &reqwest::Error) -> (u16, String) {
     (status, kind.to_owned())
 }
 
-const MAX_RETRY_AFTER_SECONDS: f64 = 30.0;
+const MAX_RETRY_AFTER_SECONDS: f64 = 10.0;
 
+/// Parse upstream retry-after hints.
+/// AWS SDK's `x-amz-retry-after` is an integer delay in milliseconds, whereas
+/// standard HTTP `retry-after` is in seconds.
 pub(crate) fn parse_retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<f64> {
-    for name in ["x-amz-retry-after", "retry-after"] {
-        let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) else {
-            continue;
-        };
+    if let Some(raw) = headers
+        .get("x-amz-retry-after")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Ok(millis) = raw.trim().parse::<u64>() {
+            if millis > 0 {
+                return Some((millis as f64 / 1000.0).min(MAX_RETRY_AFTER_SECONDS));
+            }
+        }
+    }
+    if let Some(raw) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
         if let Ok(seconds) = raw.trim().parse::<f64>() {
             if seconds.is_finite() && seconds > 0.0 {
                 return Some(seconds.min(MAX_RETRY_AFTER_SECONDS));
@@ -567,6 +577,7 @@ impl Transport {
             config::MAX_RETRIES
         }
         .max(1);
+        let invocation_id = uuid::Uuid::new_v4().to_string();
         let mut last_response: Option<UpstreamResponse> = None;
         let mut last_error: Option<reqwest::Error> = None;
         for attempt in 0..max_retries {
@@ -575,10 +586,11 @@ impl Transport {
                 .await
                 .map_err(|e| Err(TransportError::Auth(e)))?;
             let mut req = client.request(method.clone(), url);
-            let mut headers = utils::kiro_headers_for_attempt(
+            let mut headers = utils::kiro_headers_for_retry(
                 &token,
                 (attempt + 1) as usize,
                 max_retries as usize,
+                &invocation_id,
             );
             for (k, v) in overrides {
                 if let Some(h) = headers
@@ -654,8 +666,16 @@ impl Transport {
             };
             if status == 403 {
                 let s = String::from_utf8_lossy(&text);
-                if is_suspension_error(403, Some(&s), reason_of(&s).as_deref()) {
+                let reason = reason_of(&s);
+                if is_suspension_error(403, Some(&s), reason.as_deref()) {
                     tracing::error!("Received 403 account suspension; returning immediately for account failover");
+                    return Ok(buffered);
+                }
+                if crate::errors::is_consent_reason(reason.as_deref()) {
+                    tracing::warn!(
+                        "Received 403 model consent error ({}); returning immediately for account failover",
+                        reason.as_deref().unwrap_or("CONSENT_REQUIRED")
+                    );
                     return Ok(buffered);
                 }
                 last_response = Some(buffered);
@@ -1061,14 +1081,19 @@ mod once_tests {
         headers.insert("retry-after", "2.5".parse().unwrap());
         assert_eq!(parse_retry_after_seconds(&headers), Some(2.5));
 
-        headers.insert("x-amz-retry-after", "1.25".parse().unwrap());
+        // AWS x-amz-retry-after is integer milliseconds.
+        headers.insert("x-amz-retry-after", "1250".parse().unwrap());
         assert_eq!(parse_retry_after_seconds(&headers), Some(1.25));
 
-        headers.insert("x-amz-retry-after", "999".parse().unwrap());
+        headers.insert("x-amz-retry-after", "999999".parse().unwrap());
         assert_eq!(
             parse_retry_after_seconds(&headers),
             Some(MAX_RETRY_AFTER_SECONDS)
         );
+
+        // Non-integer or zero x-amz-retry-after is ignored and falls back to retry-after.
+        headers.insert("x-amz-retry-after", "0.01".parse().unwrap());
+        assert_eq!(parse_retry_after_seconds(&headers), Some(2.5));
 
         headers.insert("x-amz-retry-after", "0".parse().unwrap());
         assert_eq!(parse_retry_after_seconds(&headers), Some(2.5));

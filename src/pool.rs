@@ -1624,6 +1624,13 @@ impl AccountManager {
         self.commit_failure(&a, model, error_type, status, reason, message);
     }
 
+    fn daily_quota_quarantine_until(now: f64) -> f64 {
+        let cap = config::get().account_quota_quarantine as f64;
+        let seconds_into_day = now.rem_euclid(86_400.0);
+        let until_utc_midnight = (86_400.0 - seconds_into_day).clamp(60.0, cap.max(60.0));
+        now + until_utc_midnight
+    }
+
     pub fn commit_failure(
         &self,
         a: &Arc<Account>,
@@ -1645,10 +1652,14 @@ impl AccountManager {
         let now = store::now_f64();
         let outcome = {
             let mut s = a.state.lock();
-            if reason == Some("INVALID_MODEL_ID") {
+            if reason == Some("INVALID_MODEL_ID") || crate::errors::is_consent_reason(reason) {
                 a.models.record_unsupported(model);
                 s.stats.total += 1;
-                tracing::warn!("Model '{model}' not available on account {}: status={status}, reason=INVALID_MODEL_ID", a.id);
+                tracing::warn!(
+                    "Model '{model}' not available on account {}: status={status}, reason={}",
+                    a.id,
+                    reason.unwrap_or("INVALID_MODEL_ID")
+                );
                 None
             } else if crate::errors::is_rate_limit_reason(reason) {
                 s.rate_limited_until = now + cfg.account_rate_limit_cooldown as f64;
@@ -1678,6 +1689,16 @@ impl AccountManager {
                 s.stats.failed += 1;
                 tracing::warn!(
                     "Account {} monthly quota exhausted; excluded for {}",
+                    a.id,
+                    format_duration((s.quota_exhausted_until - now).max(0.0))
+                );
+                Some("quota_exhausted")
+            } else if reason == Some("DAILY_REQUEST_COUNT") {
+                s.quota_exhausted_until = Self::daily_quota_quarantine_until(now);
+                s.stats.total += 1;
+                s.stats.failed += 1;
+                tracing::warn!(
+                    "Account {} daily quota exhausted; excluded for {}",
                     a.id,
                     format_duration((s.quota_exhausted_until - now).max(0.0))
                 );
@@ -2172,33 +2193,75 @@ mod tests {
     }
 
     #[test]
-    fn cli_3_6_2_rate_limit_reasons_apply_short_cooldown_without_monthly_quarantine() {
+    fn cli_3_6_2_rate_limit_daily_quota_and_consent_reasons_route_distinctly() {
         let pool = AccountManager::new(reqwest::Client::new());
-        let acct = account("acct-1");
+        let burst = account("acct-burst");
+        let daily = account("acct-daily");
+        let consent = account("acct-consent");
         {
             let mut inner = pool.inner.lock();
-            inner.order.push("acct-1".into());
-            inner.accounts.insert("acct-1".into(), acct.clone());
+            for (id, acct) in [
+                ("acct-burst", &burst),
+                ("acct-daily", &daily),
+                ("acct-consent", &consent),
+            ] {
+                inner.order.push(id.into());
+                inner.accounts.insert(id.into(), acct.clone());
+            }
         }
 
+        // Burst reasons park briefly on rate_limited_until without quota quarantine or failures.
         for reason in [
             "CREDIT_CONSUMPTION_RATE_EXCEEDED",
-            "DAILY_REQUEST_COUNT",
             "INSUFFICIENT_MODEL_CAPACITY",
         ] {
             assert!(pool.commit_failure(
-                &acct,
+                &burst,
                 "claude-sonnet-5.5",
                 ErrorType::Recoverable,
                 429,
                 Some(reason),
                 Some("throttled"),
             ));
-            let state = acct.state.lock();
+            let state = burst.state.lock();
             assert!(state.rate_limited_until > 0.0, "{reason}");
             assert_eq!(state.quota_exhausted_until, 0.0, "{reason}");
             assert_eq!(state.failures, 0, "{reason}");
         }
+
+        // Daily quota enters bounded daily quarantine (drops session pins) without circuit-breaker failures.
+        assert!(pool.commit_failure(
+            &daily,
+            "claude-sonnet-5.5",
+            ErrorType::Recoverable,
+            429,
+            Some("DAILY_REQUEST_COUNT"),
+            Some("daily quota exceeded"),
+        ));
+        {
+            let state = daily.state.lock();
+            assert!(state.quota_exhausted_until > store::now_f64());
+            assert_eq!(state.failures, 0);
+        }
+
+        // Consent errors mark only the affected model unsupported without penalizing other models.
+        assert!(pool.commit_failure(
+            &consent,
+            "claude-opus-5.5",
+            ErrorType::Recoverable,
+            403,
+            Some("CONSENT_REQUIRED"),
+            Some("consent required"),
+        ));
+        assert_eq!(
+            consent.models.support("claude-opus-5.5"),
+            ModelSupport::Unsupported
+        );
+        assert_eq!(
+            consent.models.support("claude-sonnet-5.5"),
+            ModelSupport::Unknown
+        );
+        assert_eq!(consent.state.lock().failures, 0);
     }
 
     fn tiered(id: &str, tier: Option<&str>) -> Arc<Account> {

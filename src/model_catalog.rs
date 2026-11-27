@@ -74,7 +74,6 @@ async fn management_call(
             }
             if let Some(next) = next_token {
                 body["nextToken"] = json!(next);
-                params.push(("nextToken", next.to_owned()));
             }
             (http.post(base).query(&params).json(&body), Some(target))
         }
@@ -176,12 +175,14 @@ async fn fetch_models(auth: &KiroAuth, http: &reqwest::Client, strict: bool) -> 
                 }
             }
         }
-        let Some(token) = v
-            .get("nextToken")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        else {
-            return Some(models);
+        let token = match v.get("nextToken") {
+            None | Some(Value::Null) => return Some(models),
+            Some(Value::String(s)) if s.is_empty() => return Some(models),
+            Some(Value::String(s)) => s.as_str(),
+            Some(_) => {
+                tracing::warn!("[Models] Rejecting malformed non-string nextToken");
+                return None;
+            }
         };
         if !seen_tokens.insert(token.to_owned()) || page + 1 >= MAX_MODEL_PAGES {
             tracing::warn!(
@@ -296,7 +297,12 @@ fn extra_allowance(b: &Value, now: f64) -> (f64, f64) {
             .get(status)
             .and_then(Value::as_str)
             .is_none_or(|s| s.eq_ignore_ascii_case("ACTIVE"));
-        let unexpired = number(v.get(expiry)).is_none_or(|t| t <= 0.0 || t > now);
+        let unexpired = match v.get(expiry) {
+            None | Some(Value::Null) => true,
+            Some(val) => number(Some(val))
+                .filter(|t| t.is_finite())
+                .is_some_and(|t| t <= 0.0 || t > now),
+        };
         active && unexpired
     };
     let mut used = 0.0;
@@ -395,7 +401,8 @@ mod tests {
             "overageCredits": [
                 {"status": "ACTIVE", "currentUsage": 12.5, "usageLimit": 100.0, "expiresAt": 1900000000.0},
                 {"status": "EXPIRED", "currentUsage": 5.0, "usageLimit": 50.0, "expiresAt": 1900000000.0},
-                {"status": "ACTIVE", "currentUsage": 1.0, "usageLimit": 25.0, "expiresAt": 1700000000.0}
+                {"status": "ACTIVE", "currentUsage": 1.0, "usageLimit": 25.0, "expiresAt": 1700000000.0},
+                {"status": "ACTIVE", "currentUsage": 1.0, "usageLimit": 25.0, "expiresAt": "malformed"}
             ]
         });
         assert_eq!(extra_allowance(&overage_credits, now), (12.5, 100.0));

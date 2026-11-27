@@ -632,13 +632,15 @@ fn merge_adjacent_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage>
             if msg.reasoning.as_deref().is_some_and(|r| !r.is_empty()) {
                 last.reasoning = msg.reasoning;
                 last.reasoning_signature = msg.reasoning_signature;
-            }
-            if msg
+                last.redacted_reasoning = None;
+            } else if msg
                 .redacted_reasoning
                 .as_deref()
                 .is_some_and(|d| !d.is_empty())
             {
                 last.redacted_reasoning = msg.redacted_reasoning;
+                last.reasoning = None;
+                last.reasoning_signature = None;
             }
         }
         if msg.role == "user" {
@@ -702,6 +704,15 @@ fn build_assistant_entry(msg: &UnifiedMessage) -> Result<Value, BuildError> {
         msg.reasoning.as_deref().filter(|r| !r.is_empty()),
         msg.reasoning_signature.as_deref().filter(|s| !s.is_empty()),
     ) {
+        if msg
+            .redacted_reasoning
+            .as_deref()
+            .is_some_and(|d| !d.is_empty())
+        {
+            tracing::debug!(
+                "Omitting redacted_thinking from history entry because Kiro reasoningContent carries a single union variant and signed thinking is present"
+            );
+        }
         a.insert(
             "reasoningContent".into(),
             json!({"reasoningText": {"text": r, "signature": s}}),

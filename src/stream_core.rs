@@ -358,7 +358,7 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                     for (k, v) in incoming {
                         existing.insert(k.clone(), v.clone());
                     }
-                } else {
+                } else if !matches!(r.usage, Some(Value::Object(_))) {
                     r.usage = Some(u);
                 }
             }
@@ -423,6 +423,65 @@ pub fn is_zero(v: &Value) -> bool {
         Value::String(s) => s.is_empty(),
         Value::Object(o) => o.is_empty(),
         Value::Array(a) => a.is_empty(),
+    }
+}
+
+/// Parsed upstream token and cache usage reported by `messageMetadataEvent` or
+/// legacy metering frames. Fields remain `None` unless explicitly reported.
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamTokenUsage {
+    pub uncached_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
+}
+
+impl UpstreamTokenUsage {
+    pub fn merge_from(&mut self, value: &Value) {
+        let source = value
+            .get("tokenUsage")
+            .filter(|v| v.is_object())
+            .unwrap_or(value);
+        let read = |keys: &[&str]| {
+            keys.iter().find_map(|k| {
+                source
+                    .get(*k)
+                    .filter(|v| v.is_number())
+                    .and_then(Value::as_f64)
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .map(|n| n as i64)
+            })
+        };
+        if let Some(n) = read(&["uncachedInputTokens", "uncached_input_tokens"]) {
+            self.uncached_input_tokens = Some(n);
+        }
+        if let Some(n) = read(&["outputTokens", "output_tokens"]) {
+            self.output_tokens = Some(n);
+        }
+        if let Some(n) = read(&["cacheReadInputTokens", "cache_read_input_tokens"]) {
+            self.cache_read_input_tokens = Some(n);
+        }
+        if let Some(n) = read(&[
+            "cacheWriteInputTokens",
+            "cache_write_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_creation_input_tokens",
+        ]) {
+            self.cache_write_input_tokens = Some(n);
+        }
+    }
+
+    pub fn has_cache_fields(&self) -> bool {
+        self.cache_read_input_tokens.is_some() || self.cache_write_input_tokens.is_some()
+    }
+
+    pub fn cache_total(&self) -> i64 {
+        self.cache_read_input_tokens.unwrap_or(0) + self.cache_write_input_tokens.unwrap_or(0)
+    }
+
+    pub fn total_input_tokens(&self) -> Option<i64> {
+        self.uncached_input_tokens
+            .map(|uncached| uncached + self.cache_total())
     }
 }
 

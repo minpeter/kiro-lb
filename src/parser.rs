@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use crate::pyjson;
 use crate::utils::tool_call_id;
 
-const PATTERNS: [(&str, &str); 16] = [
+const PATTERNS: [(&str, &str); 21] = [
     ("{\"content\":", "content"),
     ("{\"name\":", "tool_start"),
     ("{\"input\":", "tool_input"),
@@ -26,6 +26,11 @@ const PATTERNS: [(&str, &str); 16] = [
     ("{\"redactedContent\":", "native_thinking_redacted"),
     ("{\"tokenUsage\":", "token_usage"),
     ("{\"uncachedInputTokens\":", "token_usage"),
+    ("{\"cacheReadInputTokens\":", "token_usage"),
+    ("{\"cacheWriteInputTokens\":", "token_usage"),
+    ("{\"inputTokens\":", "token_usage"),
+    ("{\"outputTokens\":", "token_usage"),
+    ("{\"totalTokens\":", "token_usage"),
     ("{\"reason\":", "upstream_error"),
 ];
 
@@ -382,12 +387,36 @@ impl AwsEventStreamParser {
                 (!r.is_empty()).then(|| ParsedEvent::StopReason(r.to_owned()))
             }
             "token_usage" => {
+                if data.get("toolUseId").is_some()
+                    || data.get("name").is_some()
+                    || data.get("input").is_some()
+                {
+                    return None;
+                }
                 let usage = data
                     .get("tokenUsage")
                     .filter(|v| v.is_object())
                     .cloned()
                     .unwrap_or(data);
-                usage.is_object().then_some(ParsedEvent::Usage(usage))
+                let has_token_key = usage.as_object().is_some_and(|obj| {
+                    [
+                        "uncachedInputTokens",
+                        "uncached_input_tokens",
+                        "inputTokens",
+                        "outputTokens",
+                        "output_tokens",
+                        "totalTokens",
+                        "cacheReadInputTokens",
+                        "cache_read_input_tokens",
+                        "cacheWriteInputTokens",
+                        "cache_write_input_tokens",
+                        "cacheCreationInputTokens",
+                        "cache_creation_input_tokens",
+                    ]
+                    .iter()
+                    .any(|k| obj.get(*k).is_some_and(Value::is_number))
+                });
+                has_token_key.then_some(ParsedEvent::Usage(usage))
             }
             "upstream_error" => Some(ParsedEvent::UpstreamError {
                 reason: data
@@ -422,13 +451,19 @@ impl AwsEventStreamParser {
             self.thinking_started = false;
             out.push(ParsedEvent::ThinkingSignature(signature.to_owned()));
         }
-        if let Some(redacted) = data
-            .get("redactedContent")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+        if data.get("toolUseId").is_none()
+            && data.get("name").is_none()
+            && data.get("input").is_none()
+            && data.get("content").is_none()
         {
-            self.thinking_started = false;
-            out.push(ParsedEvent::RedactedThinking(redacted.to_owned()));
+            if let Some(redacted) = data
+                .get("redactedContent")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                self.thinking_started = false;
+                out.push(ParsedEvent::RedactedThinking(redacted.to_owned()));
+            }
         }
         out
     }
