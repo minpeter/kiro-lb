@@ -2307,13 +2307,25 @@ mod tests {
         let daily_until = a.state.lock().quota_exhausted_until;
         assert!(daily_until > store::now_f64());
 
-        // Selection in a multi-account pool skips the daily-quarantined account and picks acct-b.
+        // Selection in a multi-account pool skips the daily-quarantined account and picks acct-b;
+        // once acct-b answers, the session pin moves off the quarantined acct-a.
         let excluded = HashSet::new();
         let picked = pool
             .select("claude-sonnet-5.5", &excluded, Some(42), false)
             .await
             .expect("healthy sibling should be selected");
         assert_eq!(picked.id, "acct-b");
+        assert!(pool.commit_success(&picked, "claude-sonnet-5.5", Some(42)));
+        assert_eq!(
+            pool.session_counts().get("acct-a").copied().unwrap_or(0),
+            0,
+            "daily quarantine should let session 42 move off acct-a"
+        );
+        assert_eq!(
+            pool.session_counts().get("acct-b").copied().unwrap_or(0),
+            1,
+            "session 42 should re-pin to acct-b"
+        );
 
         // A longer monthly quarantine must not be shortened by a subsequent DAILY_REQUEST_COUNT.
         let monthly_reset = store::now_f64() + 10.0 * 86_400.0;

@@ -294,6 +294,7 @@ pub struct StreamResult {
     pub content_blocks: Vec<Value>,
     pub tool_calls: Vec<Value>,
     pub usage: Option<Value>,
+    pub usage_reported: bool,
     pub metering: Option<MeteringEvent>,
     pub upstream_usage: UpstreamTokenUsage,
     pub context_usage_percentage: Option<f64>,
@@ -352,16 +353,19 @@ pub async fn collect(mut events: EventStream) -> Result<StreamResult, StreamErro
                 r.content_blocks
                     .push(json!({"type": "tool_use", "tool": t}));
             }
-            KiroEvent::Usage(u) if !is_zero(&u) => {
-                r.upstream_usage.merge_from(&u);
-                if let (Some(Value::Object(existing)), Value::Object(incoming)) =
-                    (r.usage.as_mut(), &u)
-                {
-                    for (k, v) in incoming {
-                        existing.insert(k.clone(), v.clone());
+            KiroEvent::Usage(u) => {
+                r.usage_reported = true;
+                if !is_zero(&u) {
+                    r.upstream_usage.merge_from(&u);
+                    if let (Some(Value::Object(existing)), Value::Object(incoming)) =
+                        (r.usage.as_mut(), &u)
+                    {
+                        for (k, v) in incoming {
+                            existing.insert(k.clone(), v.clone());
+                        }
+                    } else if !matches!(r.usage, Some(Value::Object(_))) {
+                        r.usage = Some(u);
                     }
-                } else if !matches!(r.usage, Some(Value::Object(_))) {
-                    r.usage = Some(u);
                 }
             }
             KiroEvent::Metering(m) => {
@@ -497,7 +501,7 @@ pub fn tokens_from_context_usage(
 ) -> Option<(i64, i64)> {
     let p = pct.filter(|p| *p > 0.0)?;
     let total = (p / 100.0 * max_input_tokens as f64) as i64;
-    Some(((total - completion).max(0), total))
+    Some((total.saturating_sub(completion).max(0), total))
 }
 
 pub mod stop_reasons {

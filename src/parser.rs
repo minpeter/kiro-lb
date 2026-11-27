@@ -288,9 +288,17 @@ impl AwsEventStreamParser {
                     }
                 }
                 let Some((p, k)) = best else { break };
-                if let Some(outer) = enclosing_object_start(bytes, pos, p) {
-                    earliest_pos = outer;
-                    fallback_pos = Some(p);
+                let preserve_enclosing = matches!(
+                    k,
+                    "token_usage" | "stop_reason" | "native_thinking_redacted"
+                );
+                if preserve_enclosing {
+                    if let Some(outer) = enclosing_object_start(bytes, pos, p) {
+                        earliest_pos = outer;
+                        fallback_pos = Some(p);
+                    } else {
+                        earliest_pos = p;
+                    }
                 } else {
                     earliest_pos = p;
                 }
@@ -420,13 +428,27 @@ impl AwsEventStreamParser {
                     }
                 }
             }
-            "context_usage" => vec![ParsedEvent::ContextUsage(
-                data.get("contextUsagePercentage")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0),
-            )],
+            "context_usage" => {
+                let mut out = vec![ParsedEvent::ContextUsage(
+                    data.get("contextUsagePercentage")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0),
+                )];
+                if let Some(usage) = extract_token_usage(&data) {
+                    out.push(ParsedEvent::Usage(usage));
+                }
+                if let Some(reason) = extract_stop_reason(&data) {
+                    out.push(ParsedEvent::StopReason(reason));
+                }
+                out
+            }
             "stop_reason" | "token_usage" => {
                 let mut out = Vec::new();
+                if !has_non_metadata_envelope_keys(&data) {
+                    if let Some(p) = data.get("contextUsagePercentage").and_then(Value::as_f64) {
+                        out.push(ParsedEvent::ContextUsage(p));
+                    }
+                }
                 if let Some(usage) = extract_token_usage(&data) {
                     out.push(ParsedEvent::Usage(usage));
                 }

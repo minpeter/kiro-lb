@@ -70,7 +70,7 @@ fn resolve_anthropic_input(
     reported_total: Option<i64>,
 ) -> (i64, i64, bool) {
     if let Some(uncached) = upstream.uncached_input_tokens {
-        let total = uncached + upstream.cache_total();
+        let total = uncached.saturating_add(upstream.cache_total());
         return (uncached, total, true);
     }
     let (base_total, mut from_upstream) = match reported_total {
@@ -79,7 +79,7 @@ fn resolve_anthropic_input(
     };
     if upstream.has_cache_fields() {
         let cache_total = upstream.cache_total();
-        let uncached = (base_total - cache_total).max(0);
+        let uncached = base_total.saturating_sub(cache_total).max(0);
         let total = base_total.max(cache_total);
         from_upstream = true;
         return (uncached, total, from_upstream);
@@ -535,7 +535,7 @@ pub async fn collect(events: EventStream, ctx: StreamCtx) -> Result<Value, Strea
     }
     let completed = result.context_usage_percentage.is_some()
         || result.metering.is_some()
-        || result.usage.is_some();
+        || result.usage_reported;
     let truncated = !completed && !result.content.is_empty() && result.tool_calls.is_empty();
     let mapped = stop_reasons::to_anthropic(result.stop_reason.as_deref());
     let has_tools = native.iter().any(|b| b["type"] == "tool_use");

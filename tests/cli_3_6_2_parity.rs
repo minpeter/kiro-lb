@@ -900,3 +900,108 @@ fn merge_adjacent_messages_keeps_redacted_thinking_when_later_reasoning_is_unsig
         "unsigned thinking must not discard an earlier replayable redacted_thinking block"
     );
 }
+
+#[tokio::test]
+async fn wrapped_tool_reasoning_context_metadata_zero_usage_and_saturating_totals() {
+    let mut parser = AwsEventStreamParser::new();
+
+    // 1. Wrapped toolUse and reasoningContent.reasoningText frames remain parseable.
+    let wrapped_tool = parser
+        .feed(br#"{"toolUse":{"name":"lookup","toolUseId":"t1","input":{"q":1},"stop":true}}"#);
+    assert!(
+        wrapped_tool.iter().any(|e| matches!(
+            e,
+            ParsedEvent::ToolUse(t)
+                if t["id"] == "t1" && t["function"]["name"] == "lookup"
+        )),
+        "wrapped toolUse must parse cleanly: {wrapped_tool:?}"
+    );
+    let wrapped_thinking = parser
+        .feed(br#"{"reasoningContent":{"reasoningText":{"text":"step","signature":"sig1"}}}"#);
+    assert!(
+        wrapped_thinking
+            .iter()
+            .any(|e| matches!(e, ParsedEvent::Thinking { text, .. } if text == "step")),
+        "wrapped reasoningText.text must parse cleanly: {wrapped_thinking:?}"
+    );
+    assert!(
+        wrapped_thinking
+            .iter()
+            .any(|e| matches!(e, ParsedEvent::ThinkingSignature(s) if s == "sig1")),
+        "wrapped reasoningText.signature must parse cleanly: {wrapped_thinking:?}"
+    );
+
+    // 2. Context-first metadata frame emits ContextUsage, Usage, and StopReason together.
+    let ctx_first = parser.feed(
+        br#"{"contextUsagePercentage":1,"stopReason":"MAX_TOKENS","tokenUsage":{"outputTokens":25}}"#,
+    );
+    assert!(ctx_first
+        .iter()
+        .any(|e| matches!(e, ParsedEvent::ContextUsage(p) if (*p - 1.0).abs() < 1e-6)));
+    assert!(ctx_first
+        .iter()
+        .any(|e| matches!(e, ParsedEvent::Usage(u) if u["outputTokens"] == 25)));
+    assert!(ctx_first
+        .iter()
+        .any(|e| matches!(e, ParsedEvent::StopReason(r) if r == "MAX_TOKENS")));
+
+    // 3. Zero legacy usage completes consistently as end_turn in Anthropic stream & collect.
+    let make_zero_usage = || {
+        event_stream(vec![
+            Ok(KiroEvent::Content("ok".into())),
+            Ok(KiroEvent::Usage(json!(0))),
+            Ok(KiroEvent::StopReason("END_TURN".into())),
+        ])
+    };
+    let mut streamed = stream_anthropic::stream(make_zero_usage(), stream_ctx());
+    let mut stream_reason = None;
+    while let Some(item) = streamed.next().await {
+        let sse = item.expect("valid SSE");
+        if sse.starts_with("event: message_delta\n") {
+            let data = sse.split("data: ").nth(1).unwrap().trim();
+            let v: Value = serde_json::from_str(data).unwrap();
+            stream_reason = v["delta"]["stop_reason"].as_str().map(str::to_owned);
+        }
+    }
+    let collected = stream_anthropic::collect(make_zero_usage(), stream_ctx())
+        .await
+        .expect("collect succeeds");
+    assert_eq!(stream_reason.as_deref(), Some("end_turn"));
+    assert_eq!(collected["stop_reason"], "end_turn");
+
+    // 4. Extreme upstream token counts saturate without overflowing in Anthropic and OpenAI.
+    let make_huge_usage = || {
+        event_stream(vec![
+            Ok(KiroEvent::Content("ok".into())),
+            Ok(KiroEvent::Usage(json!({
+                "uncachedInputTokens": 1e19,
+                "cacheReadInputTokens": 1e19,
+                "outputTokens": 1e19
+            }))),
+            Ok(KiroEvent::StopReason("END_TURN".into())),
+        ])
+    };
+    let anth = stream_anthropic::collect(make_huge_usage(), stream_ctx())
+        .await
+        .expect("anthropic saturates cleanly");
+    assert_eq!(anth["usage"]["input_tokens"], i64::MAX);
+    assert_eq!(anth["usage"]["output_tokens"], i64::MAX);
+
+    let oai = stream_openai::collect(
+        make_huge_usage(),
+        stream_ctx(),
+        OpenAIOptions {
+            execute_web_search: false,
+            include_reasoning: false,
+            parallel_tool_calls: true,
+            request_messages: vec![],
+            request_tools: vec![],
+        },
+        false,
+    )
+    .await
+    .expect("openai saturates cleanly");
+    assert_eq!(oai["usage"]["prompt_tokens"], i64::MAX);
+    assert_eq!(oai["usage"]["completion_tokens"], i64::MAX);
+    assert_eq!(oai["usage"]["total_tokens"], i64::MAX);
+}
