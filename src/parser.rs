@@ -445,7 +445,14 @@ impl AwsEventStreamParser {
             "stop_reason" | "token_usage" => {
                 let mut out = Vec::new();
                 if !has_non_metadata_envelope_keys(&data) {
-                    if let Some(p) = data.get("contextUsagePercentage").and_then(Value::as_f64) {
+                    if let Some(p) = data
+                        .get("contextUsagePercentage")
+                        .or_else(|| {
+                            data.get("messageMetadataEvent")
+                                .and_then(|m| m.get("contextUsagePercentage"))
+                        })
+                        .and_then(Value::as_f64)
+                    {
                         out.push(ParsedEvent::ContextUsage(p));
                     }
                 }

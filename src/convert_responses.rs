@@ -652,7 +652,7 @@ pub fn usage_block(usage: Option<&Value>) -> Value {
         .and_then(|u| u.get("total_tokens"))
         .and_then(Value::as_i64)
         .filter(|t| *t != 0)
-        .unwrap_or(p + c);
+        .unwrap_or_else(|| p.saturating_add(c));
     let cached = usage
         .and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens"))
         .and_then(Value::as_i64)

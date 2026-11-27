@@ -931,7 +931,7 @@ async fn wrapped_tool_reasoning_context_metadata_zero_usage_and_saturating_total
         "wrapped reasoningText.signature must parse cleanly: {wrapped_thinking:?}"
     );
 
-    // 2. Context-first metadata frame emits ContextUsage, Usage, and StopReason together.
+    // 2. Context-first and wrapped metadata frames emit ContextUsage, Usage, and StopReason together.
     let ctx_first = parser.feed(
         br#"{"contextUsagePercentage":1,"stopReason":"MAX_TOKENS","tokenUsage":{"outputTokens":25}}"#,
     );
@@ -944,6 +944,19 @@ async fn wrapped_tool_reasoning_context_metadata_zero_usage_and_saturating_total
     assert!(ctx_first
         .iter()
         .any(|e| matches!(e, ParsedEvent::StopReason(r) if r == "MAX_TOKENS")));
+
+    let wrapped_meta = parser.feed(
+        br#"{"messageMetadataEvent":{"tokenUsage":{"outputTokens":12},"contextUsagePercentage":2.5,"stopReason":"END_TURN"}}"#,
+    );
+    assert!(wrapped_meta
+        .iter()
+        .any(|e| matches!(e, ParsedEvent::ContextUsage(p) if (*p - 2.5).abs() < 1e-6)));
+    assert!(wrapped_meta
+        .iter()
+        .any(|e| matches!(e, ParsedEvent::Usage(u) if u["outputTokens"] == 12)));
+    assert!(wrapped_meta
+        .iter()
+        .any(|e| matches!(e, ParsedEvent::StopReason(r) if r == "END_TURN")));
 
     // 3. Zero legacy usage completes consistently as end_turn in Anthropic stream & collect.
     let make_zero_usage = || {
@@ -1004,4 +1017,18 @@ async fn wrapped_tool_reasoning_context_metadata_zero_usage_and_saturating_total
     assert_eq!(oai["usage"]["prompt_tokens"], i64::MAX);
     assert_eq!(oai["usage"]["completion_tokens"], i64::MAX);
     assert_eq!(oai["usage"]["total_tokens"], i64::MAX);
+
+    // Responses usage_block and authenticated key usage_tracking also saturate cleanly.
+    let resp_usage = usage_block(oai.get("usage"));
+    assert_eq!(resp_usage["input_tokens"], i64::MAX);
+    assert_eq!(resp_usage["output_tokens"], i64::MAX);
+    assert_eq!(resp_usage["total_tokens"], i64::MAX);
+
+    let keyed_ctx = RequestCtx::new(Some("saturate-test-key".into()));
+    keyed_ctx.record_tokens("claude-sonnet-5.5", i64::MAX, i64::MAX, None);
+    keyed_ctx.record_tokens("claude-sonnet-5.5", i64::MAX, i64::MAX, None);
+    let (pending_reqs, pending_tokens) =
+        kiro_lb::usage_tracking::pending_key_totals("saturate-test-key");
+    assert_eq!(pending_reqs, 2);
+    assert_eq!(pending_tokens, i64::MAX);
 }
